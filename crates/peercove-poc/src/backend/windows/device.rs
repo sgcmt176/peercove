@@ -297,6 +297,12 @@ impl Device {
                 continue; // IPv6 等は M0 対象外
             };
             tracing::debug!("TUN から {} バイト受信(宛先 {dst})", bytes.len());
+            // ブロードキャスト・マルチキャスト(NetBIOS、mDNS 等)は対象外。
+            // ユニキャストのみピアへ転送する
+            if dst.is_multicast() || dst.is_broadcast() || dst.octets()[3] == 255 {
+                tracing::debug!("ブロードキャスト/マルチキャスト宛 {dst} を無視します");
+                continue;
+            }
             let peer = {
                 let table = self.peers.read().unwrap();
                 table.by_key.values().find(|p| p.allows(dst)).cloned()
