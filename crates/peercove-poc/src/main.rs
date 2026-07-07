@@ -4,7 +4,6 @@ mod commands;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use anyhow::bail;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -98,9 +97,8 @@ fn main() -> anyhow::Result<()> {
             commands::tunnel::run_up(&config, commands::tunnel::Role::Member)
         }
         Command::AddPeer { config, pubkey, ip } => commands::add_peer::run(&config, &pubkey, ip),
-        Command::UdpEcho { .. } | Command::UdpPing { .. } => {
-            bail!("udp-echo / udp-ping は G-5 で実装予定です")
-        }
+        Command::UdpEcho { listen } => commands::udp::run_echo(listen),
+        Command::UdpPing { target, count } => commands::udp::run_ping(target, count),
         Command::Status { config } => commands::status::run(&config),
         Command::Down { config } => commands::tunnel::run_down(&config),
     }
