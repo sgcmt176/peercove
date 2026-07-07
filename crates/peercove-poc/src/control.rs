@@ -38,13 +38,16 @@ pub async fn run_host_server(
     ledger_rx: watch::Receiver<Vec<LedgerEntry>>,
     connections: Connections,
 ) {
-    // トンネル作成直後は仮想 IP への bind が失敗しうるためリトライする
+    // トンネル作成直後は Windows が仮想 IP を数秒間「準備中」として扱うため、
+    // bind が 10049 等で失敗する。準備が整うまで 1 秒間隔でリトライする
     let listener = loop {
         match TcpListener::bind(SocketAddr::from((bind_ip, CONTROL_PORT))).await {
             Ok(listener) => break listener,
             Err(e) => {
-                tracing::debug!("コントロールチャネルの bind に失敗(再試行します): {e}");
-                tokio::time::sleep(RETRY_INTERVAL).await;
+                tracing::debug!(
+                    "コントロールチャネル起動待ち(トンネルのアドレス準備中。想定内): {e}"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     };
