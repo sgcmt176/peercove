@@ -251,6 +251,15 @@ impl Device {
                         break;
                     }
                     TunnResult::Err(WireGuardError::UnderLoad) => break,
+                    TunnResult::Err(WireGuardError::NoCurrentSession) => {
+                        // 典型例: こちらの再起動後、相手が古いセッションで送信している。
+                        // 相手は約 15 秒でデータ無応答を検知して再ハンドシェイクする
+                        tracing::warn!(
+                            "{src} からのパケットを復号できません(セッション不一致)。\
+                             相手側の自動再接続(約 15 秒)を待っています"
+                        );
+                        break;
+                    }
                     TunnResult::Err(e) => {
                         tracing::warn!("{src} からのパケットの復号に失敗: {e:?}");
                         break;
@@ -429,8 +438,12 @@ mod tests {
 
     impl TestNode {
         fn start(private_key: &PrivateKey) -> Self {
+            Self::start_with_port(private_key, None)
+        }
+
+        fn start_with_port(private_key: &PrivateKey, port: Option<u16>) -> Self {
             let (tun, handles) = mock_tun();
-            let device = Device::new(*private_key.as_bytes(), None, tun).expect("device 起動失敗");
+            let device = Device::new(*private_key.as_bytes(), port, tun).expect("device 起動失敗");
             let threads = vec![
                 spawn_loop(&device, Device::udp_loop),
                 spawn_loop(&device, Device::tun_loop),
@@ -552,6 +565,58 @@ mod tests {
         );
 
         host.stop();
+        member.stop();
+    }
+
+    /// ホスト再起動シナリオ: メンバーは古いセッションで送信を続けるが、
+    /// データ無応答の検知(約 15 秒)で自動的に再ハンドシェイクして復帰する。
+    /// G-2 実機検証で観測した NoCurrentSession の回復経路を担保する。
+    #[test]
+    fn member_recovers_after_host_restart() {
+        let host_ip: Ipv4Addr = "100.100.42.1".parse().unwrap();
+        let member_ip: Ipv4Addr = "100.100.42.2".parse().unwrap();
+        let host_key = PrivateKey::generate();
+        let member_key = PrivateKey::generate();
+        let member_peer = || peer_spec(member_key.public_key(), None, &["100.100.42.2/32"], None);
+
+        let host1 = TestNode::start(&host_key);
+        host1.device.add_peer(&member_peer()).unwrap();
+        let port = host1.device.local_port();
+
+        let member = TestNode::start(&member_key);
+        member
+            .device
+            .add_peer(&peer_spec(
+                host_key.public_key(),
+                Some(host1.endpoint()),
+                &["100.100.42.0/24"],
+                Some(25),
+            ))
+            .unwrap();
+
+        // 初回の疎通を確立
+        let m2h = ipv4_packet(member_ip, host_ip, b"before restart");
+        expect_via_tunnel(&member, &host1, m2h, "再起動前の member->host パケット");
+
+        // ホストを停止し、同じポートで新プロセス相当を起動(セッション消失)
+        host1.stop();
+        let host2 = TestNode::start_with_port(&host_key, Some(port));
+        host2.device.add_peer(&member_peer()).unwrap();
+
+        // メンバーは古いセッションのまま送信し続ける → 自動再ハンドシェイクで復帰
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let payload = ipv4_packet(member_ip, host_ip, b"after restart");
+        let recovered = loop {
+            member.tun.os_out_tx.send(payload.clone()).unwrap();
+            match host2.tun.os_in_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(received) => break received,
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                Err(e) => panic!("ホスト再起動後に復帰しませんでした: {e}"),
+            }
+        };
+        assert_eq!(recovered, payload);
+
+        host2.stop();
         member.stop();
     }
 }
