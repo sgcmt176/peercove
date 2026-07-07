@@ -1,16 +1,22 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context};
 use peercove_core::config::{Config, PeerConfig, DEFAULT_LISTEN_PORT};
 use peercove_core::keys::{read_preshared_key_file, read_private_key_file};
+use peercove_core::proto::LedgerEntry;
 
-use crate::backend::{create_backend, PeerSpec, TunnelSpec, WgBackend};
+use crate::backend::{create_backend, PeerSpec, PeerStats, TunnelSpec, WgBackend};
 use crate::commands::status;
+use crate::control;
 
 /// 設定再読込とステータスファイル書き出しの周期(ADR-0002)。
 const SUPERVISE_INTERVAL: Duration = Duration::from_secs(5);
+/// 最終ハンドシェイクがこれ以内なら「オンライン」とみなす(WG の
+/// セッション有効期限 180 秒に合わせる)。
+const ONLINE_THRESHOLD: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -74,6 +80,7 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
 
 /// Ctrl+C まで 5 秒周期で以下を行う:
 /// - (host のみ)設定を再読込し、追記された新規ピアを動的追加(ADR-0002)
+/// - (host)台帳を更新してコントロールチャネルへ配布 /(member)受信台帳の反映
 /// - ステータスファイルの書き出し
 fn supervise_until_ctrl_c(
     config_path: &Path,
@@ -87,51 +94,151 @@ fn supervise_until_ctrl_c(
         .map(|p| *p.public_key.as_bytes())
         .collect();
     let status_path = status::status_file_path(config_path);
+    let host_public_key = spec.private_key.public_key();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("非同期ランタイムの初期化に失敗しました")?;
     runtime.block_on(async {
-        let ctrl_c = tokio::signal::ctrl_c();
-        tokio::pin!(ctrl_c);
-        let mut tick = tokio::time::interval(SUPERVISE_INTERVAL);
-        loop {
-            tokio::select! {
-                result = &mut ctrl_c => {
-                    return result.context("シグナル待機に失敗しました");
-                }
-                _ = tick.tick() => {
-                    if role == Role::Host {
-                        reload_new_peers(config_path, backend, &mut known);
+        // コントロールチャネル(M1-G2)
+        let (ledger_tx, ledger_rx) = tokio::sync::watch::channel(Vec::<LedgerEntry>::new());
+        let connections: control::Connections = Default::default();
+        let member_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>> = Default::default();
+        let mut tasks = Vec::new();
+        match role {
+            Role::Host => {
+                tasks.push(tokio::spawn(control::run_host_server(
+                    spec.address.addr(),
+                    ledger_rx,
+                    Arc::clone(&connections),
+                )));
+            }
+            Role::Member => {
+                // 接続先: join が書いた control_host。無ければ慣例(サブネット先頭)
+                let config = Config::load(config_path)?;
+                let host_ip = config
+                    .peers
+                    .first()
+                    .and_then(|p| p.control_host)
+                    .or_else(|| spec.address.trunc().hosts().next());
+                match host_ip {
+                    Some(host_ip) if host_ip != spec.address.addr() => {
+                        tasks.push(tokio::spawn(control::run_member_client(
+                            host_ip,
+                            config.interface.display_name.clone(),
+                            Arc::clone(&member_ledger),
+                        )));
                     }
-                    match backend.stats() {
-                        Ok(stats) => {
-                            if let Err(e) = status::write_status_file(&status_path, &stats) {
-                                tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
-                            }
-                        }
-                        Err(e) => tracing::debug!("統計の取得に失敗: {e:#}"),
-                    }
+                    _ => tracing::warn!(
+                        "コントロールチャネルの接続先が決められないため台帳同期を行いません"
+                    ),
                 }
             }
         }
+
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        let mut tick = tokio::time::interval(SUPERVISE_INTERVAL);
+        let result = loop {
+            tokio::select! {
+                result = &mut ctrl_c => {
+                    break result.context("シグナル待機に失敗しました");
+                }
+                _ = tick.tick() => {
+                    let config = match Config::load(config_path) {
+                        Ok(config) => Some(config),
+                        Err(e) => {
+                            tracing::warn!("設定の再読込に失敗しました(前回の設定で継続): {e:#}");
+                            None
+                        }
+                    };
+                    if role == Role::Host {
+                        if let Some(config) = &config {
+                            reload_new_peers(config, backend, &mut known);
+                        }
+                    }
+                    let stats = match backend.stats() {
+                        Ok(stats) => stats,
+                        Err(e) => {
+                            tracing::debug!("統計の取得に失敗: {e:#}");
+                            continue;
+                        }
+                    };
+                    // 台帳: host は設定+統計から構築して配布、member は受信済みを表示
+                    let ledger = match role {
+                        Role::Host => config.as_ref().map(|config| {
+                            let ledger = build_ledger(config, &host_public_key, &stats);
+                            ledger_tx.send_if_modified(|current| {
+                                if *current != ledger {
+                                    *current = ledger.clone();
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            ledger
+                        }),
+                        Role::Member => member_ledger.lock().unwrap().clone(),
+                    };
+                    if let Err(e) =
+                        status::write_status_file(&status_path, &stats, ledger.as_deref())
+                    {
+                        tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
+                    }
+                }
+            }
+        };
+        for task in tasks {
+            task.abort();
+        }
+        result
     })
 }
 
-/// 設定ファイルを再読込し、未登録の公開鍵のピアだけをバックエンドへ追加する。
-/// 既存ピアの変更・削除は M1 で対応(ここでは無視)。
-fn reload_new_peers(
-    config_path: &Path,
-    backend: &mut dyn WgBackend,
-    known: &mut HashSet<[u8; 32]>,
-) {
-    let config = match Config::load(config_path) {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::warn!("設定の再読込に失敗しました(前回の設定で継続): {e:#}");
-            return;
-        }
-    };
+/// 台帳を構築する(ホスト自身 + 全ピア)。online は最終ハンドシェイクで判定。
+fn build_ledger(
+    config: &Config,
+    host_public_key: &peercove_core::keys::PublicKey,
+    stats: &[PeerStats],
+) -> Vec<LedgerEntry> {
+    let by_key: HashMap<&[u8; 32], &PeerStats> =
+        stats.iter().map(|s| (s.public_key.as_bytes(), s)).collect();
+    let now = SystemTime::now();
+    let mut ledger = vec![LedgerEntry {
+        name: config
+            .interface
+            .display_name
+            .clone()
+            .or_else(|| Some("host".to_string())),
+        ip: config.interface.address.addr(),
+        public_key: *host_public_key,
+        online: true,
+        is_host: true,
+    }];
+    for peer in &config.peers {
+        let online = by_key
+            .get(peer.public_key.as_bytes())
+            .and_then(|s| s.last_handshake)
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age <= ONLINE_THRESHOLD);
+        ledger.push(LedgerEntry {
+            name: peer.name.clone(),
+            ip: peer
+                .allowed_ips
+                .first()
+                .map(|net| net.addr())
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            public_key: peer.public_key,
+            online,
+            is_host: false,
+        });
+    }
+    ledger
+}
+
+/// 設定から、未登録の公開鍵のピアだけをバックエンドへ追加する。
+/// 既存ピアの変更・削除の反映は M1-G3 以降で対応。
+fn reload_new_peers(config: &Config, backend: &mut dyn WgBackend, known: &mut HashSet<[u8; 32]>) {
     for peer in &config.peers {
         if known.contains(peer.public_key.as_bytes()) {
             continue;

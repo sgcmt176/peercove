@@ -1,5 +1,6 @@
 mod backend;
 mod commands;
+mod control;
 mod upnp;
 
 use std::net::{Ipv4Addr, SocketAddr};

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use peercove_core::proto::LedgerEntry;
 
 use crate::backend::PeerStats;
 
@@ -56,12 +57,27 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 統計をステータスファイル・画面共通の形式に整形する。
-pub fn render(stats: &[PeerStats]) -> String {
-    if stats.is_empty() {
-        return "peers: なし\n".to_string();
-    }
+/// 統計と台帳をステータスファイル・画面共通の形式に整形する。
+pub fn render(stats: &[PeerStats], ledger: Option<&[LedgerEntry]>) -> String {
     let mut out = String::new();
+    // 台帳(コントロールチャネル経由。host は自前、member は受信したもの)
+    if let Some(ledger) = ledger {
+        out.push_str("members:\n");
+        for entry in ledger {
+            out.push_str(&format!(
+                "  {} {}({}){}\n",
+                if entry.online { "●" } else { "○" },
+                entry.name.as_deref().unwrap_or("(名前なし)"),
+                entry.ip,
+                if entry.is_host { " [host]" } else { "" }
+            ));
+        }
+        out.push('\n');
+    }
+    if stats.is_empty() {
+        out.push_str("peers: なし\n");
+        return out;
+    }
     for peer in stats {
         out.push_str(&format!("peer: {}\n", peer.public_key));
         out.push_str(&format!(
@@ -95,8 +111,12 @@ pub fn render(stats: &[PeerStats]) -> String {
 }
 
 /// ステータスファイルへ書き出す。失敗は呼び出し側で警告ログにする。
-pub fn write_status_file(path: &Path, stats: &[PeerStats]) -> anyhow::Result<()> {
-    std::fs::write(path, render(stats))
+pub fn write_status_file(
+    path: &Path,
+    stats: &[PeerStats],
+    ledger: Option<&[LedgerEntry]>,
+) -> anyhow::Result<()> {
+    std::fs::write(path, render(stats, ledger))
         .with_context(|| format!("{} の書き込みに失敗しました", path.display()))
 }
 
@@ -140,12 +160,38 @@ mod tests {
                 allowed_ips: vec!["100.100.42.3/32".parse().unwrap()],
             },
         ];
-        let text = render(&stats);
+        let text = render(&stats, None);
         assert!(text.contains("endpoint: 203.0.113.5:51820"));
         assert!(text.contains("latest handshake: 12 秒前"));
         assert!(text.contains("transfer: rx 42 B, tx 1.50 KiB"));
         assert!(text.contains("endpoint: (未接続)"));
         assert!(text.contains("latest handshake: なし"));
+        assert!(!text.contains("members:"));
+    }
+
+    #[test]
+    fn renders_ledger_section() {
+        use peercove_core::proto::LedgerEntry;
+        let ledger = vec![
+            LedgerEntry {
+                name: Some("host".to_string()),
+                ip: "100.100.42.1".parse().unwrap(),
+                public_key: PublicKey::from_bytes([3; 32]),
+                online: true,
+                is_host: true,
+            },
+            LedgerEntry {
+                name: Some("alice".to_string()),
+                ip: "100.100.42.2".parse().unwrap(),
+                public_key: PublicKey::from_bytes([4; 32]),
+                online: false,
+                is_host: false,
+            },
+        ];
+        let text = render(&[], Some(&ledger));
+        assert!(text.contains("members:"));
+        assert!(text.contains("● host(100.100.42.1) [host]"));
+        assert!(text.contains("○ alice(100.100.42.2)"));
     }
 
     #[test]

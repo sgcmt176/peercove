@@ -1,0 +1,99 @@
+//! トンネル内コントロールチャネルのプロトコル型(ADR-0005)。
+//!
+//! - トランスポート: ホスト仮想 IP の TCP [`CONTROL_PORT`]。トンネル内なので
+//!   WG により暗号化・認証済み(接続元の仮想 IP がメンバーの身元になる)
+//! - フレーミング: JSON Lines(1 行 = 1 メッセージ)
+//! - 互換性: メッセージは `type` タグ付き。未知のフィールドは無視する側で許容し、
+//!   互換性を壊す変更は [`PROTO_VERSION`] を上げる
+
+use std::net::Ipv4Addr;
+
+use serde::{Deserialize, Serialize};
+
+use crate::keys::PublicKey;
+
+/// コントロールチャネルの TCP ポート(ホスト仮想 IP 上)。
+pub const CONTROL_PORT: u16 = 51821;
+pub const PROTO_VERSION: u32 = 1;
+
+/// 1 行 1 メッセージでやり取りする制御メッセージ。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlMessage {
+    /// member → host: 接続直後に名乗る。
+    Hello {
+        version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// host → member: 台帳スナップショット(接続時と変更時に送る)。
+    Ledger { members: Vec<LedgerEntry> },
+    /// host → member: あなたは削除された(以後トンネルは通らない)。
+    Removed { message: String },
+}
+
+/// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub ip: Ipv4Addr,
+    pub public_key: PublicKey,
+    /// 最終ハンドシェイクが十分新しい(ホストから見て到達可能)か。
+    pub online: bool,
+    /// ホストかどうか。
+    #[serde(default)]
+    pub is_host: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::PrivateKey;
+
+    fn entry() -> LedgerEntry {
+        LedgerEntry {
+            name: Some("alice".to_string()),
+            ip: "100.100.42.2".parse().unwrap(),
+            public_key: PrivateKey::generate().public_key(),
+            online: true,
+            is_host: false,
+        }
+    }
+
+    #[test]
+    fn control_message_json_roundtrip() {
+        let messages = vec![
+            ControlMessage::Hello {
+                version: PROTO_VERSION,
+                name: Some("alice".to_string()),
+            },
+            ControlMessage::Ledger {
+                members: vec![entry()],
+            },
+            ControlMessage::Removed {
+                message: "ホストにより削除されました".to_string(),
+            },
+        ];
+        for message in messages {
+            let json = serde_json::to_string(&message).unwrap();
+            assert!(!json.contains('\n'), "JSON Lines 用に 1 行であること");
+            let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, message);
+        }
+    }
+
+    /// ワイヤ表現(タグ名)を固定する。変えると旧バージョンと会話できなくなる。
+    #[test]
+    fn wire_format_is_stable() {
+        let json = serde_json::to_string(&ControlMessage::Hello {
+            version: 1,
+            name: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"hello","version":1}"#);
+
+        let json = serde_json::to_string(&ControlMessage::Ledger { members: vec![] }).unwrap();
+        assert_eq!(json, r#"{"type":"ledger","members":[]}"#);
+    }
+}
