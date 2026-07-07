@@ -7,7 +7,7 @@
 ## 進捗(M0 ゴール)
 
 - [x] ワークスペース・keygen・設定 TOML 読み込み(G-1 前半)
-- [ ] G-1: トンネル作成・破棄(Windows / Linux)
+- [x] G-1: トンネル作成・破棄(Windows / Linux)※実機検証待ち
 - [ ] G-2: 1対1疎通(Host–Member ping)
 - [ ] G-3: ハブ&スポーク疎通(Member ↔ Member、Host 経由)
 - [ ] G-4: TCP 疎通
@@ -25,7 +25,10 @@
 
 - Visual Studio(C++ ビルドツール)— rustup のインストール時に案内されます
 - トンネル操作(G-1 以降)は **管理者として実行した** PowerShell / ターミナルが必要です
-- wintun.dll(G-1 以降で必要。入手手順は G-1 実装時に追記)
+- **wintun.dll**(TUN ドライバ)
+  1. <https://www.wintun.net> から wintun のzipをダウンロード
+  2. zip 内の `bin/amd64/wintun.dll` を `peercove-poc.exe` と同じフォルダ
+     (通常 `target\debug\`)にコピー
 
 ### Ubuntu 22.04+
 
@@ -67,14 +70,64 @@ cargo fmt --check
 
 ### 設定ファイル
 
-[examples/host.example.toml](examples/host.example.toml) と [examples/member.example.toml](examples/member.example.toml) をコピーして編集してください。
+[examples/host.example.toml](examples/host.example.toml) と [examples/member.example.toml](examples/member.example.toml) をコピーして編集してください。設定内の相対パス(`private_key_file` 等)は**設定ファイルのあるディレクトリ基準**で解決されます。
 
-`host` / `member` / `down` / `status` コマンドは現時点では**設定の読み込み・検証のみ**行います(トンネル操作は G-1 以降で実装)。
+### トンネルの起動と停止
+
+**Windows は管理者ターミナル、Linux は sudo が必要です。**
 
 ```bash
-./target/debug/peercove-poc member --config member.toml
-# → 設定 OK: interface=peercove0 address=100.100.42.2/24 mtu=1420 peers=1
+# ホスト(トンネル作成 + UDP 51820 待受)
+sudo ./target/debug/peercove-poc host --config host.toml
+
+# メンバー(トンネル作成 + ホストへ接続)
+sudo ./target/debug/peercove-poc member --config member.toml
 ```
+
+- 起動中は Ctrl+C で終了し、トンネルを自動でクリーンアップします
+- 異常終了などで残骸が残った場合は `down` で掃除できます:
+
+```bash
+sudo ./target/debug/peercove-poc down --config host.toml
+```
+
+> メモ: Windows のトンネルはユーザー空間実装のため、プロセスが終了すると
+> アダプタも自動的に消えます。Linux はカーネル実装のため、異常終了時に
+> インターフェースが残ることがあります(`down` で削除)。
+
+## 検証手順(G-1: トンネル作成・破棄)
+
+Windows / Linux 各 1 台で、それぞれ単体で確認できます(相手は不要)。
+
+### Windows(管理者 PowerShell)
+
+1. wintun.dll を `target\debug\` に配置する(上記「必要環境」参照)
+2. `examples\host.example.toml` を `host.toml` にコピーし、
+   `peercove-poc keygen --out host.key` で鍵を作る
+3. `.\target\debug\peercove-poc.exe host --config host.toml` を実行し、
+   「トンネル peercove0 を作成しました」「待受ポート: UDP 51820」が表示されること
+4. 別の(管理者でなくてよい)ターミナルで `ipconfig` に `peercove0` が現れ、
+   IPv4 アドレスが `100.100.42.1` であること
+5. `ping 100.100.42.1` に応答があること(自分宛)
+6. Ctrl+C で終了し、`ipconfig` から `peercove0` が消えること
+7. 管理者**でない**ターミナルで手順 3 を実行すると、管理者権限を促す
+   エラーになること(黙って失敗しないこと)
+8. wintun.dll を一時的にリネームして手順 3 を実行すると、入手手順を含む
+   エラーになること
+
+### Ubuntu 22.04+
+
+1. `examples/member.example.toml` を `member.toml` にコピーし、
+   `peercove-poc keygen --out member_a.key` で鍵を作る
+   (`public_key` / `endpoint` はこの時点ではダミーで可)
+2. `sudo ./target/debug/peercove-poc member --config member.toml` を実行し、
+   「トンネル peercove0 を作成しました」が表示されること
+3. 別ターミナルで `ip addr show peercove0` に `100.100.42.2/24` が表示され、
+   `ip route` に `100.100.42.0/24 dev peercove0` があること
+4. Ctrl+C で終了し、`ip link show peercove0` が「does not exist」になること
+5. sudo なしで手順 2 を実行すると「root 権限が必要です」エラーになること
+6. `sudo ./target/debug/peercove-poc down --config member.toml` が
+   (トンネルが無い状態でも)正常終了すること
 
 ## 検証手順(G-1 前半: keygen・設定読み込み)
 

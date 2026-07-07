@@ -1,3 +1,4 @@
+mod backend;
 mod commands;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -87,14 +88,21 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Keygen { out, psk, force } => commands::keygen::run(&out, psk, force),
-        Command::Host { config, upnp: _ } => not_yet(&config, "host", "G-1"),
-        Command::Member { config } => not_yet(&config, "member", "G-1"),
+        Command::Host { config, upnp } => {
+            if upnp {
+                tracing::warn!("--upnp は G-6 で実装予定です(無視して続行します)");
+            }
+            commands::tunnel::run_up(&config, commands::tunnel::Role::Host)
+        }
+        Command::Member { config } => {
+            commands::tunnel::run_up(&config, commands::tunnel::Role::Member)
+        }
         Command::AddPeer { .. } => bail!("add-peer は G-2 で実装予定です"),
         Command::UdpEcho { .. } | Command::UdpPing { .. } => {
             bail!("udp-echo / udp-ping は G-5 で実装予定です")
         }
         Command::Status { config } => not_yet(&config, "status", "G-2"),
-        Command::Down { config } => not_yet(&config, "down", "G-1"),
+        Command::Down { config } => commands::tunnel::run_down(&config),
     }
 }
 
@@ -108,5 +116,5 @@ fn not_yet(config_path: &Path, name: &str, goal: &str) -> anyhow::Result<()> {
         config.interface.mtu,
         config.peers.len()
     );
-    bail!("{name} のトンネル操作は {goal} で実装予定です(設定の検証のみ行いました)");
+    bail!("{name} は {goal} で実装予定です(設定の検証のみ行いました)");
 }
