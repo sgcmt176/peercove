@@ -19,7 +19,7 @@ pub enum Role {
 }
 
 /// host / member 共通: トンネルを作成し、Ctrl+C まで維持して破棄する。
-pub fn run_up(config_path: &Path, role: Role) -> anyhow::Result<()> {
+pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let spec = build_spec(&config, role)?;
     let mut backend = create_backend(&config.interface.name)?;
@@ -32,16 +32,39 @@ pub fn run_up(config_path: &Path, role: Role) -> anyhow::Result<()> {
         spec.mtu,
         spec.peers.len()
     );
+    let listen_port = spec.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
     if role == Role::Host {
-        println!(
-            "待受ポート: UDP {}(メンバーの endpoint にはこのポートを指定)",
-            spec.listen_port.unwrap_or(DEFAULT_LISTEN_PORT)
-        );
+        println!("待受ポート: UDP {listen_port}(メンバーの endpoint にはこのポートを指定)");
     }
+
+    // UPnP は失敗してもトンネル自体は継続する(手動ポートフォワードで代替可能)
+    let upnp_lease = if upnp && role == Role::Host {
+        match crate::upnp::setup(listen_port) {
+            Ok(report) => {
+                println!("UPnP ポート開放に成功しました(UDP {listen_port}、リース 24 時間)");
+                println!(
+                    "外部エンドポイント(推定): {}:{}",
+                    report.external_ip, report.external_port
+                );
+                println!("→ 別 NAT のメンバーは endpoint にこれを指定してください");
+                Some(report.lease)
+            }
+            Err(e) => {
+                tracing::warn!("UPnP: {e:#}");
+                println!("UPnP ポート開放は失敗しました(トンネルは継続します)");
+                None
+            }
+        }
+    } else {
+        None
+    };
     println!("Ctrl+C で終了します(トンネルをクリーンアップします)");
 
     let supervise_result = supervise_until_ctrl_c(config_path, role, backend.as_mut(), &spec);
     println!("終了処理中…");
+    if let Some(lease) = upnp_lease {
+        lease.release();
+    }
     let _ = std::fs::remove_file(status::status_file_path(config_path));
     backend.down()?;
     println!("クリーンアップが完了しました");

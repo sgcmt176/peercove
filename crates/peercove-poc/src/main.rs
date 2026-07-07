@@ -1,5 +1,6 @@
 mod backend;
 mod commands;
+mod upnp;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -88,13 +89,10 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Keygen { out, psk, force } => commands::keygen::run(&out, psk, force),
         Command::Host { config, upnp } => {
-            if upnp {
-                tracing::warn!("--upnp は G-6 で実装予定です(無視して続行します)");
-            }
-            commands::tunnel::run_up(&config, commands::tunnel::Role::Host)
+            commands::tunnel::run_up(&config, commands::tunnel::Role::Host, upnp)
         }
         Command::Member { config } => {
-            commands::tunnel::run_up(&config, commands::tunnel::Role::Member)
+            commands::tunnel::run_up(&config, commands::tunnel::Role::Member, false)
         }
         Command::AddPeer { config, pubkey, ip } => commands::add_peer::run(&config, &pubkey, ip),
         Command::UdpEcho { listen } => commands::udp::run_echo(listen),
