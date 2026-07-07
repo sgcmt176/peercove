@@ -236,6 +236,11 @@ impl Device {
                     TunnResult::WriteToTunnelV4(packet, src_ip) => {
                         authenticated = true;
                         if peer.allows(src_ip) {
+                            tracing::debug!(
+                                "復号 {} バイトを TUN へ書き込み(src {src_ip} 宛先 {:?})",
+                                packet.len(),
+                                Tunn::dst_address(packet)
+                            );
                             self.write_to_tun(packet);
                         } else {
                             tracing::warn!(
