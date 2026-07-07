@@ -12,8 +12,10 @@
 - [x] G-3: ハブ&スポーク疎通(Member ↔ Member、Host 経由)✅ 実機検証済み
 - [x] G-4: TCP 疎通 ✅ 実機検証済み
 - [x] G-5: UDP 疎通(udp-echo / udp-ping)✅ 実機検証済み
-- [x] G-6: UPnP による到達性セットアップ ※実機検証待ち
-- [x] G-7: 計測レポート ※実測値の記入待ち
+- [x] G-6: UPnP による到達性セットアップ ✅ 実機検証済み(別 NAT からの到達含む)
+- [x] G-7: 計測レポート ✅ 実測値記入済み([docs/m0-report-template.md](docs/m0-report-template.md))
+
+**M0 の全ゴールを達成しました(2026-07-08)。**
 
 ## 必要環境
 
