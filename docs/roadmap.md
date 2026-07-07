@@ -101,15 +101,18 @@ crates/
 > 予告(招待トークン pcv1 / トンネル内コントロールチャネル / 台帳配布 /
 > メンバー削除の CLI E2E)に基づく暫定分解。
 
-| # | タスク | 内容(概要) | 主な変更箇所 | 難易度 |
-|---|---|---|---|---|
-| M1-1 | 招待トークン(pcv1) | ホスト公開鍵・エンドポイント・PSK 等を 1 つの文字列にエンコード/デコード。バージョン付きフォーマット設計 | peercove-core に新モジュール | ★★(Opus 可) |
-| M1-2 | 台帳(メンバー一覧)の型と永続化 | メンバー公開鍵・仮想 IP・表示名などの台帳型、TOML/JSON 保存、ipalloc との統合 | peercove-core | ★★(Opus 可) |
-| M1-3 | join コマンド | トークンを貼るだけで member.toml 相当を生成し参加 | commands/ 新規 | ★★(Opus 可) |
-| M1-4 | コントロールチャネル | トンネル内(仮想 IP 上)で host⇔member の制御通信(参加通知・台帳配布・削除通知)。プロトコル設計含む | commands/tunnel.rs、新モジュール | ★★★★(高難度) |
-| M1-5 | メンバー削除 | 台帳から削除→全ノードへ配布→バックエンドから remove_peer。**Windows device への remove_peer 追加を含む** | backend/(trait 拡張)、windows/device.rs | ★★★★(高難度) |
-| M1-6 | 仮想 IP 既定レンジの再検討 | Tailscale 衝突の恒久対応(ランダム 10.x /24 生成など)。ADR 化 | core/config、examples | ★★(Opus 可、ADR は要レビュー) |
-| M1-7 | ピア設定変更の動的反映 | ADR-0002 の制限解除(エンドポイント・PSK 変更等) | tunnel.rs、backend/ | ★★★(中〜高) |
+| # | タスク | 内容(概要) | 主な変更箇所 | 難易度 | 状態 |
+|---|---|---|---|---|---|
+| M1-1 | 招待トークン(pcv1) | ADR-0005 案 B(メンバー鍵同梱)。base64url + QR(fast_qr) | core/token.rs | ★★ | ✅ 実装済み(2026-07-08) |
+| M1-2 | 台帳 | 独立ファイルにせず host.toml の `[[peer]]`(name 付き)を正本に。配布型は core/proto.rs | core | ★★ | ✅ 実装済み |
+| M1-3 | invite / join コマンド | トークン発行(既定ファイル保存、--print/--qr)と参加設定生成 | commands/invite.rs, join.rs | ★★ | ✅ 実装済み |
+| M1-4 | コントロールチャネル | ホスト仮想 IP の TCP 51821、JSON Lines。hello / 台帳配布 / 削除通知 | control.rs, tunnel.rs | ★★★★ | ✅ 実装済み |
+| M1-5 | メンバー削除 | remove-peer(toml_edit)+ 2 段階反映(通知→実削除)+ WgBackend::remove_peer | backend/, commands/remove_peer.rs | ★★★★ | ✅ 実装済み |
+| M1-6 | 仮想 IP 既定レンジの再検討 | Tailscale 衝突の恒久対応(ランダム 10.x /24 生成など)。ADR 化 | core/config、examples | ★★(Opus 可、ADR は要レビュー) | 未着手 |
+| M1-7 | ピア設定変更の動的反映 | エンドポイント・PSK 変更等の反映(追加・削除は対応済み) | tunnel.rs、backend/ | ★★★(中〜高) | 未着手 |
+
+M1-1〜M1-5 は実装・ユニットテスト完了、**実機検証待ち**(README の
+「検証手順(M1-G1〜G3)」参照)。
 
 ### 作業の振り分けガイド(依頼者の意向)
 
