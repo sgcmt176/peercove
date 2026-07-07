@@ -896,6 +896,7 @@ dependencies = [
  "libc",
  "peercove-core",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "wintun",

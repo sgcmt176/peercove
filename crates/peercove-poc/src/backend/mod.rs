@@ -35,8 +35,6 @@ pub struct PeerSpec {
     pub preshared_key: Option<PresharedKey>,
 }
 
-// TODO(G-2): status コマンドで使用する
-#[allow(dead_code)]
 pub struct PeerStats {
     pub public_key: PublicKey,
     pub endpoint: Option<SocketAddr>,
@@ -50,12 +48,10 @@ pub trait WgBackend {
     /// TUN 作成・IP/MTU 設定・ピア登録・待受開始までを行う。
     fn up(&mut self, spec: &TunnelSpec) -> anyhow::Result<()>;
 
-    /// 実行中のトンネルへピアを追加する(G-2)。
-    #[allow(dead_code)] // TODO(G-2): add-peer コマンドで使用する
+    /// 実行中のトンネルへピアを追加する。
     fn add_peer(&mut self, peer: &PeerSpec) -> anyhow::Result<()>;
 
     /// ピアごとの統計(最終ハンドシェイク・転送量)を返す。
-    #[allow(dead_code)] // TODO(G-2): status コマンドで使用する
     fn stats(&mut self) -> anyhow::Result<Vec<PeerStats>>;
 
     /// トンネルと関連設定を破棄する。`up` していないインスタンスで呼んだ場合は

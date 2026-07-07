@@ -1,10 +1,16 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use peercove_core::config::{Config, PeerConfig, DEFAULT_LISTEN_PORT};
 use peercove_core::keys::{read_preshared_key_file, read_private_key_file};
 
-use crate::backend::{create_backend, PeerSpec, TunnelSpec};
+use crate::backend::{create_backend, PeerSpec, TunnelSpec, WgBackend};
+use crate::commands::status;
+
+/// 設定再読込とステータスファイル書き出しの周期(ADR-0002)。
+const SUPERVISE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -34,11 +40,93 @@ pub fn run_up(config_path: &Path, role: Role) -> anyhow::Result<()> {
     }
     println!("Ctrl+C で終了します(トンネルをクリーンアップします)");
 
-    wait_for_ctrl_c()?;
+    let supervise_result = supervise_until_ctrl_c(config_path, role, backend.as_mut(), &spec);
     println!("終了処理中…");
+    let _ = std::fs::remove_file(status::status_file_path(config_path));
     backend.down()?;
     println!("クリーンアップが完了しました");
-    Ok(())
+    supervise_result
+}
+
+/// Ctrl+C まで 5 秒周期で以下を行う:
+/// - (host のみ)設定を再読込し、追記された新規ピアを動的追加(ADR-0002)
+/// - ステータスファイルの書き出し
+fn supervise_until_ctrl_c(
+    config_path: &Path,
+    role: Role,
+    backend: &mut dyn WgBackend,
+    spec: &TunnelSpec,
+) -> anyhow::Result<()> {
+    let mut known: HashSet<[u8; 32]> = spec
+        .peers
+        .iter()
+        .map(|p| *p.public_key.as_bytes())
+        .collect();
+    let status_path = status::status_file_path(config_path);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("非同期ランタイムの初期化に失敗しました")?;
+    runtime.block_on(async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        let mut tick = tokio::time::interval(SUPERVISE_INTERVAL);
+        loop {
+            tokio::select! {
+                result = &mut ctrl_c => {
+                    return result.context("シグナル待機に失敗しました");
+                }
+                _ = tick.tick() => {
+                    if role == Role::Host {
+                        reload_new_peers(config_path, backend, &mut known);
+                    }
+                    match backend.stats() {
+                        Ok(stats) => {
+                            if let Err(e) = status::write_status_file(&status_path, &stats) {
+                                tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
+                            }
+                        }
+                        Err(e) => tracing::debug!("統計の取得に失敗: {e:#}"),
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// 設定ファイルを再読込し、未登録の公開鍵のピアだけをバックエンドへ追加する。
+/// 既存ピアの変更・削除は M1 で対応(ここでは無視)。
+fn reload_new_peers(
+    config_path: &Path,
+    backend: &mut dyn WgBackend,
+    known: &mut HashSet<[u8; 32]>,
+) {
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!("設定の再読込に失敗しました(前回の設定で継続): {e:#}");
+            return;
+        }
+    };
+    for peer in &config.peers {
+        if known.contains(peer.public_key.as_bytes()) {
+            continue;
+        }
+        let spec = match build_peer_spec(peer, Role::Host) {
+            Ok(spec) => spec,
+            Err(e) => {
+                tracing::warn!("ピア {} の設定が不正です: {e:#}", peer.public_key);
+                continue;
+            }
+        };
+        match backend.add_peer(&spec) {
+            Ok(()) => {
+                known.insert(*peer.public_key.as_bytes());
+                tracing::info!("ピア {} を追加しました", peer.public_key);
+            }
+            Err(e) => tracing::warn!("ピア {} の追加に失敗しました: {e:#}", peer.public_key),
+        }
+    }
 }
 
 /// down コマンド: 残骸(TUN 等)のクリーンアップ。
@@ -48,15 +136,6 @@ pub fn run_down(config_path: &Path) -> anyhow::Result<()> {
     backend.down()?;
     println!("クリーンアップが完了しました({})", config.interface.name);
     Ok(())
-}
-
-fn wait_for_ctrl_c() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("非同期ランタイムの初期化に失敗しました")?
-        .block_on(tokio::signal::ctrl_c())
-        .context("シグナル待機に失敗しました")
 }
 
 pub fn build_spec(config: &Config, role: Role) -> anyhow::Result<TunnelSpec> {

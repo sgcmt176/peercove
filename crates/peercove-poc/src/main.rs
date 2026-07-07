@@ -2,7 +2,7 @@ mod backend;
 mod commands;
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::bail;
 use clap::{Parser, Subcommand};
@@ -97,24 +97,11 @@ fn main() -> anyhow::Result<()> {
         Command::Member { config } => {
             commands::tunnel::run_up(&config, commands::tunnel::Role::Member)
         }
-        Command::AddPeer { .. } => bail!("add-peer は G-2 で実装予定です"),
+        Command::AddPeer { config, pubkey, ip } => commands::add_peer::run(&config, &pubkey, ip),
         Command::UdpEcho { .. } | Command::UdpPing { .. } => {
             bail!("udp-echo / udp-ping は G-5 で実装予定です")
         }
-        Command::Status { config } => not_yet(&config, "status", "G-2"),
+        Command::Status { config } => commands::status::run(&config),
         Command::Down { config } => commands::tunnel::run_down(&config),
     }
-}
-
-/// 未実装コマンドの仮実装。設定の読み込み・検証だけ行い、内容を報告して終了する。
-fn not_yet(config_path: &Path, name: &str, goal: &str) -> anyhow::Result<()> {
-    let config = peercove_core::config::Config::load(config_path)?;
-    println!(
-        "設定 OK: interface={} address={} mtu={} peers={}",
-        config.interface.name,
-        config.interface.address,
-        config.interface.mtu,
-        config.peers.len()
-    );
-    bail!("{name} は {goal} で実装予定です(設定の検証のみ行いました)");
 }

@@ -8,7 +8,7 @@
 
 - [x] ワークスペース・keygen・設定 TOML 読み込み(G-1 前半)
 - [x] G-1: トンネル作成・破棄(Windows / Linux)※実機検証待ち
-- [ ] G-2: 1対1疎通(Host–Member ping)
+- [x] G-2: 1対1疎通(Host–Member ping)※実機検証待ち
 - [ ] G-3: ハブ&スポーク疎通(Member ↔ Member、Host 経由)
 - [ ] G-4: TCP 疎通
 - [ ] G-5: UDP 疎通(udp-echo / udp-ping)
@@ -95,6 +95,31 @@ sudo ./target/debug/peercove-poc down --config host.toml
 > アダプタも自動的に消えます。Linux はカーネル実装のため、異常終了時に
 > インターフェースが残ることがあります(`down` で削除)。
 
+### メンバーの追加(add-peer)と状態確認(status)
+
+```bash
+# ホスト側: メンバーの公開鍵と割当 IP を登録(管理者権限は不要)
+./target/debug/peercove-poc add-peer --config host.toml \
+    --pubkey "MEMBER_A_PUBKEY_B64" --ip 100.100.42.2
+```
+
+- `add-peer` は host.toml に `[[peer]]` を追記するだけです。実行中の host
+  プロセスは 5 秒間隔で設定を再読込し、新しいピアを自動で取り込みます
+  (再起動不要。ピアの削除・変更の反映は M1 で対応)
+- 状態確認は同じ設定ファイルを指定して:
+
+```bash
+./target/debug/peercove-poc status --config host.toml
+# peer: <公開鍵>
+#   endpoint: 203.0.113.10:53210
+#   allowed_ips: 100.100.42.2/32
+#   latest handshake: 3 秒前
+#   transfer: rx 1.2 KiB, tx 892 B
+```
+
+`status` は host / member プロセスが 5 秒ごとに書き出す
+`<設定名>.status.txt` を表示します(プロセスが動いていないとエラー)。
+
 ## 検証手順(G-1: トンネル作成・破棄)
 
 Windows / Linux 各 1 台で、それぞれ単体で確認できます(相手は不要)。
@@ -128,6 +153,56 @@ Windows / Linux 各 1 台で、それぞれ単体で確認できます(相手は
 5. sudo なしで手順 2 を実行すると「root 権限が必要です」エラーになること
 6. `sudo ./target/debug/peercove-poc down --config member.toml` が
    (トンネルが無い状態でも)正常終了すること
+
+## 検証手順(G-2: Host–Member 1対1 ping 疎通)
+
+Host(Windows 11)と Member A(Ubuntu)の 2 台で行います。
+まず両方の機械で G-1 の検証が通っていることが前提です。
+
+### 準備
+
+1. **Host(Windows・管理者)**
+   1. `peercove-poc keygen --out host.key` → 表示された公開鍵を控える(以下 `HOST_PUB`)
+   2. `examples\host.example.toml` を `host.toml` にコピー(そのままで可)
+2. **Member A(Ubuntu)**
+   1. `./peercove-poc keygen --out member_a.key` → 公開鍵を控える(以下 `MEMBER_A_PUB`)
+   2. `examples/member.example.toml` を `member.toml` にコピーし編集:
+      - `address = "100.100.42.2/24"`
+      - `public_key = "HOST_PUB"`
+      - `endpoint = "<HostのIP>:51820"`
+        (**同一 LAN なら Host の LAN IP**。別 NAT の場合は G-6 まではルーターで
+        UDP 51820 を Host へ手動ポートフォワードしておく)
+3. 事前共有鍵を使う場合(任意): どちらかで `keygen --psk --out psk.key` を実行し、
+   **同じファイル**を両方に配置して、双方の `[[peer]]` に
+   `preshared_key_file = "psk.key"` を追記
+
+### 疎通確認
+
+1. Host: `.\peercove-poc.exe host --config host.toml` を起動したまま、
+   別ターミナルで `add-peer --config host.toml --pubkey "MEMBER_A_PUB" --ip 100.100.42.2`
+2. Host のログに(5 秒以内に)「ピア … を追加しました」が出ること
+3. Member A: `sudo ./peercove-poc member --config member.toml` を起動
+4. 数秒以内に、両側の `status` で `latest handshake` が「n 秒前」になること
+   (ハンドシェイクが「なし」のままなら疎通失敗 → 下の確認ポイント参照)
+5. **Member A → Host**: `ping 100.100.42.1` が通ること
+6. **Host → Member A**: `ping 100.100.42.2` が通ること
+7. Member A の `status` の transfer(rx/tx)が ping のたびに増えること
+8. 片方を Ctrl+C → もう一方の `status` の handshake 経過秒が増え続けること
+   を確認後、再起動すると自動で復帰すること(メンバー再起動の場合)
+
+### 失敗時の確認ポイント
+
+- **handshake が「なし」**: endpoint の IP・ポートが正しいか。別 NAT の場合は
+  ルーターのポートフォワード(UDP 51820 → Host)を確認。Host 側 Windows
+  ファイアウォールで peercove-poc.exe の UDP 受信が許可されているか
+  (初回起動時のダイアログで「許可」を選ぶ。出なかった場合は
+  「Windows Defender ファイアウォール > アプリの許可」で追加)
+- **handshake は成立するが ping が通らない**: Windows の受信規則で
+  ICMP エコー(ファイルとプリンターの共有 (エコー要求 - ICMPv4 受信))が
+  ブロックされていないか。まず Member→Host と Host→Member を両方試し、
+  片方向だけ失敗するならファイアウォールが原因
+- **同一 LAN で繋がらない**: endpoint に外部 IP でなく **LAN IP** を指定する
+  (ルーターの hairpin NAT 非対応のため)
 
 ## 検証手順(G-1 前半: keygen・設定読み込み)
 
