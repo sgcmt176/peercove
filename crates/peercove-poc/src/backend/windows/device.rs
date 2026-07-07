@@ -76,6 +76,9 @@ pub struct Device {
     socket: UdpSocket,
     tun: Box<dyn TunIo>,
     peers: RwLock<PeerTable>,
+    /// ピア間転送(ハブ&スポーク)。宛先が別ピアのパケットを OS を経由せず
+    /// デバイス内で直接リレーする(ADR-0003)。ホストのみ true。
+    relay: bool,
     shutdown: AtomicBool,
 }
 
@@ -83,6 +86,7 @@ impl Device {
     pub fn new(
         private_key: [u8; 32],
         listen_port: Option<u16>,
+        relay: bool,
         tun: Box<dyn TunIo>,
     ) -> anyhow::Result<Arc<Self>> {
         let port = listen_port.unwrap_or(0);
@@ -103,6 +107,7 @@ impl Device {
             socket,
             tun,
             peers: RwLock::new(PeerTable::default()),
+            relay,
             shutdown: AtomicBool::new(false),
         }))
     }
@@ -180,6 +185,42 @@ impl Device {
         }
     }
 
+    fn find_peer_by_dst(&self, dst: Ipv4Addr) -> Option<Arc<DevicePeer>> {
+        let table = self.peers.read().unwrap();
+        table.by_key.values().find(|p| p.allows(dst)).cloned()
+    }
+
+    /// 復号済みパケットを配送する。宛先が別ピアならデバイス内で直接リレーし
+    /// (ハブ&スポーク、ADR-0003)、それ以外は TUN(自分の OS)へ渡す。
+    fn deliver_inbound(&self, from: &Arc<DevicePeer>, packet: &[u8]) {
+        let dst = match Tunn::dst_address(packet) {
+            Some(IpAddr::V4(dst)) => dst,
+            _ => {
+                self.write_to_tun(packet);
+                return;
+            }
+        };
+        tracing::debug!("復号 {} バイトを受信(宛先 {dst})", packet.len());
+        if self.relay {
+            if let Some(target) = self.find_peer_by_dst(dst) {
+                // 送信元ピア宛への折り返しはループになるため TUN 側へ落とす
+                if !Arc::ptr_eq(&target, from) {
+                    tracing::debug!("宛先 {dst} のピアへ直接リレーします");
+                    let mut buf = [0u8; BUF_SIZE];
+                    let mut tunn = target.tunn.lock().unwrap();
+                    match tunn.encapsulate(packet, &mut buf) {
+                        TunnResult::WriteToNetwork(data) => self.send_to_peer(&target, data),
+                        TunnResult::Err(e) => tracing::warn!("リレーの暗号化に失敗: {e:?}"),
+                        // セッション未確立時はキューされ、ハンドシェイク完了後に流れる
+                        _ => {}
+                    }
+                    return;
+                }
+            }
+        }
+        self.write_to_tun(packet);
+    }
+
     fn find_peer_for_datagram(&self, datagram: &[u8]) -> Option<Arc<DevicePeer>> {
         let packet = Tunn::parse_incoming_packet(datagram).ok()?;
         let table = self.peers.read().unwrap();
@@ -236,12 +277,7 @@ impl Device {
                     TunnResult::WriteToTunnelV4(packet, src_ip) => {
                         authenticated = true;
                         if peer.allows(src_ip) {
-                            tracing::debug!(
-                                "復号 {} バイトを TUN へ書き込み(src {src_ip} 宛先 {:?})",
-                                packet.len(),
-                                Tunn::dst_address(packet)
-                            );
-                            self.write_to_tun(packet);
+                            self.deliver_inbound(&peer, packet);
                         } else {
                             tracing::warn!(
                                 "AllowedIPs 外の送信元 {src_ip} からのパケットを破棄しました"
@@ -308,11 +344,7 @@ impl Device {
                 tracing::debug!("ブロードキャスト/マルチキャスト宛 {dst} を無視します");
                 continue;
             }
-            let peer = {
-                let table = self.peers.read().unwrap();
-                table.by_key.values().find(|p| p.allows(dst)).cloned()
-            };
-            let Some(peer) = peer else {
+            let Some(peer) = self.find_peer_by_dst(dst) else {
                 tracing::warn!("宛先 {dst} に対応するピアがありません(AllowedIPs 未登録)");
                 continue;
             };
@@ -449,12 +481,17 @@ mod tests {
 
     impl TestNode {
         fn start(private_key: &PrivateKey) -> Self {
-            Self::start_with_port(private_key, None)
+            Self::start_full(private_key, None, false)
         }
 
         fn start_with_port(private_key: &PrivateKey, port: Option<u16>) -> Self {
+            Self::start_full(private_key, port, false)
+        }
+
+        fn start_full(private_key: &PrivateKey, port: Option<u16>, relay: bool) -> Self {
             let (tun, handles) = mock_tun();
-            let device = Device::new(*private_key.as_bytes(), port, tun).expect("device 起動失敗");
+            let device =
+                Device::new(*private_key.as_bytes(), port, relay, tun).expect("device 起動失敗");
             let threads = vec![
                 spawn_loop(&device, Device::udp_loop),
                 spawn_loop(&device, Device::tun_loop),
@@ -577,6 +614,69 @@ mod tests {
 
         host.stop();
         member.stop();
+    }
+
+    /// ハブ&スポーク: Member A ↔ Member B が Host のデバイス内リレー経由で
+    /// 疎通する(A・B 間に直接のピア設定はない)。G-3 に対応。
+    #[test]
+    fn hub_and_spoke_relays_between_members() {
+        let a_ip: Ipv4Addr = "100.100.42.2".parse().unwrap();
+        let b_ip: Ipv4Addr = "100.100.42.3".parse().unwrap();
+        let host_key = PrivateKey::generate();
+        let a_key = PrivateKey::generate();
+        let b_key = PrivateKey::generate();
+
+        // host はリレー有効(ホスト役)
+        let host = TestNode::start_full(&host_key, None, true);
+        host.device
+            .add_peer(&peer_spec(
+                a_key.public_key(),
+                None,
+                &["100.100.42.2/32"],
+                None,
+            ))
+            .unwrap();
+        host.device
+            .add_peer(&peer_spec(
+                b_key.public_key(),
+                None,
+                &["100.100.42.3/32"],
+                None,
+            ))
+            .unwrap();
+
+        let member_peer = |endpoint| {
+            peer_spec(
+                host_key.public_key(),
+                Some(endpoint),
+                &["100.100.42.0/24"],
+                Some(25),
+            )
+        };
+        let a = TestNode::start(&a_key);
+        a.device.add_peer(&member_peer(host.endpoint())).unwrap();
+        let b = TestNode::start(&b_key);
+        b.device.add_peer(&member_peer(host.endpoint())).unwrap();
+
+        // A -> B(Host 経由。B のセッションが未確立でもキュー・再送で届く)
+        let a2b = ipv4_packet(a_ip, b_ip, b"a to b via host");
+        let received = expect_via_tunnel(&a, &b, a2b.clone(), "A->B リレーパケット");
+        assert_eq!(received, a2b);
+
+        // B -> A(逆方向)
+        let b2a = ipv4_packet(b_ip, a_ip, b"b to a via host");
+        let received = expect_via_tunnel(&b, &a, b2a.clone(), "B->A リレーパケット");
+        assert_eq!(received, b2a);
+
+        // リレーしたパケットは host の TUN(OS)には現れない
+        assert!(
+            host.tun.os_in_rx.try_recv().is_err(),
+            "リレー対象パケットが host の TUN に漏れた"
+        );
+
+        host.stop();
+        a.stop();
+        b.stop();
     }
 
     /// ホスト再起動シナリオ: メンバーは古いセッションで送信を続けるが、

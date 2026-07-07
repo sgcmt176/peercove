@@ -23,6 +23,9 @@ pub struct TunnelSpec {
     /// `None` は OS 任せ(メンバー)。ホストは必ず指定する。
     pub listen_port: Option<u16>,
     pub mtu: u16,
+    /// ピア間転送(ハブ&スポーク)を有効にする(ホストのみ true)。
+    /// 方式は OS ごとに異なる(ADR-0003)。
+    pub forwarding: bool,
     pub peers: Vec<PeerSpec>,
 }
 

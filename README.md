@@ -7,9 +7,9 @@
 ## 進捗(M0 ゴール)
 
 - [x] ワークスペース・keygen・設定 TOML 読み込み(G-1 前半)
-- [x] G-1: トンネル作成・破棄(Windows / Linux)※実機検証待ち
-- [x] G-2: 1対1疎通(Host–Member ping)※実機検証待ち
-- [ ] G-3: ハブ&スポーク疎通(Member ↔ Member、Host 経由)
+- [x] G-1: トンネル作成・破棄(Windows / Linux)✅ 実機検証済み
+- [x] G-2: 1対1疎通(Host–Member ping)✅ 実機検証済み(双方向 0% loss, RTT ~1ms)
+- [x] G-3: ハブ&スポーク疎通(Member ↔ Member、Host 経由)※実機検証待ち
 - [ ] G-4: TCP 疎通
 - [ ] G-5: UDP 疎通(udp-echo / udp-ping)
 - [ ] G-6: UPnP による到達性セットアップ
@@ -215,6 +215,47 @@ Host(Windows 11)と Member A(Ubuntu)の 2 台で行います。
   ことを検知してから再ハンドシェイクするため、**復帰まで最大 15〜20 秒**
   かかります(host 側には「セッション不一致」の警告が出ます)。ping を
   30 秒以上続けるか、member 側を再起動すると確実です
+
+## 検証手順(G-3: Member A ↔ Member B、Host 経由)
+
+Host + Member A(G-2 と同じ)に、**Member B(Windows 10/11)** を追加します。
+A と B の間に直接のピア設定はなく、すべて Host がリレーします。
+
+ホスト側の転送は自動で有効になります(Windows ホスト: デバイス内リレー /
+Linux ホスト: インターフェース単位の IP フォワーディング。OS のグローバル
+設定は変更しません)。
+
+### 準備(Member B)
+
+1. wintun.dll を `target\debug\` に配置(「必要環境」参照)
+2. `peercove-poc keygen --out member_b.key` → 公開鍵を控える(`MEMBER_B_PUB`)
+3. `examples\member.example.toml` を `member_b.toml` にコピーし編集:
+   - `private_key_file = "member_b.key"`
+   - `address = "100.100.42.3/24"`
+   - `public_key = "HOST_PUB"` / `endpoint = "<HostのIP>:51820"`
+4. Host 側で `add-peer --config host.toml --pubkey "MEMBER_B_PUB" --ip 100.100.42.3`
+5. Member B(管理者)で `.\peercove-poc.exe member --config member_b.toml`
+6. Member B が Tailscale 入りの場合は一時停止しておく(トラブルシューティング参照)
+
+### 疎通確認
+
+1. Host・A・B の 3 者を起動し、Host の `status` で **2 ピアとも** handshake が
+   成立していること
+2. **A → B**: Member A(Ubuntu)から `ping -c 10 100.100.42.3`
+3. **B → A**: Member B(Windows)から `ping 100.100.42.2`
+4. ping 中、**Host の `status`** で A・B 両ピアの transfer が増えること
+   (= リレーが Host を通っている証拠)
+5. B → Host(`ping 100.100.42.1`)も通ること(G-2 の Windows 版に相当)
+
+### 失敗時の確認ポイント
+
+- **A→B だけ失敗**: Member B(Windows)の ICMP 受信がファイアウォールで
+  ブロックされていないか(G-2 のトラブルシューティング参照。
+  `netsh advfirewall firewall add rule name="PeerCove ICMPv4-In" protocol=icmpv4:8,any dir=in action=allow`)
+- **両方向失敗**: Host の `status` で B の handshake が成立しているか。
+  B の endpoint(Host の IP:51820)と add-peer の IP(100.100.42.3)を確認
+- **Linux ホストの場合のみ**: `cat /proc/sys/net/ipv4/conf/peercove0/forwarding`
+  が `1` になっているか
 
 ## 検証手順(G-1 前半: keygen・設定読み込み)
 

@@ -182,6 +182,7 @@ pub fn build_spec(config: &Config, role: Role) -> anyhow::Result<TunnelSpec> {
         address: config.interface.address,
         listen_port,
         mtu: config.interface.mtu,
+        forwarding: role == Role::Host,
         peers,
     })
 }

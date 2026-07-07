@@ -36,6 +36,17 @@ impl LinuxBackend {
         }
         Ok(())
     }
+
+    /// ピア間転送のためインターフェース単位の IP フォワーディングを有効化する
+    /// (ADR-0003)。この設定はインターフェースの消滅とともに消えるため、
+    /// `down` での原状回復は不要。グローバルの ip_forward は変更しない。
+    fn enable_forwarding(&self) -> anyhow::Result<()> {
+        let path = format!("/proc/sys/net/ipv4/conf/{}/forwarding", self.if_name);
+        std::fs::write(&path, "1")
+            .with_context(|| format!("IP フォワーディングの有効化に失敗しました({path})"))?;
+        tracing::info!("IP フォワーディングを有効化しました({path} = 1)");
+        Ok(())
+    }
 }
 
 fn to_peer(spec: &PeerSpec) -> Peer {
@@ -82,6 +93,12 @@ impl WgBackend for LinuxBackend {
             // 設定に失敗したら作りかけの TUN を残さない
             let _ = self.api.remove_interface();
             return Err(anyhow::anyhow!(e).context("インターフェースの設定に失敗しました"));
+        }
+        if spec.forwarding {
+            if let Err(e) = self.enable_forwarding() {
+                let _ = self.api.remove_interface();
+                return Err(e);
+            }
         }
         Ok(())
     }

@@ -147,9 +147,13 @@ impl WgBackend for WindowsBackend {
                 .start_session(wintun::MAX_RING_CAPACITY)
                 .context("TUN セッションの開始に失敗しました")?,
         );
+        if spec.forwarding {
+            tracing::info!("ピア間転送(ハブ&スポーク)を有効化しました(デバイス内リレー)");
+        }
         let device = Device::new(
             *spec.private_key.as_bytes(),
             spec.listen_port,
+            spec.forwarding,
             Box::new(WintunIo { session }),
         )?;
         for peer in &spec.peers {
