@@ -6,6 +6,8 @@
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(test)]
+pub(crate) mod mock;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -38,6 +40,7 @@ pub struct PeerSpec {
     pub preshared_key: Option<PresharedKey>,
 }
 
+#[derive(Clone)]
 pub struct PeerStats {
     pub public_key: PublicKey,
     pub endpoint: Option<SocketAddr>,
@@ -47,7 +50,7 @@ pub struct PeerStats {
     pub allowed_ips: Vec<Ipv4Net>,
 }
 
-pub trait WgBackend {
+pub trait WgBackend: Send {
     /// TUN 作成・IP/MTU 設定・ピア登録・待受開始までを行う。
     fn up(&mut self, spec: &TunnelSpec) -> anyhow::Result<()>;
 

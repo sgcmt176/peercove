@@ -27,6 +27,12 @@
 
 **M1 の全タスクを達成しました(2026-07-08)。**
 
+### M2(進行中)
+
+- [x] M2-G1: デーモン分離 + ローカル IPC(daemon run / status / start / stop)※実機検証待ち
+- [ ] M2-G2〜G6: Tauri + React UI
+- [ ] M2-G7: インストーラ・自動起動
+
 ## 必要環境
 
 ### 共通
@@ -81,6 +87,27 @@ sudo ./target/debug/peercove-poc member --config member.toml
 (Tailscale の 100.64.0.0/10 や一般的な家庭 LAN・Docker と衝突しない帯。
 ADR-0006)。既存の設定もそのまま使えますが、CGNAT レンジ内のサブネットを
 使っていると起動時に警告が出ます。
+
+### デーモン経由の操作(M2-G1、UI の土台)
+
+将来の GUI は常駐デーモンをローカル IPC(Windows: 名前付きパイプ /
+Linux: Unix ドメインソケット)で操作します。CLI からも同じ IPC を使えます:
+
+```bash
+# 1) デーモンを起動(トンネル操作をするので管理者/root で)
+sudo ./target/debug/peercove-poc daemon run
+
+# 2) 別ターミナル(ユーザー権限でよい)から操作
+./target/debug/peercove-poc daemon start-host --config host.toml
+./target/debug/peercove-poc daemon status
+./target/debug/peercove-poc daemon stop
+./target/debug/peercove-poc daemon shutdown
+```
+
+- 招待・参加・削除(invite / join / remove-peer)は**デーモンを介さず**
+  従来どおり実行します(設定ファイル操作なので。実行中のトンネルは
+  5 秒ごとの再読込で自動追随します)
+- 従来の `host` / `member`(プロセス内実行)も引き続き使えます
 
 ### 鍵の生成(keygen)
 
@@ -528,6 +555,24 @@ M1-G1 の構成(Host + join 済み Member A)をそのまま使います。
 
 失敗時: Windows ホストのファイアウォールで TCP 51821 の受信許可
 (初回ダイアログ)を確認。Tailscale 起動中なら停止(README 上部参照)。
+
+## 検証手順(M2-G1: デーモン + IPC)
+
+daemon 経由でも従来と同じ疎通ができることを確認します(2 台構成)。
+
+1. Host: `sudo ./target/debug/peercove-poc daemon run` を起動したままにする
+2. Host(別ターミナル): `daemon status` → 「待機中」と出ること
+3. Host: `daemon start-host --config host.toml` → 「開始しました」
+4. Host: `daemon status` → 「ホストとして稼働中」+ 仮想 IP + members が出ること
+5. Member A: 従来どおり接続(`sudo ./peercove-poc member --config member.toml`
+   か、Member 側でも daemon を使うなら `daemon start-member`)
+6. Host↔Member A で ping が通ること(= daemon 経由でもトンネルが機能)
+7. Host: `daemon start-host …` を**もう一度**実行 → 「既にトンネルが動いています」
+   エラーになること(同時 1 ネットワークの制約)
+8. Host: `daemon stop` → ping が止まり、`daemon status` が「待機中」に戻ること
+9. Host: `daemon shutdown` → daemon run のプロセスが終了すること
+10. 異常系: daemon を起動せずに `daemon status` → 「接続できません」と
+    案内が出ること
 
 ## 検証手順(M1-G3: メンバー削除)
 

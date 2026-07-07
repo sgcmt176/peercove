@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod ipalloc;
+pub mod ipc;
 pub mod keys;
 pub mod proto;
 pub mod token;

@@ -24,8 +24,17 @@ pub enum Role {
     Member,
 }
 
-/// host / member 共通: トンネルを作成し、Ctrl+C まで維持して破棄する。
-pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> {
+/// 起動済みトンネル一式(バックエンド + UPnP リース)。
+/// [`bring_up`] で作り、[`tear_down`] で必ず対で破棄する。
+pub struct ActiveTunnel {
+    pub backend: Box<dyn WgBackend>,
+    pub spec: TunnelSpec,
+    pub role: Role,
+    upnp_lease: Option<crate::upnp::UpnpLease>,
+}
+
+/// 設定を読み、UPnP(任意)→ トンネル作成までを行う(CLI / daemon 共通)。
+pub fn bring_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<ActiveTunnel> {
     let config = Config::load(config_path)?;
     if peercove_core::ipalloc::overlaps_cgnat(config.interface.address.trunc()) {
         tracing::warn!(
@@ -63,38 +72,118 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
     };
 
     backend.up(&spec)?;
-    println!(
+    tracing::info!(
         "トンネル {} を作成しました(address={} mtu={} peers={})",
         config.interface.name,
         config.interface.address,
         spec.mtu,
         spec.peers.len()
     );
-    if role == Role::Host {
-        println!("待受ポート: UDP {listen_port}(メンバーの endpoint にはこのポートを指定)");
-    }
-    println!("Ctrl+C で終了します(トンネルをクリーンアップします)");
+    Ok(ActiveTunnel {
+        backend,
+        spec,
+        role,
+        upnp_lease,
+    })
+}
 
-    let supervise_result = supervise_until_ctrl_c(config_path, role, backend.as_mut(), &spec);
-    println!("終了処理中…");
-    if let Some(lease) = upnp_lease {
+impl ActiveTunnel {
+    /// 停止シグナルまで supervisor を回す(daemon 用の入り口)。
+    pub async fn supervise_run(
+        &mut self,
+        config_path: &Path,
+        stop: tokio::sync::watch::Receiver<bool>,
+        snapshot: Option<SharedSnapshot>,
+    ) -> anyhow::Result<()> {
+        supervise(
+            config_path,
+            self.role,
+            self.backend.as_mut(),
+            &self.spec,
+            stop,
+            snapshot,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(spec: TunnelSpec, role: Role, backend: Box<dyn WgBackend>) -> Self {
+        Self {
+            backend,
+            spec,
+            role,
+            upnp_lease: None,
+        }
+    }
+}
+
+/// トンネルと関連リソースを対で破棄する。
+pub fn tear_down(mut tunnel: ActiveTunnel, config_path: &Path) -> anyhow::Result<()> {
+    if let Some(lease) = tunnel.upnp_lease.take() {
         lease.release();
     }
     let _ = std::fs::remove_file(status::status_file_path(config_path));
-    backend.down()?;
+    tunnel.backend.down()
+}
+
+/// host / member 共通: トンネルを作成し、Ctrl+C まで維持して破棄する(CLI モード)。
+pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> {
+    let mut tunnel = bring_up(config_path, role, upnp)?;
+    println!(
+        "トンネルを作成しました(address={} peers={})",
+        tunnel.spec.address,
+        tunnel.spec.peers.len()
+    );
+    if role == Role::Host {
+        println!(
+            "待受ポート: UDP {}(メンバーの endpoint にはこのポートを指定)",
+            tunnel.spec.listen_port.unwrap_or(DEFAULT_LISTEN_PORT)
+        );
+    }
+    println!("Ctrl+C で終了します(トンネルをクリーンアップします)");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("非同期ランタイムの初期化に失敗しました")?;
+    let supervise_result = runtime.block_on(async {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let ctrl_c = tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = stop_tx.send(true);
+        });
+        let result = supervise(
+            config_path,
+            role,
+            tunnel.backend.as_mut(),
+            &tunnel.spec,
+            stop_rx,
+            None,
+        )
+        .await;
+        ctrl_c.abort();
+        result
+    });
+    println!("終了処理中…");
+    tear_down(tunnel, config_path)?;
     println!("クリーンアップが完了しました");
     supervise_result
 }
 
-/// Ctrl+C まで 5 秒周期で以下を行う:
-/// - (host のみ)設定を再読込し、追記された新規ピアを動的追加(ADR-0002)
+/// supervise が周期的に更新する共有スナップショット(daemon の status 応答用)。
+pub type SharedSnapshot = Arc<Mutex<Option<(Vec<PeerStats>, Option<Vec<LedgerEntry>>)>>>;
+
+/// 停止シグナルまで 5 秒周期で以下を行う(CLI = Ctrl+C / daemon = stop 要求):
+/// - (host のみ)設定を再読込し、ピアの追加・変更・削除を同期(ADR-0002 / M1-G3/7)
 /// - (host)台帳を更新してコントロールチャネルへ配布 /(member)受信台帳の反映
-/// - ステータスファイルの書き出し
-fn supervise_until_ctrl_c(
+/// - ステータスファイルと共有スナップショットの書き出し
+pub async fn supervise(
     config_path: &Path,
     role: Role,
     backend: &mut dyn WgBackend,
     spec: &TunnelSpec,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    snapshot: Option<SharedSnapshot>,
 ) -> anyhow::Result<()> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
@@ -107,11 +196,7 @@ fn supervise_until_ctrl_c(
     let mut pending_removal: HashSet<[u8; 32]> = HashSet::new();
     let status_path = status::status_file_path(config_path);
     let host_public_key = spec.private_key.public_key();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("非同期ランタイムの初期化に失敗しました")?;
-    runtime.block_on(async {
+    {
         // コントロールチャネル(M1-G2)
         let (ledger_tx, ledger_rx) = tokio::sync::watch::channel(Vec::<LedgerEntry>::new());
         let connections: control::Connections = Default::default();
@@ -148,13 +233,11 @@ fn supervise_until_ctrl_c(
             }
         }
 
-        let ctrl_c = tokio::signal::ctrl_c();
-        tokio::pin!(ctrl_c);
         let mut tick = tokio::time::interval(SUPERVISE_INTERVAL);
         let result = loop {
             tokio::select! {
-                result = &mut ctrl_c => {
-                    break result.context("シグナル待機に失敗しました");
+                _ = stop.changed() => {
+                    break Ok(());
                 }
                 _ = tick.tick() => {
                     let config = match Config::load(config_path) {
@@ -203,6 +286,9 @@ fn supervise_until_ctrl_c(
                     {
                         tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
                     }
+                    if let Some(snapshot) = &snapshot {
+                        *snapshot.lock().unwrap() = Some((stats, ledger));
+                    }
                 }
             }
         };
@@ -210,7 +296,7 @@ fn supervise_until_ctrl_c(
             task.abort();
         }
         result
-    })
+    }
 }
 
 /// 台帳を構築する(ホスト自身 + 全ピア)。online は最終ハンドシェイクで判定。
@@ -454,35 +540,8 @@ fn build_peer_spec(peer: &PeerConfig, role: Role) -> anyhow::Result<PeerSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use peercove_core::keys::{PrivateKey, PublicKey};
-
-    /// WgBackend の呼び出しを記録するモック。
-    #[derive(Default)]
-    struct MockBackend {
-        ops: Vec<String>,
-    }
-
-    impl WgBackend for MockBackend {
-        fn up(&mut self, _spec: &TunnelSpec) -> anyhow::Result<()> {
-            self.ops.push("up".to_string());
-            Ok(())
-        }
-        fn add_peer(&mut self, peer: &PeerSpec) -> anyhow::Result<()> {
-            self.ops.push(format!("add:{}", peer.public_key));
-            Ok(())
-        }
-        fn remove_peer(&mut self, public_key: &PublicKey) -> anyhow::Result<()> {
-            self.ops.push(format!("remove:{public_key}"));
-            Ok(())
-        }
-        fn stats(&mut self) -> anyhow::Result<Vec<PeerStats>> {
-            Ok(Vec::new())
-        }
-        fn down(&mut self) -> anyhow::Result<()> {
-            self.ops.push("down".to_string());
-            Ok(())
-        }
-    }
+    use crate::backend::mock::MockBackend;
+    use peercove_core::keys::PrivateKey;
 
     fn host_config(peers_toml: &str) -> Config {
         let text = format!(

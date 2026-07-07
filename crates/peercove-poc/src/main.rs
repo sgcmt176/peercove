@@ -1,6 +1,7 @@
 mod backend;
 mod commands;
 mod control;
+mod daemon;
 mod upnp;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -146,6 +147,36 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// デーモン(UI/CLI から IPC で操作する常駐プロセス)の管理
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// デーモンを起動して常駐する(トンネル操作に管理者/root 権限が必要)
+    Run,
+    /// デーモンとトンネルの状態を表示する
+    Status,
+    /// ホストとしてトンネルを開始する
+    StartHost {
+        #[arg(long)]
+        config: PathBuf,
+        /// UPnP IGD によるポート自動開放を試行する
+        #[arg(long)]
+        upnp: bool,
+    },
+    /// メンバーとしてトンネルを開始する
+    StartMember {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// トンネルを停止する(デーモンは常駐継続)
+    Stop,
+    /// デーモンを終了する
+    Shutdown,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -220,5 +251,49 @@ fn main() -> anyhow::Result<()> {
         Command::UdpPing { target, count } => commands::udp::run_ping(target, count),
         Command::Status { config } => commands::status::run(&config),
         Command::Down { config } => commands::tunnel::run_down(&config),
+        Command::Daemon { action } => run_daemon_action(action),
+    }
+}
+
+fn run_daemon_action(action: DaemonAction) -> anyhow::Result<()> {
+    use peercove_core::ipc::{IpcRequest, IpcResponse};
+    // デーモンとクライアントで作業ディレクトリが違うため、パスは絶対にして送る
+    let canon = |path: PathBuf| -> anyhow::Result<PathBuf> {
+        std::fs::canonicalize(&path)
+            .map_err(|e| anyhow::anyhow!("{} が見つかりません: {e}", path.display()))
+    };
+    match action {
+        DaemonAction::Run => daemon::run_server(),
+        DaemonAction::Status => {
+            if let IpcResponse::Status(status) = daemon::request(IpcRequest::Status)? {
+                daemon::print_status(&status);
+            }
+            Ok(())
+        }
+        DaemonAction::StartHost { config, upnp } => {
+            daemon::request(IpcRequest::StartHost {
+                config: canon(config)?,
+                upnp,
+            })?;
+            println!("ホストとしてトンネルを開始しました(daemon status で確認できます)");
+            Ok(())
+        }
+        DaemonAction::StartMember { config } => {
+            daemon::request(IpcRequest::StartMember {
+                config: canon(config)?,
+            })?;
+            println!("メンバーとしてトンネルを開始しました(daemon status で確認できます)");
+            Ok(())
+        }
+        DaemonAction::Stop => {
+            daemon::request(IpcRequest::Stop)?;
+            println!("トンネルを停止しました");
+            Ok(())
+        }
+        DaemonAction::Shutdown => {
+            daemon::request(IpcRequest::Shutdown)?;
+            println!("デーモンを終了しました");
+            Ok(())
+        }
     }
 }
