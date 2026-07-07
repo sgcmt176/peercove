@@ -1,7 +1,12 @@
 # CLAUDE.md — PeerCove リポジトリ指示
 
 このリポジトリは PeerCove(サーバーレス P2P VPN、WireGuard プロトコル利用)の開発リポジトリです。
-現在のフェーズは **M0: 技術検証(PoC)** です。仕様の正本は `docs/peercove-m0-handoff.md` にあります。実装前に必ず読んでください。
+**M0: 技術検証(PoC)は完了済み**(2026-07-08、全ゴール実機検証済み)。現在は **M1(招待トークン・コントロールチャネル・台帳・メンバー削除)** の準備段階です。
+
+実装前に必ず読むこと:
+1. `docs/roadmap.md` … 全体像・現在地・M1 タスク分解・**難易度別の作業振り分けガイド**・開発ワークフロー
+2. `docs/peercove-m0-handoff.md` … M0 の仕様正本(M1 の handoff は受領後に追加予定)
+3. `docs/decisions.md` … 確定済みの技術判断(ADR)。矛盾する実装をしないこと
 
 ## プロジェクトの前提
 
@@ -9,7 +14,7 @@
 - Phase 1 は WireGuard AllowedIPs + OS ルーティングによるハブ&スポーク(ホスト経由)
 - アプリ層 UDP プロキシは作らない。TCP/UDP/ICMP はトンネル内の通常 IP 通信として扱う
 - 対応 OS: Windows 10/11, Ubuntu 22.04+。**macOS のコードは書かない**(将来対応を妨げない抽象化はする)
-- M0 は CLI のみ。Tauri/React UI はまだ作らない
+- M0/M1 は CLI のみ。Tauri/React UI はまだ作らない
 - 製品名・crate 名・バイナリ名に "WireGuard" を含めない(商標方針)。説明文での言及は可
 
 ## ワークスペース構成
@@ -32,23 +37,28 @@
 - ネットワーク実疎通を伴う検証は自動テスト化しなくてよい。代わりに README に人間が再現できる手順を書く
 - root/管理者権限が必要な操作は、コード内で必要性を検出して分かりやすいエラーを出す(黙って失敗しない)
 - クリーンアップ(`down`)を常に対で実装する。TUN・ルート・フォワーディング設定の残骸を残さない
-- 1 つのゴール(handoff の G-1〜G-7)を終えるごとに、動作確認手順を README に反映してからコミットする
+- 1 つのゴール(タスク)を終えるごとに、動作確認手順を README に反映してからコミットする
+- **難易度の高い実装(Windows デバイスループ内部、コントロールチャネルのプロトコル設計、WgBackend trait の変更、OS API 境界)は、docs/roadmap.md §5 の振り分けガイドに従うこと**
 
 ## よく使うコマンド
 
 ```bash
 cargo build --workspace
-cargo test -p peercove-core
+cargo test --workspace          # Windows ではデバイスのループバックテストも走る
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+
+# Windows 開発機から Linux 側のコンパイル/lint を検証する場合(要 zig + cargo-zigbuild)
+cargo-zigbuild clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 
 # Linux での起動例(要 sudo)
 sudo ./target/debug/peercove-poc host --config host.toml
 sudo ./target/debug/peercove-poc member --config member.toml
 ```
 
-## やらないこと(M0)
+## やらないこと(現時点)
 
-- 招待トークン / QR / コントロールチャネル / 台帳 / メンバー削除(M1 で実装)
 - UDP ホールパンチング、直接通信(Phase 2)
 - UI、インストーラ、コード署名、macOS、モバイル、IPv6
+- 招待トークン / QR / コントロールチャネル / 台帳 / メンバー削除は **M1 の対象**
+  (正式な handoff 受領後に着手。暫定タスク分解は docs/roadmap.md §5)
