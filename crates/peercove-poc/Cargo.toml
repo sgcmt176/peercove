@@ -1,0 +1,16 @@
+[package]
+name = "peercove-poc"
+description = "PeerCove M0 技術検証 CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+peercove-core.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

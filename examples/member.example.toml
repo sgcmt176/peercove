@@ -1,0 +1,12 @@
+# PeerCove メンバー設定の例。実際に使うときはリポジトリ外へコピーして編集する。
+[interface]
+private_key_file = "member_a.key" # peercove-poc keygen --out member_a.key で生成
+address = "100.100.42.2/24"       # ホストから割り当てられた仮想 IP
+mtu = 1420                        # PPPoE 環境では 1412 などへ下げる
+
+[[peer]]
+public_key = "HOST_PUBKEY_B64"    # ホストの keygen が表示した公開鍵
+endpoint = "203.0.113.5:51820"    # ホストの外部 IP:ポート(同一 LAN なら LAN IP)
+allowed_ips = ["100.100.42.0/24"] # 全メンバー宛をホスト経由にする(ハブ&スポーク)
+persistent_keepalive = 25
+# preshared_key_file = "psk.key"  # 任意

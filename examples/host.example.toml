@@ -1,0 +1,13 @@
+# PeerCove ホスト設定の例。実際に使うときはリポジトリ外へコピーして編集する。
+[interface]
+# name = "peercove0"          # 省略時 peercove0
+private_key_file = "host.key" # peercove-poc keygen --out host.key で生成
+address = "100.100.42.1/24"
+listen_port = 51820
+mtu = 1420
+
+# メンバーは add-peer コマンドで追記する(手書きでもよい)。例:
+# [[peer]]
+# public_key = "MEMBER_A_PUBKEY_B64"
+# allowed_ips = ["100.100.42.2/32"]
+# preshared_key_file = "psk.key"   # 任意。使う場合はメンバーと同じファイル内容にする
