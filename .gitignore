@@ -1,4 +1,5 @@
 /target
+/target-smoke
 *.key
 # 実環境の設定(例は examples/ に置く)
 /host.toml
