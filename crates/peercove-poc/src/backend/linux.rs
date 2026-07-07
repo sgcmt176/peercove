@@ -121,7 +121,10 @@ impl WgBackend for LinuxBackend {
             .map(|peer| PeerStats {
                 public_key: peercove_core::keys::PublicKey::from_bytes(peer.public_key.as_array()),
                 endpoint: peer.endpoint,
-                last_handshake: peer.last_handshake,
+                // カーネルは「未成立」を UNIX エポックで返すため None に正規化する
+                last_handshake: peer
+                    .last_handshake
+                    .filter(|t| *t != std::time::UNIX_EPOCH),
                 tx_bytes: peer.tx_bytes,
                 rx_bytes: peer.rx_bytes,
                 allowed_ips: peer
