@@ -1,4 +1,5 @@
 pub mod add_peer;
+pub mod init;
 pub mod invite;
 pub mod join;
 pub mod keygen;

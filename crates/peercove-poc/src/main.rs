@@ -42,6 +42,18 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// ホストを初期化する(host.key と host.toml を生成、サブネットは自動選択)
+    Init {
+        /// 出力先ディレクトリ
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// UDP 待受ポート
+        #[arg(long, default_value_t = peercove_core::config::DEFAULT_LISTEN_PORT)]
+        port: u16,
+        /// 既存ファイルを上書きする
+        #[arg(long)]
+        force: bool,
+    },
     /// メンバー招待トークン(pcv1)を発行する(鍵と IP を自動生成して登録)
     Invite {
         #[arg(long)]
@@ -153,6 +165,7 @@ fn main() -> anyhow::Result<()> {
         Command::Member { config } => {
             commands::tunnel::run_up(&config, commands::tunnel::Role::Member, false)
         }
+        Command::Init { dir, port, force } => commands::init::run(&dir, port, force),
         Command::Invite {
             config,
             name,

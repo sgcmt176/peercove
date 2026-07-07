@@ -19,9 +19,11 @@
 
 ### M1(進行中)
 
-- [x] M1-G1: 招待トークン pcv1(invite / join、QR 対応)※実機検証待ち
-- [x] M1-G2: トンネル内コントロールチャネル(台帳配布)※実機検証待ち
-- [x] M1-G3: メンバー削除(remove-peer)※実機検証待ち
+- [x] M1-G1: 招待トークン pcv1(invite / join、QR 対応)✅ 実機検証済み
+- [x] M1-G2: トンネル内コントロールチャネル(台帳配布)✅ 実機検証済み
+- [x] M1-G3: メンバー削除(remove-peer)✅ 実機検証済み
+- [x] M1-6: init コマンド(ランダムサブネット生成、Tailscale 衝突回避)※実機検証待ち
+- [x] M1-7: ピア設定変更の動的反映 ※実機検証待ち
 
 ## 必要環境
 
@@ -59,6 +61,24 @@ cargo fmt --check
 ```
 
 ## 使い方
+
+### クイックスタート(ホストの初期化 → 招待)
+
+```bash
+# ホスト側(初期化は管理者権限不要)
+./target/debug/peercove-poc init                # host.key + host.toml を生成
+sudo ./target/debug/peercove-poc host --config host.toml   # Windows は管理者で
+./target/debug/peercove-poc invite --config host.toml --name alice
+
+# メンバー側(トークンを受け取って)
+./target/debug/peercove-poc join --token "pcv1.…"
+sudo ./target/debug/peercove-poc member --config member.toml
+```
+
+`init` はトンネルのサブネットを **ランダムな 10.x.y.0/24** から選びます
+(Tailscale の 100.64.0.0/10 や一般的な家庭 LAN・Docker と衝突しない帯。
+ADR-0006)。既存の設定もそのまま使えますが、CGNAT レンジ内のサブネットを
+使っていると起動時に警告が出ます。
 
 ### 鍵の生成(keygen)
 
@@ -189,6 +209,14 @@ members:
   **1) 本人へ削除通知(コントロールチャネル)→ 2) トンネルから除外**。
   以後そのメンバーのトークン・鍵では接続できません
 - 全員の `status` の members からも自動で消えます(台帳配布)
+
+### ピア設定の手動変更も自動反映されます(M1-7)
+
+host.toml の `[[peer]]` の `endpoint` / `allowed_ips` /
+`persistent_keepalive` / `preshared_key_file` を編集して保存すると、
+実行中の host が約 5 秒で検知して反映します(内部的には削除→再追加のため、
+そのピアは数秒間だけ再ハンドシェイクになります)。member 側の設定変更は
+これまでどおり member の再起動が必要です。
 
 ## 検証手順(G-1: トンネル作成・破棄)
 

@@ -27,6 +27,14 @@ pub enum Role {
 /// host / member 共通: トンネルを作成し、Ctrl+C まで維持して破棄する。
 pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
+    if peercove_core::ipalloc::overlaps_cgnat(config.interface.address.trunc()) {
+        tracing::warn!(
+            "トンネルのサブネット {} は CGNAT レンジ(100.64.0.0/10)内です。\
+             Tailscale が動作しているマシンではパケットが破棄されます。\
+             `peercove-poc init` で生成した設定への移行を推奨します(ADR-0006)",
+            config.interface.address.trunc()
+        );
+    }
     let spec = build_spec(&config, role)?;
     let mut backend = create_backend(&config.interface.name)?;
 
@@ -88,19 +96,12 @@ fn supervise_until_ctrl_c(
     backend: &mut dyn WgBackend,
     spec: &TunnelSpec,
 ) -> anyhow::Result<()> {
-    // 登録済みピア(公開鍵 → 仮想 IP)。削除通知の宛先解決にも使う
-    let mut known: HashMap<[u8; 32], std::net::Ipv4Addr> = spec
+    // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
+    // 削除通知の宛先解決に使う
+    let mut known: HashMap<[u8; 32], PeerFingerprint> = spec
         .peers
         .iter()
-        .map(|p| {
-            (
-                *p.public_key.as_bytes(),
-                p.allowed_ips
-                    .first()
-                    .map(|net| net.addr())
-                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
-            )
-        })
+        .map(|p| (*p.public_key.as_bytes(), PeerFingerprint::of(p)))
         .collect();
     // 削除通知済み・次の周期で実削除するピア
     let mut pending_removal: HashSet<[u8; 32]> = HashSet::new();
@@ -253,22 +254,48 @@ fn build_ledger(
     ledger
 }
 
-/// 設定とバックエンドのピアを同期する(ADR-0002 / M1-G3)。
+/// ピア設定の変更検知用フィンガープリント(M1-7)。
+#[derive(Clone, PartialEq, Eq)]
+struct PeerFingerprint {
+    ip: std::net::Ipv4Addr,
+    endpoint: Option<std::net::SocketAddr>,
+    allowed_ips: Vec<ipnet::Ipv4Net>,
+    keepalive: Option<u16>,
+    psk: Option<[u8; 32]>,
+}
+
+impl PeerFingerprint {
+    fn of(spec: &PeerSpec) -> Self {
+        Self {
+            ip: spec
+                .allowed_ips
+                .first()
+                .map(|net| net.addr())
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            endpoint: spec.endpoint,
+            allowed_ips: spec.allowed_ips.clone(),
+            keepalive: spec.persistent_keepalive,
+            psk: spec.preshared_key.as_ref().map(|k| *k.as_bytes()),
+        }
+    }
+}
+
+/// 設定とバックエンドのピアを同期する(ADR-0002 / M1-G3 / M1-7)。
 /// - 設定に増えたピア: バックエンドへ追加
+/// - 設定が変わったピア(endpoint / allowed_ips / keepalive / PSK): 削除→再追加で反映
+///   (再ハンドシェイクが走るため数秒の断がある)
 /// - 設定から消えたピア: まず削除通知を送り(1 周期目)、次の周期で実削除する
 ///   (通知はトンネル経由なので、先にピアを消すと届かないため)
 fn sync_peers(
     config: &Config,
     backend: &mut dyn WgBackend,
-    known: &mut HashMap<[u8; 32], std::net::Ipv4Addr>,
+    known: &mut HashMap<[u8; 32], PeerFingerprint>,
     pending_removal: &mut HashSet<[u8; 32]>,
     connections: &control::Connections,
 ) {
-    // 追加
+    // 追加・変更
     for peer in &config.peers {
-        if known.contains_key(peer.public_key.as_bytes()) {
-            continue;
-        }
+        let key = *peer.public_key.as_bytes();
         let spec = match build_peer_spec(peer, Role::Host) {
             Ok(spec) => spec,
             Err(e) => {
@@ -276,18 +303,34 @@ fn sync_peers(
                 continue;
             }
         };
-        match backend.add_peer(&spec) {
-            Ok(()) => {
-                known.insert(
-                    *peer.public_key.as_bytes(),
-                    peer.allowed_ips
-                        .first()
-                        .map(|net| net.addr())
-                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
-                );
-                tracing::info!("ピア {} を追加しました", peer.public_key);
+        let fingerprint = PeerFingerprint::of(&spec);
+        match known.get(&key) {
+            None => match backend.add_peer(&spec) {
+                Ok(()) => {
+                    known.insert(key, fingerprint);
+                    tracing::info!("ピア {} を追加しました", peer.public_key);
+                }
+                Err(e) => {
+                    tracing::warn!("ピア {} の追加に失敗しました: {e:#}", peer.public_key)
+                }
+            },
+            Some(current) if *current != fingerprint => {
+                // 変更 = 削除して再追加(両 OS 共通の確実な反映方法)
+                let result = backend
+                    .remove_peer(&peer.public_key)
+                    .and_then(|()| backend.add_peer(&spec));
+                match result {
+                    Ok(()) => {
+                        known.insert(key, fingerprint);
+                        tracing::info!("ピア {} の設定変更を反映しました", peer.public_key);
+                    }
+                    Err(e) => tracing::warn!(
+                        "ピア {} の設定変更の反映に失敗しました: {e:#}",
+                        peer.public_key
+                    ),
+                }
             }
-            Err(e) => tracing::warn!("ピア {} の追加に失敗しました: {e:#}", peer.public_key),
+            Some(_) => {}
         }
     }
 
@@ -300,7 +343,7 @@ fn sync_peers(
     let removed: Vec<([u8; 32], std::net::Ipv4Addr)> = known
         .iter()
         .filter(|(key, _)| !config_keys.contains(*key))
-        .map(|(key, ip)| (*key, *ip))
+        .map(|(key, fingerprint)| (*key, fingerprint.ip))
         .collect();
     for (key, ip) in removed {
         let public_key = peercove_core::keys::PublicKey::from_bytes(key);
@@ -406,4 +449,121 @@ fn build_peer_spec(peer: &PeerConfig, role: Role) -> anyhow::Result<PeerSpec> {
         persistent_keepalive,
         preshared_key,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peercove_core::keys::{PrivateKey, PublicKey};
+
+    /// WgBackend の呼び出しを記録するモック。
+    #[derive(Default)]
+    struct MockBackend {
+        ops: Vec<String>,
+    }
+
+    impl WgBackend for MockBackend {
+        fn up(&mut self, _spec: &TunnelSpec) -> anyhow::Result<()> {
+            self.ops.push("up".to_string());
+            Ok(())
+        }
+        fn add_peer(&mut self, peer: &PeerSpec) -> anyhow::Result<()> {
+            self.ops.push(format!("add:{}", peer.public_key));
+            Ok(())
+        }
+        fn remove_peer(&mut self, public_key: &PublicKey) -> anyhow::Result<()> {
+            self.ops.push(format!("remove:{public_key}"));
+            Ok(())
+        }
+        fn stats(&mut self) -> anyhow::Result<Vec<PeerStats>> {
+            Ok(Vec::new())
+        }
+        fn down(&mut self) -> anyhow::Result<()> {
+            self.ops.push("down".to_string());
+            Ok(())
+        }
+    }
+
+    fn host_config(peers_toml: &str) -> Config {
+        let text = format!(
+            "[interface]\nprivate_key_file = \"host.key\"\naddress = \"10.100.42.1/24\"\nlisten_port = 51820\n{peers_toml}"
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn sync_peers_adds_updates_and_removes() {
+        let member_key = PrivateKey::generate().public_key();
+        let peer_toml = |endpoint: &str| {
+            format!(
+                "[[peer]]\nname = \"alice\"\npublic_key = \"{member_key}\"\nendpoint = \"{endpoint}\"\nallowed_ips = [\"10.100.42.2/32\"]\n"
+            )
+        };
+        let mut backend = MockBackend::default();
+        let mut known = HashMap::new();
+        let mut pending = HashSet::new();
+        let connections: control::Connections = Default::default();
+
+        // 1. 追加
+        let config = host_config(&peer_toml("192.168.0.12:51820"));
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &connections,
+        );
+        assert_eq!(backend.ops, vec![format!("add:{member_key}")]);
+        assert_eq!(known.len(), 1);
+
+        // 2. 変更なし → 何もしない
+        backend.ops.clear();
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &connections,
+        );
+        assert!(backend.ops.is_empty());
+
+        // 3. endpoint 変更 → remove + add
+        let config = host_config(&peer_toml("203.0.113.9:51820"));
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &connections,
+        );
+        assert_eq!(
+            backend.ops,
+            vec![format!("remove:{member_key}"), format!("add:{member_key}")]
+        );
+
+        // 4. 設定から削除 → 1 周期目は通知のみ(バックエンド操作なし)
+        backend.ops.clear();
+        let config = host_config("");
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &connections,
+        );
+        assert!(backend.ops.is_empty(), "1 周期目は実削除しない");
+        assert!(pending.contains(member_key.as_bytes()));
+
+        // 5. 2 周期目に実削除
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &connections,
+        );
+        assert_eq!(backend.ops, vec![format!("remove:{member_key}")]);
+        assert!(known.is_empty());
+        assert!(pending.is_empty());
+    }
 }

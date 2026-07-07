@@ -108,11 +108,12 @@ crates/
 | M1-3 | invite / join コマンド | トークン発行(既定ファイル保存、--print/--qr)と参加設定生成 | commands/invite.rs, join.rs | ★★ | ✅ 実装済み |
 | M1-4 | コントロールチャネル | ホスト仮想 IP の TCP 51821、JSON Lines。hello / 台帳配布 / 削除通知 | control.rs, tunnel.rs | ★★★★ | ✅ 実装済み |
 | M1-5 | メンバー削除 | remove-peer(toml_edit)+ 2 段階反映(通知→実削除)+ WgBackend::remove_peer | backend/, commands/remove_peer.rs | ★★★★ | ✅ 実装済み |
-| M1-6 | 仮想 IP 既定レンジの再検討 | Tailscale 衝突の恒久対応(ランダム 10.x /24 生成など)。ADR 化 | core/config、examples | ★★(Opus 可、ADR は要レビュー) | 未着手 |
-| M1-7 | ピア設定変更の動的反映 | エンドポイント・PSK 変更等の反映(追加・削除は対応済み) | tunnel.rs、backend/ | ★★★(中〜高) | 未着手 |
+| M1-6 | 仮想 IP 既定レンジの再検討 | ADR-0006: `init` コマンドがランダム 10.x.y.0/24 を生成。CGNAT レンジ使用時は起動警告 | commands/init.rs, core/ipalloc.rs | ★★ | ✅ 実装済み |
+| M1-7 | ピア設定変更の動的反映 | sync_peers がフィンガープリント比較で変更検知 → 削除+再追加で反映 | tunnel.rs | ★★★ | ✅ 実装済み |
 
-M1-1〜M1-5 は実装・ユニットテスト完了、**実機検証待ち**(README の
-「検証手順(M1-G1〜G3)」参照)。
+**M1 の全タスクが実装済み**。M1-G1〜G3 は実機検証済み(2026-07-08)、
+M1-6/M1-7 は実機検証待ち。次のマイルストーン(M2: UI 等)は上位文書の
+確認と依頼者との整理が必要。
 
 ### 作業の振り分けガイド(依頼者の意向)
 
