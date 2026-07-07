@@ -54,6 +54,10 @@ pub trait WgBackend {
     /// 実行中のトンネルへピアを追加する。
     fn add_peer(&mut self, peer: &PeerSpec) -> anyhow::Result<()>;
 
+    /// 実行中のトンネルからピアを削除する(M1-G3)。
+    /// 存在しないピアの削除は成功扱い(冪等)。
+    fn remove_peer(&mut self, public_key: &PublicKey) -> anyhow::Result<()>;
+
     /// ピアごとの統計(最終ハンドシェイク・転送量)を返す。
     fn stats(&mut self) -> anyhow::Result<Vec<PeerStats>>;
 

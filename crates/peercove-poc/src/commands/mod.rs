@@ -2,6 +2,7 @@ pub mod add_peer;
 pub mod invite;
 pub mod join;
 pub mod keygen;
+pub mod remove_peer;
 pub mod status;
 pub mod tunnel;
 pub mod udp;

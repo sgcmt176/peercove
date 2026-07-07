@@ -97,6 +97,20 @@ enum Command {
         #[arg(long)]
         ip: Ipv4Addr,
     },
+    /// メンバーを削除する(--name / --pubkey / --ip のいずれかで指定)
+    RemovePeer {
+        #[arg(long)]
+        config: PathBuf,
+        /// 表示名で指定
+        #[arg(long)]
+        name: Option<String>,
+        /// 公開鍵(base64)で指定
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// 仮想 IP で指定
+        #[arg(long)]
+        ip: Option<Ipv4Addr>,
+    },
     /// UDP echo サーバー(G-5 検証用)
     UdpEcho {
         #[arg(long, default_value = "0.0.0.0:9999")]
@@ -172,6 +186,23 @@ fn main() -> anyhow::Result<()> {
             force,
         }),
         Command::AddPeer { config, pubkey, ip } => commands::add_peer::run(&config, &pubkey, ip),
+        Command::RemovePeer {
+            config,
+            name,
+            pubkey,
+            ip,
+        } => {
+            use commands::remove_peer::Selector;
+            let selector = match (&name, &pubkey, ip) {
+                (Some(name), None, None) => Selector::Name(name),
+                (None, Some(key), None) => Selector::PublicKey(key),
+                (None, None, Some(ip)) => Selector::Ip(ip),
+                _ => {
+                    anyhow::bail!("--name / --pubkey / --ip のいずれか 1 つだけを指定してください")
+                }
+            };
+            commands::remove_peer::run(&config, &selector)
+        }
         Command::UdpEcho { listen } => commands::udp::run_echo(listen),
         Command::UdpPing { target, count } => commands::udp::run_ping(target, count),
         Command::Status { config } => commands::status::run(&config),

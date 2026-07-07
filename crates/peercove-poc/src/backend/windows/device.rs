@@ -43,6 +43,8 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 pub struct DevicePeer {
     pub public_key: [u8; 32],
     pub allowed_ips: Vec<Ipv4Net>,
+    /// `Tunn::new` に渡した 24bit ピアインデックス(削除時にテーブルから引く)。
+    index: u32,
     tunn: Mutex<Tunn>,
     endpoint: RwLock<Option<SocketAddr>>,
 }
@@ -130,6 +132,7 @@ impl Device {
         let peer = Arc::new(DevicePeer {
             public_key: *spec.public_key.as_bytes(),
             allowed_ips: spec.allowed_ips.clone(),
+            index,
             tunn: Mutex::new(tunn),
             endpoint: RwLock::new(spec.endpoint),
         });
@@ -148,6 +151,19 @@ impl Device {
             }
         }
         Ok(())
+    }
+
+    /// ピアを削除する。以後このピアのパケットはテーブルで引けなくなり破棄される。
+    /// 存在しない場合は何もしない(冪等)。
+    pub fn remove_peer(&self, public_key: &[u8; 32]) {
+        let mut table = self.peers.write().unwrap();
+        if let Some(peer) = table.by_key.remove(public_key) {
+            table.by_index.remove(&peer.index);
+            tracing::info!(
+                "ピア {} を削除しました",
+                peercove_core::keys::PublicKey::from_bytes(*public_key)
+            );
+        }
     }
 
     pub fn peers(&self) -> Vec<Arc<DevicePeer>> {
@@ -677,6 +693,55 @@ mod tests {
         host.stop();
         a.stop();
         b.stop();
+    }
+
+    /// remove_peer 後はそのピアのパケットが一切通らなくなる(M1-G3)。
+    #[test]
+    fn removed_peer_traffic_is_dropped() {
+        let host_ip: Ipv4Addr = "100.100.42.1".parse().unwrap();
+        let member_ip: Ipv4Addr = "100.100.42.2".parse().unwrap();
+        let host_key = PrivateKey::generate();
+        let member_key = PrivateKey::generate();
+
+        let host = TestNode::start(&host_key);
+        host.device
+            .add_peer(&peer_spec(
+                member_key.public_key(),
+                None,
+                &["100.100.42.2/32"],
+                None,
+            ))
+            .unwrap();
+        let member = TestNode::start(&member_key);
+        member
+            .device
+            .add_peer(&peer_spec(
+                host_key.public_key(),
+                Some(host.endpoint()),
+                &["100.100.42.0/24"],
+                Some(25),
+            ))
+            .unwrap();
+
+        // 疎通確立
+        let packet = ipv4_packet(member_ip, host_ip, b"before removal");
+        expect_via_tunnel(&member, &host, packet, "削除前のパケット");
+
+        // 削除 → テーブルから消える
+        host.device.remove_peer(member_key.public_key().as_bytes());
+        assert!(host.device.peers().is_empty());
+
+        // 以後のパケットは host の TUN に届かない
+        let packet = ipv4_packet(member_ip, host_ip, b"after removal");
+        member.tun.os_out_tx.send(packet).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            host.tun.os_in_rx.try_recv().is_err(),
+            "削除済みピアのパケットが通過した"
+        );
+
+        host.stop();
+        member.stop();
     }
 
     /// ホスト再起動シナリオ: メンバーは古いセッションで送信を続けるが、

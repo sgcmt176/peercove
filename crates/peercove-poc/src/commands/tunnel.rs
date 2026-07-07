@@ -88,11 +88,22 @@ fn supervise_until_ctrl_c(
     backend: &mut dyn WgBackend,
     spec: &TunnelSpec,
 ) -> anyhow::Result<()> {
-    let mut known: HashSet<[u8; 32]> = spec
+    // 登録済みピア(公開鍵 → 仮想 IP)。削除通知の宛先解決にも使う
+    let mut known: HashMap<[u8; 32], std::net::Ipv4Addr> = spec
         .peers
         .iter()
-        .map(|p| *p.public_key.as_bytes())
+        .map(|p| {
+            (
+                *p.public_key.as_bytes(),
+                p.allowed_ips
+                    .first()
+                    .map(|net| net.addr())
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            )
+        })
         .collect();
+    // 削除通知済み・次の周期で実削除するピア
+    let mut pending_removal: HashSet<[u8; 32]> = HashSet::new();
     let status_path = status::status_file_path(config_path);
     let host_public_key = spec.private_key.public_key();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -154,7 +165,13 @@ fn supervise_until_ctrl_c(
                     };
                     if role == Role::Host {
                         if let Some(config) = &config {
-                            reload_new_peers(config, backend, &mut known);
+                            sync_peers(
+                                config,
+                                backend,
+                                &mut known,
+                                &mut pending_removal,
+                                &connections,
+                            );
                         }
                     }
                     let stats = match backend.stats() {
@@ -236,11 +253,20 @@ fn build_ledger(
     ledger
 }
 
-/// 設定から、未登録の公開鍵のピアだけをバックエンドへ追加する。
-/// 既存ピアの変更・削除の反映は M1-G3 以降で対応。
-fn reload_new_peers(config: &Config, backend: &mut dyn WgBackend, known: &mut HashSet<[u8; 32]>) {
+/// 設定とバックエンドのピアを同期する(ADR-0002 / M1-G3)。
+/// - 設定に増えたピア: バックエンドへ追加
+/// - 設定から消えたピア: まず削除通知を送り(1 周期目)、次の周期で実削除する
+///   (通知はトンネル経由なので、先にピアを消すと届かないため)
+fn sync_peers(
+    config: &Config,
+    backend: &mut dyn WgBackend,
+    known: &mut HashMap<[u8; 32], std::net::Ipv4Addr>,
+    pending_removal: &mut HashSet<[u8; 32]>,
+    connections: &control::Connections,
+) {
+    // 追加
     for peer in &config.peers {
-        if known.contains(peer.public_key.as_bytes()) {
+        if known.contains_key(peer.public_key.as_bytes()) {
             continue;
         }
         let spec = match build_peer_spec(peer, Role::Host) {
@@ -252,10 +278,50 @@ fn reload_new_peers(config: &Config, backend: &mut dyn WgBackend, known: &mut Ha
         };
         match backend.add_peer(&spec) {
             Ok(()) => {
-                known.insert(*peer.public_key.as_bytes());
+                known.insert(
+                    *peer.public_key.as_bytes(),
+                    peer.allowed_ips
+                        .first()
+                        .map(|net| net.addr())
+                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                );
                 tracing::info!("ピア {} を追加しました", peer.public_key);
             }
             Err(e) => tracing::warn!("ピア {} の追加に失敗しました: {e:#}", peer.public_key),
+        }
+    }
+
+    // 削除(2 段階)
+    let config_keys: HashSet<[u8; 32]> = config
+        .peers
+        .iter()
+        .map(|p| *p.public_key.as_bytes())
+        .collect();
+    let removed: Vec<([u8; 32], std::net::Ipv4Addr)> = known
+        .iter()
+        .filter(|(key, _)| !config_keys.contains(*key))
+        .map(|(key, ip)| (*key, *ip))
+        .collect();
+    for (key, ip) in removed {
+        let public_key = peercove_core::keys::PublicKey::from_bytes(key);
+        if pending_removal.insert(key) {
+            // 1 周期目: 本人へ削除通知(接続していなければ何もしない)
+            if let Some(tx) = connections.lock().unwrap().get(&ip) {
+                let _ = tx.send(peercove_core::proto::ControlMessage::Removed {
+                    message: "ホストによってこのネットワークから削除されました".to_string(),
+                });
+                tracing::info!("ピア {public_key}({ip})へ削除通知を送りました");
+            }
+            continue;
+        }
+        // 2 周期目: バックエンドから実削除
+        match backend.remove_peer(&public_key) {
+            Ok(()) => {
+                known.remove(&key);
+                pending_removal.remove(&key);
+                tracing::info!("ピア {public_key}({ip})を削除しました");
+            }
+            Err(e) => tracing::warn!("ピア {public_key} の削除に失敗しました: {e:#}"),
         }
     }
 }

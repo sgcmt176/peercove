@@ -110,6 +110,13 @@ impl WgBackend for LinuxBackend {
             .with_context(|| format!("ピア {} の追加に失敗しました", peer.public_key))
     }
 
+    fn remove_peer(&mut self, public_key: &peercove_core::keys::PublicKey) -> anyhow::Result<()> {
+        Self::ensure_root()?;
+        self.api
+            .remove_peer(&Key::new(*public_key.as_bytes()))
+            .with_context(|| format!("ピア {public_key} の削除に失敗しました"))
+    }
+
     fn stats(&mut self) -> anyhow::Result<Vec<PeerStats>> {
         let host = self
             .api

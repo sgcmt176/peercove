@@ -21,7 +21,7 @@
 
 - [x] M1-G1: 招待トークン pcv1(invite / join、QR 対応)※実機検証待ち
 - [x] M1-G2: トンネル内コントロールチャネル(台帳配布)※実機検証待ち
-- [ ] M1-G3: メンバー削除(remove-peer)
+- [x] M1-G3: メンバー削除(remove-peer)※実機検証待ち
 
 ## 必要環境
 
@@ -174,6 +174,21 @@ members:
 - **Windows ホストの場合**: peercove-poc.exe の TCP 受信(51821)が
   ファイアウォールでブロックされると member の台帳が更新されません。
   初回のダイアログで「許可」を選んでください
+
+### メンバーの削除(remove-peer)— M1-G3
+
+```bash
+# 名前 / 公開鍵 / 仮想 IP のいずれかで指定(管理者権限は不要)
+./target/debug/peercove-poc remove-peer --config host.toml --name alice
+./target/debug/peercove-poc remove-peer --config host.toml --ip 100.100.42.2
+```
+
+- host.toml から該当 `[[peer]]` を削除します(コメント等は保持)。
+  invite --psk で作られたホスト側 PSK ファイルも片付けます
+- 実行中の host は約 10 秒で反映します:
+  **1) 本人へ削除通知(コントロールチャネル)→ 2) トンネルから除外**。
+  以後そのメンバーのトークン・鍵では接続できません
+- 全員の `status` の members からも自動で消えます(台帳配布)
 
 ## 検証手順(G-1: トンネル作成・破棄)
 
@@ -483,6 +498,21 @@ M1-G1 の構成(Host + join 済み Member A)をそのまま使います。
 
 失敗時: Windows ホストのファイアウォールで TCP 51821 の受信許可
 (初回ダイアログ)を確認。Tailscale 起動中なら停止(README 上部参照)。
+
+## 検証手順(M1-G3: メンバー削除)
+
+M1-G2 の構成(Host + Member A 接続中)の続きで行います。
+
+1. Member A が接続中(ping が通る状態)であることを確認
+2. Host: `remove-peer --config host.toml --name test-a`
+3. **Member A のログ**に約 10 秒以内に「ホストから削除されました」の警告が出ること
+4. Member A から `ping 100.100.42.1` が**通らなくなる**こと
+   (既存セッションの残りで数十秒通る場合があります。3 分以内に完全に停止)
+5. Host の `status` の members から test-a が消えること
+6. host.toml から該当 `[[peer]]` が消え、コメント等は残っていること
+7. **再参加**: Host で `invite --name test-a2` → Member A で
+   `join --force` → member 再起動 → 疎通が復活すること
+   (削除されたトークンは無効、新しいトークンで再参加できる)
 
 ## 検証手順(G-1 前半: keygen・設定読み込み)
 

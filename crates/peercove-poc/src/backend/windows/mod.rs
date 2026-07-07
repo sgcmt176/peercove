@@ -181,6 +181,16 @@ impl WgBackend for WindowsBackend {
         }
     }
 
+    fn remove_peer(&mut self, public_key: &peercove_core::keys::PublicKey) -> anyhow::Result<()> {
+        match &self.running {
+            Some(running) => {
+                running.device.remove_peer(public_key.as_bytes());
+                Ok(())
+            }
+            None => bail!("トンネルが起動していません"),
+        }
+    }
+
     fn stats(&mut self) -> anyhow::Result<Vec<PeerStats>> {
         let Some(running) = &self.running else {
             bail!("トンネルが起動していません");
