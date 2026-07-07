@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use anyhow::{bail, Context};
 
-use self::device::Device;
+use self::device::{Device, TunIo};
 use super::{PeerSpec, PeerStats, TunnelSpec, WgBackend};
 
 /// wintun アダプタの「トンネル種別」表示名。
@@ -39,13 +39,63 @@ impl WindowsBackend {
     }
 
     fn load_wintun() -> anyhow::Result<wintun::Wintun> {
+        // exe と同じフォルダの dll を最優先で読み込む。既定の DLL 検索パス任せに
+        // すると、他ソフトが System32 等に置いた wintun.dll が使われて挙動が
+        // 環境依存になるため(検証時に発覚)。
+        let exe_dir_dll = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.join("wintun.dll")))
+            .filter(|path| path.exists());
         // SAFETY: wintun.dll の読み込みは FFI 境界のため unsafe。dll が差し替えられて
         // いない(正規の wintun.net 配布物である)ことは利用者の配置手順に依存する。
-        unsafe { wintun::load() }.context(
+        let result = match &exe_dir_dll {
+            Some(path) => {
+                tracing::debug!("{} を読み込みます", path.display());
+                unsafe { wintun::load_from_path(path) }
+            }
+            None => {
+                tracing::warn!(
+                    "exe と同じフォルダに wintun.dll が無いため、システムの DLL 検索\
+                     パスから探します"
+                );
+                unsafe { wintun::load() }
+            }
+        };
+        result.context(
             "wintun.dll が読み込めませんでした。https://www.wintun.net から wintun \
              をダウンロードし、bin/amd64/wintun.dll を peercove-poc.exe と同じフォルダに\
              配置してください",
         )
+    }
+}
+
+/// wintun セッションを [`TunIo`] として扱うアダプタ。
+struct WintunIo {
+    session: Arc<wintun::Session>,
+}
+
+impl TunIo for WintunIo {
+    fn recv(&self) -> anyhow::Result<Vec<u8>> {
+        let packet = self
+            .session
+            .receive_blocking()
+            .map_err(|e| anyhow::anyhow!("wintun セッションが停止しました: {e}"))?;
+        Ok(packet.bytes().to_vec())
+    }
+
+    fn send(&self, packet: &[u8]) -> anyhow::Result<()> {
+        let len = u16::try_from(packet.len()).context("パケットが大きすぎます")?;
+        let mut tun_packet = self
+            .session
+            .allocate_send_packet(len)
+            .map_err(|e| anyhow::anyhow!("TUN バッファの確保に失敗しました: {e}"))?;
+        tun_packet.bytes_mut().copy_from_slice(packet);
+        self.session.send_packet(tun_packet);
+        Ok(())
+    }
+
+    fn shutdown(&self) {
+        let _ = self.session.shutdown();
     }
 }
 
@@ -73,13 +123,35 @@ impl WgBackend for WindowsBackend {
             .and_then(|()| adapter.set_netmask(prefix_to_netmask(spec.address.prefix_len())))
             .and_then(|()| adapter.set_mtu(usize::from(spec.mtu)))
             .context("TUN アダプタの IP/MTU 設定に失敗しました")?;
+        // netsh が黙って失敗すると tx 経路が丸ごと死ぬため、設定を読み戻して確認する
+        let assigned = adapter.get_addresses().unwrap_or_default();
+        if assigned
+            .iter()
+            .any(|a| *a == std::net::IpAddr::V4(spec.address.addr()))
+        {
+            tracing::info!(
+                "アダプタ {} に {} を割り当てました",
+                self.if_name,
+                spec.address
+            );
+        } else {
+            tracing::warn!(
+                "アダプタ {} への IP 割当が確認できませんでした(現在: {assigned:?})。\
+                 `ipconfig` と `route print -4` で 100.100.42.0/24 の経路を確認してください",
+                self.if_name
+            );
+        }
 
         let session = Arc::new(
             adapter
                 .start_session(wintun::MAX_RING_CAPACITY)
                 .context("TUN セッションの開始に失敗しました")?,
         );
-        let device = Device::new(*spec.private_key.as_bytes(), spec.listen_port, session)?;
+        let device = Device::new(
+            *spec.private_key.as_bytes(),
+            spec.listen_port,
+            Box::new(WintunIo { session }),
+        )?;
         for peer in &spec.peers {
             device.add_peer(peer)?;
         }

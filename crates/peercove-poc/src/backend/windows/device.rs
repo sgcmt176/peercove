@@ -24,6 +24,16 @@ use ipnet::Ipv4Net;
 
 use super::super::PeerSpec;
 
+/// TUN デバイスの読み書き。wintun の他、テスト用モックを差し込めるようにする。
+pub trait TunIo: Send + Sync + 'static {
+    /// OS から出ていくパケットを 1 つ受け取る(ブロッキング)。Err はシャットダウン。
+    fn recv(&self) -> anyhow::Result<Vec<u8>>;
+    /// 復号済みパケットを OS へ渡す。
+    fn send(&self, packet: &[u8]) -> anyhow::Result<()>;
+    /// `recv` のブロックを解除する。
+    fn shutdown(&self);
+}
+
 /// MTU 1500 + WG ヘッダに十分な作業バッファ。
 const BUF_SIZE: usize = 2048;
 const TIMER_TICK: Duration = Duration::from_millis(250);
@@ -64,7 +74,7 @@ pub struct Device {
     private_key: x25519::StaticSecret,
     public_key: x25519::PublicKey,
     socket: UdpSocket,
-    session: Arc<wintun::Session>,
+    tun: Box<dyn TunIo>,
     peers: RwLock<PeerTable>,
     shutdown: AtomicBool,
 }
@@ -73,7 +83,7 @@ impl Device {
     pub fn new(
         private_key: [u8; 32],
         listen_port: Option<u16>,
-        session: Arc<wintun::Session>,
+        tun: Box<dyn TunIo>,
     ) -> anyhow::Result<Arc<Self>> {
         let port = listen_port.unwrap_or(0);
         let socket = UdpSocket::bind(("0.0.0.0", port)).with_context(|| {
@@ -91,7 +101,7 @@ impl Device {
             private_key,
             public_key,
             socket,
-            session,
+            tun,
             peers: RwLock::new(PeerTable::default()),
             shutdown: AtomicBool::new(false),
         }))
@@ -148,7 +158,7 @@ impl Device {
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = self.session.shutdown();
+        self.tun.shutdown();
     }
 
     fn is_shutdown(&self) -> bool {
@@ -165,15 +175,8 @@ impl Device {
 
     /// 復号済みパケットをトンネル(TUN)へ書き込む。
     fn write_to_tun(&self, packet: &[u8]) {
-        let Ok(len) = u16::try_from(packet.len()) else {
-            return;
-        };
-        match self.session.allocate_send_packet(len) {
-            Ok(mut tun_packet) => {
-                tun_packet.bytes_mut().copy_from_slice(packet);
-                self.session.send_packet(tun_packet);
-            }
-            Err(e) => tracing::debug!("TUN への書き込みに失敗: {e}"),
+        if let Err(e) = self.tun.send(packet) {
+            tracing::debug!("TUN への書き込みに失敗: {e}");
         }
     }
 
@@ -235,7 +238,7 @@ impl Device {
                         if peer.allows(src_ip) {
                             self.write_to_tun(packet);
                         } else {
-                            tracing::debug!(
+                            tracing::warn!(
                                 "AllowedIPs 外の送信元 {src_ip} からのパケットを破棄しました"
                             );
                         }
@@ -249,7 +252,7 @@ impl Device {
                     }
                     TunnResult::Err(WireGuardError::UnderLoad) => break,
                     TunnResult::Err(e) => {
-                        tracing::debug!("{src} からのパケットの復号に失敗: {e:?}");
+                        tracing::warn!("{src} からのパケットの復号に失敗: {e:?}");
                         break;
                     }
                 }
@@ -271,20 +274,26 @@ impl Device {
     pub fn tun_loop(self: &Arc<Self>) {
         let mut work_buf = [0u8; BUF_SIZE];
         while !self.is_shutdown() {
-            let packet = match self.session.receive_blocking() {
+            let packet = match self.tun.recv() {
                 Ok(packet) => packet,
-                Err(_) => break, // セッション shutdown
+                Err(e) => {
+                    if !self.is_shutdown() {
+                        tracing::warn!("TUN の読み取りが停止しました: {e:#}");
+                    }
+                    break;
+                }
             };
-            let bytes = packet.bytes();
+            let bytes = packet.as_slice();
             let Some(IpAddr::V4(dst)) = Tunn::dst_address(bytes) else {
                 continue; // IPv6 等は M0 対象外
             };
+            tracing::debug!("TUN から {} バイト受信(宛先 {dst})", bytes.len());
             let peer = {
                 let table = self.peers.read().unwrap();
                 table.by_key.values().find(|p| p.allows(dst)).cloned()
             };
             let Some(peer) = peer else {
-                tracing::debug!("宛先 {dst} に対応するピアがありません");
+                tracing::warn!("宛先 {dst} に対応するピアがありません(AllowedIPs 未登録)");
                 continue;
             };
             let mut tunn = peer.tunn.lock().unwrap();
@@ -293,12 +302,12 @@ impl Device {
                     if peer.endpoint().is_some() {
                         self.send_to_peer(&peer, data);
                     } else {
-                        tracing::debug!(
+                        tracing::warn!(
                             "ピアのエンドポイントが未学習のため宛先 {dst} のパケットを破棄しました"
                         );
                     }
                 }
-                TunnResult::Err(e) => tracing::debug!("暗号化に失敗: {e:?}"),
+                TunnResult::Err(e) => tracing::warn!("暗号化に失敗: {e:?}"),
                 _ => {}
             }
         }
@@ -319,5 +328,230 @@ impl Device {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 2 つの `Device` を localhost の UDP で対向させ、モック TUN 経由で
+    //! WG プロトコル一式(ハンドシェイク・暗号化データ転送・AllowedIPs 検査)を
+    //! 実トンネルなしで検証するループバックテスト。
+
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    use super::*;
+    use peercove_core::keys::{PrivateKey, PublicKey};
+
+    /// チャネルで OS 側を模す TUN。
+    /// - `os_out_tx` にテストが積んだパケット = 「OS が送信したパケット」
+    /// - `os_in_rx` でテストが受け取るパケット = 「OS に届いたパケット」
+    struct MockTun {
+        os_out_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+        os_in_tx: Mutex<mpsc::Sender<Vec<u8>>>,
+        shutdown: AtomicBool,
+    }
+
+    struct MockTunHandles {
+        os_out_tx: mpsc::Sender<Vec<u8>>,
+        os_in_rx: mpsc::Receiver<Vec<u8>>,
+    }
+
+    fn mock_tun() -> (Box<MockTun>, MockTunHandles) {
+        let (os_out_tx, os_out_rx) = mpsc::channel();
+        let (os_in_tx, os_in_rx) = mpsc::channel();
+        (
+            Box::new(MockTun {
+                os_out_rx: Mutex::new(os_out_rx),
+                os_in_tx: Mutex::new(os_in_tx),
+                shutdown: AtomicBool::new(false),
+            }),
+            MockTunHandles {
+                os_out_tx,
+                os_in_rx,
+            },
+        )
+    }
+
+    impl TunIo for MockTun {
+        fn recv(&self) -> anyhow::Result<Vec<u8>> {
+            loop {
+                let packet = self
+                    .os_out_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(100));
+                if self.shutdown.load(Ordering::SeqCst) {
+                    anyhow::bail!("shutdown");
+                }
+                match packet {
+                    Ok(packet) => return Ok(packet),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("closed"),
+                }
+            }
+        }
+
+        fn send(&self, packet: &[u8]) -> anyhow::Result<()> {
+            self.os_in_tx
+                .lock()
+                .unwrap()
+                .send(packet.to_vec())
+                .map_err(|_| anyhow::anyhow!("closed"))
+        }
+
+        fn shutdown(&self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 最小の IPv4 ヘッダ + ペイロードを組み立てる(チェックサムは未計算。
+    /// デバイスループは検査しない)。
+    fn ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+        let total_len = 20 + payload.len();
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45; // version 4, IHL 5
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64; // TTL
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet[20..].copy_from_slice(payload);
+        packet
+    }
+
+    struct TestNode {
+        device: Arc<Device>,
+        tun: MockTunHandles,
+        threads: Vec<JoinHandle<()>>,
+    }
+
+    impl TestNode {
+        fn start(private_key: &PrivateKey) -> Self {
+            let (tun, handles) = mock_tun();
+            let device = Device::new(*private_key.as_bytes(), None, tun).expect("device 起動失敗");
+            let threads = vec![
+                spawn_loop(&device, Device::udp_loop),
+                spawn_loop(&device, Device::tun_loop),
+                spawn_loop(&device, Device::timer_loop),
+            ];
+            Self {
+                device,
+                tun: handles,
+                threads,
+            }
+        }
+
+        fn endpoint(&self) -> SocketAddr {
+            format!("127.0.0.1:{}", self.device.local_port())
+                .parse()
+                .unwrap()
+        }
+
+        fn stop(self) {
+            self.device.shutdown();
+            for thread in self.threads {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn spawn_loop(
+        device: &Arc<Device>,
+        f: impl Fn(&Arc<Device>) + Send + 'static,
+    ) -> JoinHandle<()> {
+        let device = Arc::clone(device);
+        std::thread::spawn(move || f(&device))
+    }
+
+    fn peer_spec(
+        public_key: PublicKey,
+        endpoint: Option<SocketAddr>,
+        allowed_ips: &[&str],
+        keepalive: Option<u16>,
+    ) -> PeerSpec {
+        PeerSpec {
+            public_key,
+            endpoint,
+            allowed_ips: allowed_ips.iter().map(|s| s.parse().unwrap()).collect(),
+            persistent_keepalive: keepalive,
+            preshared_key: None,
+        }
+    }
+
+    /// 送信パケットが相手の TUN から出てくるまで待つ。
+    fn expect_via_tunnel(from: &TestNode, to: &TestNode, packet: Vec<u8>, what: &str) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // ハンドシェイク完了前の送信は boringtun がキューするので、1 度だけ送って待つ
+        from.tun.os_out_tx.send(packet).unwrap();
+        loop {
+            match to.tun.os_in_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(received) => return received,
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                Err(e) => panic!("{what} がトンネルを通りませんでした: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn loopback_host_and_member_exchange_packets() {
+        let host_ip: Ipv4Addr = "100.100.42.1".parse().unwrap();
+        let member_ip: Ipv4Addr = "100.100.42.2".parse().unwrap();
+        let host_key = PrivateKey::generate();
+        let member_key = PrivateKey::generate();
+
+        // host: listen ポートは OS 任せ(local_port で取得)。メンバーの endpoint は不明
+        let host = TestNode::start(&host_key);
+        host.device
+            .add_peer(&peer_spec(
+                member_key.public_key(),
+                None,
+                &["100.100.42.2/32"],
+                None,
+            ))
+            .unwrap();
+
+        // member: host の endpoint を指定し、即ハンドシェイク開始
+        let member = TestNode::start(&member_key);
+        member
+            .device
+            .add_peer(&peer_spec(
+                host_key.public_key(),
+                Some(host.endpoint()),
+                &["100.100.42.0/24"],
+                Some(25),
+            ))
+            .unwrap();
+
+        // member -> host(member 発の初回データがハンドシェイクを完了させる)
+        let m2h = ipv4_packet(member_ip, host_ip, b"member to host");
+        let received = expect_via_tunnel(&member, &host, m2h.clone(), "member->host パケット");
+        assert_eq!(received, m2h);
+
+        // host -> member(host は学習したエンドポイントへ返す)
+        let h2m = ipv4_packet(host_ip, member_ip, b"host to member");
+        let received = expect_via_tunnel(&host, &member, h2m.clone(), "host->member パケット");
+        assert_eq!(received, h2m);
+
+        // 統計が増えていること(G-2 の status 相当)
+        let host_stats = host.device.peers();
+        let (since, tx, rx) = host_stats[0].stats();
+        assert!(since.is_some(), "host にハンドシェイクが記録されていない");
+        assert!(rx > 0, "host の rx が 0");
+        assert!(tx > 0, "host の tx が 0");
+
+        // AllowedIPs 外の送信元は host の TUN に出てこないこと
+        let spoofed = ipv4_packet("100.100.42.99".parse().unwrap(), host_ip, b"spoofed");
+        member.tun.os_out_tx.send(spoofed).unwrap();
+        // 少し待って、届いていないことを確認
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            host.tun.os_in_rx.try_recv().is_err(),
+            "AllowedIPs 外の送信元のパケットが通過した"
+        );
+
+        host.stop();
+        member.stop();
     }
 }
