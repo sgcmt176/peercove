@@ -203,6 +203,13 @@ Host(Windows 11)と Member A(Ubuntu)の 2 台で行います。
   片方向だけ失敗するならファイアウォールが原因
 - **同一 LAN で繋がらない**: endpoint に外部 IP でなく **LAN IP** を指定する
   (ルーターの hairpin NAT 非対応のため)
+- **Tailscale が入っているマシンで、handshake も transfer も正常なのに ping が届かない**:
+  Tailscale はなりすまし防止のため「送信元が 100.64.0.0/10(CGNAT レンジ)なのに
+  tailscale0 以外から入ってきたパケット」を iptables(`ts-input`)で DROP します。
+  PeerCove の既定例 `100.100.42.x` はこのレンジ内のため衝突します。
+  `sudo tailscale down` で一時停止するか、両側の設定の仮想 IP を
+  `10.100.42.x` などレンジ外に変更してください(tcpdump にはパケットが
+  映るのに ping に届かない、が典型症状)
 - **host を再起動した直後に通らない**: Windows の host はユーザー空間実装のため、
   再起動するとセッションが消えます。member 側は「データを送っても応答が無い」
   ことを検知してから再ハンドシェイクするため、**復帰まで最大 15〜20 秒**
