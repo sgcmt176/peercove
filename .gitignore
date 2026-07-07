@@ -3,3 +3,5 @@
 # 実環境の設定(例は examples/ に置く)
 /host.toml
 /member*.toml
+# 実行中プロセスが書き出すステータスファイル
+*.status.txt
