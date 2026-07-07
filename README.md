@@ -17,6 +17,12 @@
 
 **M0 の全ゴールを達成しました(2026-07-08)。**
 
+### M1(進行中)
+
+- [x] M1-G1: 招待トークン pcv1(invite / join、QR 対応)※実機検証待ち
+- [ ] M1-G2: トンネル内コントロールチャネル(台帳配布)
+- [ ] M1-G3: メンバー削除(remove-peer)
+
 ## 必要環境
 
 ### 共通
@@ -96,6 +102,32 @@ sudo ./target/debug/peercove-poc down --config host.toml
 > メモ: Windows のトンネルはユーザー空間実装のため、プロセスが終了すると
 > アダプタも自動的に消えます。Linux はカーネル実装のため、異常終了時に
 > インターフェースが残ることがあります(`down` で削除)。
+
+### メンバーの招待(invite / join)— M1 の推奨フロー
+
+M0 の「keygen → 公開鍵を伝える → add-peer」を 1 ステップにしたものです。
+
+```bash
+# ホスト側: 招待トークンを発行(メンバーの鍵と IP を自動生成して登録)
+./target/debug/peercove-poc invite --config host.toml --name alice
+# → invite.token に保存。--endpoint 203.0.113.5:51820 で外部候補を追加、
+#   --psk で事前共有鍵も発行、--print で文字列表示、--qr でターミナルに QR 表示
+
+# メンバー側: トークンから鍵と設定を生成
+./target/debug/peercove-poc join --token "pcv1.…" --out-dir .
+# ファイル渡しの場合: --token-file invite.token
+# → member.key / member.toml(PSK ありなら member.psk)が生成される
+
+# あとは通常どおり接続(管理者/sudo)
+sudo ./target/debug/peercove-poc member --config member.toml
+```
+
+- **トークンはメンバーの秘密鍵を含む秘密情報です**。本人以外へ渡さず、
+  受け渡し後は双方で削除してください(既定でファイル保存なのはこのため)
+- トークンにはエンドポイント候補が複数入ります(LAN は自動、外部は
+  `--endpoint` で追加)。join は先頭候補を設定し、残りはコメントとして
+  member.toml に残します。**同一 LAN なら LAN 候補**を使ってください
+- 招待の取り消しは remove-peer(M1-G3)で行う予定です
 
 ### メンバーの追加(add-peer)と状態確認(status)
 
@@ -390,6 +422,29 @@ iperf3 -c 100.100.42.2 -u -b 100M   # UDP(帯域・損失率・ジッター)
 - 可能ならトンネル外(物理 LAN の IP 宛)でも 1 回計測し、参考値として記入
 - スループットが伸びない場合は member.toml の `mtu` を調整して差を記録すると
   今後の参考になります
+
+## 検証手順(M1-G1: invite / join)
+
+Host(Windows)+ Member A(Ubuntu)の 2 台。G-2 と同じ構成ですが、
+**鍵交換・設定編集を一切手作業しない**のがポイントです。
+
+1. Host: 新しい作業フォルダで `keygen --out host.key` と host.toml を用意し、
+   `host --config host.toml` を起動しておく
+2. Host(別ターミナル): `invite --config host.toml --name test-a --print`
+   - `invite.token` が作られ、トークン文字列が表示されること
+   - host.toml の末尾に `name = "test-a"` 付きの `[[peer]]` が追記されること
+   - 起動中の host のログに 5 秒以内に「ピア … を追加しました」が出ること
+3. トークン文字列を Member A へコピペ(チャット等を想定)
+4. Member A: `./peercove-poc join --token "pcv1.…" --out-dir ~/pc-test`
+   - member.key(600)/ member.toml が生成されること
+   - member.toml の endpoint が Host の LAN IP になっていること
+5. Member A: `sudo ./peercove-poc member --config ~/pc-test/member.toml`
+   → `ping 100.100.42.1` が通ること(手作業の設定なしで疎通)
+6. QR 確認: Host で `invite --config host.toml --name test-b --qr` を実行し、
+   ターミナルに QR が表示され、スマホのカメラで `pcv1.` から始まる文字列として
+   読み取れること(読み取った文字列で join できればなお良い)
+7. エラー系: トークンの末尾を数文字削って join → 「コピー漏れ」を示唆する
+   エラーになること
 
 ## 検証手順(G-1 前半: keygen・設定読み込み)
 

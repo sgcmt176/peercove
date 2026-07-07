@@ -17,6 +17,7 @@ tracing-subscriber.workspace = true
 ipnet.workspace = true
 toml.workspace = true
 igd-next = "0.17"
+fast_qr = "0.13.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = "0.5"

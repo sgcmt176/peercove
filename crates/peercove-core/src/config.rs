@@ -31,6 +31,9 @@ pub struct InterfaceConfig {
     /// トンネルインターフェース名(省略時 `peercove0`)。
     #[serde(default = "default_if_name")]
     pub name: String,
+    /// 台帳・コントロールチャネルで使う自分の表示名(join で設定される)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub private_key_file: PathBuf,
     /// 仮想 IP とサブネット(例: `100.100.42.2/24`)。
     pub address: Ipv4Net,
@@ -44,6 +47,13 @@ pub struct InterfaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
+    /// 台帳用の表示名(invite で発行したメンバーに付く)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// このピア(ホスト)の仮想 IP。メンバー側でコントロールチャネルの
+    /// 接続先として使う(join が設定する)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_host: Option<std::net::Ipv4Addr>,
     pub public_key: PublicKey,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<SocketAddr>,

@@ -7,6 +7,7 @@
 pub mod config;
 pub mod ipalloc;
 pub mod keys;
+pub mod token;
 
 use std::path::PathBuf;
 
@@ -26,6 +27,8 @@ pub enum Error {
     Toml(#[from] toml::de::Error),
     #[error("設定が不正です: {0}")]
     InvalidConfig(String),
+    #[error("招待トークンが不正です: {0}")]
+    InvalidToken(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

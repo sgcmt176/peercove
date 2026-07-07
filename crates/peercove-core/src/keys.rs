@@ -131,6 +131,10 @@ impl PresharedKey {
         Self(bytes)
     }
 
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(bytes)
+    }
+
     pub fn from_base64(s: &str) -> Result<Self> {
         decode_key(s).map(Self)
     }

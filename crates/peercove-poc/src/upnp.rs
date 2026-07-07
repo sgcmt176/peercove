@@ -142,7 +142,7 @@ fn local_ip_towards(gateway: SocketAddr) -> anyhow::Result<IpAddr> {
 
 /// デフォルトルート(インターネット)へ向かう経路のローカル IP。
 /// UDP の connect は実際にはパケットを送らないため、外部へ通信は発生しない。
-fn default_route_local_ip() -> Option<IpAddr> {
+pub fn default_route_local_ip() -> Option<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:53").ok()?;
     socket.local_addr().ok().map(|a| a.ip())
