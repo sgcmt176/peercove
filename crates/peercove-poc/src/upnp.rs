@@ -45,8 +45,18 @@ impl UpnpLease {
 }
 
 /// UPnP でポート開放を試行する。エラーには利用者が次に取るべき行動を含める。
+///
+/// トンネル作成**前**に呼ぶこと。トンネルの TUN にはマルチキャスト経路が付くため、
+/// 後から呼ぶと SSDP 探索がトンネル側へ流れて失敗することがある。
 pub fn setup(listen_port: u16) -> anyhow::Result<UpnpReport> {
+    // 探索ソケットを物理 LAN の IP へ明示的にバインドし、仮想アダプタ
+    // (VirtualBox / TUN 等)へマルチキャストが流れるのを防ぐ
+    let bind_addr = default_route_local_ip()
+        .map(|ip| SocketAddr::new(ip, 0))
+        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+    tracing::debug!("SSDP 探索を {bind_addr} から送信します");
     let options = SearchOptions {
+        bind_addr,
         timeout: Some(SEARCH_TIMEOUT),
         ..Default::default()
     };
@@ -128,6 +138,14 @@ fn local_ip_towards(gateway: SocketAddr) -> anyhow::Result<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(gateway)?;
     Ok(socket.local_addr()?.ip())
+}
+
+/// デフォルトルート(インターネット)へ向かう経路のローカル IP。
+/// UDP の connect は実際にはパケットを送らないため、外部へ通信は発生しない。
+fn default_route_local_ip() -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:53").ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
 }
 
 /// グローバル(外部から到達可能な)IPv4 かどうかの簡易判定。

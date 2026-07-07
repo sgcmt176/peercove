@@ -24,20 +24,9 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
     let spec = build_spec(&config, role)?;
     let mut backend = create_backend(&config.interface.name)?;
 
-    backend.up(&spec)?;
-    println!(
-        "トンネル {} を作成しました(address={} mtu={} peers={})",
-        config.interface.name,
-        config.interface.address,
-        spec.mtu,
-        spec.peers.len()
-    );
+    // UPnP はトンネル作成前に試行する(TUN のマルチキャスト経路が SSDP 探索を
+    // 妨げないように)。失敗してもトンネルは起動する(手動ポートフォワードで代替可能)
     let listen_port = spec.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
-    if role == Role::Host {
-        println!("待受ポート: UDP {listen_port}(メンバーの endpoint にはこのポートを指定)");
-    }
-
-    // UPnP は失敗してもトンネル自体は継続する(手動ポートフォワードで代替可能)
     let upnp_lease = if upnp && role == Role::Host {
         match crate::upnp::setup(listen_port) {
             Ok(report) => {
@@ -51,13 +40,25 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
             }
             Err(e) => {
                 tracing::warn!("UPnP: {e:#}");
-                println!("UPnP ポート開放は失敗しました(トンネルは継続します)");
+                println!("UPnP ポート開放は失敗しました(トンネルは起動します)");
                 None
             }
         }
     } else {
         None
     };
+
+    backend.up(&spec)?;
+    println!(
+        "トンネル {} を作成しました(address={} mtu={} peers={})",
+        config.interface.name,
+        config.interface.address,
+        spec.mtu,
+        spec.peers.len()
+    );
+    if role == Role::Host {
+        println!("待受ポート: UDP {listen_port}(メンバーの endpoint にはこのポートを指定)");
+    }
     println!("Ctrl+C で終了します(トンネルをクリーンアップします)");
 
     let supervise_result = supervise_until_ctrl_c(config_path, role, backend.as_mut(), &spec);
