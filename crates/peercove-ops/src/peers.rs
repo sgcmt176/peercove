@@ -85,7 +85,7 @@ pub fn append_peer(config_path: &Path, peer: &NewPeer) -> anyhow::Result<()> {
 }
 
 /// 書き込む前に、結果が正しく解析・検証できることを確認する。
-fn write_validated(config_path: &Path, text: &str) -> anyhow::Result<()> {
+pub(crate) fn write_validated(config_path: &Path, text: &str) -> anyhow::Result<()> {
     let parsed: Config = toml::from_str(text).context("編集結果の TOML が不正です")?;
     parsed.validate()?;
     std::fs::write(config_path, text)
@@ -140,7 +140,7 @@ fn peer_tables(doc: &mut toml_edit::DocumentMut) -> anyhow::Result<&mut toml_edi
         .context("[[peer]] が見つかりません")
 }
 
-fn load_doc(config_path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+pub(crate) fn load_doc(config_path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
     std::fs::read_to_string(config_path)
         .with_context(|| format!("{} の読み込みに失敗しました", config_path.display()))?
         .parse()

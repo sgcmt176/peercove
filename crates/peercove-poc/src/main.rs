@@ -2,6 +2,7 @@ mod backend;
 mod commands;
 mod control;
 mod daemon;
+mod logbuf;
 mod upnp;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -179,6 +180,12 @@ enum DaemonAction {
     },
     /// トンネルを停止する(デーモンは常駐継続)
     Stop,
+    /// デーモンが保持する直近のログを表示する
+    Logs {
+        /// 新しい行を待ち続ける(Ctrl+C で終了)
+        #[arg(long, short)]
+        follow: bool,
+    },
     /// デーモンを終了する
     Shutdown,
 }
@@ -192,13 +199,23 @@ fn main() -> anyhow::Result<()> {
 /// ログの詳細度: `--log-level` > `RUST_LOG` > 既定(info)。
 ///
 /// パケット 1 個ごとのログは trace なので、既定の info では静かに動く。
+///
+/// 標準エラー出力に加えてリングバッファへも複製する([`logbuf`])。デーモンの
+/// ログを UI から読むための唯一の経路なので、フィルタは両者で共通にする
+/// (`--log-level warn` にすると UI のログビューも warn 以上だけになる)。
 fn init_tracing(log_level: Option<&str>) {
+    use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
+
     let filter = match log_level {
         Some(level) => EnvFilter::new(level),
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(logbuf::RingLayer)
+        .init();
 }
 
 fn run(command: Command) -> anyhow::Result<()> {
@@ -304,6 +321,7 @@ fn run_daemon_action(action: DaemonAction) -> anyhow::Result<()> {
             println!("トンネルを停止しました");
             Ok(())
         }
+        DaemonAction::Logs { follow } => daemon::print_logs(follow),
         DaemonAction::Shutdown => {
             daemon::request(IpcRequest::Shutdown)?;
             println!("デーモンを終了しました");

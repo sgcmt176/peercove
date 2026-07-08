@@ -6,6 +6,7 @@ import {
   errorMessage,
   formatBytes,
   formatHandshake,
+  formatRtt,
   stateLabel,
 } from "../ipc";
 import { ConfirmModal } from "./Modal";
@@ -21,6 +22,8 @@ export function TunnelView({
 }) {
   const tunnel = status.tunnel!;
   const isHost = status.state === "hosting";
+  // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
+  const rttByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer.rttMs]));
   const [inviting, setInviting] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
   const [busy, setBusy] = useState(false);
@@ -111,6 +114,7 @@ export function TunnelView({
               <MemberRow
                 key={member.publicKey}
                 member={member}
+                rttMs={rttByKey.get(member.publicKey) ?? null}
                 canManage={isHost && !member.isHost}
                 onRemove={() => setRemoving(member)}
                 onRename={(newName) => void rename(member, newName)}
@@ -129,6 +133,7 @@ export function TunnelView({
                 <th>公開鍵</th>
                 <th>エンドポイント</th>
                 <th>最終ハンドシェイク</th>
+                <th>RTT</th>
                 <th>受信</th>
                 <th>送信</th>
               </tr>
@@ -141,6 +146,9 @@ export function TunnelView({
                   </td>
                   <td className="mono">{peer.endpoint ?? "(未接続)"}</td>
                   <td>{formatHandshake(peer.lastHandshakeAgeSecs)}</td>
+                  <td title="トンネル内のコントロールチャネルで測った往復時間">
+                    {formatRtt(peer.rttMs)}
+                  </td>
                   <td>{formatBytes(peer.rxBytes)}</td>
                   <td>{formatBytes(peer.txBytes)}</td>
                 </tr>
@@ -187,11 +195,13 @@ export function TunnelView({
 
 function MemberRow({
   member,
+  rttMs,
   canManage,
   onRemove,
   onRename,
 }: {
   member: Member;
+  rttMs: number | null;
   canManage: boolean;
   onRemove: () => void;
   onRename: (newName: string) => void;
@@ -228,6 +238,11 @@ function MemberRow({
       )}
       <span className="mono muted">{member.ip}</span>
       {member.isHost && <span className="tag">host</span>}
+      {rttMs !== null && (
+        <span className="tag" title="トンネル内の往復時間">
+          {formatRtt(rttMs)}
+        </span>
+      )}
       {canManage && !editing && (
         <span className="member__actions">
           <button

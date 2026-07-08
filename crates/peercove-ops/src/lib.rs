@@ -12,3 +12,4 @@ pub mod join;
 pub mod net;
 pub mod peers;
 pub mod secret;
+pub mod settings;

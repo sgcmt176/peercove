@@ -8,6 +8,7 @@
 //! トランスポート非依存の部分(`handle_connection` / `request_over`)は
 //! 任意の AsyncRead+AsyncWrite で動き、テストは `tokio::io::duplex` で行う。
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -78,6 +79,10 @@ impl DaemonShared {
                 let _ = self.shutdown_tx.send(true);
                 Ok(IpcResponse::Done)
             }
+            IpcRequest::Logs { after_seq } => {
+                let (lines, dropped) = crate::logbuf::ring().since(after_seq);
+                Ok(IpcResponse::Logs { lines, dropped })
+            }
         }
     }
 
@@ -147,17 +152,28 @@ impl DaemonShared {
         let Some(active) = active.as_ref() else {
             return DaemonStatus::Idle;
         };
-        let (peers, ledger) = active
-            .snapshot
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or((Vec::new(), None));
+        // ロックはこのブロックの間だけ(status 応答の組み立ては外でやる)
+        let (peers, ledger, rtt_ms) = {
+            let snapshot = active.snapshot.lock().unwrap();
+            match snapshot.as_ref() {
+                Some(snapshot) => (
+                    snapshot.peers.clone(),
+                    snapshot.ledger.clone(),
+                    snapshot.rtt_ms.clone(),
+                ),
+                None => (Vec::new(), None, HashMap::new()),
+            }
+        };
+        let ledger = ledger.unwrap_or_default();
+        // RTT は仮想 IP をキーに測っている。台帳が公開鍵 ↔ 仮想 IP を対応づける
+        let ip_by_key: HashMap<&[u8; 32], Ipv4Addr> = ledger
+            .iter()
+            .map(|entry| (entry.public_key.as_bytes(), entry.ip))
+            .collect();
         let now = SystemTime::now();
         let info = TunnelInfo {
             config: active.config.clone(),
             address: active.address,
-            ledger: ledger.unwrap_or_default(),
             peers: peers
                 .iter()
                 .map(|p| PeerSummary {
@@ -169,8 +185,13 @@ impl DaemonShared {
                         .map(|d| d.as_secs()),
                     rx_bytes: p.rx_bytes,
                     tx_bytes: p.tx_bytes,
+                    rtt_ms: ip_by_key
+                        .get(p.public_key.as_bytes())
+                        .and_then(|ip| rtt_ms.get(ip))
+                        .copied(),
                 })
                 .collect(),
+            ledger,
         };
         match active.role {
             Role::Host => DaemonStatus::Hosting(info),
@@ -188,6 +209,10 @@ where
     let mut reader = BufReader::new(read_half).take(MAX_LINE_LEN);
     let mut line = String::new();
     loop {
+        // take の上限は reader の累計なので、1 行ごとに戻す。今のクライアントは
+        // 1 接続 1 リクエストなので効いていないが、接続を使い回すと上限に達した
+        // 時点で EOF と区別できなくなる(control.rs で同じ罠を踏んだ)
+        reader.set_limit(MAX_LINE_LEN);
         line.clear();
         if reader.read_line(&mut line).await? == 0 {
             return Ok(()); // クライアント切断
@@ -443,13 +468,58 @@ pub fn print_status(status: &DaemonStatus) {
                     Some(age) => format!("{age} 秒前"),
                     None => "なし".to_string(),
                 };
+                let rtt = match peer.rtt_ms {
+                    Some(ms) => format!(", rtt {ms:.1} ms"),
+                    None => String::new(),
+                };
                 println!(
-                    "  peer {}: handshake {handshake}, rx {} B, tx {} B",
+                    "  peer {}: handshake {handshake}, rx {} B, tx {} B{rtt}",
                     peer.public_key, peer.rx_bytes, peer.tx_bytes
                 );
             }
         }
     }
+}
+
+/// `daemon logs`: デーモンが保持する直近のログを表示する(M2-G5)。
+///
+/// `--follow` のときは 1 秒ごとに続きを取りに行く(Ctrl+C で終了)。
+pub fn print_logs(follow: bool) -> anyhow::Result<()> {
+    let mut after_seq = 0u64;
+    loop {
+        if let IpcResponse::Logs { lines, dropped } = request(IpcRequest::Logs { after_seq })? {
+            if dropped > 0 {
+                eprintln!("(バッファから溢れた {dropped} 行は失われました)");
+            }
+            for line in &lines {
+                println!("{}", format_log_line(line));
+            }
+            if let Some(last) = lines.last() {
+                after_seq = last.seq;
+            }
+        }
+        if !follow {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// `12:34:56.789 INFO  peercove_poc::daemon: メッセージ`
+///
+/// 時刻は UTC(デーモンの標準エラー出力に出る `tracing` の既定表記に合わせる)。
+fn format_log_line(line: &peercove_core::ipc::LogLine) -> String {
+    let secs_of_day = (line.unix_ms / 1000) % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}.{:03} {:<5} {}: {}",
+        secs_of_day / 3600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60,
+        line.unix_ms % 1000,
+        line.level,
+        line.target,
+        line.message
+    )
 }
 
 #[cfg(test)]
@@ -581,6 +651,40 @@ mod tests {
         let server = accept.await.unwrap();
         drop(client);
         drop(server);
+    }
+
+    /// Logs 要求は `after_seq` より後の行だけを返す(UI のポーリング用)。
+    #[tokio::test]
+    async fn logs_return_only_new_lines() {
+        let (shared, _rx) = test_shared();
+        let ring = crate::logbuf::ring();
+        let logs = |after_seq| {
+            let shared = Arc::clone(&shared);
+            async move {
+                match shared
+                    .dispatch(IpcRequest::Logs { after_seq })
+                    .await
+                    .unwrap()
+                {
+                    IpcResponse::Logs { lines, dropped } => (lines, dropped),
+                    other => panic!("Logs を期待: {other:?}"),
+                }
+            }
+        };
+
+        // 他のテストが積んだ行と混ざらないよう、いまの末尾から見る
+        let after_seq = ring.since(0).0.last().map(|line| line.seq).unwrap_or(0);
+        assert!(logs(after_seq).await.0.is_empty(), "新しい行はまだ無い");
+
+        ring.push("INFO", "peercove_poc::test", "テスト行".to_string());
+        let (lines, dropped) = logs(after_seq).await;
+        assert_eq!(dropped, 0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].message, "テスト行");
+        assert!(lines[0].seq > after_seq);
+
+        // 取り込んだ続きからは、また空になる
+        assert!(logs(lines[0].seq).await.0.is_empty());
     }
 
     /// stop 時に MockBackend の down が呼ばれる(クリーンアップの対称性)。

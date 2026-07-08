@@ -30,6 +30,13 @@ pub enum ControlMessage {
     Ledger { members: Vec<LedgerEntry> },
     /// host → member: あなたは削除された(以後トンネルは通らない)。
     Removed { message: String },
+    /// 双方向: RTT 計測(M2-G5)。受け取った側は同じ nonce で [`ControlMessage::Pong`] を返す。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。ping を知らない旧実装は
+    /// 解析に失敗して黙って無視するため、RTT が測れないだけで通信は壊れない。
+    Ping { nonce: u64 },
+    /// 双方向: [`ControlMessage::Ping`] への応答。
+    Pong { nonce: u64 },
 }
 
 /// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。
@@ -74,6 +81,8 @@ mod tests {
             ControlMessage::Removed {
                 message: "ホストにより削除されました".to_string(),
             },
+            ControlMessage::Ping { nonce: 7 },
+            ControlMessage::Pong { nonce: 7 },
         ];
         for message in messages {
             let json = serde_json::to_string(&message).unwrap();
@@ -95,5 +104,10 @@ mod tests {
 
         let json = serde_json::to_string(&ControlMessage::Ledger { members: vec![] }).unwrap();
         assert_eq!(json, r#"{"type":"ledger","members":[]}"#);
+
+        let json = serde_json::to_string(&ControlMessage::Ping { nonce: 1 }).unwrap();
+        assert_eq!(json, r#"{"type":"ping","nonce":1}"#);
+        let json = serde_json::to_string(&ControlMessage::Pong { nonce: 1 }).unwrap();
+        assert_eq!(json, r#"{"type":"pong","nonce":1}"#);
     }
 }

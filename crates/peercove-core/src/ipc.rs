@@ -38,6 +38,12 @@ pub enum IpcRequest {
     Stop,
     /// デーモンを終了する(トンネルが動いていれば停止してから)。
     Shutdown,
+    /// デーモンが保持する直近のログを取り出す(M2-G5)。
+    /// `after_seq` より後の行だけを返す(0 なら持っている分すべて)。
+    Logs {
+        #[serde(default)]
+        after_seq: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,7 +67,33 @@ pub enum IpcResponse {
     Status(DaemonStatus),
     /// 副作用系(start/stop/shutdown)への応答。
     Done,
+    /// Logs への応答。`dropped` はリングバッファから溢れて失われた行数。
+    Logs {
+        lines: Vec<LogLine>,
+        #[serde(default)]
+        dropped: u64,
+    },
 }
+
+/// デーモンが保持する直近のログ 1 行(M2-G5)。
+///
+/// 秘密鍵・PSK・トークンはそもそもログに出さない方針(CLAUDE.md)なので、
+/// この行をそのまま UI へ渡してよい。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogLine {
+    /// デーモン起動からの連番。次回取得の `after_seq` に使う。
+    pub seq: u64,
+    /// UNIX エポックからのミリ秒。
+    pub unix_ms: u64,
+    /// `ERROR` / `WARN` / `INFO` / `DEBUG` / `TRACE`。
+    pub level: String,
+    pub target: String,
+    pub message: String,
+}
+
+/// 1 応答で返すログ行の上限([`crate::ipc`] の 1 行 JSON が
+/// `peercove-ipc` の受信上限を超えないようにする)。
+pub const MAX_LOG_LINES_PER_REPLY: usize = 200;
 
 /// デーモンの状態モデル(M2 handoff Q4: 同時 1 ネットワーク)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +126,10 @@ pub struct PeerSummary {
     pub last_handshake_age_secs: Option<u64>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// トンネル内コントロールチャネルの往復時間(ミリ秒、M2-G5)。
+    /// 相手が旧バージョンで ping に応答しない場合や、制御接続前は `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
 }
 
 #[cfg(test)]
@@ -113,6 +149,7 @@ mod tests {
             },
             IpcRequest::Stop,
             IpcRequest::Shutdown,
+            IpcRequest::Logs { after_seq: 42 },
         ];
         for (i, req) in requests.into_iter().enumerate() {
             let envelope = IpcEnvelope { id: i as u64, req };
@@ -166,5 +203,40 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"id":8,"err":"x"}"#);
+
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 9,
+            req: IpcRequest::Logs { after_seq: 3 },
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"id":9,"req":{"method":"logs","after_seq":3}}"#);
+
+        let json = serde_json::to_string(&IpcReply {
+            id: 9,
+            result: IpcResult::Ok(IpcResponse::Logs {
+                lines: vec![LogLine {
+                    seq: 1,
+                    unix_ms: 1_700_000_000_000,
+                    level: "INFO".to_string(),
+                    target: "peercove_poc::daemon".to_string(),
+                    message: "トンネルを開始しました".to_string(),
+                }],
+                dropped: 0,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":9,"ok":{"type":"logs","lines":[{"seq":1,"unix_ms":1700000000000,"level":"INFO","target":"peercove_poc::daemon","message":"トンネルを開始しました"}],"dropped":0}}"#
+        );
+    }
+
+    /// `rtt_ms` は後方互換のため省略可能(旧デーモンの応答も読める)。
+    #[test]
+    fn peer_summary_rtt_is_optional() {
+        let json = r#"{"public_key":"hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr06uSpB6ipTmo=","rx_bytes":1,"tx_bytes":2}"#;
+        let peer: PeerSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(peer.rtt_ms, None);
+        assert!(!serde_json::to_string(&peer).unwrap().contains("rtt_ms"));
     }
 }

@@ -1,14 +1,19 @@
-//! PeerCove デスクトップ UI の Rust 側(M2-G2/G3/G4)。
+//! PeerCove デスクトップ UI の Rust 側(M2-G2〜G6)。
 //!
 //! UI は**非特権**で動く。役割は 2 つ:
 //!
 //! 1. **デーモン操作**(要特権のトンネル操作): ローカル IPC 経由(ADR-0007)
-//! 2. **設定ファイル操作**(init / invite / join / メンバー管理): `peercove-ops` を
-//!    ユーザー権限で直接呼ぶ。デーモンには 5 秒の再読込で自動反映される(ADR-0008)
+//! 2. **設定ファイル操作**(init / invite / join / メンバー管理 / 設定編集):
+//!    `peercove-ops` をユーザー権限で直接呼ぶ。デーモンには 5 秒の再読込で
+//!    自動反映される(ADR-0008)
 //!
 //! IPC の応答は `dto` で UI 用 DTO(camelCase)へ変換してから frontend に渡す。
+//!
+//! トレイ常駐(M2-G6)は `tray` モジュール。ウィンドウを閉じてもプロセスは
+//! 残り、トレイから復帰・終了できる。
 
 mod dto;
+mod tray;
 
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
@@ -17,7 +22,10 @@ use peercove_core::ipc::{IpcRequest, IpcResponse};
 use peercove_ops::peers::Selector;
 use tauri::Manager;
 
-use crate::dto::{ConfigPaths, ConfigSlot, InitResult, InviteResult, JoinResult, Status};
+use crate::dto::{
+    ConfigPaths, ConfigSlot, InitResult, InviteResult, JoinResult, LogEntry, Logs, SaveResult,
+    Settings, SettingsUpdate, Status,
+};
 
 /// デフォルトの設定ディレクトリ(Windows: %APPDATA%\… / Linux: ~/.config/…)。
 /// UI からは「別の設定を使う」で任意のファイルも選べる(ADR-0008)。
@@ -62,6 +70,22 @@ async fn start_member(config_path: String) -> Result<(), String> {
 #[tauri::command]
 async fn stop_tunnel() -> Result<(), String> {
     send(IpcRequest::Stop).await
+}
+
+/// デーモンが保持する直近のログを取り出す(M2-G5)。
+///
+/// `after_seq` に前回の最終 seq を渡すと差分だけが返る。UI はこれを 1 秒間隔で
+/// 呼び、ログビューが開いている間だけ追記していく。
+#[tauri::command]
+async fn daemon_logs(after_seq: u64) -> Result<Logs, String> {
+    match peercove_ipc::request_async(IpcRequest::Logs { after_seq }).await {
+        Ok(IpcResponse::Logs { lines, dropped }) => Ok(Logs {
+            lines: lines.into_iter().map(LogEntry::from).collect(),
+            dropped,
+        }),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
 }
 
 async fn send(request: IpcRequest) -> Result<(), String> {
@@ -190,13 +214,47 @@ fn rename_member(config_path: String, public_key: String, new_name: String) -> R
     .map_err(to_message)
 }
 
+/// 設定ファイルの現在値を読む(M2-G5)。
+#[tauri::command]
+fn read_settings(config_path: String) -> Result<Settings, String> {
+    peercove_ops::settings::read(Path::new(&config_path))
+        .map(Settings::from)
+        .map_err(to_message)
+}
+
+/// 設定ファイルを書き戻す。`restartRequired` が true なら、再接続するまで
+/// 反映されない項目(MTU / 待受ポート / ホストのエンドポイント)が変わっている。
+#[tauri::command]
+fn save_settings(config_path: String, update: SettingsUpdate) -> Result<SaveResult, String> {
+    let path = Path::new(&config_path);
+    let update: peercove_ops::settings::Update = update.into();
+    let current = peercove_ops::settings::read(path).map_err(to_message)?;
+    let restart_required = current.restart_required(&update);
+    peercove_ops::settings::update(path, &update).map_err(to_message)?;
+    Ok(SaveResult { restart_required })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            tray::setup(app.handle())?;
+            Ok(())
+        })
+        // ウィンドウを閉じてもプロセスは残す(トレイ常駐 — M2-G6)。
+        // 終了はトレイメニューの「終了」から
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            daemon_logs,
             start_host,
             start_member,
             stop_tunnel,
@@ -206,6 +264,8 @@ pub fn run() {
             join_network,
             remove_member,
             rename_member,
+            read_settings,
+            save_settings,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri アプリの起動に失敗しました");

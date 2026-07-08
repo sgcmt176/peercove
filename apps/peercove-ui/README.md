@@ -32,16 +32,20 @@ npm run tauri build   # 配布用バイナリ(M2-G7 で本格対応)
 ```
 src/                        React(TypeScript)
   ipc.ts                    UI 用の型・コマンドラッパ・表示ヘルパ
-  App.tsx                   接続状態で画面を出し分け
+  notify.ts                 メンバー参加/切断の差分検知と OS 通知(G6)
+  App.tsx                   接続状態で画面を出し分け + ヘッダの設定/ログボタン
   components/StartView.tsx  待機中: ホスト開始 / トークンで参加
-  components/TunnelView.tsx 稼働中: メンバー一覧・招待・削除・名前変更・切断
+  components/TunnelView.tsx 稼働中: メンバー一覧・RTT・招待・削除・名前変更・切断
   components/InviteDialog.tsx 招待の発行と QR 表示(発行直後のみ)
+  components/SettingsDialog.tsx 自分側の設定編集(表示名 / ポート / MTU / endpoint)
+  components/LogsDialog.tsx デーモンのログビュー(1 秒間隔で差分取得)
   components/Modal.tsx      モーダルと確認ダイアログ
 src-tauri/                  Rust(Tauri バックエンド)
   src/lib.rs                invoke コマンド(デーモン操作 + 設定ファイル操作)
   src/dto.rs                IPC 応答 → UI DTO の変換(camelCase)
+  src/tray.rs               トレイ常駐(閉じても終了しない、メニューで復帰・終了)
   tauri.conf.json           ウィンドウ・CSP・バンドル設定
-  capabilities/             権限(core:default + ファイル選択 + クリップボード)
+  capabilities/             権限(core:default + ファイル選択 + クリップボード + 通知)
 scripts/make-icon.mjs       アプリアイコンの生成(外部素材に依存しない)
 ```
 
@@ -72,6 +76,19 @@ UI の役割は 2 つに分かれます(ADR-0007 / 0008):
 - 設定ファイルの既定の置き場所はアプリのデータディレクトリ
   (Windows `%APPDATA%\app.peercove.desktop\`、Linux `~/.config/app.peercove.desktop/`)。
   「別の設定ファイルを使う」で任意のパスも選べます
+- **ログはデーモンのメモリから IPC で取り出します**(ADR-0009)。ファイルに
+  書かないので、特権プロセスが作ったファイルを読む権限問題も、消し忘れの
+  残骸もありません。表示できるのはデーモンが記録しているレベルまでです
+  (`--log-level warn` で起動していれば warn 以上だけ)
+- **RTT はコントロールチャネルの ping/pong で測ります**(ADR-0009)。ICMP は
+  raw socket に特権が要るため使いません。台帳には載せません(5 秒ごとに値が
+  変わり、全メンバーへの再配布が走ってしまうため)
+- **参加/切断の通知は UI が status の差分から出します**。デーモンは状態を
+  持つだけです(G7 で Windows サービス化すると Session 0 からデスクトップへ
+  通知できないため)。ウィンドウを閉じてもトレイに常駐して通知を出し続けます
+- **設定編集で触れるのは「自分側の設定」だけ**です。メンバーの追加・削除・改名は
+  メンバー一覧側の操作。MTU・待受ポート・ホストの endpoint はインターフェース
+  生成時に決まるため、保存しても**再接続するまで反映されません**(UI が明示します)
 
 ## アイコンの再生成
 

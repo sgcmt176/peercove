@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
-import { Connection, api, errorMessage, stateLabel } from "./ipc";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Connection, Member, api, errorMessage, stateLabel } from "./ipc";
+import { diffMembers, notifyMemberEvents } from "./notify";
 import { StartView } from "./components/StartView";
 import { TunnelView } from "./components/TunnelView";
+import { LogsDialog } from "./components/LogsDialog";
+import { SettingsDialog } from "./components/SettingsDialog";
 
 /** デーモンの状態を取りに行く間隔。CLI の status(5 秒)より短くしておく。 */
 const POLL_INTERVAL_MS = 2000;
@@ -10,12 +13,28 @@ export default function App() {
   const [connection, setConnection] = useState<Connection>({
     kind: "connecting",
   });
+  const [dialog, setDialog] = useState<"logs" | "settings" | null>(null);
+  /** 設定編集の対象。トンネル稼働中はその設定、待機中は既定のホスト/参加設定。 */
+  const [idleConfig, setIdleConfig] = useState<string | null>(null);
+
+  // 通知の差分計算に使う前回の台帳。レンダーに関係しないので ref に置く
+  const previousMembers = useRef<Member[] | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      setConnection({ kind: "ok", status: await api.daemonStatus() });
+      const status = await api.daemonStatus();
+      setConnection({ kind: "ok", status });
+      const members = status.tunnel?.members ?? null;
+      if (members === null) {
+        // 切断したら次回の接続を「初回」に戻す(全員分の通知が鳴るのを防ぐ)
+        previousMembers.current = null;
+      } else {
+        void notifyMemberEvents(diffMembers(previousMembers.current, members));
+        previousMembers.current = members;
+      }
     } catch (error) {
       setConnection({ kind: "unreachable", message: errorMessage(error) });
+      previousMembers.current = null;
     }
   }, []);
 
@@ -25,11 +44,54 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  // 待機中に設定を編集できるよう、既定の設定ファイルの所在を調べておく
+  useEffect(() => {
+    api
+      .configPaths()
+      .then((paths) => {
+        const slot = paths.host.exists
+          ? paths.host
+          : paths.member.exists
+            ? paths.member
+            : null;
+        setIdleConfig(slot?.path ?? null);
+      })
+      .catch(() => setIdleConfig(null));
+  }, [connection.kind]);
+
+  const tunnelConfig =
+    connection.kind === "ok" ? (connection.status.tunnel?.config ?? null) : null;
+  const settingsConfig = tunnelConfig ?? idleConfig;
+
   return (
     <main className="app">
       <header className="app__header">
         <h1>PeerCove</h1>
-        <ConnectionBadge connection={connection} />
+        <div className="app__actions">
+          <ConnectionBadge connection={connection} />
+          <button
+            type="button"
+            className="button--icon"
+            title={
+              settingsConfig
+                ? "設定"
+                : "設定ファイルがまだありません（ホストを始めるか参加してください）"
+            }
+            disabled={settingsConfig === null}
+            onClick={() => setDialog("settings")}
+          >
+            ⚙
+          </button>
+          <button
+            type="button"
+            className="button--icon"
+            title="デーモンのログ"
+            disabled={connection.kind === "unreachable"}
+            onClick={() => setDialog("logs")}
+          >
+            ☰
+          </button>
+        </div>
       </header>
 
       {connection.kind === "unreachable" ? (
@@ -43,6 +105,17 @@ export default function App() {
         <StartView onStarted={() => void refresh()} />
       ) : (
         <TunnelView status={connection.status} onChanged={() => void refresh()} />
+      )}
+
+      {dialog === "logs" && <LogsDialog onClose={() => setDialog(null)} />}
+      {dialog === "settings" && settingsConfig && (
+        <SettingsDialog
+          configPath={settingsConfig}
+          onClose={() => {
+            setDialog(null);
+            void refresh();
+          }}
+        />
       )}
     </main>
   );

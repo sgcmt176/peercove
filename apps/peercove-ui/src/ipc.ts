@@ -19,6 +19,8 @@ export interface Peer {
   lastHandshakeAgeSecs: number | null;
   rxBytes: number;
   txBytes: number;
+  /** トンネル内 RTT。制御接続が確立するまでは null。 */
+  rttMs: number | null;
 }
 
 export interface Tunnel {
@@ -72,6 +74,45 @@ export interface JoinResult {
   otherEndpoints: string[];
 }
 
+/** 設定ファイルの現在値(M2-G5)。 */
+export interface Settings {
+  interfaceName: string;
+  displayName: string | null;
+  address: string;
+  listenPort: number | null;
+  mtu: number;
+  hostEndpoint: string | null;
+  isMember: boolean;
+  defaultMtu: number;
+  defaultListenPort: number;
+}
+
+export interface SettingsUpdate {
+  displayName: string | null;
+  listenPort: number | null;
+  mtu: number;
+  hostEndpoint: string | null;
+}
+
+export interface SaveResult {
+  /** MTU / 待受ポート / エンドポイントを変えた場合。再接続まで反映されない。 */
+  restartRequired: boolean;
+}
+
+export interface LogEntry {
+  seq: number;
+  unixMs: number;
+  level: string;
+  target: string;
+  message: string;
+}
+
+export interface Logs {
+  lines: LogEntry[];
+  /** バッファから溢れて失われた行数。 */
+  dropped: number;
+}
+
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =
   | { kind: "connecting" }
@@ -101,6 +142,11 @@ export const api = {
     invoke<string>("remove_member", { configPath, publicKey }),
   renameMember: (configPath: string, publicKey: string, newName: string) =>
     invoke<void>("rename_member", { configPath, publicKey, newName }),
+  daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
+  readSettings: (configPath: string) =>
+    invoke<Settings>("read_settings", { configPath }),
+  saveSettings: (configPath: string, update: SettingsUpdate) =>
+    invoke<SaveResult>("save_settings", { configPath, update }),
 };
 
 // ---- 表示ヘルパ ----
@@ -133,6 +179,20 @@ export function formatHandshake(ageSecs: number | null): string {
   const minutes = Math.floor(ageSecs / 60);
   if (minutes < 60) return `${minutes} 分前`;
   return `${Math.floor(minutes / 60)} 時間前`;
+}
+
+/** 1 ミリ秒未満は「< 1 ms」。ローカルの検証で 0.0 ms と出るのを避ける。 */
+export function formatRtt(rttMs: number | null): string {
+  if (rttMs === null) return "—";
+  if (rttMs < 1) return "< 1 ms";
+  return `${rttMs.toFixed(rttMs < 10 ? 1 : 0)} ms`;
+}
+
+/** ログの時刻はローカルタイムで表示する(デーモンは UNIX ミリ秒で返す)。 */
+export function formatLogTime(unixMs: number): string {
+  const at = new Date(unixMs);
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}.${pad(at.getMilliseconds(), 3)}`;
 }
 
 /** invoke のエラーは文字列で返る。 */

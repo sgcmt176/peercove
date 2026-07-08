@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use peercove_core::ipc::{DaemonStatus, PeerSummary, TunnelInfo};
+use peercove_core::ipc::{DaemonStatus, LogLine, PeerSummary, TunnelInfo};
 use peercove_core::proto::LedgerEntry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +36,8 @@ pub struct Peer {
     pub last_handshake_age_secs: Option<u64>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// トンネル内 RTT(ミリ秒)。制御接続が確立するまでは null。
+    pub rtt_ms: Option<f64>,
 }
 
 impl From<&PeerSummary> for Peer {
@@ -46,6 +48,7 @@ impl From<&PeerSummary> for Peer {
             last_handshake_age_secs: peer.last_handshake_age_secs,
             rx_bytes: peer.rx_bytes,
             tx_bytes: peer.tx_bytes,
+            rtt_ms: peer.rtt_ms,
         }
     }
 }
@@ -171,6 +174,96 @@ pub struct JoinResult {
     pub other_endpoints: Vec<String>,
 }
 
+/// 設定編集(M2-G5)。`peercove_ops::settings` の型を camelCase で往復させる。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub interface_name: String,
+    pub display_name: Option<String>,
+    pub address: String,
+    pub listen_port: Option<u16>,
+    pub mtu: u16,
+    pub host_endpoint: Option<String>,
+    pub is_member: bool,
+    /// 既定値。UI の入力欄のプレースホルダに使う。
+    pub default_mtu: u16,
+    pub default_listen_port: u16,
+}
+
+impl From<peercove_ops::settings::Settings> for Settings {
+    fn from(settings: peercove_ops::settings::Settings) -> Self {
+        Self {
+            interface_name: settings.interface_name,
+            display_name: settings.display_name,
+            address: settings.address,
+            listen_port: settings.listen_port,
+            mtu: settings.mtu,
+            host_endpoint: settings.host_endpoint,
+            is_member: settings.is_member,
+            default_mtu: peercove_core::config::DEFAULT_MTU,
+            default_listen_port: peercove_core::config::DEFAULT_LISTEN_PORT,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsUpdate {
+    pub display_name: Option<String>,
+    pub listen_port: Option<u16>,
+    pub mtu: u16,
+    pub host_endpoint: Option<String>,
+}
+
+impl From<SettingsUpdate> for peercove_ops::settings::Update {
+    fn from(update: SettingsUpdate) -> Self {
+        Self {
+            display_name: update.display_name,
+            listen_port: update.listen_port,
+            mtu: update.mtu,
+            host_endpoint: update.host_endpoint,
+        }
+    }
+}
+
+/// 設定保存の結果。トンネル再起動が要るかを UI へ伝える。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveResult {
+    pub restart_required: bool,
+}
+
+/// デーモンのログ 1 行(M2-G5)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    pub seq: u64,
+    pub unix_ms: u64,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+}
+
+impl From<LogLine> for LogEntry {
+    fn from(line: LogLine) -> Self {
+        Self {
+            seq: line.seq,
+            unix_ms: line.unix_ms,
+            level: line.level,
+            target: line.target,
+            message: line.message,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Logs {
+    pub lines: Vec<LogEntry>,
+    /// バッファから溢れて失われた行数(0 なら欠落なし)。
+    pub dropped: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +311,56 @@ mod tests {
             display_path(Path::new("/home/me/.config/peercove/host.toml")),
             "/home/me/.config/peercove/host.toml"
         );
+    }
+
+    /// RTT は camelCase の `rttMs` で、未測定なら null で出る(UI が判定に使う)。
+    #[test]
+    fn peer_rtt_serializes_as_nullable_camel_case() {
+        let mut summary = PeerSummary {
+            public_key: PrivateKey::generate().public_key(),
+            endpoint: None,
+            last_handshake_age_secs: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rtt_ms: None,
+        };
+        let json = serde_json::to_value(Peer::from(&summary)).unwrap();
+        assert!(json["rttMs"].is_null());
+
+        summary.rtt_ms = Some(12.5);
+        let json = serde_json::to_value(Peer::from(&summary)).unwrap();
+        assert_eq!(json["rttMs"], 12.5);
+    }
+
+    /// 設定は camelCase で往復する(frontend の SettingsForm と対)。
+    #[test]
+    fn settings_round_trip_through_ui_shape() {
+        let json = serde_json::to_value(Settings::from(peercove_ops::settings::Settings {
+            interface_name: "peercove0".to_string(),
+            display_name: Some("alice".to_string()),
+            address: "10.119.96.2/24".to_string(),
+            listen_port: None,
+            mtu: 1420,
+            host_endpoint: Some("203.0.113.5:51820".to_string()),
+            is_member: true,
+        }))
+        .unwrap();
+        assert_eq!(json["hostEndpoint"], "203.0.113.5:51820");
+        assert_eq!(json["isMember"], true);
+        assert!(json["listenPort"].is_null());
+        assert_eq!(json["defaultMtu"], 1420);
+
+        let update: SettingsUpdate = serde_json::from_value(serde_json::json!({
+            "displayName": "bob",
+            "listenPort": 51900,
+            "mtu": 1380,
+            "hostEndpoint": null,
+        }))
+        .unwrap();
+        let update: peercove_ops::settings::Update = update.into();
+        assert_eq!(update.display_name.as_deref(), Some("bob"));
+        assert_eq!(update.listen_port, Some(51900));
+        assert_eq!(update.host_endpoint, None);
     }
 
     #[test]

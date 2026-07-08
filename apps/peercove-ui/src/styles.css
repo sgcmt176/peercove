@@ -472,3 +472,75 @@ textarea.token {
     flex-direction: column;
   }
 }
+
+/* ---- G5/G6 で追加した要素 ---- */
+
+.app__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.app__actions .button--icon {
+  font-size: 16px;
+  padding: 4px 8px;
+}
+
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+
+.logs__controls {
+  margin-top: 0;
+  justify-content: space-between;
+}
+
+.logs__level {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.logs {
+  /* 行が増えても縦に伸びず、中でスクロールする。長いメッセージは折り返す */
+  max-height: 45vh;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 10px 0;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.logs__line {
+  display: grid;
+  grid-template-columns: 84px 44px minmax(0, 1fr);
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+
+.logs__line-error,
+.logs__level-error {
+  color: #c0392b;
+}
+
+.logs__level-warn {
+  color: #b8860b;
+}
+
+.logs__level-info {
+  color: var(--online);
+}
+
+.logs__level-debug,
+.logs__level-trace {
+  color: var(--muted);
+}

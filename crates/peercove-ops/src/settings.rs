@@ -1,0 +1,314 @@
+//! 設定ファイルの `[interface]` と、メンバー設定のホスト endpoint の編集(M2-G5)。
+//!
+//! `[[peer]]` の追加・削除・改名は [`crate::peers`] の担当。ここで扱うのは
+//! 「自分側の設定」だけ:
+//!
+//! | 項目 | 反映タイミング |
+//! |---|---|
+//! | `display_name` | 次の supervisor 周期(約 5 秒)で台帳に載る |
+//! | `listen_port` / `mtu` | **トンネルの再起動が必要**(インターフェース生成時に決まる) |
+//! | ホストの `endpoint`(メンバー設定) | **トンネルの再起動が必要**(自分のピア設定は再読込しない) |
+//!
+//! 呼び出し側は [`Settings::restart_required`] を見て、その旨を利用者に伝えること。
+//! コメントと整形を保つため書き換えは `toml_edit` で行う。
+
+use std::net::SocketAddr;
+use std::path::Path;
+
+use anyhow::{bail, Context};
+use peercove_core::config::Config;
+
+use crate::peers::{load_doc, write_validated};
+
+/// MTU の許容範囲。下限は [`Config::validate`] と揃える。上限はイーサネットの
+/// ペイロード上限(1500)。WG のヘッダ分を引いた 1420 が既定値。
+const MTU_RANGE: std::ops::RangeInclusive<u16> = 576..=1500;
+
+/// 画面に出す現在値。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub interface_name: String,
+    /// 台帳に載る自分の表示名。
+    pub display_name: Option<String>,
+    /// 自分の仮想 IP とサブネット(表示のみ。変更は init/join のやり直し)。
+    pub address: String,
+    /// UDP 待受ポート。メンバーでは未指定(OS 任せ)が普通。
+    pub listen_port: Option<u16>,
+    pub mtu: u16,
+    /// メンバー設定のときだけ Some(ホストの `IP:ポート`)。
+    pub host_endpoint: Option<String>,
+    /// この設定がメンバー設定か(= ピアが 1 つで endpoint を持つ)。
+    pub is_member: bool,
+}
+
+impl Settings {
+    /// この設定を変えたときトンネルの再起動が必要か(`display_name` 以外は必要)。
+    pub fn restart_required(&self, update: &Update) -> bool {
+        self.listen_port != update.listen_port
+            || self.mtu != update.mtu
+            || (self.is_member && self.host_endpoint != update.host_endpoint)
+    }
+}
+
+/// 書き戻す値。UI は現在値を読んでから、全項目を埋めて渡す。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    /// `None` または空文字で削除。
+    pub display_name: Option<String>,
+    /// `None` で削除(ホストでは既定の 51820、メンバーでは OS 任せになる)。
+    pub listen_port: Option<u16>,
+    pub mtu: u16,
+    /// メンバー設定のときだけ意味を持つ。ホスト設定では無視する。
+    pub host_endpoint: Option<String>,
+}
+
+/// 現在の設定を読む。
+pub fn read(config_path: &Path) -> anyhow::Result<Settings> {
+    let config = Config::load(config_path)?;
+    // join が書く member.toml は「endpoint を持つピアがちょうど 1 つ」。
+    // host.toml のピア(メンバー)は endpoint を持たない
+    let host_endpoint = match config.peers.as_slice() {
+        [peer] => peer.endpoint.map(|e| e.to_string()),
+        _ => None,
+    };
+    Ok(Settings {
+        interface_name: config.interface.name.clone(),
+        display_name: config.interface.display_name.clone(),
+        address: config.interface.address.to_string(),
+        listen_port: config.interface.listen_port,
+        mtu: config.interface.mtu,
+        is_member: host_endpoint.is_some(),
+        host_endpoint,
+    })
+}
+
+/// 設定を書き戻す。書く前に、結果が設定として妥当かを検証する。
+pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
+    if !MTU_RANGE.contains(&update.mtu) {
+        bail!(
+            "MTU は {}〜{} の範囲で指定してください(既定 {})",
+            MTU_RANGE.start(),
+            MTU_RANGE.end(),
+            peercove_core::config::DEFAULT_MTU
+        );
+    }
+    if update.listen_port == Some(0) {
+        bail!("待受ポートに 0 は指定できません");
+    }
+    let display_name = update
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    if let Some(name) = display_name {
+        crate::invite::validate_name(name)?;
+    }
+    let endpoint = update
+        .host_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<SocketAddr>().with_context(|| {
+                format!("エンドポイント {value} は IP:ポート形式で指定してください")
+            })
+        })
+        .transpose()?;
+
+    let current = read(config_path)?;
+    let mut doc = load_doc(config_path)?;
+    let interface = doc
+        .get_mut("interface")
+        .and_then(|item| item.as_table_like_mut())
+        .context("[interface] が見つかりません")?;
+
+    match display_name {
+        Some(name) => interface.insert("display_name", toml_edit::value(name)),
+        None => interface.remove("display_name"),
+    };
+    match update.listen_port {
+        Some(port) => interface.insert("listen_port", toml_edit::value(i64::from(port))),
+        None => interface.remove("listen_port"),
+    };
+    interface.insert("mtu", toml_edit::value(i64::from(update.mtu)));
+
+    // endpoint はメンバー設定(ピア 1 つ)のときだけ触る。ホスト設定のピアは
+    // メンバーの登録なので、ここから書き換えてはいけない
+    if let (true, Some(endpoint)) = (current.is_member, endpoint) {
+        let peers = doc
+            .get_mut("peer")
+            .and_then(|item| item.as_array_of_tables_mut())
+            .context("[[peer]] が見つかりません")?;
+        let peer = peers.get_mut(0).context("[[peer]] が空です")?;
+        peer["endpoint"] = toml_edit::value(endpoint.to_string());
+    }
+
+    write_validated(config_path, &doc.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MEMBER: &str = r#"
+# 参加設定(コメントは保持されること)
+[interface]
+private_key_file = "member.key"
+display_name = "alice"
+address = "10.119.96.2/24"
+mtu = 1420
+
+[[peer]]
+control_host = "10.119.96.1"
+public_key = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr06uSpB6ipTmo="
+endpoint = "203.0.113.5:51820"
+allowed_ips = ["10.119.96.0/24"]
+persistent_keepalive = 25
+"#;
+
+    const HOST: &str = r#"
+[interface]
+private_key_file = "host.key"
+address = "10.119.96.1/24"
+listen_port = 51820
+mtu = 1420
+
+[[peer]]
+name = "bob"
+public_key = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr06uSpB6ipTmo="
+allowed_ips = ["10.119.96.2/32"]
+"#;
+
+    fn write(name: &str, text: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("peercove-settings-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        // private_key_file の実体は read/update では読まないので作らない
+        path
+    }
+
+    #[test]
+    fn reads_member_and_host_shapes() {
+        let member = read(&write("read-member", MEMBER)).unwrap();
+        assert!(member.is_member);
+        assert_eq!(member.host_endpoint.as_deref(), Some("203.0.113.5:51820"));
+        assert_eq!(member.display_name.as_deref(), Some("alice"));
+        assert_eq!(member.listen_port, None);
+
+        let host = read(&write("read-host", HOST)).unwrap();
+        assert!(!host.is_member, "ホストのピアは endpoint を持たない");
+        assert_eq!(host.host_endpoint, None);
+        assert_eq!(host.listen_port, Some(51820));
+    }
+
+    #[test]
+    fn update_member_rewrites_endpoint_and_keeps_comments() {
+        let path = write("update-member", MEMBER);
+        update(
+            &path,
+            &Update {
+                display_name: Some("  alice2 ".to_string()),
+                listen_port: Some(51900),
+                mtu: 1380,
+                host_endpoint: Some("198.51.100.7:51820".to_string()),
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 参加設定"), "コメントが保持される");
+        assert!(text.contains("persistent_keepalive = 25"), "他項目は不変");
+
+        let after = read(&path).unwrap();
+        assert_eq!(after.display_name.as_deref(), Some("alice2"), "trim される");
+        assert_eq!(after.listen_port, Some(51900));
+        assert_eq!(after.mtu, 1380);
+        assert_eq!(after.host_endpoint.as_deref(), Some("198.51.100.7:51820"));
+    }
+
+    /// ホスト設定では endpoint を渡されても `[[peer]]`(= メンバー登録)を触らない。
+    #[test]
+    fn update_host_never_touches_peer_endpoint() {
+        let path = write("update-host", HOST);
+        update(
+            &path,
+            &Update {
+                display_name: None,
+                listen_port: None,
+                mtu: 1400,
+                host_endpoint: Some("198.51.100.7:51820".to_string()),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("endpoint"), "ピアに endpoint が生えていない");
+        assert!(!text.contains("listen_port"), "None なら削除される");
+        assert_eq!(read(&path).unwrap().mtu, 1400);
+    }
+
+    #[test]
+    fn rejects_bad_values_without_writing() {
+        let path = write("reject", MEMBER);
+        let base = Update {
+            display_name: None,
+            listen_port: None,
+            mtu: 1420,
+            host_endpoint: None,
+        };
+
+        let bad_mtu = Update {
+            mtu: 100,
+            ..base.clone()
+        };
+        assert!(update(&path, &bad_mtu)
+            .unwrap_err()
+            .to_string()
+            .contains("MTU"));
+
+        let bad_port = Update {
+            listen_port: Some(0),
+            ..base.clone()
+        };
+        assert!(update(&path, &bad_port).is_err());
+
+        let bad_endpoint = Update {
+            host_endpoint: Some("203.0.113.5".to_string()),
+            ..base.clone()
+        };
+        assert!(update(&path, &bad_endpoint)
+            .unwrap_err()
+            .to_string()
+            .contains("IP:ポート"));
+
+        // どれも書き込まれていない
+        assert_eq!(
+            read(&path).unwrap(),
+            read(&write("reject-ref", MEMBER)).unwrap()
+        );
+    }
+
+    #[test]
+    fn restart_required_only_for_interface_and_endpoint() {
+        let current = read(&write("restart", MEMBER)).unwrap();
+        let same = Update {
+            display_name: current.display_name.clone(),
+            listen_port: current.listen_port,
+            mtu: current.mtu,
+            host_endpoint: current.host_endpoint.clone(),
+        };
+        assert!(!current.restart_required(&same));
+        assert!(!current.restart_required(&Update {
+            display_name: Some("bob".to_string()),
+            ..same.clone()
+        }));
+        assert!(current.restart_required(&Update {
+            mtu: 1380,
+            ..same.clone()
+        }));
+        assert!(current.restart_required(&Update {
+            host_endpoint: Some("198.51.100.7:51820".to_string()),
+            ..same.clone()
+        }));
+    }
+}

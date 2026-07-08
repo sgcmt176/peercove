@@ -170,8 +170,17 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
     supervise_result
 }
 
-/// supervise が周期的に更新する共有スナップショット(daemon の status 応答用)。
-pub type SharedSnapshot = Arc<Mutex<Option<(Vec<PeerStats>, Option<Vec<LedgerEntry>>)>>>;
+/// supervise が周期的に更新する状態(daemon の status 応答用)。
+#[derive(Default)]
+pub struct Snapshot {
+    pub peers: Vec<PeerStats>,
+    /// host は自前構築した台帳、member は受信済みの台帳(未受信なら None)。
+    pub ledger: Option<Vec<LedgerEntry>>,
+    /// 相手の仮想 IP → コントロールチャネルで測った RTT(ミリ秒、M2-G5)。
+    pub rtt_ms: HashMap<std::net::Ipv4Addr, f64>,
+}
+
+pub type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
 
 /// 停止シグナルまで 5 秒周期で以下を行う(CLI = Ctrl+C / daemon = stop 要求):
 /// - (host のみ)設定を再読込し、ピアの追加・変更・削除を同期(ADR-0002 / M1-G3/7)
@@ -201,6 +210,7 @@ pub async fn supervise(
         let (ledger_tx, ledger_rx) = tokio::sync::watch::channel(Vec::<LedgerEntry>::new());
         let connections: control::Connections = Default::default();
         let member_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>> = Default::default();
+        let rtt: control::RttMap = Default::default();
         let mut tasks = Vec::new();
         match role {
             Role::Host => {
@@ -208,6 +218,7 @@ pub async fn supervise(
                     spec.address.addr(),
                     ledger_rx,
                     Arc::clone(&connections),
+                    Arc::clone(&rtt),
                 )));
             }
             Role::Member => {
@@ -224,6 +235,7 @@ pub async fn supervise(
                             host_ip,
                             config.interface.display_name.clone(),
                             Arc::clone(&member_ledger),
+                            Arc::clone(&rtt),
                         )));
                     }
                     _ => tracing::warn!(
@@ -287,7 +299,11 @@ pub async fn supervise(
                         tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
                     }
                     if let Some(snapshot) = &snapshot {
-                        *snapshot.lock().unwrap() = Some((stats, ledger));
+                        *snapshot.lock().unwrap() = Some(Snapshot {
+                            peers: stats,
+                            ledger,
+                            rtt_ms: rtt.lock().unwrap().clone(),
+                        });
                     }
                 }
             }
