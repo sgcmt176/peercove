@@ -598,10 +598,16 @@ M1-G1 の構成(Host + join 済み Member A)をそのまま使います。
 
 ## 検証手順(M2-G5/G6: 設定・ログ・RTT・トレイ常駐)
 
-前提: ホストとメンバーがそれぞれ `daemon run` を起動し、UI から接続済みであること
-(M2-G3/G4 の手順まで終わった状態)。**デーモンは新しいバイナリで起動し直して
-ください**(`daemon logs` と RTT は新プロトコルです。古いデーモンのままだと
-ログビューが「想定外の応答」で失敗します)。
+前提:
+
+- **`cd apps/peercove-ui && npm install` を実行**(通知プラグインが増えています。
+  未実行だと UI 起動時に `Failed to resolve import "@tauri-apps/plugin-notification"`
+  で止まります)
+- Linux は `sudo apt install libayatana-appindicator3-dev`(トレイのビルドに必要)
+- **デーモンは新しいバイナリで起動し直す**(`daemon logs` と RTT は新プロトコル。
+  古いデーモンのままだとログビューが「想定外の応答」で失敗します)
+- ホストとメンバーがそれぞれ `daemon run` を起動し、UI から接続済みであること
+  (M2-G3/G4 の手順まで終わった状態)
 
 ### RTT 表示(G5)
 

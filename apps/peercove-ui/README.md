@@ -14,7 +14,8 @@ Tauri 2 + React のデスクトップ UI。**非特権**で動き、管理者/ro
 
 ```bash
 cd apps/peercove-ui
-npm install
+npm install     # 初回、および pull で依存が増えたあとは必ず実行
+                # (未実行だと vite が「Failed to resolve import」で止まる)
 
 # 別ターミナルでデーモンを起動しておく(管理者 / sudo)
 #   peercove-poc daemon run
@@ -92,8 +93,12 @@ UI の役割は 2 つに分かれます(ADR-0007 / 0008):
 
 ## アイコンの再生成
 
+元画像(1024x1024 の master)は `src-tauri/icons/source.png`。差し替えたら:
+
 ```bash
-node scripts/make-icon.mjs                    # src-tauri/icons/source.png
-npx tauri icon src-tauri/icons/source.png     # 各サイズを生成
+npx tauri icon src-tauri/icons/source.png            # 各サイズを生成
 rm -rf src-tauri/icons/android src-tauri/icons/ios   # モバイルは対象外
 ```
+
+`src/tray.rs` は `icons/32x32.png` を `include_bytes!` で埋め込んでいるので、
+再生成すればトレイアイコンも一緒に入れ替わります。
