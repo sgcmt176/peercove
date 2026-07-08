@@ -1089,6 +1089,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "peercove-ops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ipnet",
+ "peercove-core",
+ "toml",
+ "toml_edit 0.25.12+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "peercove-poc"
 version = "0.1.0"
 dependencies = [
@@ -1102,6 +1114,7 @@ dependencies = [
  "libc",
  "peercove-core",
  "peercove-ipc",
+ "peercove-ops",
  "serde_json",
  "tokio",
  "toml",

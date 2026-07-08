@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use anyhow::{bail, Context};
-use peercove_core::keys::{write_secret_file, PresharedKey, PrivateKey};
+use peercove_core::keys::{PresharedKey, PrivateKey};
+use peercove_ops::secret::write_secret;
 
 pub fn run(out: &Path, psk: bool, force: bool) -> anyhow::Result<()> {
     if out.exists() && !force {
@@ -14,15 +15,12 @@ pub fn run(out: &Path, psk: bool, force: bool) -> anyhow::Result<()> {
     // 秘密鍵・PSK の base64 はファイルへのみ書き、標準出力・ログへは出さない。
     if psk {
         let key = PresharedKey::generate();
-        write_secret_file(out, &format!("{}\n", key.to_base64()))
-            .context("PSK の保存に失敗しました")?;
-        super::restrict_secret_file_acl(out);
+        write_secret(out, &format!("{}\n", key.to_base64())).context("PSK の保存に失敗しました")?;
         println!("事前共有鍵(PSK)を {} に保存しました", out.display());
     } else {
         let private = PrivateKey::generate();
-        write_secret_file(out, &format!("{}\n", private.to_base64()))
+        write_secret(out, &format!("{}\n", private.to_base64()))
             .context("秘密鍵の保存に失敗しました")?;
-        super::restrict_secret_file_acl(out);
         println!("秘密鍵を {} に保存しました", out.display());
         println!("公開鍵: {}", private.public_key());
     }

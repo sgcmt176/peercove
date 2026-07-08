@@ -133,20 +133,9 @@ fn add_port_error(e: AddPortError) -> anyhow::Error {
     anyhow::anyhow!("ポート開放に失敗しました({e})。{hint}")
 }
 
-/// ゲートウェイへ向かう経路のローカル IP(= LAN 内でこの PC を指す IP)。
-fn local_ip_towards(gateway: SocketAddr) -> anyhow::Result<IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect(gateway)?;
-    Ok(socket.local_addr()?.ip())
-}
-
-/// デフォルトルート(インターネット)へ向かう経路のローカル IP。
-/// UDP の connect は実際にはパケットを送らないため、外部へ通信は発生しない。
-pub fn default_route_local_ip() -> Option<IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:53").ok()?;
-    socket.local_addr().ok().map(|a| a.ip())
-}
+// 経路のローカル IP を求めるヘルパは `peercove-ops::net`(招待の
+// エンドポイント候補と共用)。
+use peercove_ops::net::{default_route_local_ip, local_ip_towards};
 
 /// グローバル(外部から到達可能な)IPv4 かどうかの簡易判定。
 /// プライベート(RFC1918)・CGNAT(RFC6598)・リンクローカル等を除外する。

@@ -207,7 +207,7 @@ fn main() -> anyhow::Result<()> {
             print,
             qr,
             force,
-        } => commands::invite::run(&commands::invite::InviteOptions {
+        } => commands::invite::run(&commands::invite::CliOptions {
             config_path: &config,
             name: name.as_deref(),
             ip,
@@ -223,7 +223,7 @@ fn main() -> anyhow::Result<()> {
             token_file,
             out_dir,
             force,
-        } => commands::join::run(&commands::join::JoinOptions {
+        } => commands::join::run(&commands::join::CliOptions {
             token: token.as_deref(),
             token_file: token_file.as_deref(),
             out_dir: &out_dir,

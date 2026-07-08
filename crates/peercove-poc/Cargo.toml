@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 peercove-core.workspace = true
 peercove-ipc.workspace = true
+peercove-ops.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

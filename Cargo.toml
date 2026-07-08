@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/peercove-core", "crates/peercove-ipc", "crates/peercove-poc"]
+members = [
+    "crates/peercove-core",
+    "crates/peercove-ipc",
+    "crates/peercove-ops",
+    "crates/peercove-poc",
+]
 # UI(Tauri)は独自ワークスペース。ここに含めると cargo test/clippy が
 # WebView・フロントエンドのビルドに巻き込まれ、開発ループが重くなるため
 exclude = ["apps"]
@@ -14,6 +19,7 @@ publish = false
 [workspace.dependencies]
 peercove-core = { path = "crates/peercove-core" }
 peercove-ipc = { path = "crates/peercove-ipc" }
+peercove-ops = { path = "crates/peercove-ops" }
 
 anyhow = "1"
 thiserror = "2"
