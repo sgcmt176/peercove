@@ -68,6 +68,28 @@
 cargo build --workspace
 ```
 
+### Linux 検証機への同期(git bundle)
+
+このリポジトリはまだリモート未設定です(roadmap C-1)。Linux VM へは
+**git bundle で履歴ごと**同期してください。ファイルの手コピーは
+`package.json` と `src/` の版がずれてビルド不能になります(実際に起きました):
+
+```bash
+# Windows 側: 共有フォルダへバンドルを書き出す
+git bundle create D:/Development/VirtualBoxShare/peercove.bundle main
+
+# Linux 側: バンドルから取り込んで作業ツリーを揃える
+cd ~/workspaces/peercove
+git fetch /media/sf_VirtualBoxShare/peercove.bundle main  # マウント先は ls /media で確認
+git log --oneline -1 FETCH_HEAD   # Windows 側の最新コミットが見えること
+git reset --hard FETCH_HEAD       # 手元の混合状態を捨てて揃える
+git clean -fd apps crates         # 追跡外の残骸を掃除(鍵・*.toml は ignored なので消えない)
+git log --oneline -1              # 揃ったことを確認
+```
+
+> `reset --hard` は追跡ファイルへのローカル変更を捨てます。開発はすべて
+> Windows 側で行っている前提です(検証用の鍵・設定は ignored なので残ります)。
+
 テスト・lint:
 
 ```bash
