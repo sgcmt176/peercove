@@ -14,8 +14,7 @@ Tauri 2 + React のデスクトップ UI。**非特権**で動き、管理者/ro
 
 ```bash
 cd apps/peercove-ui
-npm install     # 初回、および pull で依存が増えたあとは必ず実行
-                # (未実行だと vite が「Failed to resolve import」で止まる)
+npm install     # 初回のみ
 
 # 別ターミナルでデーモンを起動しておく(管理者 / sudo)
 #   peercove-poc daemon run
@@ -46,7 +45,7 @@ src-tauri/                  Rust(Tauri バックエンド)
   src/dto.rs                IPC 応答 → UI DTO の変換(camelCase)
   src/tray.rs               トレイ常駐(閉じても終了しない、メニューで復帰・終了)
   tauri.conf.json           ウィンドウ・CSP・バンドル設定
-  capabilities/             権限(core:default + ファイル選択 + クリップボード + 通知)
+  capabilities/             権限(core:default + ファイル選択 + クリップボード)
 scripts/make-icon.mjs       アプリアイコンの生成(外部素材に依存しない)
 ```
 
@@ -86,7 +85,10 @@ UI の役割は 2 つに分かれます(ADR-0007 / 0008):
   変わり、全メンバーへの再配布が走ってしまうため)
 - **参加/切断の通知は UI が status の差分から出します**。デーモンは状態を
   持つだけです(G7 で Windows サービス化すると Session 0 からデスクトップへ
-  通知できないため)。ウィンドウを閉じてもトレイに常駐して通知を出し続けます
+  通知できないため)。ウィンドウを閉じてもトレイに常駐して通知を出し続けます。
+  通知の送出は Rust 側の `notify` コマンドが行い、frontend は
+  `@tauri-apps/plugin-notification` に依存しません(npm 依存を増やさず、
+  デスクトップでは不要な許可の問い合わせも避けるため)
 - **設定編集で触れるのは「自分側の設定」だけ**です。メンバーの追加・削除・改名は
   メンバー一覧側の操作。MTU・待受ポート・ホストの endpoint はインターフェース
   生成時に決まるため、保存しても**再接続するまで反映されません**(UI が明示します)

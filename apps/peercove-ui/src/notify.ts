@@ -3,12 +3,11 @@
 // デーモンは状態を持つだけで通知は投げない(サービスとして Session 0 で動くと
 // デスクトップへ通知できないため)。UI が 2 秒ごとの status ポーリングの差分を
 // 見て通知する。UI を閉じてもトレイに常駐しているので通知は出続ける。
+//
+// 通知そのものは Rust 側の `notify` コマンドが出す。@tauri-apps/plugin-notification
+// を frontend から使うと npm 依存が 1 つ増え、許可の問い合わせも要るため。
 
-import {
-  isPermissionGranted,
-  requestPermission,
-  sendNotification,
-} from "@tauri-apps/plugin-notification";
+import { invoke } from "@tauri-apps/api/core";
 import { Member } from "./ipc";
 
 export interface MemberEvent {
@@ -43,33 +42,16 @@ export function diffMembers(
 export function describe(event: MemberEvent): { title: string; body: string } {
   const name = event.member.name ?? event.member.ip;
   return event.kind === "joined"
-    ? { title: "メンバーが参加しました", body: `${name}(${event.member.ip})` }
-    : { title: "メンバーが切断しました", body: `${name}(${event.member.ip})` };
-}
-
-/** 通知の許可状態。初回だけ OS に問い合わせる。 */
-let granted: boolean | null = null;
-
-async function ensurePermission(): Promise<boolean> {
-  if (granted !== null) return granted;
-  try {
-    granted =
-      (await isPermissionGranted()) ||
-      (await requestPermission()) === "granted";
-  } catch {
-    granted = false; // 通知が使えない環境でも UI は動かす
-  }
-  return granted;
+    ? { title: "メンバーが参加しました", body: `${name}（${event.member.ip}）` }
+    : { title: "メンバーが切断しました", body: `${name}（${event.member.ip}）` };
 }
 
 export async function notifyMemberEvents(events: MemberEvent[]): Promise<void> {
-  if (events.length === 0) return;
-  if (!(await ensurePermission())) return;
   for (const event of events) {
     try {
-      sendNotification(describe(event));
+      await invoke("notify", describe(event));
     } catch {
-      // 通知の失敗で UI を止めない
+      // 通知の失敗で UI を止めない(通知デーモンが無い環境など)
     }
   }
 }

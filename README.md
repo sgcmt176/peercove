@@ -600,9 +600,6 @@ M1-G1 の構成(Host + join 済み Member A)をそのまま使います。
 
 前提:
 
-- **`cd apps/peercove-ui && npm install` を実行**(通知プラグインが増えています。
-  未実行だと UI 起動時に `Failed to resolve import "@tauri-apps/plugin-notification"`
-  で止まります)
 - Linux は `sudo apt install libayatana-appindicator3-dev`(トレイのビルドに必要)
 - **デーモンは新しいバイナリで起動し直す**(`daemon logs` と RTT は新プロトコル。
   古いデーモンのままだとログビューが「想定外の応答」で失敗します)

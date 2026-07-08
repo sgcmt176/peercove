@@ -72,6 +72,21 @@ async fn stop_tunnel() -> Result<(), String> {
     send(IpcRequest::Stop).await
 }
 
+// ---- 通知(M2-G6) ----
+
+/// OS 通知を出す(メンバーの参加・切断)。
+///
+/// frontend から `@tauri-apps/plugin-notification` を直接呼ばず Rust 経由にしている:
+/// JS の依存を 1 つ減らせるうえ、デスクトップでは許可の問い合わせも不要なため。
+/// 通知が出せない環境(通知デーモンが無い等)でも UI は止めない。
+#[tauri::command]
+fn notify(app: tauri::AppHandle, title: String, body: String) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        eprintln!("通知を表示できませんでした: {e}");
+    }
+}
+
 /// デーモンが保持する直近のログを取り出す(M2-G5)。
 ///
 /// `after_seq` に前回の最終 seq を渡すと差分だけが返る。UI はこれを 1 秒間隔で
@@ -258,6 +273,7 @@ pub fn run() {
             start_host,
             start_member,
             stop_tunnel,
+            notify,
             config_paths,
             init_host,
             create_invite,
