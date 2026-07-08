@@ -30,7 +30,8 @@
 ### M2(進行中)
 
 - [x] M2-G1: デーモン分離 + ローカル IPC(daemon run / status / start / stop)✅ 実機検証済み
-- [ ] M2-G2〜G6: Tauri + React UI
+- [x] M2-G2: Tauri + React UI の骨組みと状態表示 ※実機検証待ち
+- [ ] M2-G3〜G6: 接続/参加・招待/削除・設定/ログ・トレイ
 - [ ] M2-G7: インストーラ・自動起動
 
 ## 必要環境
@@ -566,6 +567,28 @@ M1-G1 の構成(Host + join 済み Member A)をそのまま使います。
 
 失敗時: Windows ホストのファイアウォールで TCP 51821 の受信許可
 (初回ダイアログ)を確認。Tailscale 起動中なら停止(README 上部参照)。
+
+## 検証手順(M2-G2: デスクトップ UI の骨組み)
+
+UI(非特権)から、管理者/root のデーモンの状態が見えることを確認します。
+UI の詳細は [apps/peercove-ui/README.md](apps/peercove-ui/README.md) を参照。
+
+1. 初回のみ: `cd apps/peercove-ui && npm install`
+2. **デーモンを起動せずに** `npm run tauri dev` → 「PeerCove」ウィンドウが開き、
+   「デーモンに接続できません」と起動方法の案内が出ること(「再試行」ボタンあり)
+3. 別ターミナル(**管理者 / sudo**)で `peercove-poc daemon run` を起動
+   → UI が数秒で「待機中」表示に切り替わること(**UI 側は非特権のまま**)
+4. さらに別ターミナル(通常ユーザー)で
+   `peercove-poc daemon start-host --config host.toml`
+   → UI が「ホストとして稼働中」になり、仮想 IP と設定ファイルが表示されること
+5. メンバーを接続する → UI の **メンバー一覧**に ●(オンライン)で現れること。
+   ピア統計(エンドポイント・最終ハンドシェイク・rx/tx)が 2 秒ごとに更新されること
+6. `peercove-poc remove-peer --name <名前>` → 約 10 秒で UI の一覧から消えること
+7. `peercove-poc daemon stop` → UI が「待機中」に戻ること
+8. `peercove-poc daemon shutdown` → UI が「デーモンに接続できません」に戻ること
+   (UI は落ちない)
+
+> 注: 開始・参加・招待の**操作**は M2-G3/G4 で追加します。G2 は「見える」ところまでです。
 
 ## 検証手順(M2-G1: デーモン + IPC)
 

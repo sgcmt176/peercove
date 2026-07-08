@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "UI が使う最小の権限。デーモン操作は自前の invoke コマンド経由で行うため、追加のプラグイン権限は要らない。",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

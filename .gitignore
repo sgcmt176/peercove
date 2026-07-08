@@ -8,3 +8,9 @@
 *.status.txt
 # 招待トークン(秘密情報)
 *.token
+
+# UI(Tauri + Vite)
+/apps/peercove-ui/node_modules
+/apps/peercove-ui/dist
+/apps/peercove-ui/src-tauri/target
+/apps/peercove-ui/src-tauri/gen
