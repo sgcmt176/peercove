@@ -257,7 +257,8 @@ pub fn run_server() -> anyhow::Result<()> {
         .build()
         .context("非同期ランタイムの初期化に失敗しました")?;
     let (shared, shutdown_rx) = DaemonShared::new(Box::new(tunnel::bring_up));
-    println!("peercove デーモンを開始しました(Ctrl+C か shutdown 要求で終了)");
+    // 「開始しました」は待受け開始後(accept_loop 内)に表示する。
+    // 先に出すと、パイプ/ソケットの作成に失敗したときに紛らわしいため
     runtime.block_on(async {
         tokio::select! {
             result = accept_loop(Arc::clone(&shared)) => result,
@@ -288,23 +289,115 @@ async fn wait_shutdown(mut rx: watch::Receiver<bool>) {
     }
 }
 
+/// 昇格したデーモンが作るパイプへ、非特権の UI/CLI が接続できるようにする
+/// セキュリティ記述子(認証済みユーザーへ読み書き許可)。M2 の権限モデル
+/// (デーモン = サービス / UI = 非特権)の前提。
+#[cfg(windows)]
+mod winsec {
+    use anyhow::Context;
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    const SDDL_REVISION_1: u32 = 1;
+
+    /// パイプの DACL:
+    /// - SYSTEM(SY)と Administrators(BA)にフルアクセス
+    /// - 認証済みユーザー(AU)に FILE_GENERIC_READ | FILE_GENERIC_WRITE
+    ///   (FW は FILE_APPEND_DATA を含み、= FILE_CREATE_PIPE_INSTANCE)
+    ///
+    /// ACE に総称権(GA/GR/GW)を書くとオブジェクト固有権へマップされず
+    /// アクセス拒否になるため、必ず FR/FW/FA を使うこと。
+    const PIPE_SDDL: &str = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;AU)\0";
+
+    /// 上記 DACL を持つセキュリティ記述子。
+    pub struct PipeSecurity {
+        descriptor: PSECURITY_DESCRIPTOR,
+    }
+
+    // 記述子は不変のポインタを保持するだけで、スレッド間で共有しても安全。
+    unsafe impl Send for PipeSecurity {}
+    unsafe impl Sync for PipeSecurity {}
+
+    impl PipeSecurity {
+        pub fn authenticated_users() -> anyhow::Result<Self> {
+            let sddl: Vec<u16> = PIPE_SDDL.encode_utf16().collect();
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // SAFETY: FFI 境界。sddl は null 終端の UTF-16。descriptor は関数側が
+            // LocalAlloc で確保し、Drop で LocalFree する
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("パイプのセキュリティ記述子の作成に失敗しました");
+            }
+            Ok(Self { descriptor })
+        }
+
+        /// SECURITY_ATTRIBUTES を組み立てる。戻り値は self より長生きさせないこと。
+        pub fn attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.descriptor,
+                bInheritHandle: 0,
+            }
+        }
+    }
+
+    impl Drop for PipeSecurity {
+        fn drop(&mut self) {
+            // SAFETY: descriptor は Convert... が確保したもののみ
+            unsafe {
+                LocalFree(self.descriptor as HLOCAL);
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(peercove_core::ipc::PIPE_NAME)
-        .context("名前付きパイプの作成に失敗しました(既にデーモンが動いていませんか?)")?;
-    tracing::info!("IPC: {} で待受けます", peercove_core::ipc::PIPE_NAME);
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+    let security = winsec::PipeSecurity::authenticated_users()?;
+    let make = |first: bool| -> anyhow::Result<NamedPipeServer> {
+        let mut attrs = security.attributes();
+        // SAFETY: attrs は本呼び出し中のみ参照される。指す記述子は security が保持
+        unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first)
+                .create_with_security_attributes_raw(
+                    peercove_core::ipc::PIPE_NAME,
+                    &mut attrs as *mut _ as *mut std::ffi::c_void,
+                )
+        }
+        .with_context(|| {
+            format!(
+                "名前付きパイプ {} を作成できません。既に peercove デーモンが\
+                 起動していないか確認してください(タスクマネージャーで peercove-poc を確認。\
+                 管理者で起動したデーモンは管理者ターミナルからしか終了できません)",
+                peercove_core::ipc::PIPE_NAME
+            )
+        })
+    };
+
+    let mut server = make(true)?;
+    println!(
+        "peercove デーモンを開始しました({} で待受け中。Ctrl+C か shutdown 要求で終了)",
+        peercove_core::ipc::PIPE_NAME
+    );
     loop {
         server
             .connect()
             .await
             .context("パイプ接続の待受に失敗しました")?;
         let stream = server;
-        server = ServerOptions::new()
-            .create(peercove_core::ipc::PIPE_NAME)
-            .context("次のパイプインスタンスの作成に失敗しました")?;
+        server = make(false)?;
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, shared).await {
@@ -320,7 +413,18 @@ async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&path); // 前回異常終了の残骸
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("{} の bind に失敗しました", path.display()))?;
-    tracing::info!("IPC: {} で待受けます", path.display());
+    // root で起動したデーモンのソケットへ、非特権の UI/CLI が接続できるようにする
+    // (Windows 側で認証済みユーザーに許可するのと同じ方針。単一ユーザー PC 前提で、
+    //  複数ユーザーの権限分離は将来課題 — ADR-0007)
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .with_context(|| format!("{} のパーミッション設定に失敗しました", path.display()))?;
+    }
+    println!(
+        "peercove デーモンを開始しました({} で待受け中。Ctrl+C か shutdown 要求で終了)",
+        path.display()
+    );
     loop {
         let (stream, _) = listener
             .accept()
@@ -517,6 +621,39 @@ mod tests {
 
         drop(client);
         server.await.unwrap().unwrap();
+    }
+
+    /// パイプに付けたセキュリティ記述子で、クライアントが接続できること。
+    /// (総称権 GA を ACE に書くとここで access denied になる。FR/FW が必要)
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_security_descriptor_allows_client_connect() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let name = format!(r"\\.\pipe\peercove-sdtest-{}", std::process::id());
+        let security = winsec::PipeSecurity::authenticated_users().expect("記述子の作成");
+        let mut attrs = security.attributes();
+        // SAFETY: attrs は本呼び出し中のみ参照される
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(
+                    &name,
+                    &mut attrs as *mut _ as *mut std::ffi::c_void,
+                )
+        }
+        .expect("パイプの作成");
+
+        let accept = tokio::spawn(async move {
+            server.connect().await.expect("接続の受理");
+            server
+        });
+        let client = ClientOptions::new()
+            .open(&name)
+            .expect("クライアントからの接続");
+        let server = accept.await.unwrap();
+        drop(client);
+        drop(server);
     }
 
     /// stop 時に MockBackend の down が呼ばれる(クリーンアップの対称性)。

@@ -1095,6 +1095,7 @@ dependencies = [
  "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
  "wintun",
 ]
 
