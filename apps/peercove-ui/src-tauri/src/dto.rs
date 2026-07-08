@@ -62,12 +62,24 @@ pub struct Tunnel {
 impl From<&TunnelInfo> for Tunnel {
     fn from(info: &TunnelInfo) -> Self {
         Self {
-            config: info.config.display().to_string(),
+            config: display_path(&info.config),
             address: info.address.to_string(),
             members: info.ledger.iter().map(Member::from).collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
         }
     }
+}
+
+/// 表示用にパスを整える。
+///
+/// Windows の `canonicalize` は verbatim 接頭辞(`\\?\`)を付ける。デーモンへ渡す
+/// パスとしては正しいが、画面に出すと読みづらいだけなので剥がす。
+fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}");
+    }
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +201,23 @@ mod tests {
         let json = serde_json::to_value(Status::from(DaemonStatus::Idle)).unwrap();
         assert_eq!(json["state"], "idle");
         assert!(json["tunnel"].is_null());
+    }
+
+    /// Windows の verbatim 接頭辞は表示から取り除く。
+    #[test]
+    fn display_path_strips_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\D:\dev\peercove\host.toml")),
+            r"D:\dev\peercove\host.toml"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\host.toml")),
+            r"\\server\share\host.toml"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/me/.config/peercove/host.toml")),
+            "/home/me/.config/peercove/host.toml"
+        );
     }
 
     #[test]

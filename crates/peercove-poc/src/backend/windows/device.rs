@@ -216,12 +216,12 @@ impl Device {
                 return;
             }
         };
-        tracing::debug!("復号 {} バイトを受信(宛先 {dst})", packet.len());
+        tracing::trace!("復号 {} バイトを受信(宛先 {dst})", packet.len());
         if self.relay {
             if let Some(target) = self.find_peer_by_dst(dst) {
                 // 送信元ピア宛への折り返しはループになるため TUN 側へ落とす
                 if !Arc::ptr_eq(&target, from) {
-                    tracing::debug!("宛先 {dst} のピアへ直接リレーします");
+                    tracing::trace!("宛先 {dst} のピアへ直接リレーします");
                     let mut buf = [0u8; BUF_SIZE];
                     let mut tunn = target.tunn.lock().unwrap();
                     match tunn.encapsulate(packet, &mut buf) {
@@ -273,7 +273,12 @@ impl Device {
             };
             let datagram = &recv_buf[..len];
             let Some(peer) = self.find_peer_for_datagram(datagram) else {
-                tracing::debug!("{src} からの不明なパケットを破棄しました");
+                // 削除済みメンバーの再ハンドシェイクなどで定期的に届く。
+                // 拒否できているので debug に留める(5 秒間隔で繰り返しうる)
+                tracing::debug!(
+                    "{src} からの不明なパケットを破棄しました\
+                     (登録されていないピアからのハンドシェイクの可能性)"
+                );
                 continue;
             };
 
@@ -353,11 +358,12 @@ impl Device {
             let Some(IpAddr::V4(dst)) = Tunn::dst_address(bytes) else {
                 continue; // IPv6 等は M0 対象外
             };
-            tracing::debug!("TUN から {} バイト受信(宛先 {dst})", bytes.len());
+            // パケット 1 個ごとのログは trace(debug でも多すぎるため)
+            tracing::trace!("TUN から {} バイト受信(宛先 {dst})", bytes.len());
             // ブロードキャスト・マルチキャスト(NetBIOS、mDNS 等)は対象外。
             // ユニキャストのみピアへ転送する
             if dst.is_multicast() || dst.is_broadcast() || dst.octets()[3] == 255 {
-                tracing::debug!("ブロードキャスト/マルチキャスト宛 {dst} を無視します");
+                tracing::trace!("ブロードキャスト/マルチキャスト宛 {dst} を無視します");
                 continue;
             }
             let Some(peer) = self.find_peer_by_dst(dst) else {

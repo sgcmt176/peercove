@@ -73,6 +73,19 @@ cargo fmt --check
 
 ## 使い方
 
+### ログの詳細度
+
+すべてのコマンドで `--log-level <error|warn|info|debug|trace>` が使えます
+(`RUST_LOG` 環境変数より優先)。既定は `info` で、通常運用では静かです。
+
+- `debug`: 接続の受理・ピアの追加削除・破棄したパケットの理由など
+- `trace`: パケット 1 個ごと(大量に出るので調査時のみ)
+
+```bash
+peercove-poc --log-level warn daemon run   # 警告以上だけ
+peercove-poc --log-level debug host --config host.toml
+```
+
 ### クイックスタート(ホストの初期化 → 招待)
 
 ```bash
@@ -99,6 +112,7 @@ Linux: Unix ドメインソケット)で操作します。CLI からも同じ IP
 ```bash
 # 1) デーモンを起動(トンネル操作をするので管理者/root で)
 sudo ./target/debug/peercove-poc daemon run
+# ログを絞りたいときは --log-level warn(既定は info)
 
 # 2) 別ターミナル(ユーザー権限でよい)から操作
 ./target/debug/peercove-poc daemon start-host --config host.toml

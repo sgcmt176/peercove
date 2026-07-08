@@ -10,8 +10,12 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "peercove-poc", version, about = "PeerCove M0 技術検証 CLI")]
+#[command(name = "peercove-poc", version, about = "PeerCove CLI / デーモン")]
 struct Cli {
+    /// ログの詳細度(error/warn/info/debug/trace)。RUST_LOG より優先する
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -180,15 +184,25 @@ enum DaemonAction {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
-    match cli.command {
+    init_tracing(cli.log_level.as_deref());
+    run(cli.command)
+}
+
+/// ログの詳細度: `--log-level` > `RUST_LOG` > 既定(info)。
+///
+/// パケット 1 個ごとのログは trace なので、既定の info では静かに動く。
+fn init_tracing(log_level: Option<&str>) {
+    use tracing_subscriber::EnvFilter;
+    let filter = match log_level {
+        Some(level) => EnvFilter::new(level),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+fn run(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Keygen { out, psk, force } => commands::keygen::run(&out, psk, force),
         Command::Host { config, upnp } => {
             commands::tunnel::run_up(&config, commands::tunnel::Role::Host, upnp)
