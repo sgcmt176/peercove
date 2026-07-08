@@ -302,7 +302,10 @@ mod tests {
         assert!(psk_path.exists());
 
         let removed = remove_peer(&config, &Selector::Ip(result.ip)).unwrap();
-        assert_eq!(removed.removed_psk_file.as_deref(), Some(psk_path.as_path()));
+        assert_eq!(
+            removed.removed_psk_file.as_deref(),
+            Some(psk_path.as_path())
+        );
         assert!(!psk_path.exists(), "PSK ファイルが削除される");
     }
 
