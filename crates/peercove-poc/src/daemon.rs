@@ -248,6 +248,9 @@ pub fn run_server() -> anyhow::Result<()> {
             }
         }
     });
+    // UDS のファイルは自動で消えないため、残骸を残さない(Windows のパイプは不要)
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(peercove_ipc::socket_path());
     println!("peercove デーモンを終了しました");
     Ok(())
 }

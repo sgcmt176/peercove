@@ -111,6 +111,11 @@ crates/
    (daemon.rs の `winsec` とテスト `pipe_security_descriptor_allows_client_connect` 参照)
 8. 管理者で起動したデーモンは非特権シェルから終了できない。二重起動でパイプ名が
    衝突すると新デーモンは即死する(エラー文言で誘導済み)
+9. **Linux の UDS パスを「自分の euid」で決めると、root のデーモンと非特権の
+   クライアントですれ違う**。サーバーは euid で bind 先を決め、クライアントは
+   `/run/peercove.sock` → ユーザー領域の順に**候補を順に試す**
+   (`peercove-ipc::socket_candidates`)。Windows はパイプ名が固定なので起きない
+   = **OS 間で対称に見える設計でも、権限モデルの差でバグが出る**
 
 ## 5. M1 ロードマップ(✅ 全タスク完了・実機検証済み 2026-07-08)
 

@@ -122,6 +122,11 @@ sudo ./target/debug/peercove-poc daemon run
   ください。**管理者で起動したデーモンは管理者ターミナルからしか終了できません**
   (`daemon shutdown` を管理者ターミナルで実行するのが確実)
 - **`daemon run` が「名前付きパイプを作成できません」**: 同上(二重起動)
+- **Linux で「そのようなファイルやディレクトリはありません (os error 2)」**:
+  デーモンのソケットは root 実行時 `/run/peercove.sock`、通常ユーザー実行時
+  `$XDG_RUNTIME_DIR/peercove.sock` に作られます。クライアントは両方を順に
+  探すので通常は問題ありませんが、環境変数 `PEERCOVE_SOCKET` で明示的に
+  同じパスを指定することもできます(デーモン・クライアントの双方に設定)
 
 ### 鍵の生成(keygen)
 

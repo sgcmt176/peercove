@@ -68,15 +68,31 @@ async fn connect_impl() -> anyhow::Result<IpcStream> {
 
 #[cfg(unix)]
 async fn connect_impl() -> anyhow::Result<IpcStream> {
-    let path = socket_path();
-    tokio::net::UnixStream::connect(&path)
-        .await
-        .with_context(|| {
-            format!(
-                "デーモンに接続できません({} 。`peercove-poc daemon run` が起動していますか?)",
-                path.display()
-            )
-        })
+    // デーモンは root(サービス)で動くことが多く、そのソケットは /run にある。
+    // 一方クライアントは通常ユーザーなので、自分の euid だけでパスを決めると
+    // すれ違う。候補を順に試す。
+    let candidates = socket_candidates();
+    let mut last_error = None;
+    for path in &candidates {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => {
+                tracing::debug!("IPC: {} へ接続しました", path.display());
+                return Ok(stream);
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    let places = candidates
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(last_error.expect("候補は 1 つ以上ある")).with_context(|| {
+        format!(
+            "デーモンに接続できません(`peercove-poc daemon run` が起動していますか?)。\
+             探した場所: {places}"
+        )
+    })
 }
 
 /// デーモンへ 1 リクエストを送って応答を返す(非同期)。
@@ -94,18 +110,88 @@ pub fn request(req: IpcRequest) -> anyhow::Result<IpcResponse> {
         .block_on(request_async(req))
 }
 
-/// Unix ドメインソケットのパス。root 実行時は `/run`、それ以外はユーザー領域。
-/// サーバー(bind)とクライアント(connect)の双方が使う。
+/// 環境変数でソケットパスを上書きする(検証・複数インスタンス用)。
+#[cfg(unix)]
+pub const SOCKET_ENV: &str = "PEERCOVE_SOCKET";
+
+/// **サーバー**が bind する Unix ドメインソケットのパス。
+/// root(サービス)なら `/run/peercove.sock`、それ以外はユーザー領域。
 #[cfg(unix)]
 pub fn socket_path() -> std::path::PathBuf {
     use std::path::PathBuf;
+    if let Ok(path) = std::env::var(SOCKET_ENV) {
+        return PathBuf::from(path);
+    }
     // SAFETY: geteuid は引数なし・常に成功する POSIX API。OS 境界のため unsafe。
     let euid = unsafe { libc::geteuid() };
     if euid == 0 {
         PathBuf::from(peercove_core::ipc::SOCKET_PATH_ROOT)
-    } else if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+    } else {
+        user_socket_path(euid)
+    }
+}
+
+#[cfg(unix)]
+fn user_socket_path(euid: u32) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(dir).join("peercove.sock")
     } else {
         std::env::temp_dir().join(format!("peercove-{euid}.sock"))
+    }
+}
+
+/// **クライアント**が順に試すソケットの候補。
+///
+/// デーモンは root で動くのが普通(サービス化後は必ず)なので、
+/// 自分の euid から決め打ちすると通常ユーザーの UI/CLI が繋がらない。
+/// root のソケット → 自分のユーザー領域、の順に探す。
+#[cfg(unix)]
+pub fn socket_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(path) = std::env::var(SOCKET_ENV) {
+        return vec![PathBuf::from(path)];
+    }
+    // SAFETY: geteuid は引数なし・常に成功する POSIX API。
+    let euid = unsafe { libc::geteuid() };
+    let mut candidates = vec![PathBuf::from(peercove_core::ipc::SOCKET_PATH_ROOT)];
+    let user = user_socket_path(euid);
+    if !candidates.contains(&user) {
+        candidates.push(user);
+    }
+    candidates
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// 環境変数を共有するため 1 つのテストにまとめる(並列実行での競合を避ける)。
+    #[test]
+    fn socket_paths_for_server_and_client() {
+        std::env::remove_var(SOCKET_ENV);
+
+        // クライアントは root のソケットを先に試す(デーモンはサービス = root)
+        let candidates = socket_candidates();
+        assert_eq!(
+            candidates[0],
+            std::path::Path::new(peercove_core::ipc::SOCKET_PATH_ROOT)
+        );
+        // SAFETY: geteuid は引数なし・常に成功する POSIX API。
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            // 非 root なら自分のユーザー領域も候補に入り、サーバーはそこへ bind する
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(socket_path(), candidates[1]);
+        } else {
+            assert_eq!(socket_path(), candidates[0]);
+        }
+
+        // 環境変数の上書きはサーバー・クライアント双方に効く
+        let override_path = std::path::PathBuf::from("/tmp/peercove-test.sock");
+        std::env::set_var(SOCKET_ENV, &override_path);
+        assert_eq!(socket_candidates(), vec![override_path.clone()]);
+        assert_eq!(socket_path(), override_path);
+        std::env::remove_var(SOCKET_ENV);
     }
 }

@@ -14,3 +14,4 @@
 /apps/peercove-ui/dist
 /apps/peercove-ui/src-tauri/target
 /apps/peercove-ui/src-tauri/gen
+*.psk
