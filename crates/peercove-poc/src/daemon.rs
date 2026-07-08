@@ -18,12 +18,11 @@ use peercove_core::ipc::{
     DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult, PeerSummary,
     TunnelInfo,
 };
+use peercove_ipc::MAX_LINE_LEN;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
 use crate::commands::tunnel::{self, ActiveTunnel, Role, SharedSnapshot};
-
-const MAX_LINE_LEN: u64 = 256 * 1024;
 
 /// トンネルの起動方法(テストでは差し替える)。
 type BringUp = Box<dyn Fn(&Path, Role, bool) -> anyhow::Result<ActiveTunnel> + Send + Sync>;
@@ -215,37 +214,9 @@ where
     }
 }
 
-/// 任意のストリーム上で 1 リクエストを送る(クライアント側の共通部)。
-pub async fn request_over<S>(
-    stream: &mut S,
-    id: u64,
-    req: &IpcRequest,
-) -> anyhow::Result<IpcResponse>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut json = serde_json::to_string(&IpcEnvelope {
-        id,
-        req: req.clone(),
-    })
-    .expect("IpcEnvelope は常に直列化可能");
-    json.push('\n');
-    stream.write_all(json.as_bytes()).await?;
-
-    let mut reader = BufReader::new(stream).take(MAX_LINE_LEN);
-    let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
-        bail!("デーモンが応答せず切断しました");
-    }
-    let reply: IpcReply = serde_json::from_str(&line).context("デーモンの応答を解析できません")?;
-    if reply.id != id {
-        bail!("応答 id が一致しません(期待 {id}、実際 {})", reply.id);
-    }
-    match reply.result {
-        IpcResult::Ok(response) => Ok(response),
-        IpcResult::Err(message) => bail!("{message}"),
-    }
-}
+// クライアント側(接続・リクエスト送信)は UI と共用するため
+// `peercove-ipc` crate にある(ADR-0007)。
+pub use peercove_ipc::request;
 
 // ---- サーバー(OS 別トランスポート) ----
 
@@ -409,7 +380,7 @@ async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
-    let path = socket_path();
+    let path = peercove_ipc::socket_path();
     let _ = std::fs::remove_file(&path); // 前回異常終了の残骸
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("{} の bind に失敗しました", path.display()))?;
@@ -437,54 +408,6 @@ async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
             }
         });
     }
-}
-
-#[cfg(unix)]
-pub fn socket_path() -> PathBuf {
-    // SAFETY: geteuid は引数なし・常に成功する POSIX API。
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
-        PathBuf::from(peercove_core::ipc::SOCKET_PATH_ROOT)
-    } else if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("peercove.sock")
-    } else {
-        std::env::temp_dir().join(format!("peercove-{euid}.sock"))
-    }
-}
-
-// ---- クライアント ----
-
-/// デーモンへ 1 リクエストを送って応答を返す(CLI / 将来の UI 用)。
-pub fn request(req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("非同期ランタイムの初期化に失敗しました")?;
-    runtime.block_on(async {
-        let mut stream = connect().await?;
-        request_over(&mut stream, 1, &req).await
-    })
-}
-
-#[cfg(windows)]
-async fn connect() -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    ClientOptions::new()
-        .open(peercove_core::ipc::PIPE_NAME)
-        .context("デーモンに接続できません(`peercove-poc daemon run` が起動していますか?)")
-}
-
-#[cfg(unix)]
-async fn connect() -> anyhow::Result<tokio::net::UnixStream> {
-    let path = socket_path();
-    tokio::net::UnixStream::connect(&path)
-        .await
-        .with_context(|| {
-            format!(
-                "デーモンに接続できません({} 。`peercove-poc daemon run` が起動していますか?)",
-                path.display()
-            )
-        })
 }
 
 /// status 応答を人間向けに表示する。
@@ -532,6 +455,7 @@ mod tests {
     use crate::backend::mock::MockBackend;
     use crate::backend::TunnelSpec;
     use peercove_core::keys::PrivateKey;
+    use peercove_ipc::request_over;
 
     fn test_shared() -> (Arc<DaemonShared>, watch::Receiver<bool>) {
         DaemonShared::new(Box::new(|config, role, _upnp| {
