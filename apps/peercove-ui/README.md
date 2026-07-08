@@ -30,16 +30,31 @@ npm run tauri build   # 配布用バイナリ(M2-G7 で本格対応)
 ## 構成
 
 ```
-src/                  React(TypeScript)
-  ipc.ts              UI 用の型と表示ヘルパ
-  App.tsx             状態表示・メンバー一覧・ピア統計
-src-tauri/            Rust(Tauri バックエンド)
-  src/lib.rs          invoke コマンド(daemon_status)
-  src/dto.rs          IPC 応答 → UI DTO の変換(camelCase)
-  tauri.conf.json     ウィンドウ・CSP・バンドル設定
-  capabilities/       権限(core:default のみ)
-scripts/make-icon.mjs アプリアイコンの生成(外部素材に依存しない)
+src/                        React(TypeScript)
+  ipc.ts                    UI 用の型・コマンドラッパ・表示ヘルパ
+  App.tsx                   接続状態で画面を出し分け
+  components/StartView.tsx  待機中: ホスト開始 / トークンで参加
+  components/TunnelView.tsx 稼働中: メンバー一覧・招待・削除・名前変更・切断
+  components/InviteDialog.tsx 招待の発行と QR 表示(発行直後のみ)
+  components/Modal.tsx      モーダルと確認ダイアログ
+src-tauri/                  Rust(Tauri バックエンド)
+  src/lib.rs                invoke コマンド(デーモン操作 + 設定ファイル操作)
+  src/dto.rs                IPC 応答 → UI DTO の変換(camelCase)
+  tauri.conf.json           ウィンドウ・CSP・バンドル設定
+  capabilities/             権限(core:default + ファイル選択 + クリップボード)
+scripts/make-icon.mjs       アプリアイコンの生成(外部素材に依存しない)
 ```
+
+UI の役割は 2 つに分かれます(ADR-0007 / 0008):
+
+| 操作 | 経路 | 権限 |
+|---|---|---|
+| トンネルの開始・停止・状態取得 | ローカル IPC → デーモン | デーモンが管理者/root |
+| init / invite / join / メンバー管理 | `peercove-ops` を直接呼ぶ | UI のユーザー権限 |
+
+設定ファイルを書き換えるだけの操作をデーモンに投げないのは、特権プロセスを
+ファイルの書き手にして権限昇格の面を広げないためです。実行中のトンネルは
+5 秒ごとの再読込で自動追随します。
 
 **このアプリはルートの cargo ワークスペースから独立しています**
 (`src-tauri/Cargo.toml` の空の `[workspace]` と、ルートの `exclude = ["apps"]`)。
@@ -51,8 +66,12 @@ scripts/make-icon.mjs アプリアイコンの生成(外部素材に依存しな
   `src-tauri/src/dto.rs` で **UI 用 DTO(camelCase)** に変換しています。
   プロトコル表現の変更が UI に波及しないようにするためで、
   DTO の形は `dto.rs` のユニットテストで固定しています
-- 招待・参加・削除はデーモンを介さず設定ファイル操作で行う設計(ADR-0007)なので、
-  UI もそれらは自前で実行します(M2-G3/G4 で実装)
+- **招待トークンは発行直後のダイアログでしか表示しません**(ADR-0008)。
+  トークンはメンバーの秘密鍵を含む(ADR-0005)ため、画面やファイルに残し続けません。
+  取り消しはメンバー一覧からの削除で行います
+- 設定ファイルの既定の置き場所はアプリのデータディレクトリ
+  (Windows `%APPDATA%\app.peercove.desktop\`、Linux `~/.config/app.peercove.desktop/`)。
+  「別の設定ファイルを使う」で任意のパスも選べます
 
 ## アイコンの再生成
 

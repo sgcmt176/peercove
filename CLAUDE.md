@@ -21,6 +21,7 @@
 
 - `crates/peercove-core` … OS 非依存(鍵、設定型、IP 割当、プロトコル型)。ユニットテスト必須
 - `crates/peercove-ipc` … デーモン制御 IPC のクライアント(UI と CLI が共用)
+- `crates/peercove-ops` … 設定ファイル操作(init / invite / join / メンバー管理)。表示を持たず構造体を返す。UI と CLI が共用
 - `crates/peercove-poc` … CLI + デーモン。OS 依存層(TUN/WG/ルーティング/フォワーディング)は trait で抽象化し、`#[cfg(target_os)]` で実装を分ける
 - `apps/peercove-ui` … M2 デスクトップ UI(Tauri + React)。**ルートのワークスペースから独立**しているので、`cargo test --workspace` には含まれない。UI を変更したら `apps/peercove-ui/src-tauri` で `cargo test` と `npm run build` を別途通すこと
 

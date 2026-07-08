@@ -231,3 +231,243 @@ button:hover {
 .peers tr:last-child td {
   border-bottom: none;
 }
+
+/* ---- G3/G4 で追加した要素 ---- */
+
+.card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.card__head h2 {
+  margin: 0;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.small {
+  font-size: 12px;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+  filter: none;
+}
+
+.button--ghost {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.button--ghost:hover {
+  filter: none;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.button--danger {
+  background: #c0392b;
+}
+
+.button--icon {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 2px 6px;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: 4px;
+}
+
+.button--icon:hover {
+  filter: none;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.button--icon-danger:hover {
+  color: #c0392b;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0;
+}
+
+.field > span {
+  color: var(--muted);
+}
+
+.field--check {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.field--check > span {
+  color: var(--text);
+}
+
+input[type="text"],
+.field input:not([type="checkbox"]),
+textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  width: 100%;
+}
+
+input:focus,
+textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+textarea.token {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  resize: vertical;
+  word-break: break-all;
+}
+
+.error-text {
+  color: #c0392b;
+  margin: 8px 0 0;
+}
+
+.notice {
+  color: var(--online);
+  margin: 8px 0 0;
+}
+
+.warn {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.member__actions {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.member__edit {
+  max-width: 200px;
+  padding: 2px 6px !important;
+  width: auto !important;
+}
+
+/* ---- モーダル ---- */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 10;
+}
+
+.modal {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 100%;
+  max-width: 460px;
+  max-height: 100%;
+  overflow-y: auto;
+}
+
+.modal--wide {
+  max-width: 720px;
+}
+
+.modal:focus {
+  outline: none;
+}
+
+.modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal__header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.modal__body {
+  padding: 16px 18px;
+}
+
+.modal__body p {
+  margin: 0 0 10px;
+}
+
+.modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.invite {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  margin: 14px 0;
+}
+
+.invite__qr {
+  flex: none;
+  width: 220px;
+  height: 220px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.invite__qr svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.invite__detail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+@media (max-width: 640px) {
+  .invite {
+    flex-direction: column;
+  }
+}

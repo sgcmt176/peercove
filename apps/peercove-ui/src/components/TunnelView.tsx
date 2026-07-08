@@ -1,0 +1,256 @@
+import { useState } from "react";
+import {
+  Member,
+  Status,
+  api,
+  errorMessage,
+  formatBytes,
+  formatHandshake,
+  stateLabel,
+} from "../ipc";
+import { ConfirmModal } from "./Modal";
+import { InviteDialog } from "./InviteDialog";
+
+/** トンネル稼働中の画面。ホストのときだけ招待・削除・名前変更ができる。 */
+export function TunnelView({
+  status,
+  onChanged,
+}: {
+  status: Status;
+  onChanged: () => void;
+}) {
+  const tunnel = status.tunnel!;
+  const isHost = status.state === "hosting";
+  const [inviting, setInviting] = useState(false);
+  const [removing, setRemoving] = useState<Member | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const stop = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.stopTunnel();
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (member: Member) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const name = await api.removeMember(tunnel.config, member.publicKey);
+      setRemoving(null);
+      setNotice(`${name} を削除しました。約 10 秒でトンネルから外れます。`);
+      setTimeout(() => setNotice(null), 8000);
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rename = async (member: Member, newName: string) => {
+    setError(null);
+    try {
+      await api.renameMember(tunnel.config, member.publicKey, newName);
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
+  return (
+    <>
+      <section className="card">
+        <div className="card__head">
+          <h2>{stateLabel(status.state)}</h2>
+          <button
+            type="button"
+            className="button--ghost"
+            onClick={() => void stop()}
+            disabled={busy}
+          >
+            切断
+          </button>
+        </div>
+        <dl className="facts">
+          <dt>仮想 IP</dt>
+          <dd className="mono">{tunnel.address}</dd>
+          <dt>設定ファイル</dt>
+          <dd className="mono ellipsis" title={tunnel.config}>
+            {tunnel.config}
+          </dd>
+        </dl>
+        {error && <p className="error-text">{error}</p>}
+        {notice && <p className="notice">{notice}</p>}
+      </section>
+
+      <section className="card">
+        <div className="card__head">
+          <h2>メンバー（{tunnel.members.length}）</h2>
+          {isHost && (
+            <button type="button" onClick={() => setInviting(true)}>
+              メンバーを招待
+            </button>
+          )}
+        </div>
+        {tunnel.members.length === 0 ? (
+          <p className="muted">
+            台帳をまだ受信していません（接続直後は数秒かかります）。
+          </p>
+        ) : (
+          <ul className="members">
+            {tunnel.members.map((member) => (
+              <MemberRow
+                key={member.publicKey}
+                member={member}
+                canManage={isHost && !member.isHost}
+                onRemove={() => setRemoving(member)}
+                onRename={(newName) => void rename(member, newName)}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {tunnel.peers.length > 0 && (
+        <section className="card">
+          <h2>ピア統計</h2>
+          <table className="peers">
+            <thead>
+              <tr>
+                <th>公開鍵</th>
+                <th>エンドポイント</th>
+                <th>最終ハンドシェイク</th>
+                <th>受信</th>
+                <th>送信</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tunnel.peers.map((peer) => (
+                <tr key={peer.publicKey}>
+                  <td className="mono ellipsis" title={peer.publicKey}>
+                    {peer.publicKey.slice(0, 12)}…
+                  </td>
+                  <td className="mono">{peer.endpoint ?? "(未接続)"}</td>
+                  <td>{formatHandshake(peer.lastHandshakeAgeSecs)}</td>
+                  <td>{formatBytes(peer.rxBytes)}</td>
+                  <td>{formatBytes(peer.txBytes)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {inviting && (
+        <InviteDialog
+          configPath={tunnel.config}
+          onClose={() => {
+            setInviting(false);
+            onChanged();
+          }}
+        />
+      )}
+
+      {removing && (
+        <ConfirmModal
+          title="メンバーを削除"
+          confirmLabel="削除する"
+          busy={busy}
+          onClose={() => setRemoving(null)}
+          onConfirm={() => void remove(removing)}
+          message={
+            <>
+              <p>
+                <strong>{removing.name ?? removing.ip}</strong> をネットワークから
+                削除します。
+              </p>
+              <p className="muted">
+                本人へ通知され、約 10 秒でトンネルから外れます。渡した招待トークンも
+                使えなくなります。もう一度参加してもらうには招待をやり直してください。
+              </p>
+            </>
+          }
+        />
+      )}
+    </>
+  );
+}
+
+function MemberRow({
+  member,
+  canManage,
+  onRemove,
+  onRename,
+}: {
+  member: Member;
+  canManage: boolean;
+  onRemove: () => void;
+  onRename: (newName: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(member.name ?? "");
+
+  const commit = () => {
+    const trimmed = draft.trim();
+    setEditing(false);
+    if (trimmed && trimmed !== member.name) onRename(trimmed);
+  };
+
+  return (
+    <li className="member">
+      <span
+        className={member.online ? "dot dot--online" : "dot dot--offline"}
+        aria-label={member.online ? "オンライン" : "オフライン"}
+      />
+      {editing ? (
+        <input
+          className="member__edit"
+          value={draft}
+          autoFocus
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") commit();
+            if (event.key === "Escape") setEditing(false);
+          }}
+        />
+      ) : (
+        <span className="member__name">{member.name ?? "(名前なし)"}</span>
+      )}
+      <span className="mono muted">{member.ip}</span>
+      {member.isHost && <span className="tag">host</span>}
+      {canManage && !editing && (
+        <span className="member__actions">
+          <button
+            type="button"
+            className="button--icon"
+            title="名前を変更"
+            onClick={() => {
+              setDraft(member.name ?? "");
+              setEditing(true);
+            }}
+          >
+            ✎
+          </button>
+          <button
+            type="button"
+            className="button--icon button--icon-danger"
+            title="削除"
+            onClick={onRemove}
+          >
+            ×
+          </button>
+        </span>
+      )}
+    </li>
+  );
+}

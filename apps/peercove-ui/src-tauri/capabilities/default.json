@@ -1,7 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "UI が使う最小の権限。デーモン操作は自前の invoke コマンド経由で行うため、追加のプラグイン権限は要らない。",
+  "description": "UI が使う最小の権限。デーモン操作と設定ファイル操作は自前の invoke コマンド経由で行うため、プラグイン権限はファイル選択とトークンのコピーだけ。",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "clipboard-manager:allow-write-text"
+  ]
 }
