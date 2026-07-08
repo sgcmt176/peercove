@@ -29,7 +29,7 @@
 
 ### M2(進行中)
 
-- [x] M2-G1: デーモン分離 + ローカル IPC(daemon run / status / start / stop)※実機検証待ち
+- [x] M2-G1: デーモン分離 + ローカル IPC(daemon run / status / start / stop)✅ 実機検証済み
 - [ ] M2-G2〜G6: Tauri + React UI
 - [ ] M2-G7: インストーラ・自動起動
 

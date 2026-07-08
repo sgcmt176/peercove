@@ -94,6 +94,13 @@ crates/
 5. wintun.dll は exe と同じフォルダのものを明示ロード(システムに別の
    wintun.dll がいる環境がある)
 6. カーネル WG は「handshake 未成立」を UNIX エポックで返す(status で None 扱い)
+7. **昇格プロセスが作る IPC 端点は、非特権クライアントから使えるよう明示的に
+   権限を与える**こと。Windows は名前付きパイプに DACL を付与するが、ACE に
+   総称権(`GA`/`GR`/`GW`)を書くとオブジェクト固有権へマップされず拒否される
+   → `FR`/`FW`/`FA` を使う。Linux は root 作成の UDS を 0666 にする
+   (daemon.rs の `winsec` とテスト `pipe_security_descriptor_allows_client_connect` 参照)
+8. 管理者で起動したデーモンは非特権シェルから終了できない。二重起動でパイプ名が
+   衝突すると新デーモンは即死する(エラー文言で誘導済み)
 
 ## 5. M1 ロードマップ(✅ 全タスク完了・実機検証済み 2026-07-08)
 
