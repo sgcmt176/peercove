@@ -6,7 +6,7 @@
 //! - 互換性: メッセージは `type` タグ付き。未知のフィールドは無視する側で許容し、
 //!   互換性を壊す変更は [`PROTO_VERSION`] を上げる
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,19 @@ pub struct LedgerEntry {
     /// ホストかどうか。
     #[serde(default)]
     pub is_host: bool,
+    /// ホストが観測したこのメンバーの外部エンドポイント(NAT 変換後の
+    /// IP:port)。直接通信(ADR-0013)の宛先候補。ホストは新鮮なもの
+    /// (オンライン判定の閾値内)だけを載せる。ホスト自身のエントリは None
+    /// (メンバーは設定でホストの endpoint を持っている)。
+    /// 後から足したフィールドなので旧バージョンとは互いに無視し合う
+    /// ([`ControlMessage::Ledger`] の dns_records と同じ互換規則)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<SocketAddr>,
+    /// `endpoint` をホストが観測してからの経過秒。マシン間の時計ずれを
+    /// 避けるため絶対時刻ではなく相対値で運ぶ。受信側は
+    /// 「この値 + 受信からの経過」で鮮度を判定する(ADR-0013 追加条件 1)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_age_secs: Option<u64>,
 }
 
 #[cfg(test)]
@@ -73,6 +86,8 @@ mod tests {
             public_key: PrivateKey::generate().public_key(),
             online: true,
             is_host: false,
+            endpoint: Some("203.0.113.5:51820".parse().unwrap()),
+            endpoint_age_secs: Some(3),
         }
     }
 
@@ -137,5 +152,29 @@ mod tests {
         assert_eq!(json, r#"{"type":"ping","nonce":1}"#);
         let json = serde_json::to_string(&ControlMessage::Pong { nonce: 1 }).unwrap();
         assert_eq!(json, r#"{"type":"pong","nonce":1}"#);
+    }
+
+    /// エンドポイント(ADR-0013、M3-2)の互換規則:
+    /// 無ければワイヤに現れず、旧ホストからのエントリ(フィールドなし)も読める。
+    #[test]
+    fn ledger_entry_endpoint_is_optional_on_the_wire() {
+        let mut without = entry();
+        without.endpoint = None;
+        without.endpoint_age_secs = None;
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(
+            !json.contains("endpoint"),
+            "None なら旧バージョンとワイヤ表現が一致する: {json}"
+        );
+
+        let old_wire = json; // 旧ホストが送る形と同じ
+        let parsed: LedgerEntry = serde_json::from_str(&old_wire).unwrap();
+        assert_eq!(parsed, without);
+
+        let with = entry();
+        let parsed: LedgerEntry =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(parsed.endpoint, Some("203.0.113.5:51820".parse().unwrap()));
+        assert_eq!(parsed.endpoint_age_secs, Some(3));
     }
 }

@@ -345,6 +345,8 @@ mod tests {
                 public_key: PrivateKey::generate().public_key(),
                 online: true,
                 is_host: false,
+                endpoint: None,
+                endpoint_age_secs: None,
             }],
             peers: vec![],
             removed: false,

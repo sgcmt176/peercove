@@ -506,6 +506,8 @@ mod tests {
             public_key: PrivateKey::generate().public_key(),
             online,
             is_host: false,
+            endpoint: None,
+            endpoint_age_secs: None,
         }
     }
 

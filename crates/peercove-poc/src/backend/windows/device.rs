@@ -58,6 +58,15 @@ impl DevicePeer {
         self.allowed_ips.iter().any(|net| net.contains(&ip))
     }
 
+    /// `ip` を含む AllowedIPs のうち最長のプレフィックス長(含まなければ None)。
+    fn longest_match(&self, ip: Ipv4Addr) -> Option<u8> {
+        self.allowed_ips
+            .iter()
+            .filter(|net| net.contains(&ip))
+            .map(|net| net.prefix_len())
+            .max()
+    }
+
     /// (最終ハンドシェイクからの経過, tx, rx)
     pub fn stats(&self) -> (Option<Duration>, usize, usize) {
         let (since, tx, rx, _loss, _rtt) = self.tunn.lock().unwrap().stats();
@@ -201,9 +210,17 @@ impl Device {
         }
     }
 
+    /// 宛先 IP からピアを選ぶ。**最長プレフィックス一致**(ADR-0013)。
+    /// 直接通信ではホスト(/24)と直接ピア(/32)の AllowedIPs が重なるため、
+    /// first-match(HashMap 順で不定)では経路が壊れる。
     fn find_peer_by_dst(&self, dst: Ipv4Addr) -> Option<Arc<DevicePeer>> {
         let table = self.peers.read().unwrap();
-        table.by_key.values().find(|p| p.allows(dst)).cloned()
+        table
+            .by_key
+            .values()
+            .filter_map(|p| p.longest_match(dst).map(|len| (len, p)))
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, p)| Arc::clone(p))
     }
 
     /// 復号済みパケットを配送する。宛先が別ピアならデバイス内で直接リレーし
@@ -561,6 +578,48 @@ mod tests {
             persistent_keepalive: keepalive,
             preshared_key: None,
         }
+    }
+
+    /// 最長プレフィックス一致(ADR-0013): ホスト(/24)と直接ピア(/32)の
+    /// AllowedIPs が重なったら /32 が勝ち、/32 を消せば /24(ホスト経由)へ戻る。
+    #[test]
+    fn find_peer_by_dst_prefers_longest_prefix() {
+        let (tun, _handles) = mock_tun();
+        let device =
+            Device::new(*PrivateKey::generate().as_bytes(), None, false, tun).expect("device");
+        let host_key = PrivateKey::generate().public_key();
+        let direct_key = PrivateKey::generate().public_key();
+        device
+            .add_peer(&peer_spec(host_key, None, &["10.99.0.0/24"], None))
+            .unwrap();
+        device
+            .add_peer(&peer_spec(direct_key, None, &["10.99.0.3/32"], None))
+            .unwrap();
+
+        let dst: Ipv4Addr = "10.99.0.3".parse().unwrap();
+        let picked = device.find_peer_by_dst(dst).expect("/32 に一致する");
+        assert_eq!(
+            picked.public_key,
+            *direct_key.as_bytes(),
+            "/32 が /24 に勝つ"
+        );
+
+        let other = device
+            .find_peer_by_dst("10.99.0.4".parse().unwrap())
+            .expect("/24 に一致する");
+        assert_eq!(other.public_key, *host_key.as_bytes());
+        assert!(
+            device
+                .find_peer_by_dst("10.98.0.1".parse().unwrap())
+                .is_none(),
+            "どの AllowedIPs にも入らない宛先は不一致"
+        );
+
+        // 直接ピアを消せばホストへ戻る(直接通信フォールバックの前提)
+        device.remove_peer(direct_key.as_bytes());
+        let fallback = device.find_peer_by_dst(dst).expect("/24 が引き継ぐ");
+        assert_eq!(fallback.public_key, *host_key.as_bytes());
+        device.shutdown();
     }
 
     /// 送信パケットが相手の TUN から出てくるまで待つ。

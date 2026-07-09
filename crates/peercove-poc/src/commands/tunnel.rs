@@ -404,13 +404,24 @@ fn build_ledger(
         public_key: *host_public_key,
         online: true,
         is_host: true,
+        // ホスト自身のエンドポイントは載せない(メンバーは設定で持っている)
+        endpoint: None,
+        endpoint_age_secs: None,
     }];
     for peer in &config.peers {
-        let online = by_key
-            .get(peer.public_key.as_bytes())
+        let stats = by_key.get(peer.public_key.as_bytes());
+        let handshake_age = stats
             .and_then(|s| s.last_handshake)
-            .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|age| age <= ONLINE_THRESHOLD);
+            .and_then(|t| now.duration_since(t).ok());
+        let online = handshake_age.is_some_and(|age| age <= ONLINE_THRESHOLD);
+        // 直接通信(ADR-0013)用の外部エンドポイント。オンライン(= 新鮮)な
+        // ときだけ載せる。endpoint は認証済みパケットのたびに最新化されるため、
+        // 観測経過はハンドシェイク経過で近似する(実際より古く見積もる側に安全)
+        let endpoint = if online {
+            stats.and_then(|s| s.endpoint)
+        } else {
+            None
+        };
         ledger.push(LedgerEntry {
             name: peer.name.clone(),
             ip: peer
@@ -421,6 +432,8 @@ fn build_ledger(
             public_key: peer.public_key,
             online,
             is_host: false,
+            endpoint,
+            endpoint_age_secs: endpoint.and(handshake_age).map(|age| age.as_secs()),
         });
     }
     ledger
@@ -671,6 +684,49 @@ mod tests {
             used_if_names: vec!["mytun".to_string()],
         };
         assert!(plan_interface(&config, &limits).is_err());
+    }
+
+    /// 台帳のエンドポイント(ADR-0013、M3-2): オンラインのピアだけ
+    /// 外部エンドポイント + 観測経過秒が載り、オフラインでは載らない。
+    #[test]
+    fn build_ledger_publishes_endpoints_only_when_fresh() {
+        let online_key = PrivateKey::generate().public_key();
+        let stale_key = PrivateKey::generate().public_key();
+        let config = host_config(&format!(
+            "[[peer]]\nname = \"alice\"\npublic_key = \"{online_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\n\
+             [[peer]]\nname = \"bob\"\npublic_key = \"{stale_key}\"\nallowed_ips = [\"10.100.42.3/32\"]\n"
+        ));
+        let stats_for = |key: &peercove_core::keys::PublicKey, age: Duration| PeerStats {
+            public_key: *key,
+            endpoint: Some("203.0.113.9:12345".parse().unwrap()),
+            last_handshake: Some(SystemTime::now() - age),
+            tx_bytes: 0,
+            rx_bytes: 0,
+            allowed_ips: vec![],
+        };
+        let host_key = PrivateKey::generate().public_key();
+        let ledger = build_ledger(
+            &config,
+            &host_key,
+            &[
+                stats_for(&online_key, Duration::from_secs(30)),
+                stats_for(&stale_key, ONLINE_THRESHOLD + Duration::from_secs(60)),
+            ],
+        );
+
+        assert!(ledger[0].is_host);
+        assert_eq!(ledger[0].endpoint, None, "ホスト自身には載せない");
+
+        let alice = &ledger[1];
+        assert!(alice.online);
+        assert_eq!(alice.endpoint, Some("203.0.113.9:12345".parse().unwrap()));
+        let age = alice.endpoint_age_secs.expect("観測経過秒が付く");
+        assert!((30..40).contains(&age), "ハンドシェイク経過で近似: {age}");
+
+        let bob = &ledger[2];
+        assert!(!bob.online);
+        assert_eq!(bob.endpoint, None, "古い観測は配布しない");
+        assert_eq!(bob.endpoint_age_secs, None);
     }
 
     #[test]

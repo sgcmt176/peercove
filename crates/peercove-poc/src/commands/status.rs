@@ -179,6 +179,8 @@ mod tests {
                 public_key: PublicKey::from_bytes([3; 32]),
                 online: true,
                 is_host: true,
+                endpoint: None,
+                endpoint_age_secs: None,
             },
             LedgerEntry {
                 name: Some("alice".to_string()),
@@ -186,6 +188,8 @@ mod tests {
                 public_key: PublicKey::from_bytes([4; 32]),
                 online: false,
                 is_host: false,
+                endpoint: None,
+                endpoint_age_secs: None,
             },
         ];
         let text = render(&[], Some(&ledger));
