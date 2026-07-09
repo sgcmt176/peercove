@@ -54,6 +54,9 @@ enum Command {
         /// 出力先ディレクトリ
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+        /// ネットワーク名(DNS のサブドメインと表示に使う。英数字とハイフン)
+        #[arg(long, default_value = peercove_core::names::DEFAULT_NETWORK_NAME)]
+        name: String,
         /// UDP 待受ポート
         #[arg(long, default_value_t = peercove_core::config::DEFAULT_LISTEN_PORT)]
         port: u16,
@@ -235,7 +238,12 @@ fn run(command: Command) -> anyhow::Result<()> {
         Command::Member { config } => {
             commands::tunnel::run_up(&config, commands::tunnel::Role::Member, false)
         }
-        Command::Init { dir, port, force } => commands::init::run(&dir, port, force),
+        Command::Init {
+            dir,
+            name,
+            port,
+            force,
+        } => commands::init::run(&dir, &name, port, force),
         Command::Invite {
             config,
             name,

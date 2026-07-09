@@ -974,6 +974,42 @@ sudo ./target/release/peercove-poc daemon service-install
 > 設定ファイルの既定の置き場所は、Windows `%APPDATA%\app.peercove.desktop\`、
 > Linux `~/.config/app.peercove.desktop/` です(UI が表示します)。
 
+## 設定の配置とネットワーク名(M3-0a 以降)
+
+複数ネットワーク対応(ADR-0012)の下準備として、設定は
+**1 ネットワーク = 1 ディレクトリ**で置かれます:
+
+```
+<設定ディレクトリ>/networks/<ネットワーク名>/
+  host.toml + host.key (+ peer-*.psk)   … ホストするネットワーク
+  member.toml + member.key (+ member.psk) … 参加しているネットワーク
+```
+
+- **ネットワーク名**は `init` 時に決めます(CLI: `peercove-poc init --name game-lan`、
+  UI は現状 `home` 固定 — 名前入力は M3-0c で追加)。名前は小文字英数とハイフンに
+  正規化され、将来の DNS(`<メンバー>.<ネットワーク名>.peercove.internal`)と
+  ディレクトリ名に使われます
+- **招待トークンにネットワーク名が入る**ため、参加側では自動的に同じ名前の
+  ディレクトリに設定が作られます。旧形式のトークンも従来どおり参加できます
+  (既定名 `home` になります)
+- **旧配置からの自動移行**: 設定ディレクトリ直下の host.toml / member.toml 一式は、
+  UI の起動時に networks/ へ自動で移動されます。**トンネルを切断した状態で
+  アップデート後の UI を起動してください**(稼働中に移すと、デーモンの定期再読込が
+  旧パスを見失います)
+- CLI の `--config` は従来どおり任意のパスを指定できます(networks/ 配下でなくても
+  動きます)
+
+### 検証手順(M3-0a: 設定配置と移行)
+
+1. 旧配置(設定ディレクトリ直下に host.toml など)がある状態で UI を起動
+   → `networks/home/` へ移動され、「保存済みの設定で再接続」がそのまま使えること
+2. UI から新規ホスト作成 → `networks/home/host.toml` に作られること
+3. 新しい招待トークンで参加(別マシン)→ ホスト側の `--name`(未指定なら home)と
+   同じ名前のディレクトリに member.toml が作られること
+4. `peercove-poc init --dir tmp --name "Game LAN"` → 「ネットワーク名: game-lan」と
+   正規化されて表示されること
+5. 旧バージョンで発行済みのトークンでも参加できること(ネットワーク名は home)
+
 ## 検証手順(M2-G2: デスクトップ UI の骨組み)
 
 UI(非特権)から、管理者/root のデーモンの状態が見えることを確認します。

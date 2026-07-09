@@ -118,23 +118,54 @@ fn canonical(path: &str) -> Result<PathBuf, String> {
 // ---- 設定ファイル操作(ops) ----
 
 /// 既定の設定ファイルの所在と、存在するかどうか。
+///
+/// M3-0a: 実体は `networks/<スラッグ>/` 配下(ADR-0012)。旧配置(直下の
+/// host.toml / member.toml)はここで自動移行する。現在の UI は 1 ホスト +
+/// 1 メンバーの 2 スロット表示なので、一覧の先頭をスロットに割り当てる
+/// (一覧 UI 化は M3-0c)。
 #[tauri::command]
 fn config_paths(app: tauri::AppHandle) -> Result<ConfigPaths, String> {
     let dir = config_dir(&app)?;
+    // 旧配置からの移行。失敗しても UI を止めない(次回また試みる)
+    if let Err(e) = peercove_ops::networks::migrate_legacy(&dir) {
+        eprintln!("旧設定の移行に失敗しました: {e:#}");
+    }
+    let networks = peercove_ops::networks::list(&dir);
+    let slot = |role: peercove_ops::networks::Role, fallback: &str| {
+        networks
+            .iter()
+            .find(|n| n.role == role)
+            .map(|n| ConfigSlot::of(&n.config_path))
+            .unwrap_or_else(|| {
+                ConfigSlot::of(
+                    &peercove_ops::networks::networks_dir(&dir)
+                        .join(peercove_core::names::DEFAULT_NETWORK_NAME)
+                        .join(fallback),
+                )
+            })
+    };
     Ok(ConfigPaths {
-        host: ConfigSlot::of(&dir.join("host.toml")),
-        member: ConfigSlot::of(&dir.join("member.toml")),
+        host: slot(peercove_ops::networks::Role::Host, "host.toml"),
+        member: slot(peercove_ops::networks::Role::Member, "member.toml"),
         dir: dir.display().to_string(),
     })
 }
 
 /// ホストを初期化する(鍵とランダムサブネットの host.toml を生成)。
+///
+/// M3-0a: 書き込み先は `networks/<既定名>/`。名前の入力 UI は M3-0c で付ける。
 #[tauri::command]
 fn init_host(app: tauri::AppHandle, force: bool) -> Result<InitResult, String> {
-    let dir = config_dir(&app)?;
-    let result =
-        peercove_ops::init::init_host(&dir, peercove_core::config::DEFAULT_LISTEN_PORT, force)
-            .map_err(to_message)?;
+    let base = config_dir(&app)?;
+    let name = peercove_core::names::DEFAULT_NETWORK_NAME;
+    let (_, dir) = peercove_ops::networks::network_dir(&base, name).map_err(to_message)?;
+    let result = peercove_ops::init::init_host(
+        &dir,
+        name,
+        peercove_core::config::DEFAULT_LISTEN_PORT,
+        force,
+    )
+    .map_err(to_message)?;
     Ok(InitResult {
         config_path: result.config_path.display().to_string(),
         subnet: result.subnet.to_string(),
@@ -190,9 +221,18 @@ fn render_qr_svg(token: &str) -> Result<String, String> {
 }
 
 /// 招待トークンから参加設定(member.key / member.toml)を作る。
+///
+/// M3-0a: 書き込み先はトークンのネットワーク名から決まる
+/// `networks/<スラッグ>/`(旧トークンは既定名)。
 #[tauri::command]
 fn join_network(app: tauri::AppHandle, token: String, force: bool) -> Result<JoinResult, String> {
-    let dir = config_dir(&app)?;
+    let base = config_dir(&app)?;
+    let parsed = peercove_core::token::InviteToken::parse(&token).map_err(|e| e.to_string())?;
+    let name = parsed
+        .network
+        .as_deref()
+        .unwrap_or(peercove_core::names::DEFAULT_NETWORK_NAME);
+    let (_, dir) = peercove_ops::networks::join_dir(&base, name).map_err(to_message)?;
     let result = peercove_ops::join::join(&token, &dir, force).map_err(to_message)?;
     Ok(JoinResult {
         config_path: result.config_path.display().to_string(),

@@ -13,6 +13,8 @@ pub struct JoinResult {
     pub key_path: PathBuf,
     pub psk_path: Option<PathBuf>,
     pub name: String,
+    /// 参加したネットワーク名(トークン由来。旧トークンは既定名)
+    pub network: String,
     pub address: Ipv4Net,
     /// 採用したエンドポイント(先頭候補)
     pub endpoint: SocketAddrV4,
@@ -59,6 +61,10 @@ pub fn join(token_text: &str, out_dir: &Path, force: bool) -> anyhow::Result<Joi
         key_path,
         psk_path: written_psk,
         name: token.name.clone(),
+        network: token
+            .network
+            .clone()
+            .unwrap_or_else(|| peercove_core::names::DEFAULT_NETWORK_NAME.to_string()),
         address: token.member_address,
         endpoint: token.endpoints[0],
         other_endpoints: token.endpoints[1..].to_vec(),
@@ -68,6 +74,12 @@ pub fn join(token_text: &str, out_dir: &Path, force: bool) -> anyhow::Result<Joi
 
 fn render_member_config(token: &InviteToken) -> String {
     let mut out = String::from("# peercove の join により生成\n[interface]\n");
+    // 旧トークン(名前なし)は既定名を明示して書き込む
+    let network = token
+        .network
+        .as_deref()
+        .unwrap_or(peercove_core::names::DEFAULT_NETWORK_NAME);
+    out.push_str(&format!("network_name = \"{network}\"\n"));
     out.push_str(&format!("display_name = {:?}\n", token.name));
     out.push_str("private_key_file = \"member.key\"\n");
     out.push_str(&format!("address = \"{}\"\n", token.member_address));
@@ -106,6 +118,7 @@ mod tests {
                 "203.0.113.5:51820".parse().unwrap(),
             ],
             name: "carol".to_string(),
+            network: Some("my-game-lan".to_string()),
         }
     }
 
@@ -127,6 +140,8 @@ mod tests {
 
         let config = Config::load(&result.config_path).unwrap();
         assert_eq!(config.interface.display_name.as_deref(), Some("carol"));
+        assert_eq!(config.network_name(), "my-game-lan");
+        assert_eq!(result.network, "my-game-lan");
         assert_eq!(config.interface.address.to_string(), "10.100.42.5/24");
         let peer = &config.peers[0];
         assert_eq!(peer.public_key, token.host_public_key);
@@ -137,6 +152,20 @@ mod tests {
         assert_eq!(key.as_bytes(), token.member_private_key.as_bytes());
         let psk = peercove_core::keys::read_preshared_key_file(&result.psk_path.unwrap()).unwrap();
         assert_eq!(psk.as_bytes(), token.preshared_key.unwrap().as_bytes());
+    }
+
+    #[test]
+    fn join_v1_token_falls_back_to_default_network() {
+        let mut token = sample_token(false);
+        token.network = None; // 旧バイナリが発行したトークン相当(v1)
+        let dir = out_dir("v1");
+        let result = join(&token.encode().unwrap(), &dir, false).unwrap();
+        assert_eq!(result.network, peercove_core::names::DEFAULT_NETWORK_NAME);
+        let config = Config::load(&result.config_path).unwrap();
+        assert_eq!(
+            config.network_name(),
+            peercove_core::names::DEFAULT_NETWORK_NAME
+        );
     }
 
     #[test]

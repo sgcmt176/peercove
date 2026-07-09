@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context};
 
-pub fn run(dir: &Path, listen_port: u16, force: bool) -> anyhow::Result<()> {
+pub fn run(dir: &Path, name: &str, listen_port: u16, force: bool) -> anyhow::Result<()> {
     let key_path = dir.join("host.key");
     let config_path = dir.join("host.toml");
     for path in [&key_path, &config_path] {
@@ -16,10 +16,11 @@ pub fn run(dir: &Path, listen_port: u16, force: bool) -> anyhow::Result<()> {
         }
     }
 
-    let result = peercove_ops::init::init_host(dir, listen_port, force)
+    let result = peercove_ops::init::init_host(dir, name, listen_port, force)
         .context("ホストの初期化に失敗しました")?;
 
     println!("ホスト設定を初期化しました");
+    println!("  ネットワーク名: {}", result.network);
     println!("  設定: {}", result.config_path.display());
     println!(
         "  トンネルサブネット: {}(ホスト = {})",

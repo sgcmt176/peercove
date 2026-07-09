@@ -31,6 +31,10 @@ pub struct InterfaceConfig {
     /// トンネルインターフェース名(省略時 `peercove0`)。
     #[serde(default = "default_if_name")]
     pub name: String,
+    /// 所属ネットワーク名(ADR-0012)。正規化済みの DNS ラベル。
+    /// 旧設定には無いフィールドで、省略時は [`crate::names::DEFAULT_NETWORK_NAME`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
     /// 台帳・コントロールチャネルで使う自分の表示名(join で設定される)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -74,6 +78,14 @@ fn default_if_name() -> String {
 }
 
 impl Config {
+    /// 所属ネットワーク名。旧設定(フィールドなし)は既定名として扱う。
+    pub fn network_name(&self) -> &str {
+        self.interface
+            .network_name
+            .as_deref()
+            .unwrap_or(crate::names::DEFAULT_NETWORK_NAME)
+    }
+
     /// 設定ファイルを読み込み、検証し、相対パスを設定ファイル基準で解決する。
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
@@ -122,6 +134,13 @@ impl Config {
         keys.dedup();
         if keys.len() != self.peers.len() {
             return invalid("同じ public_key のピアが重複しています".to_string());
+        }
+        if let Some(name) = &self.interface.network_name {
+            if !crate::names::is_dns_label(name) {
+                return invalid(format!(
+                    "network_name \"{name}\" が不正です(小文字英数とハイフンのみ、63 文字以内)"
+                ));
+            }
         }
         Ok(())
     }
@@ -229,6 +248,22 @@ typo_field = 1
     fn validate_rejects_duplicate_peers() {
         let mut config = parse(MEMBER_TOML);
         config.peers.push(config.peers[0].clone());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn network_name_defaults_and_validates() {
+        let config = parse(MEMBER_TOML);
+        assert_eq!(config.interface.network_name, None);
+        assert_eq!(config.network_name(), crate::names::DEFAULT_NETWORK_NAME);
+
+        let mut config = parse(MEMBER_TOML);
+        config.interface.network_name = Some("my-game-lan".into());
+        config.validate().unwrap();
+        assert_eq!(config.network_name(), "my-game-lan");
+
+        // 正規化されていない名前は弾く
+        config.interface.network_name = Some("My LAN".into());
         assert!(config.validate().is_err());
     }
 

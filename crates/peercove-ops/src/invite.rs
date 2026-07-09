@@ -111,6 +111,8 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
         host_virtual_ip: config.interface.address.addr(),
         endpoints: endpoints.clone(),
         name: name.clone(),
+        // 設定に名前が無い(旧設定)場合は None のまま = v1 トークン
+        network: config.interface.network_name.clone(),
     };
 
     Ok(InviteResult {
@@ -154,7 +156,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("peercove-ops-invite-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::init::init_host(&dir, 51820, false)
+        crate::init::init_host(&dir, "home", 51820, false)
             .unwrap()
             .config_path
     }
@@ -186,6 +188,11 @@ mod tests {
         assert_eq!(token.member_address.addr(), result.ip);
         assert_eq!(token.host_virtual_ip, config.interface.address.addr());
         assert!(!token.endpoints.is_empty());
+        assert_eq!(
+            token.network.as_deref(),
+            Some("home"),
+            "ネットワーク名がトークンに載る"
+        );
 
         // 2 人目は次の空き IP
         let second = invite(&options(&config_path)).unwrap();

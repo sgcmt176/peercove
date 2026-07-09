@@ -35,6 +35,7 @@ pub fn run(options: &CliOptions) -> anyhow::Result<()> {
     let result = peercove_ops::join::join(&text, options.out_dir, options.force)?;
 
     println!("参加設定を生成しました({} さん)", result.name);
+    println!("  ネットワーク名: {}", result.network);
     println!("  設定: {}", result.config_path.display());
     println!("  割当 IP: {}", result.address);
     if result.other_endpoints.is_empty() {

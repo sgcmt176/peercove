@@ -20,8 +20,14 @@
 //! u8       endpoint_count (1..=MAX_ENDPOINTS)
 //! per ep:  [u8;4] ip, u16 port (be)
 //! u8       name_len (1..=MAX_NAME_LEN) + name (UTF-8)
+//! -- ここまで version 1。version 2(ADR-0012)は末尾に追加:
+//! u8       network_len (1..=63) + network (正規化済み DNS ラベル)
 //! ```
-//! 文字列表現は `pcv1.` + base64url(パディングなし)。
+//! `network` が無い場合(既定名)は version 1 としてエンコードする。これにより
+//! 既定名のトークンは旧バイナリでも読める。v1 のパースは `network = None`。
+//!
+//! 文字列表現は `pcv1.` + base64url(パディングなし)。プレフィックスの
+//! `pcv1` はトークン**書式ファミリー**の識別子で、内部バージョンとは独立。
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -34,7 +40,8 @@ use crate::keys::{PresharedKey, PrivateKey, PublicKey, KEY_LEN};
 use crate::{Error, Result};
 
 pub const TOKEN_PREFIX: &str = "pcv1.";
-const VERSION: u8 = 1;
+const VERSION_1: u8 = 1;
+const VERSION_2: u8 = 2;
 const FLAG_PSK: u8 = 0b0000_0001;
 pub const MAX_ENDPOINTS: usize = 4;
 pub const MAX_NAME_LEN: usize = 64;
@@ -55,6 +62,9 @@ pub struct InviteToken {
     pub endpoints: Vec<SocketAddrV4>,
     /// メンバーの表示名(台帳用)
     pub name: String,
+    /// ネットワーク名(ADR-0012、正規化済み DNS ラベル)。
+    /// `None` は既定名(旧トークン、または既定名のまま運用しているホスト)。
+    pub network: Option<String>,
 }
 
 impl fmt::Debug for InviteToken {
@@ -69,6 +79,7 @@ impl fmt::Debug for InviteToken {
             .field("member_address", &self.member_address)
             .field("endpoints", &self.endpoints)
             .field("name", &self.name)
+            .field("network", &self.network)
             .finish()
     }
 }
@@ -95,6 +106,13 @@ impl InviteToken {
                 self.member_address.prefix_len()
             ));
         }
+        if let Some(network) = &self.network {
+            if !crate::names::is_dns_label(network) {
+                return invalid(format!(
+                    "ネットワーク名 \"{network}\" が不正です(正規化済みの DNS ラベルのみ)"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -102,7 +120,12 @@ impl InviteToken {
     pub fn encode(&self) -> Result<String> {
         self.validate()?;
         let mut buf = Vec::with_capacity(160);
-        buf.push(VERSION);
+        // 既定名(network なし)は v1 のまま = 旧バイナリでも読める
+        buf.push(if self.network.is_some() {
+            VERSION_2
+        } else {
+            VERSION_1
+        });
         buf.extend_from_slice(self.member_private_key.as_bytes());
         buf.extend_from_slice(self.host_public_key.as_bytes());
         match &self.preshared_key {
@@ -122,6 +145,10 @@ impl InviteToken {
         }
         buf.push(self.name.len() as u8);
         buf.extend_from_slice(self.name.as_bytes());
+        if let Some(network) = &self.network {
+            buf.push(network.len() as u8);
+            buf.extend_from_slice(network.as_bytes());
+        }
         Ok(format!("{TOKEN_PREFIX}{}", B64URL.encode(&buf)))
     }
 
@@ -138,7 +165,7 @@ impl InviteToken {
         let mut r = Reader::new(&bytes);
 
         let version = r.u8()?;
-        if version != VERSION {
+        if version != VERSION_1 && version != VERSION_2 {
             return Err(Error::InvalidToken(format!(
                 "未対応のトークンバージョンです({version})。新しい peercove に更新してください"
             )));
@@ -169,6 +196,14 @@ impl InviteToken {
         let name_len = r.u8()? as usize;
         let name = String::from_utf8(r.bytes(name_len)?.to_vec())
             .map_err(|_| invalid("名前が UTF-8 ではありません"))?;
+        let network = if version >= VERSION_2 {
+            let len = r.u8()? as usize;
+            let text = String::from_utf8(r.bytes(len)?.to_vec())
+                .map_err(|_| invalid("ネットワーク名が UTF-8 ではありません"))?;
+            Some(text)
+        } else {
+            None
+        };
         r.finish()?;
 
         let token = Self {
@@ -179,6 +214,7 @@ impl InviteToken {
             host_virtual_ip,
             endpoints,
             name,
+            network,
         };
         token.validate()?;
         Ok(token)
@@ -252,6 +288,7 @@ mod tests {
                 "203.0.113.5:51820".parse().unwrap(),
             ],
             name: "member-a".to_string(),
+            network: Some("my-game-lan".to_string()),
         }
     }
 
@@ -275,7 +312,40 @@ mod tests {
             assert_eq!(parsed.host_virtual_ip, token.host_virtual_ip);
             assert_eq!(parsed.endpoints, token.endpoints);
             assert_eq!(parsed.name, token.name);
+            assert_eq!(parsed.network, token.network);
         }
+    }
+
+    #[test]
+    fn network_none_encodes_as_v1_for_backward_compat() {
+        let mut token = sample();
+        token.network = None;
+        let encoded = token.encode().unwrap();
+        let bytes = B64URL.decode(&encoded[TOKEN_PREFIX.len()..]).unwrap();
+        assert_eq!(bytes[0], VERSION_1, "既定名のトークンは v1 のまま");
+        let parsed = InviteToken::parse(&encoded).unwrap();
+        assert_eq!(parsed.network, None);
+    }
+
+    #[test]
+    fn network_some_encodes_as_v2_and_roundtrips() {
+        let token = sample();
+        let encoded = token.encode().unwrap();
+        let bytes = B64URL.decode(&encoded[TOKEN_PREFIX.len()..]).unwrap();
+        assert_eq!(bytes[0], VERSION_2);
+        assert_eq!(
+            InviteToken::parse(&encoded).unwrap().network.as_deref(),
+            Some("my-game-lan")
+        );
+    }
+
+    #[test]
+    fn rejects_non_normalized_network_name() {
+        let mut token = sample();
+        token.network = Some("My LAN".to_string());
+        assert!(token.encode().is_err());
+        token.network = Some(String::new());
+        assert!(token.encode().is_err());
     }
 
     #[test]

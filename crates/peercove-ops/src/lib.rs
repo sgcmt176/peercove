@@ -10,6 +10,7 @@ pub mod init;
 pub mod invite;
 pub mod join;
 pub mod net;
+pub mod networks;
 pub mod peers;
 pub mod secret;
 pub mod settings;
