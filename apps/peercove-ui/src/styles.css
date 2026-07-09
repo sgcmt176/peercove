@@ -65,6 +65,39 @@ body {
   line-height: 1.5;
 }
 
+.start__intro {
+  margin: 0 0 4px;
+}
+
+/* 参加カード内の「既存で再接続」「新しく参加」を仕切る */
+.start__section + .start__section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.subhead {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* リンク風ボタン(折りたたみの開閉トグル) */
+.button--link {
+  background: transparent;
+  color: var(--accent);
+  border: none;
+  padding: 0;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.button--link:hover {
+  filter: none;
+  text-decoration: underline;
+}
+
 .app__header {
   display: flex;
   align-items: center;

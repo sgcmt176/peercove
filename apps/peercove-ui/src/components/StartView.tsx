@@ -31,8 +31,13 @@ export function StartView({ onStarted }: { onStarted: () => void }) {
 
   return (
     <>
+      <p className="muted start__intro">
+        このネットワークの<strong>中心（ホスト）になる</strong>か、
+        既存のネットワークに<strong>参加する</strong>かを選んでください。
+        どちらも「新しく始める」と「保存済みの設定で再開する」を選べます。
+      </p>
       <HostCard paths={paths} onStarted={onStarted} setError={setError} />
-      <JoinCard onStarted={onStarted} />
+      <JoinCard paths={paths} onStarted={onStarted} setError={setError} />
     </>
   );
 }
@@ -132,14 +137,48 @@ function HostCard({
   );
 }
 
-function JoinCard({ onStarted }: { onStarted: () => void }) {
+function JoinCard({
+  paths,
+  onStarted,
+  setError,
+}: {
+  paths: ConfigPaths;
+  onStarted: () => void;
+  setError: (message: string) => void;
+}) {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
   const [overwrite, setOverwrite] = useState(false);
+  // 保存済みの設定が無いときは、最初からトークン入力を開いておく
+  const [showNewJoin, setShowNewJoin] = useState(!paths.member.exists);
 
+  // 既存の member.toml(または選んだファイル)でそのまま接続する
+  const startFrom = async (configPath: string) => {
+    setBusy("トンネルを開始中…");
+    setLocalError(null);
+    try {
+      await api.startMember(configPath);
+      onStarted();
+    } catch (e) {
+      setLocalError(errorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const pickConfig = async () => {
+    const picked = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "PeerCove の設定", extensions: ["toml"] }],
+    });
+    if (typeof picked === "string") await startFrom(picked);
+  };
+
+  // 招待トークンから新しく参加設定を作って接続する
   const join = async () => {
-    setError(null);
+    setLocalError(null);
     try {
       setBusy("参加設定を作成中…");
       const result = await api.joinNetwork(token.trim(), overwrite);
@@ -148,7 +187,7 @@ function JoinCard({ onStarted }: { onStarted: () => void }) {
       onStarted();
     } catch (e) {
       const message = errorMessage(e);
-      setError(message);
+      setLocalError(message);
       // 既存の member.toml があるときは、上書きの意思を確認してから再実行させる
       if (message.includes("既に存在します")) setOverwrite(true);
     } finally {
@@ -160,34 +199,89 @@ function JoinCard({ onStarted }: { onStarted: () => void }) {
     <section className="card">
       <h2>参加する</h2>
       <p className="muted">
-        ホストから受け取った招待トークン（<code>pcv1.</code> で始まる文字列）を
-        貼り付けてください。
+        ほかの人がホストするネットワークにメンバーとして加わります。
       </p>
-      <textarea
-        className="token"
-        rows={3}
-        placeholder="pcv1.…"
-        value={token}
-        onChange={(event) => setToken(event.target.value)}
-      />
-      {overwrite && (
-        <label className="field field--check">
-          <input
-            type="checkbox"
-            checked={overwrite}
-            onChange={(event) => setOverwrite(event.target.checked)}
-          />
-          <span>既存の参加設定を上書きする</span>
-        </label>
+
+      {paths.member.exists && (
+        <div className="start__section">
+          <h3 className="subhead">保存済みの設定で再接続</h3>
+          <dl className="facts">
+            <dt>設定</dt>
+            <dd className="mono ellipsis" title={paths.member.path}>
+              {paths.member.path}
+            </dd>
+          </dl>
+          <div className="row">
+            <button
+              type="button"
+              onClick={() => void startFrom(paths.member.path)}
+              disabled={busy !== null}
+            >
+              {busy ?? "前回のネットワークに再接続"}
+            </button>
+            <button
+              type="button"
+              className="button--ghost"
+              onClick={() =>
+                void pickConfig().catch((e) => setError(errorMessage(e)))
+              }
+            >
+              別の設定ファイルを使う
+            </button>
+          </div>
+        </div>
       )}
-      {error && <p className="error-text">{error}</p>}
-      <button
-        type="button"
-        onClick={() => void join()}
-        disabled={busy !== null || token.trim() === ""}
-      >
-        {busy ?? "参加する"}
-      </button>
+
+      <div className="start__section">
+        {paths.member.exists ? (
+          <button
+            type="button"
+            className="button--link"
+            onClick={() => setShowNewJoin((v) => !v)}
+          >
+            {showNewJoin
+              ? "新しい招待での参加を閉じる"
+              : "別のネットワークに新しく参加する（招待トークン）"}
+          </button>
+        ) : (
+          <h3 className="subhead">招待トークンで新しく参加</h3>
+        )}
+
+        {showNewJoin && (
+          <>
+            <p className="muted small">
+              ホストから受け取った招待トークン（<code>pcv1.</code> で始まる
+              文字列）を貼り付けてください。
+            </p>
+            <textarea
+              className="token"
+              rows={3}
+              placeholder="pcv1.…"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+            />
+            {overwrite && (
+              <label className="field field--check">
+                <input
+                  type="checkbox"
+                  checked={overwrite}
+                  onChange={(event) => setOverwrite(event.target.checked)}
+                />
+                <span>既存の参加設定を上書きする</span>
+              </label>
+            )}
+            <button
+              type="button"
+              onClick={() => void join()}
+              disabled={busy !== null || token.trim() === ""}
+            >
+              {busy ?? "参加する"}
+            </button>
+          </>
+        )}
+      </div>
+
+      {localError && <p className="error-text">{localError}</p>}
     </section>
   );
 }

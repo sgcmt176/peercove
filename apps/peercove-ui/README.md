@@ -34,7 +34,7 @@ src/                        React(TypeScript)
   ipc.ts                    UI 用の型・コマンドラッパ・表示ヘルパ
   notify.ts                 メンバー参加/切断の差分検知と OS 通知(G6)
   App.tsx                   接続状態で画面を出し分け + ヘッダの設定/ログボタン
-  components/StartView.tsx  待機中: ホスト開始 / トークンで参加
+  components/StartView.tsx  待機中: ホスト開始 / 保存済み設定で再接続 / トークンで参加
   components/TunnelView.tsx 稼働中: メンバー一覧・RTT・招待・削除・名前変更・切断
   components/InviteDialog.tsx 招待の発行と QR 表示(発行直後のみ)
   components/SettingsDialog.tsx 自分側の設定編集(表示名 / ポート / MTU / endpoint)
