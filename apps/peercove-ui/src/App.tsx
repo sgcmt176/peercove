@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Connection, Member, api, errorMessage, stateLabel } from "./ipc";
+import { t } from "./i18n";
 import { diffMembers, notifyMemberEvents } from "./notify";
 import { StartView } from "./components/StartView";
 import { TunnelView } from "./components/TunnelView";
@@ -76,9 +77,7 @@ export default function App() {
             type="button"
             className="button--icon"
             title={
-              settingsConfig
-                ? "設定"
-                : "設定ファイルがまだありません（ホストを始めるか参加してください）"
+              settingsConfig ? t.header.settings : t.header.settingsUnavailable
             }
             disabled={settingsConfig === null}
             onClick={() => setDialog("settings")}
@@ -88,7 +87,7 @@ export default function App() {
           <button
             type="button"
             className="button--icon"
-            title="デーモンのログ"
+            title={t.header.logs}
             disabled={connection.kind === "unreachable"}
             onClick={() => setDialog("logs")}
           >
@@ -103,7 +102,7 @@ export default function App() {
           onRetry={() => void refresh()}
         />
       ) : connection.kind === "connecting" ? (
-        <p className="muted">デーモンに接続しています…</p>
+        <p className="muted">{t.state.connectingDaemon}</p>
       ) : connection.status.state === "idle" || connection.status.tunnel === null ? (
         <StartView onStarted={() => void refresh()} />
       ) : (
@@ -121,17 +120,14 @@ export default function App() {
         />
       )}
 
-      <footer className="app__footer muted small">
-        wintun.dll © WireGuard LLC — Prebuilt Binaries License の下で無改変同梱
-        （インストール先の <span className="mono">wintun-LICENSE.txt</span> を参照）。
-      </footer>
+      <footer className="app__footer muted small">{t.footer}</footer>
     </main>
   );
 }
 
 function ConnectionBadge({ connection }: { connection: Connection }) {
   if (connection.kind !== "ok") {
-    return <span className="badge badge--off">デーモン未接続</span>;
+    return <span className="badge badge--off">{t.state.daemonDisconnected}</span>;
   }
   const { state } = connection.status;
   return (
@@ -150,21 +146,18 @@ function DaemonUnreachable({
 }) {
   return (
     <section className="card card--error">
-      <h2>デーモンに接続できません</h2>
-      <p>
-        トンネルの操作には管理者権限のデーモンが必要です。ターミナルで次を実行して
-        ください:
-      </p>
+      <h2>{t.daemonUnreachable.title}</h2>
+      <p>{t.daemonUnreachable.body}</p>
       <pre>
-        <code>peercove-poc daemon run</code>
+        <code>{t.daemonUnreachable.command}</code>
       </pre>
-      <p className="muted">Windows は管理者ターミナル、Linux は sudo で実行します。</p>
+      <p className="muted">{t.daemonUnreachable.platforms}</p>
       <details>
-        <summary>詳細</summary>
+        <summary>{t.daemonUnreachable.details}</summary>
         <pre className="error-detail">{message}</pre>
       </details>
       <button type="button" onClick={onRetry}>
-        再試行
+        {t.common.retry}
       </button>
     </section>
   );

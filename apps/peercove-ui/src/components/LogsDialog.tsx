@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { LogEntry, api, errorMessage, formatLogTime } from "../ipc";
 import { Modal } from "./Modal";
+import { t } from "../i18n";
 
 /** ログの取りに行く間隔。開いている間だけポーリングする。 */
 const POLL_INTERVAL_MS = 1000;
@@ -60,18 +61,18 @@ export function LogsDialog({ onClose }: { onClose: () => void }) {
   }, [visible.length, follow]);
 
   return (
-    <Modal title="デーモンのログ" onClose={onClose} wide>
+    <Modal title={t.logs.title} onClose={onClose} wide>
       <div className="modal__body">
         <div className="row logs__controls">
           <label className="logs__level">
-            <span className="muted">表示レベル</span>
+            <span className="muted">{t.logs.level}</span>
             <select
               value={minLevel}
               onChange={(event) => setMinLevel(event.target.value as Level)}
             >
               {LEVELS.map((level) => (
                 <option key={level} value={level}>
-                  {level} 以上
+                  {t.logs.levelOption(level)}
                 </option>
               ))}
             </select>
@@ -82,30 +83,24 @@ export function LogsDialog({ onClose }: { onClose: () => void }) {
               checked={follow}
               onChange={(event) => setFollow(event.target.checked)}
             />
-            <span>最新行を追う</span>
+            <span>{t.logs.follow}</span>
           </label>
           <button
             type="button"
             className="button--ghost small"
             onClick={() => setLines([])}
           >
-            表示をクリア
+            {t.logs.clear}
           </button>
         </div>
 
         {error && <p className="error-text">{error}</p>}
-        {dropped > 0 && (
-          <p className="muted small">
-            バッファから溢れた {dropped} 行は失われています。
-          </p>
-        )}
+        {dropped > 0 && <p className="muted small">{t.logs.dropped(dropped)}</p>}
 
         <div className="logs">
           {visible.length === 0 ? (
             <p className="muted">
-              {lines.length === 0
-                ? "まだログがありません。"
-                : "このレベルに該当する行がありません。"}
+              {lines.length === 0 ? t.logs.empty : t.logs.emptyForLevel}
             </p>
           ) : (
             visible.map((line) => (
@@ -121,15 +116,11 @@ export function LogsDialog({ onClose }: { onClose: () => void }) {
           <div ref={bottom} />
         </div>
 
-        <p className="muted small">
-          デーモンが <code>--log-level</code> で絞っている場合、ここにもそれより
-          詳しい行は出ません。詳細を見るにはデーモンを
-          <code> --log-level debug</code> で起動し直してください。
-        </p>
+        <p className="muted small">{t.logs.footer}</p>
       </div>
       <div className="modal__actions">
         <button type="button" className="button--ghost" onClick={onClose}>
-          閉じる
+          {t.common.close}
         </button>
       </div>
     </Modal>

@@ -11,6 +11,7 @@ import {
 } from "../ipc";
 import { ConfirmModal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
+import { t } from "../i18n";
 
 /** トンネル稼働中の画面。ホストのときだけ招待・削除・名前変更ができる。 */
 export function TunnelView({
@@ -49,7 +50,7 @@ export function TunnelView({
     try {
       const name = await api.removeMember(tunnel.config, member.publicKey);
       setRemoving(null);
-      setNotice(`${name} を削除しました。約 10 秒でトンネルから外れます。`);
+      setNotice(t.tunnel.removeNotice(name));
       setTimeout(() => setNotice(null), 8000);
       onChanged();
     } catch (e) {
@@ -73,18 +74,15 @@ export function TunnelView({
     <>
       {tunnel.removed && (
         <section className="card card--error">
-          <h2>ホストから削除されました</h2>
-          <p>
-            このネットワークからあなたは削除されました。通信はすでに遮断されています。
-            「切断」してから、必要なら新しい招待トークンで参加し直してください。
-          </p>
+          <h2>{t.tunnel.removedTitle}</h2>
+          <p>{t.tunnel.removedBody}</p>
           <button
             type="button"
             className="button--danger"
             onClick={() => void stop()}
             disabled={busy}
           >
-            切断する
+            {t.tunnel.disconnectConfirm}
           </button>
         </section>
       )}
@@ -98,13 +96,13 @@ export function TunnelView({
             onClick={() => void stop()}
             disabled={busy}
           >
-            切断
+            {t.tunnel.disconnect}
           </button>
         </div>
         <dl className="facts">
-          <dt>仮想 IP</dt>
+          <dt>{t.common.virtualIp}</dt>
           <dd className="mono">{tunnel.address}</dd>
-          <dt>設定ファイル</dt>
+          <dt>{t.tunnel.configFileLabel}</dt>
           <dd className="mono ellipsis" title={tunnel.config}>
             {tunnel.config}
           </dd>
@@ -115,17 +113,15 @@ export function TunnelView({
 
       <section className="card">
         <div className="card__head">
-          <h2>メンバー（{tunnel.members.length}）</h2>
+          <h2>{t.tunnel.membersHead(tunnel.members.length)}</h2>
           {isHost && (
             <button type="button" onClick={() => setInviting(true)}>
-              メンバーを招待
+              {t.tunnel.invite}
             </button>
           )}
         </div>
         {tunnel.members.length === 0 ? (
-          <p className="muted">
-            台帳をまだ受信していません（接続直後は数秒かかります）。
-          </p>
+          <p className="muted">{t.tunnel.ledgerPending}</p>
         ) : (
           <ul className="members">
             {tunnel.members.map((member) => (
@@ -144,16 +140,16 @@ export function TunnelView({
 
       {tunnel.peers.length > 0 && (
         <section className="card">
-          <h2>ピア統計</h2>
+          <h2>{t.tunnel.peers.head}</h2>
           <table className="peers">
             <thead>
               <tr>
-                <th>公開鍵</th>
-                <th>エンドポイント</th>
-                <th>最終ハンドシェイク</th>
-                <th>RTT</th>
-                <th>受信</th>
-                <th>送信</th>
+                <th>{t.tunnel.peers.publicKey}</th>
+                <th>{t.tunnel.peers.endpoint}</th>
+                <th>{t.tunnel.peers.lastHandshake}</th>
+                <th>{t.tunnel.peers.rtt}</th>
+                <th>{t.tunnel.peers.rx}</th>
+                <th>{t.tunnel.peers.tx}</th>
               </tr>
             </thead>
             <tbody>
@@ -162,11 +158,11 @@ export function TunnelView({
                   <td className="mono ellipsis" title={peer.publicKey}>
                     {peer.publicKey.slice(0, 12)}…
                   </td>
-                  <td className="mono">{peer.endpoint ?? "(未接続)"}</td>
-                  <td>{formatHandshake(peer.lastHandshakeAgeSecs)}</td>
-                  <td title="トンネル内のコントロールチャネルで測った往復時間">
-                    {formatRtt(peer.rttMs)}
+                  <td className="mono">
+                    {peer.endpoint ?? t.tunnel.peers.notConnected}
                   </td>
+                  <td>{formatHandshake(peer.lastHandshakeAgeSecs)}</td>
+                  <td title={t.tunnel.peers.rttTitle}>{formatRtt(peer.rttMs)}</td>
                   <td>{formatBytes(peer.rxBytes)}</td>
                   <td>{formatBytes(peer.txBytes)}</td>
                 </tr>
@@ -188,23 +184,12 @@ export function TunnelView({
 
       {removing && (
         <ConfirmModal
-          title="メンバーを削除"
-          confirmLabel="削除する"
+          title={t.tunnel.remove.title}
+          confirmLabel={t.tunnel.remove.confirm}
           busy={busy}
           onClose={() => setRemoving(null)}
           onConfirm={() => void remove(removing)}
-          message={
-            <>
-              <p>
-                <strong>{removing.name ?? removing.ip}</strong> をネットワークから
-                削除します。
-              </p>
-              <p className="muted">
-                本人へ通知され、約 10 秒でトンネルから外れます。渡した招待トークンも
-                使えなくなります。もう一度参加してもらうには招待をやり直してください。
-              </p>
-            </>
-          }
+          message={t.tunnel.remove.message(removing.name ?? removing.ip)}
         />
       )}
     </>
@@ -237,7 +222,7 @@ function MemberRow({
     <li className="member">
       <span
         className={member.online ? "dot dot--online" : "dot dot--offline"}
-        aria-label={member.online ? "オンライン" : "オフライン"}
+        aria-label={member.online ? t.tunnel.member.online : t.tunnel.member.offline}
       />
       {editing ? (
         <input
@@ -252,12 +237,12 @@ function MemberRow({
           }}
         />
       ) : (
-        <span className="member__name">{member.name ?? "(名前なし)"}</span>
+        <span className="member__name">{member.name ?? t.tunnel.member.noName}</span>
       )}
       <span className="mono muted">{member.ip}</span>
       {member.isHost && <span className="tag">host</span>}
       {rttMs !== null && (
-        <span className="tag" title="トンネル内の往復時間">
+        <span className="tag" title={t.tunnel.member.rttTitle}>
           {formatRtt(rttMs)}
         </span>
       )}
@@ -266,7 +251,7 @@ function MemberRow({
           <button
             type="button"
             className="button--icon"
-            title="名前を変更"
+            title={t.tunnel.member.rename}
             onClick={() => {
               setDraft(member.name ?? "");
               setEditing(true);
@@ -277,7 +262,7 @@ function MemberRow({
           <button
             type="button"
             className="button--icon button--icon-danger"
-            title="削除"
+            title={t.tunnel.member.remove}
             onClick={onRemove}
           >
             ×

@@ -1,4 +1,5 @@
 import { ReactNode, useEffect, useRef } from "react";
+import { t } from "../i18n";
 
 /** Esc とバックドロップで閉じられるモーダル。 */
 export function Modal({
@@ -46,7 +47,7 @@ export function Modal({
             type="button"
             className="button--icon"
             onClick={onClose}
-            aria-label="閉じる"
+            aria-label={t.common.close}
           >
             ×
           </button>
@@ -78,7 +79,7 @@ export function ConfirmModal({
       <div className="modal__body">{message}</div>
       <div className="modal__actions">
         <button type="button" className="button--ghost" onClick={onClose}>
-          キャンセル
+          {t.common.cancel}
         </button>
         <button
           type="button"
@@ -86,7 +87,7 @@ export function ConfirmModal({
           onClick={onConfirm}
           disabled={busy}
         >
-          {busy ? "実行中…" : confirmLabel}
+          {busy ? t.common.running : confirmLabel}
         </button>
       </div>
     </Modal>

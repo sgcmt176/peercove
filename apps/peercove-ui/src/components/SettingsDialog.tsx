@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Settings, api, errorMessage } from "../ipc";
 import { Modal } from "./Modal";
+import { t } from "../i18n";
 
 /**
  * 設定編集(M2-G5)。編集できるのは「自分側の設定」だけ。
@@ -30,7 +31,7 @@ export function SettingsDialog({
   }, [configPath]);
 
   return (
-    <Modal title="設定" onClose={onClose}>
+    <Modal title={t.settings.title} onClose={onClose}>
       {settings ? (
         <SettingsForm
           configPath={configPath}
@@ -42,7 +43,7 @@ export function SettingsDialog({
           {error ? (
             <p className="error-text">{error}</p>
           ) : (
-            <p className="muted">読み込み中…</p>
+            <p className="muted">{t.common.loading}</p>
           )}
         </div>
       )}
@@ -75,10 +76,10 @@ function SettingsForm({
     setNotice(null);
     try {
       const mtuValue = Number(mtu);
-      if (!Number.isInteger(mtuValue)) throw "MTU には整数を入力してください";
+      if (!Number.isInteger(mtuValue)) throw t.settings.mtuInteger;
       const portValue = listenPort.trim() === "" ? null : Number(listenPort);
       if (portValue !== null && !Number.isInteger(portValue)) {
-        throw "待受ポートには整数を入力してください";
+        throw t.settings.portInteger;
       }
       const result = await api.saveSettings(configPath, {
         displayName: displayName.trim() === "" ? null : displayName.trim(),
@@ -91,8 +92,8 @@ function SettingsForm({
       });
       setNotice(
         result.restartRequired
-          ? "保存しました。切断して接続し直すと反映されます。"
-          : "保存しました。数秒でトンネルに反映されます。",
+          ? t.settings.savedRestart
+          : t.settings.savedLive,
       );
     } catch (e) {
       setError(errorMessage(e));
@@ -105,30 +106,36 @@ function SettingsForm({
     <>
       <div className="modal__body">
         <dl className="facts">
-          <dt>インターフェース</dt>
+          <dt>{t.settings.interface}</dt>
           <dd className="mono">{settings.interfaceName}</dd>
-          <dt>仮想 IP</dt>
+          <dt>{t.common.virtualIp}</dt>
           <dd className="mono">{settings.address}</dd>
-          <dt>設定ファイル</dt>
+          <dt>{t.common.configFile}</dt>
           <dd className="mono ellipsis" title={configPath}>
             {configPath}
           </dd>
         </dl>
 
         <label className="field">
-          <span>表示名（メンバー一覧に出る名前）</span>
+          <span>{t.settings.displayNameLabel}</span>
           <input
             type="text"
             value={displayName}
-            placeholder={settings.isMember ? "（未設定）" : "host"}
+            placeholder={
+              settings.isMember
+                ? t.settings.displayNamePlaceholderMember
+                : t.settings.displayNamePlaceholderHost
+            }
             onChange={(event) => setDisplayName(event.target.value)}
           />
         </label>
 
         <label className="field">
           <span>
-            待受ポート（UDP）
-            <small className="muted"> — 空欄なら{settings.isMember ? "OS 任せ" : `既定の ${settings.defaultListenPort}`}</small>
+            {t.settings.portLabel}
+            <small className="muted">
+              {t.settings.portHint(settings.isMember, settings.defaultListenPort)}
+            </small>
           </span>
           <input
             type="text"
@@ -141,8 +148,8 @@ function SettingsForm({
 
         <label className="field">
           <span>
-            MTU
-            <small className="muted"> — 既定 {settings.defaultMtu}。回線によっては下げると安定します</small>
+            {t.settings.mtuLabel}
+            <small className="muted">{t.settings.mtuHint(settings.defaultMtu)}</small>
           </span>
           <input
             type="text"
@@ -155,34 +162,29 @@ function SettingsForm({
         {settings.isMember && (
           <label className="field">
             <span>
-              ホストのエンドポイント
-              <small className="muted"> — ホストの IP:ポート。引っ越し後の付け替えに使います</small>
+              {t.settings.hostEndpointLabel}
+              <small className="muted">{t.settings.hostEndpointHint}</small>
             </span>
             <input
               type="text"
               value={hostEndpoint}
-              placeholder="203.0.113.5:51820"
+              placeholder={t.settings.hostEndpointPlaceholder}
               onChange={(event) => setHostEndpoint(event.target.value)}
             />
           </label>
         )}
 
-        <p className="muted small">
-          待受ポート・MTU
-          {settings.isMember && "・ホストのエンドポイント"}
-          は、トンネルを作り直すまで反映されません（切断 →
-          接続で反映されます）。
-        </p>
+        <p className="muted small">{t.settings.restartHint(settings.isMember)}</p>
 
         {error && <p className="error-text">{error}</p>}
         {notice && <p className="notice">{notice}</p>}
       </div>
       <div className="modal__actions">
         <button type="button" className="button--ghost" onClick={onClose}>
-          閉じる
+          {t.common.close}
         </button>
         <button type="button" onClick={() => void save()} disabled={busy}>
-          {busy ? "保存中…" : "保存"}
+          {busy ? t.common.saving : t.common.save}
         </button>
       </div>
     </>

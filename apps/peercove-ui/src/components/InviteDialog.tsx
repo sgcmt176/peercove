@@ -2,6 +2,7 @@ import { useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { InviteResult, api, errorMessage } from "../ipc";
 import { Modal } from "./Modal";
+import { t } from "../i18n";
 
 /**
  * 招待の発行と、発行直後のトークン表示。
@@ -52,12 +53,9 @@ export function InviteDialog({
 
   if (result) {
     return (
-      <Modal title={`${result.name} さんの招待`} onClose={onClose} wide>
+      <Modal title={t.invite.resultTitle(result.name)} onClose={onClose} wide>
         <div className="modal__body">
-          <p className="warn">
-            このトークンは<strong>この画面でしか表示されません</strong>。
-            本人だけに渡し、受け渡し後は削除してください。
-          </p>
+          <p className="warn">{t.invite.warn}</p>
           <div className="invite">
             <div
               className="invite__qr"
@@ -66,28 +64,25 @@ export function InviteDialog({
             />
             <div className="invite__detail">
               <dl className="facts">
-                <dt>割当 IP</dt>
+                <dt>{t.invite.allocatedIp}</dt>
                 <dd className="mono">{result.ip}</dd>
-                <dt>接続先候補</dt>
+                <dt>{t.invite.endpoints}</dt>
                 <dd className="mono">{result.endpoints.join(", ")}</dd>
-                <dt>事前共有鍵</dt>
-                <dd>{result.psk ? "あり" : "なし"}</dd>
+                <dt>{t.invite.psk}</dt>
+                <dd>{result.psk ? t.invite.yes : t.invite.no}</dd>
               </dl>
               <textarea className="token" readOnly value={result.token} rows={3} />
               <button type="button" onClick={() => void copy()}>
-                {copied ? "コピーしました" : "トークンをコピー"}
+                {copied ? t.invite.copied : t.invite.copy}
               </button>
               {error && <p className="error-text">{error}</p>}
             </div>
           </div>
-          <p className="muted">
-            同じ LAN のメンバーは LAN 側の候補、別ネットワークのメンバーは外部の
-            候補で接続します。取り消すときはメンバー一覧から削除してください。
-          </p>
+          <p className="muted">{t.invite.resultNote}</p>
         </div>
         <div className="modal__actions">
           <button type="button" onClick={onClose}>
-            閉じる
+            {t.common.close}
           </button>
         </div>
       </Modal>
@@ -95,28 +90,26 @@ export function InviteDialog({
   }
 
   return (
-    <Modal title="メンバーを招待" onClose={onClose}>
+    <Modal title={t.invite.formTitle} onClose={onClose}>
       <div className="modal__body">
         <label className="field">
-          <span>名前（省略すると自動で付きます）</span>
+          <span>{t.invite.nameLabel}</span>
           <input
             value={name}
             onChange={(event) => setName(event.target.value)}
-            placeholder="alice"
+            placeholder={t.invite.namePlaceholder}
             autoFocus
           />
         </label>
         <label className="field">
-          <span>外部の接続先（別ネットワークの人を招く場合）</span>
+          <span>{t.invite.externalLabel}</span>
           <input
             value={externalEndpoint}
             onChange={(event) => setExternalEndpoint(event.target.value)}
-            placeholder="203.0.113.5:51820"
+            placeholder={t.invite.externalPlaceholder}
             className="mono"
           />
-          <small className="muted">
-            LAN 内の接続先は自動で入ります。省略しても構いません。
-          </small>
+          <small className="muted">{t.invite.externalHint}</small>
         </label>
         <label className="field field--check">
           <input
@@ -124,16 +117,16 @@ export function InviteDialog({
             checked={psk}
             onChange={(event) => setPsk(event.target.checked)}
           />
-          <span>事前共有鍵（PSK）も発行する</span>
+          <span>{t.invite.pskLabel}</span>
         </label>
         {error && <p className="error-text">{error}</p>}
       </div>
       <div className="modal__actions">
         <button type="button" className="button--ghost" onClick={onClose}>
-          キャンセル
+          {t.common.cancel}
         </button>
         <button type="button" onClick={() => void submit()} disabled={busy}>
-          {busy ? "発行中…" : "招待を発行"}
+          {busy ? t.invite.issuing : t.invite.issue}
         </button>
       </div>
     </Modal>

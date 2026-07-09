@@ -4,6 +4,7 @@
 // 表現を UI が直接なぞらないことで、プロトコルの変更が UI に波及しない。
 
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "./i18n";
 
 export interface Member {
   name: string | null;
@@ -156,11 +157,11 @@ export const api = {
 export function stateLabel(state: TunnelState): string {
   switch (state) {
     case "idle":
-      return "待機中";
+      return t.state.idle;
     case "hosting":
-      return "ホストとして稼働中";
+      return t.state.hosting;
     case "joined":
-      return "メンバーとして参加中";
+      return t.state.joined;
   }
 }
 
@@ -176,11 +177,11 @@ export function formatBytes(bytes: number): string {
 }
 
 export function formatHandshake(ageSecs: number | null): string {
-  if (ageSecs === null) return "なし";
-  if (ageSecs < 60) return `${ageSecs} 秒前`;
+  if (ageSecs === null) return t.format.none;
+  if (ageSecs < 60) return t.format.secondsAgo(ageSecs);
   const minutes = Math.floor(ageSecs / 60);
-  if (minutes < 60) return `${minutes} 分前`;
-  return `${Math.floor(minutes / 60)} 時間前`;
+  if (minutes < 60) return t.format.minutesAgo(minutes);
+  return t.format.hoursAgo(Math.floor(minutes / 60));
 }
 
 /** 1 ミリ秒未満は「< 1 ms」。ローカルの検証で 0.0 ms と出るのを避ける。 */

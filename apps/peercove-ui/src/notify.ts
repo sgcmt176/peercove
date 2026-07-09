@@ -9,6 +9,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { Member } from "./ipc";
+import { t } from "./i18n";
 
 export interface MemberEvent {
   kind: "joined" | "left";
@@ -59,9 +60,10 @@ export function diffMembers(
 
 export function describe(event: MemberEvent): { title: string; body: string } {
   const name = event.member.name ?? event.member.ip;
+  const body = t.notify.body(name, event.member.ip);
   return event.kind === "joined"
-    ? { title: "メンバーが参加しました", body: `${name}（${event.member.ip}）` }
-    : { title: "メンバーが切断しました", body: `${name}（${event.member.ip}）` };
+    ? { title: t.notify.joinedTitle, body }
+    : { title: t.notify.leftTitle, body };
 }
 
 export async function notifyMemberEvents(events: MemberEvent[]): Promise<void> {
