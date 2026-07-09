@@ -36,6 +36,9 @@ mod windows_impl {
     const DISPLAY_NAME: &str = "PeerCove Daemon";
     const DESCRIPTION: &str =
         "PeerCove の常駐デーモン。トンネルの作成・維持・破棄を行います(UI/CLI からローカル IPC で操作)。";
+    /// ファイアウォールの受信許可ルール名。install/uninstall で対に管理する。
+    /// MSI(G7b)も同じ名前でルールを作る・消すこと(手動追加とも互換)。
+    const FIREWALL_RULE: &str = "PeerCove Daemon";
 
     // SCM が呼ぶ FFI エントリポイントを生成する
     define_windows_service!(ffi_service_main, service_main);
@@ -170,6 +173,11 @@ mod windows_impl {
             .set_description(DESCRIPTION)
             .context("サービスの説明の設定に失敗しました")?;
 
+        // ファイアウォールの受信許可(UDP)。Session 0 のサービスには
+        // 「アクセスを許可しますか?」のダイアログが出ないため、明示的に
+        // ルールを作らないと WG のハンドシェイクが黙って遮断される(PoC で発覚)
+        add_firewall_rule(&exe);
+
         let no_args: [&std::ffi::OsStr; 0] = [];
         service.start(&no_args).context(
             "サービスの起動に失敗しました(登録は完了しています。\
@@ -181,6 +189,48 @@ mod windows_impl {
         println!("  状態確認: Get-Service {SERVICE_NAME}(または sc.exe query {SERVICE_NAME})");
         println!("  停止: sc.exe stop {SERVICE_NAME}");
         Ok(())
+    }
+
+    /// 受信許可ルールを追加する(このプログラム宛の UDP。待受ポートは設定で
+    /// 変わるためポート指定はしない)。再インストールで重複しないよう、
+    /// 同名ルールを消してから追加する。
+    fn add_firewall_rule(exe: &std::path::Path) {
+        let _ = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule"])
+            .arg(format!("name={FIREWALL_RULE}"))
+            .output();
+        let result = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "add", "rule"])
+            .arg(format!("name={FIREWALL_RULE}"))
+            .args(["dir=in", "action=allow", "protocol=UDP"])
+            .arg(format!("program={}", exe.display()))
+            .output();
+        match result {
+            Ok(output) if output.status.success() => {
+                println!("ファイアウォールの受信許可(UDP)を追加しました: {FIREWALL_RULE}");
+            }
+            _ => eprintln!(
+                "警告: ファイアウォールルールの追加に失敗しました。メンバーからの接続が\
+                 通らない場合は手動で追加してください:\n  netsh advfirewall firewall add rule \
+                 name=\"{FIREWALL_RULE}\" dir=in action=allow protocol=UDP program=\"{}\"",
+                exe.display()
+            ),
+        }
+    }
+
+    /// install が追加した受信許可ルールを削除する。
+    fn remove_firewall_rule() {
+        let result = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule"])
+            .arg(format!("name={FIREWALL_RULE}"))
+            .output();
+        match result {
+            Ok(output) if output.status.success() => {
+                println!("ファイアウォールの受信許可ルールを削除しました: {FIREWALL_RULE}");
+            }
+            // 元々無い場合も delete は失敗コードを返す。残骸ではないので黙る
+            _ => {}
+        }
     }
 
     /// サービスを停止して登録解除する(要管理者)。
@@ -220,6 +270,7 @@ mod windows_impl {
             }
         }
         service.delete().context("サービスの削除に失敗しました")?;
+        remove_firewall_rule();
         println!("サービス {SERVICE_NAME} を登録解除しました");
         Ok(())
     }

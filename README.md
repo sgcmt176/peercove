@@ -646,6 +646,9 @@ icacls "$env:APPDATA\app.peercove.desktop\*.psk" /grant "*S-1-5-18:F"
 #    (管理者ターミナルで)peercove-poc daemon shutdown
 
 # 4) サービス登録 + 起動(管理者 PowerShell)
+#    ファイアウォールの受信許可(UDP、この exe 宛)も一緒に追加されます。
+#    Session 0 のサービスには「許可しますか?」ダイアログが出ないため、
+#    ルールを作らないとハンドシェイクが黙って遮断されます
 .\target\release\peercove-poc.exe daemon service-install
 ```
 
@@ -668,7 +671,9 @@ icacls "$env:APPDATA\app.peercove.desktop\*.psk" /grant "*S-1-5-18:F"
    UI を開くと「待機中」表示 → そのまま「開始」で前回のネットワークに繋がること
 6. トンネル稼働中に(管理者で)`daemon service-uninstall` →
    「停止しています…」の後に登録解除され、`ipconfig` に peercove0 が
-   残っていないこと(クリーンアップの確認)
+   残っていないこと(クリーンアップの確認)。ファイアウォールルール
+   「PeerCove Daemon」も消えていること
+   (`Get-NetFirewallRule -DisplayName "PeerCove Daemon"` がエラーになる)
 
 ### Ubuntu(メンバー機)
 

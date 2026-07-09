@@ -49,13 +49,25 @@
    `externalBin` は使わないこと(WiX の規則で ServiceInstall はサービス exe を
    KeyPath に持つ Component 内に必要 — フラグメントのコメント参照)
 
+5. **ファイアウォールの受信許可ルール**(PoC で発覚した必須要件 — ADR-0010
+   「Session 0 の追加要件」参照)。Session 0 のサービスには許可ダイアログが
+   出ないため、ルールを作らないと inbound UDP が黙って遮断される。
+   - ルール名は **`PeerCove Daemon`**(`service.rs` の `FIREWALL_RULE` と同じ。
+     変えないこと)。対象 = インストールされたデーモン exe、protocol=UDP、dir=in
+   - 実現方法は要調査で 2 案: (a) WiX の FirewallExtension
+     (`xmlns:fire` + `<fire:FirewallException>`。Tauri が WiX 拡張を
+     渡せるかを確認)、(b) カスタムアクションで
+     `netsh advfirewall firewall add rule ...` / アンインストール時に delete。
+   - **アンインストールでルールが残らないこと**が受け入れ条件
+
 受け入れ確認(依頼者に検証依頼する項目):
 - インストール → サービス `peercove-daemon` が登録され RUNNING
 - スタートメニューから PeerCove(UI)起動 → ホスト開始 → 疎通
+  (疎通しない場合の第一容疑者はファイアウォールルールの不備)
 - **通知の表示元が「PeerCove」になっている**(AppUserModelID がショートカット
   経由で登録されるため。dev では PowerShell 表示だった件の解消確認)
-- アンインストール → サービス・ファイル・トンネル残骸ゼロ(`sc query` /
-  `ipconfig` で確認)
+- アンインストール → サービス・ファイル・トンネル・ファイアウォールルールの
+  残骸ゼロ(`sc.exe query` / `ipconfig` / `Get-NetFirewallRule` で確認)
 
 ## 3. タスク 2: Ubuntu deb
 
