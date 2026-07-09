@@ -27,7 +27,15 @@ pub enum ControlMessage {
         name: Option<String>,
     },
     /// host → member: 台帳スナップショット(接続時と変更時に送る)。
-    Ledger { members: Vec<LedgerEntry> },
+    ///
+    /// `dns_records` はカスタム DNS レコード(ADR-0011、M3-1)。後から足した
+    /// フィールドなので、旧ホストからは届かず(default = 空)、旧メンバーは
+    /// 未知フィールドとして無視する。[`PROTO_VERSION`] は上げない。
+    Ledger {
+        members: Vec<LedgerEntry>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dns_records: Vec<crate::dns::DnsRecord>,
+    },
     /// host → member: あなたは削除された(以後トンネルは通らない)。
     Removed { message: String },
     /// 双方向: RTT 計測(M2-G5)。受け取った側は同じ nonce で [`ControlMessage::Pong`] を返す。
@@ -77,6 +85,10 @@ mod tests {
             },
             ControlMessage::Ledger {
                 members: vec![entry()],
+                dns_records: vec![crate::dns::DnsRecord {
+                    name: "nas".to_string(),
+                    ip: "100.100.42.50".parse().unwrap(),
+                }],
             },
             ControlMessage::Removed {
                 message: "ホストにより削除されました".to_string(),
@@ -102,8 +114,24 @@ mod tests {
         .unwrap();
         assert_eq!(json, r#"{"type":"hello","version":1}"#);
 
-        let json = serde_json::to_string(&ControlMessage::Ledger { members: vec![] }).unwrap();
+        // dns_records が空なら旧バージョンとワイヤ表現が一致する(互換維持)
+        let json = serde_json::to_string(&ControlMessage::Ledger {
+            members: vec![],
+            dns_records: vec![],
+        })
+        .unwrap();
         assert_eq!(json, r#"{"type":"ledger","members":[]}"#);
+
+        // 旧ホストからの台帳(dns_records なし)も読める
+        let old: ControlMessage =
+            serde_json::from_str(r#"{"type":"ledger","members":[]}"#).unwrap();
+        assert_eq!(
+            old,
+            ControlMessage::Ledger {
+                members: vec![],
+                dns_records: vec![],
+            }
+        );
 
         let json = serde_json::to_string(&ControlMessage::Ping { nonce: 1 }).unwrap();
         assert_eq!(json, r#"{"type":"ping","nonce":1}"#);

@@ -230,6 +230,10 @@ pub struct Snapshot {
     pub peers: Vec<PeerStats>,
     /// host は自前構築した台帳、member は受信済みの台帳(未受信なら None)。
     pub ledger: Option<Vec<LedgerEntry>>,
+    /// カスタム DNS レコード(M3-1)。host は自分の設定、member は受信したもの。
+    /// M3-1b(DNS サーバのゾーン構築)で読まれるまで未参照
+    #[allow(dead_code)]
+    pub dns_records: Vec<peercove_core::dns::DnsRecord>,
     /// 相手の仮想 IP → コントロールチャネルで測った RTT(ミリ秒、M2-G5)。
     pub rtt_ms: HashMap<std::net::Ipv4Addr, f64>,
     /// (member のみ)ホストからネットワーク削除された(M2-G6)。UI が明示する。
@@ -263,9 +267,9 @@ pub async fn supervise(
     let host_public_key = spec.private_key.public_key();
     {
         // コントロールチャネル(M1-G2)
-        let (ledger_tx, ledger_rx) = tokio::sync::watch::channel(Vec::<LedgerEntry>::new());
+        let (ledger_tx, ledger_rx) = tokio::sync::watch::channel(control::Distribution::default());
         let connections: control::Connections = Default::default();
-        let member_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>> = Default::default();
+        let member_ledger: Arc<Mutex<Option<control::Distribution>>> = Default::default();
         let rtt: control::RttMap = Default::default();
         // (member)ホストから削除されたら立つ。status に載せて UI が表示する
         let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -336,22 +340,27 @@ pub async fn supervise(
                             continue;
                         }
                     };
-                    // 台帳: host は設定+統計から構築して配布、member は受信済みを表示
-                    let ledger = match role {
+                    // 台帳 + DNS レコード: host は設定+統計から構築して配布、
+                    // member は受信済みを表示(M3-1 で dns_records が加わった)
+                    let distribution = match role {
                         Role::Host => config.as_ref().map(|config| {
-                            let ledger = build_ledger(config, &host_public_key, &stats);
+                            let dist = control::Distribution {
+                                members: build_ledger(config, &host_public_key, &stats),
+                                dns_records: config.dns_records.clone(),
+                            };
                             ledger_tx.send_if_modified(|current| {
-                                if *current != ledger {
-                                    *current = ledger.clone();
+                                if *current != dist {
+                                    *current = dist.clone();
                                     true
                                 } else {
                                     false
                                 }
                             });
-                            ledger
+                            dist
                         }),
                         Role::Member => member_ledger.lock().unwrap().clone(),
                     };
+                    let ledger = distribution.as_ref().map(|dist| dist.members.clone());
                     if let Err(e) =
                         status::write_status_file(&status_path, &stats, ledger.as_deref())
                     {
@@ -361,6 +370,9 @@ pub async fn supervise(
                         *snapshot.lock().unwrap() = Some(Snapshot {
                             peers: stats,
                             ledger,
+                            dns_records: distribution
+                                .map(|dist| dist.dns_records)
+                                .unwrap_or_default(),
                             rtt_ms: rtt.lock().unwrap().clone(),
                             removed: removed.load(std::sync::atomic::Ordering::Relaxed),
                         });

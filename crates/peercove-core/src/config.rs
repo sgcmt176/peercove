@@ -23,6 +23,10 @@ pub struct Config {
     pub interface: InterfaceConfig,
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+    /// カスタム DNS レコード(ADR-0011 §1b)。ホスト設定のみ意味を持ち、
+    /// 台帳と一緒にメンバーへ配布される。
+    #[serde(default, rename = "dns_record", skip_serializing_if = "Vec::is_empty")]
+    pub dns_records: Vec<crate::dns::DnsRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +146,18 @@ impl Config {
                 ));
             }
         }
+        let mut seen_records = std::collections::HashSet::new();
+        for record in &self.dns_records {
+            if !crate::names::is_dns_label(&record.name) {
+                return invalid(format!(
+                    "dns_record \"{}\" が不正です(小文字英数とハイフンのみ、63 文字以内)",
+                    record.name
+                ));
+            }
+            if !seen_records.insert(record.name.as_str()) {
+                return invalid(format!("dns_record \"{}\" が重複しています", record.name));
+            }
+        }
         Ok(())
     }
 }
@@ -249,6 +265,33 @@ typo_field = 1
         let mut config = parse(MEMBER_TOML);
         config.peers.push(config.peers[0].clone());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dns_records_parse_and_validate() {
+        let config = parse(
+            r#"
+[interface]
+private_key_file = "host.key"
+address = "10.100.42.1/24"
+
+[[dns_record]]
+name = "nas"
+ip = "10.100.42.50"
+"#,
+        );
+        config.validate().unwrap();
+        assert_eq!(config.dns_records.len(), 1);
+        assert_eq!(config.dns_records[0].name, "nas");
+        assert_eq!(config.dns_records[0].ip.to_string(), "10.100.42.50");
+
+        // 不正ラベル・重複は弾く
+        let mut bad = config.clone();
+        bad.dns_records[0].name = "Bad Label".to_string();
+        assert!(bad.validate().is_err());
+        let mut dup = config.clone();
+        dup.dns_records.push(dup.dns_records[0].clone());
+        assert!(dup.validate().is_err());
     }
 
     #[test]

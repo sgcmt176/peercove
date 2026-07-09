@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use peercove_core::dns::DnsRecord;
 use peercove_core::proto::{ControlMessage, LedgerEntry, CONTROL_PORT, PROTO_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,6 +34,14 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 接続中メンバー(仮想 IP → 送信キュー)。削除通知(M1-G3)で使う。
 pub type Connections = Arc<Mutex<HashMap<Ipv4Addr, mpsc::UnboundedSender<ControlMessage>>>>;
+
+/// ホストが配布する内容一式(台帳 + カスタム DNS レコード — M3-1)。
+/// watch チャネルでまとめて流し、どちらかが変わったら再配布される。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Distribution {
+    pub members: Vec<LedgerEntry>,
+    pub dns_records: Vec<DnsRecord>,
+}
 
 /// 相手の仮想 IP → 直近の RTT(ミリ秒、M2-G5)。切断時にエントリを消す。
 pub type RttMap = Arc<Mutex<HashMap<Ipv4Addr, f64>>>;
@@ -133,7 +142,7 @@ fn handle_ping_pong(
 /// ホスト側サーバー。台帳の変更を watch チャネルで受け取り、全接続へ配布する。
 pub async fn run_host_server(
     bind_ip: Ipv4Addr,
-    ledger_rx: watch::Receiver<Vec<LedgerEntry>>,
+    ledger_rx: watch::Receiver<Distribution>,
     connections: Connections,
     rtt: RttMap,
 ) {
@@ -188,7 +197,7 @@ pub async fn run_host_server(
 async fn handle_member(
     stream: TcpStream,
     member_ip: Ipv4Addr,
-    mut ledger_rx: watch::Receiver<Vec<LedgerEntry>>,
+    mut ledger_rx: watch::Receiver<Distribution>,
     connections: &Connections,
     rtt: &RttMap,
 ) -> anyhow::Result<()> {
@@ -259,18 +268,17 @@ async fn handle_member(
 /// 書き側。分岐はすべてキャンセル安全なものだけにすること。
 async fn host_writer(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
-    initial_ledger: Vec<LedgerEntry>,
-    mut ledger_rx: watch::Receiver<Vec<LedgerEntry>>,
+    initial: Distribution,
+    mut ledger_rx: watch::Receiver<Distribution>,
     mut rx: mpsc::UnboundedReceiver<ControlMessage>,
     ping: SharedPing,
 ) -> anyhow::Result<()> {
+    let ledger_message = |dist: Distribution| ControlMessage::Ledger {
+        members: dist.members,
+        dns_records: dist.dns_records,
+    };
     write_half
-        .write_all(
-            encode_line(&ControlMessage::Ledger {
-                members: initial_ledger,
-            })
-            .as_bytes(),
-        )
+        .write_all(encode_line(&ledger_message(initial)).as_bytes())
         .await?;
 
     let mut ping_tick = tokio::time::interval(PING_INTERVAL);
@@ -282,7 +290,7 @@ async fn host_writer(
                 }
                 let snapshot = ledger_rx.borrow_and_update().clone();
                 write_half
-                    .write_all(encode_line(&ControlMessage::Ledger { members: snapshot }).as_bytes())
+                    .write_all(encode_line(&ledger_message(snapshot)).as_bytes())
                     .await?;
             }
             queued = rx.recv() => {
@@ -340,7 +348,7 @@ async fn host_reader(
 pub async fn run_member_client(
     host_ip: Ipv4Addr,
     display_name: Option<String>,
-    latest_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>>,
+    latest_ledger: Arc<Mutex<Option<Distribution>>>,
     rtt: RttMap,
     removed: Arc<AtomicBool>,
 ) {
@@ -384,7 +392,7 @@ pub async fn run_member_client(
 async fn member_session(
     stream: TcpStream,
     display_name: &Option<String>,
-    latest_ledger: &Arc<Mutex<Option<Vec<LedgerEntry>>>>,
+    latest_ledger: &Arc<Mutex<Option<Distribution>>>,
     host_ip: Ipv4Addr,
     rtt: &RttMap,
     removed: &Arc<AtomicBool>,
@@ -449,7 +457,7 @@ async fn member_reader(
     out: Outbox,
     ping: SharedPing,
     rtt: RttMap,
-    latest_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>>,
+    latest_ledger: Arc<Mutex<Option<Distribution>>>,
     removed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
@@ -459,9 +467,19 @@ async fn member_reader(
         }
         match serde_json::from_str::<ControlMessage>(&line) {
             Ok(message) if handle_ping_pong(&message, host_ip, &out, &ping, &rtt) => {}
-            Ok(ControlMessage::Ledger { members }) => {
-                tracing::info!("台帳を受信しました({} 名)", members.len());
-                *latest_ledger.lock().unwrap() = Some(members);
+            Ok(ControlMessage::Ledger {
+                members,
+                dns_records,
+            }) => {
+                tracing::info!(
+                    "台帳を受信しました({} 名、DNS レコード {} 件)",
+                    members.len(),
+                    dns_records.len()
+                );
+                *latest_ledger.lock().unwrap() = Some(Distribution {
+                    members,
+                    dns_records,
+                });
             }
             Ok(ControlMessage::Removed { message }) => {
                 tracing::warn!("ホストから削除されました: {message}");
@@ -499,7 +517,10 @@ mod tests {
         // サーバー本体ではなく handle_member を直接テストする
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ledger_tx, ledger_rx) = watch::channel(vec![entry("alice", "100.100.42.2", true)]);
+        let (ledger_tx, ledger_rx) = watch::channel(Distribution {
+            members: vec![entry("alice", "100.100.42.2", true)],
+            dns_records: vec![],
+        });
         let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
         let host_rtt: RttMap = Default::default();
 
@@ -514,7 +535,7 @@ mod tests {
             let _ = handle_member(stream, ip, ledger_rx, &server_connections, &server_rtt).await;
         });
 
-        let latest: Arc<Mutex<Option<Vec<LedgerEntry>>>> = Arc::new(Mutex::new(None));
+        let latest: Arc<Mutex<Option<Distribution>>> = Arc::new(Mutex::new(None));
         let client_latest = Arc::clone(&latest);
         let member_rtt: RttMap = Default::default();
         let client_rtt = Arc::clone(&member_rtt);
@@ -533,21 +554,29 @@ mod tests {
         });
 
         // 初回スナップショットを受信
-        wait_for(&latest, |l| l.as_ref().map(|m| m.len()) == Some(1)).await;
+        wait_for(&latest, |l| l.as_ref().map(|d| d.members.len()) == Some(1)).await;
 
-        // 台帳の変更が配布される
+        // 台帳 + DNS レコードの変更が配布される
         ledger_tx
-            .send(vec![
-                entry("alice", "100.100.42.2", true),
-                entry("bob", "100.100.42.3", false),
-            ])
+            .send(Distribution {
+                members: vec![
+                    entry("alice", "100.100.42.2", true),
+                    entry("bob", "100.100.42.3", false),
+                ],
+                dns_records: vec![DnsRecord {
+                    name: "nas".to_string(),
+                    ip: "100.100.42.50".parse().unwrap(),
+                }],
+            })
             .unwrap();
-        wait_for(&latest, |l| l.as_ref().map(|m| m.len()) == Some(2)).await;
+        wait_for(&latest, |l| l.as_ref().map(|d| d.members.len()) == Some(2)).await;
         {
             let ledger = latest.lock().unwrap();
-            let members = ledger.as_ref().unwrap();
-            assert_eq!(members[1].name.as_deref(), Some("bob"));
-            assert!(!members[1].online);
+            let dist = ledger.as_ref().unwrap();
+            assert_eq!(dist.members[1].name.as_deref(), Some("bob"));
+            assert!(!dist.members[1].online);
+            assert_eq!(dist.dns_records.len(), 1, "DNS レコードも一緒に届く");
+            assert_eq!(dist.dns_records[0].name, "nas");
         }
 
         // 接続レジストリに登録されている(削除通知の配送口)
@@ -570,7 +599,7 @@ mod tests {
     async fn removed_notification_ends_session() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (_ledger_tx, ledger_rx) = watch::channel(vec![]);
+        let (_ledger_tx, ledger_rx) = watch::channel(Distribution::default());
         let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
 
         let server_connections = Arc::clone(&connections);
@@ -584,7 +613,7 @@ mod tests {
             handle_member(stream, ip, ledger_rx, &server_connections, &server_rtt).await
         });
 
-        let latest: Arc<Mutex<Option<Vec<LedgerEntry>>>> = Arc::new(Mutex::new(None));
+        let latest: Arc<Mutex<Option<Distribution>>> = Arc::new(Mutex::new(None));
         let client_latest = Arc::clone(&latest);
         let client_rtt: RttMap = Default::default();
         let client_removed = Arc::new(AtomicBool::new(false));

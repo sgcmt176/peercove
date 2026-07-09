@@ -1,0 +1,309 @@
+//! 内蔵 DNS リゾルバ(ADR-0011 §3、M3-1)。
+//!
+//! `*.peercove.internal` の A レコードだけを返す最小の UDP DNS サーバ。
+//! 情報源は全ネットワークのゾーンを合算した共有テーブル([`SharedZones`])で、
+//! supervisor が台帳の更新に合わせて書き換える。
+//!
+//! 方針(ADR-0011):
+//! - A クエリ: ゾーンにあれば応答(TTL 30 秒)、無ければ NXDOMAIN
+//! - A 以外のタイプ: 名前があれば NOERROR/NODATA、無ければ NXDOMAIN
+//! - 再帰なし(RA=0)。スプリット DNS でこのサフィックスしか来ない前提
+//! - hickory 等の crate は使わず自前(質問 1 問のパースと応答組み立てだけ)
+
+// M3-1b(デーモン統合: トンネル IP の :53 で待受け + OS 設定)で配線される。
+// それまで本体からは未使用なので dead_code を許す(テストは動いている)
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, RwLock};
+
+use tokio::net::UdpSocket;
+
+use peercove_core::dns::DNS_TTL_SECS;
+
+/// FQDN(小文字、末尾ドットなし)→ IPv4 の共有テーブル。
+pub type SharedZones = Arc<RwLock<HashMap<String, Ipv4Addr>>>;
+
+/// クエリ 1 個の最大サイズ(RFC 1035 の UDP メッセージ上限)。
+const MAX_PACKET: usize = 512;
+
+// DNS RCODE
+const RCODE_NOERROR: u8 = 0;
+const RCODE_FORMERR: u8 = 1;
+const RCODE_NXDOMAIN: u8 = 3;
+const RCODE_NOTIMP: u8 = 4;
+
+const TYPE_A: u16 = 1;
+const CLASS_IN: u16 = 1;
+
+/// 受信ループ。ソケットは呼び出し側が bind する(テストはエフェメラルポート、
+/// 本番はトンネル IP の :53 — M3-1b)。
+pub async fn serve(socket: UdpSocket, zones: SharedZones) {
+    let mut buf = [0u8; MAX_PACKET];
+    loop {
+        let (len, from) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            Err(e) => {
+                tracing::debug!("DNS 受信エラー: {e}");
+                continue;
+            }
+        };
+        let response = {
+            let zones = zones.read().unwrap();
+            respond(&buf[..len], &zones)
+        };
+        if let Some(response) = response {
+            if let Err(e) = socket.send_to(&response, from).await {
+                tracing::debug!("DNS 応答の送信に失敗: {e}");
+            }
+        }
+    }
+}
+
+/// 1 クエリに対する応答バイト列を組み立てる(純関数 — テストの主対象)。
+/// ヘッダすら読めないパケットは `None`(黙って捨てる)。
+pub fn respond(query: &[u8], zones: &HashMap<String, Ipv4Addr>) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    let id = [query[0], query[1]];
+    let flags1 = query[2];
+    if flags1 & 0x80 != 0 {
+        return None; // QR=1(応答)には応答しない(ループ防止)
+    }
+    let opcode = (flags1 >> 3) & 0x0F;
+    let rd = flags1 & 0x01;
+    let qdcount = u16::from_be_bytes([query[4], query[5]]);
+
+    // 応答ヘッダの共通部。QR=1, opcode 引き継ぎ, AA=1, RD 引き継ぎ, RA=0
+    let header = |rcode: u8, ancount: u16, echo_question: bool| -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(&id);
+        out.push(0x80 | (opcode << 3) | 0x04 | rd); // QR|opcode|AA|RD
+        out.push(rcode);
+        out.extend_from_slice(&(u16::from(echo_question)).to_be_bytes()); // QDCOUNT
+        out.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT
+        out.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT, ARCOUNT
+        out
+    };
+
+    if opcode != 0 {
+        return Some(header(RCODE_NOTIMP, 0, false));
+    }
+    if qdcount != 1 {
+        return Some(header(RCODE_FORMERR, 0, false));
+    }
+
+    // 質問セクション(QNAME + QTYPE + QCLASS)をパース
+    let Some((name, qtype, qclass, question_end)) = parse_question(query) else {
+        return Some(header(RCODE_FORMERR, 0, false));
+    };
+    let question = &query[12..question_end];
+
+    let known_ip = zones.get(&name).copied();
+    let answer_ip = match known_ip {
+        Some(ip) if qtype == TYPE_A && qclass == CLASS_IN => Some(ip),
+        Some(_) => None, // 名前はある = NOERROR/NODATA
+        None => {
+            let mut out = header(RCODE_NXDOMAIN, 0, true);
+            out.extend_from_slice(question);
+            return Some(out);
+        }
+    };
+
+    let mut out = header(RCODE_NOERROR, u16::from(answer_ip.is_some()), true);
+    out.extend_from_slice(question);
+    if let Some(ip) = answer_ip {
+        out.extend_from_slice(&[0xC0, 0x0C]); // 質問の名前への圧縮ポインタ
+        out.extend_from_slice(&TYPE_A.to_be_bytes());
+        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+        out.extend_from_slice(&DNS_TTL_SECS.to_be_bytes());
+        out.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+        out.extend_from_slice(&ip.octets());
+    }
+    Some(out)
+}
+
+/// 質問セクションをパースして (小文字 FQDN, QTYPE, QCLASS, 終端オフセット) を返す。
+/// 圧縮ポインタは質問には現れない前提(RFC 上も慣習上も生のラベル列)。
+fn parse_question(query: &[u8]) -> Option<(String, u16, u16, usize)> {
+    let mut pos = 12;
+    let mut name = String::new();
+    loop {
+        let len = *query.get(pos)? as usize;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if len > 63 || pos + len > query.len() {
+            return None;
+        }
+        if !name.is_empty() {
+            name.push('.');
+        }
+        for &b in &query[pos..pos + len] {
+            name.push(b.to_ascii_lowercase() as char);
+        }
+        pos += len;
+        if name.len() > 253 {
+            return None;
+        }
+    }
+    let qtype = u16::from_be_bytes([*query.get(pos)?, *query.get(pos + 1)?]);
+    let qclass = u16::from_be_bytes([*query.get(pos + 2)?, *query.get(pos + 3)?]);
+    Some((name, qtype, qclass, pos + 4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// テスト用のクエリを組み立てる。
+    fn build_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&[0x01, 0x00]); // RD=1
+        out.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]); // QDCOUNT=1
+        for label in name.split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out.extend_from_slice(&qtype.to_be_bytes());
+        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+        out
+    }
+
+    fn zones() -> HashMap<String, Ipv4Addr> {
+        let mut map = HashMap::new();
+        map.insert(
+            "alice.home.peercove.internal".to_string(),
+            "10.68.1.2".parse().unwrap(),
+        );
+        map
+    }
+
+    fn rcode(response: &[u8]) -> u8 {
+        response[3] & 0x0F
+    }
+
+    fn ancount(response: &[u8]) -> u16 {
+        u16::from_be_bytes([response[6], response[7]])
+    }
+
+    #[test]
+    fn answers_known_a_query_case_insensitively() {
+        let query = build_query(0x1234, "Alice.HOME.peercove.internal", TYPE_A);
+        let response = respond(&query, &zones()).unwrap();
+
+        assert_eq!(&response[0..2], &[0x12, 0x34], "ID を引き継ぐ");
+        assert_eq!(response[2] & 0x80, 0x80, "QR=1");
+        assert_eq!(rcode(&response), RCODE_NOERROR);
+        assert_eq!(ancount(&response), 1);
+        // 末尾 4 バイトが A レコードの IP
+        assert_eq!(&response[response.len() - 4..], &[10, 68, 1, 2]);
+        // TTL(RDATA の 6 バイト前から 4 バイト)
+        let ttl_at = response.len() - 10;
+        assert_eq!(
+            u32::from_be_bytes(response[ttl_at..ttl_at + 4].try_into().unwrap()),
+            DNS_TTL_SECS
+        );
+    }
+
+    #[test]
+    fn unknown_name_is_nxdomain() {
+        let query = build_query(1, "nobody.home.peercove.internal", TYPE_A);
+        let response = respond(&query, &zones()).unwrap();
+        assert_eq!(rcode(&response), RCODE_NXDOMAIN);
+        assert_eq!(ancount(&response), 0);
+    }
+
+    #[test]
+    fn known_name_with_other_type_is_nodata() {
+        let aaaa = 28;
+        let query = build_query(1, "alice.home.peercove.internal", aaaa);
+        let response = respond(&query, &zones()).unwrap();
+        assert_eq!(
+            rcode(&response),
+            RCODE_NOERROR,
+            "名前はあるので NXDOMAIN ではない"
+        );
+        assert_eq!(ancount(&response), 0, "答えは無い(NODATA)");
+    }
+
+    #[test]
+    fn rejects_garbage_and_non_queries() {
+        assert!(respond(&[0; 4], &zones()).is_none(), "ヘッダ未満は捨てる");
+
+        // QR=1(応答パケット)には応答しない
+        let mut echo = build_query(1, "alice.home.peercove.internal", TYPE_A);
+        echo[2] |= 0x80;
+        assert!(respond(&echo, &zones()).is_none());
+
+        // 質問が壊れている(ラベル長がパケットを超える)→ FORMERR
+        let mut broken = build_query(1, "alice.home.peercove.internal", TYPE_A);
+        broken.truncate(14);
+        broken[12] = 63;
+        let response = respond(&broken, &zones()).unwrap();
+        assert_eq!(rcode(&response), RCODE_FORMERR);
+
+        // opcode != QUERY → NOTIMP
+        let mut status = build_query(1, "alice.home.peercove.internal", TYPE_A);
+        status[2] = 0x10; // opcode=2 (STATUS)
+        let response = respond(&status, &zones()).unwrap();
+        assert_eq!(rcode(&response), RCODE_NOTIMP);
+    }
+
+    /// UDP で実際に往復する(エフェメラルポート = 特権不要)。
+    #[tokio::test]
+    async fn serves_over_udp() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let zones: SharedZones = Arc::new(RwLock::new(zones()));
+        let server = tokio::spawn(serve(server_socket, Arc::clone(&zones)));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(
+                &build_query(7, "alice.home.peercove.internal", TYPE_A),
+                server_addr,
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; MAX_PACKET];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = &buf[..len];
+        assert_eq!(rcode(response), RCODE_NOERROR);
+        assert_eq!(&response[len - 4..], &[10, 68, 1, 2]);
+
+        // ゾーンの動的更新が次のクエリに反映される
+        zones.write().unwrap().insert(
+            "bob.home.peercove.internal".to_string(),
+            "10.68.1.3".parse().unwrap(),
+        );
+        client
+            .send_to(
+                &build_query(8, "bob.home.peercove.internal", TYPE_A),
+                server_addr,
+            )
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buf[len - 4..len], &[10, 68, 1, 3]);
+
+        server.abort();
+    }
+}
