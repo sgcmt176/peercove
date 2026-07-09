@@ -231,8 +231,6 @@ pub struct Snapshot {
     /// host は自前構築した台帳、member は受信済みの台帳(未受信なら None)。
     pub ledger: Option<Vec<LedgerEntry>>,
     /// カスタム DNS レコード(M3-1)。host は自分の設定、member は受信したもの。
-    /// M3-1b(DNS サーバのゾーン構築)で読まれるまで未参照
-    #[allow(dead_code)]
     pub dns_records: Vec<peercove_core::dns::DnsRecord>,
     /// 相手の仮想 IP → コントロールチャネルで測った RTT(ミリ秒、M2-G5)。
     pub rtt_ms: HashMap<std::net::Ipv4Addr, f64>,

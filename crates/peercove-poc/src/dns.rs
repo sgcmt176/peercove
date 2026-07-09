@@ -10,17 +10,14 @@
 //! - 再帰なし(RA=0)。スプリット DNS でこのサフィックスしか来ない前提
 //! - hickory 等の crate は使わず自前(質問 1 問のパースと応答組み立てだけ)
 
-// M3-1b(デーモン統合: トンネル IP の :53 で待受け + OS 設定)で配線される。
-// それまで本体からは未使用なので dead_code を許す(テストは動いている)
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 
 use tokio::net::UdpSocket;
 
-use peercove_core::dns::DNS_TTL_SECS;
+use peercove_core::dns::{zone_for, DnsRecord, DNS_TTL_SECS};
+use peercove_core::proto::LedgerEntry;
 
 /// FQDN(小文字、末尾ドットなし)→ IPv4 の共有テーブル。
 pub type SharedZones = Arc<RwLock<HashMap<String, Ipv4Addr>>>;
@@ -37,8 +34,57 @@ const RCODE_NOTIMP: u8 = 4;
 const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
 
+/// 全ネットワークのゾーンを 1 つの表に合算する(fqdn → IP)。
+///
+/// 同名ネットワークが複数あると fqdn が衝突しうる(後勝ち)。M3-0a の join が
+/// ディレクトリを分けても network_name までは変えないため起こりうるが、
+/// 名前解決が片方に寄るだけで通信は壊れない(debug ログに残す)。
+pub fn merge_zones(
+    networks: &[(String, Vec<LedgerEntry>, Vec<DnsRecord>)],
+) -> HashMap<String, Ipv4Addr> {
+    let mut merged = HashMap::new();
+    for (network, ledger, custom) in networks {
+        for entry in zone_for(network, ledger, custom) {
+            if let Some(old) = merged.insert(entry.fqdn.clone(), entry.ip) {
+                if old != entry.ip {
+                    tracing::debug!(
+                        "DNS 名 {} が複数ネットワークで衝突しています({old} → {})",
+                        entry.fqdn,
+                        entry.ip
+                    );
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// トンネル用の待受け(デーモンがトンネルごとに 1 タスク起動する — M3-1b)。
+///
+/// トンネル作成直後は Windows がアドレスを数秒「準備中」として扱い bind に
+/// 失敗するため、成功するまでリトライする(control.rs と同じパターン)。
+/// 53 番が他ソフトに取られている場合もここでリトライし続けるだけで、
+/// トンネル自体には影響しない(最初の失敗だけ警告する)。
+pub async fn run_for_tunnel(bind_ip: Ipv4Addr, zones: SharedZones) {
+    let mut logged = false;
+    let socket = loop {
+        match UdpSocket::bind((bind_ip, 53)).await {
+            Ok(socket) => break socket,
+            Err(e) => {
+                if !logged {
+                    tracing::info!("内蔵 DNS の待受け待ち({bind_ip}:53): {e}");
+                    logged = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    };
+    tracing::info!("内蔵 DNS を {bind_ip}:53 で待受けます");
+    serve(socket, zones).await;
+}
+
 /// 受信ループ。ソケットは呼び出し側が bind する(テストはエフェメラルポート、
-/// 本番はトンネル IP の :53 — M3-1b)。
+/// 本番はトンネル IP の :53)。
 pub async fn serve(socket: UdpSocket, zones: SharedZones) {
     let mut buf = [0u8; MAX_PACKET];
     loop {
@@ -190,6 +236,48 @@ mod tests {
 
     fn ancount(response: &[u8]) -> u16 {
         u16::from_be_bytes([response[6], response[7]])
+    }
+
+    #[test]
+    fn merge_zones_combines_networks() {
+        use peercove_core::keys::PrivateKey;
+        let entry = |name: &str, ip: &str| LedgerEntry {
+            name: Some(name.to_string()),
+            ip: ip.parse().unwrap(),
+            public_key: PrivateKey::generate().public_key(),
+            online: true,
+            is_host: false,
+        };
+        let networks = vec![
+            (
+                "game".to_string(),
+                vec![entry("alice", "10.1.0.2")],
+                vec![DnsRecord {
+                    name: "nas".to_string(),
+                    ip: "10.1.0.50".parse().unwrap(),
+                }],
+            ),
+            (
+                "family".to_string(),
+                vec![entry("alice", "10.2.0.2")],
+                vec![],
+            ),
+        ];
+        let merged = merge_zones(&networks);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged["alice.game.peercove.internal"].to_string(),
+            "10.1.0.2"
+        );
+        assert_eq!(
+            merged["alice.family.peercove.internal"].to_string(),
+            "10.2.0.2",
+            "同じ表示名でもネットワーク階層で分離される"
+        );
+        assert_eq!(
+            merged["nas.game.peercove.internal"].to_string(),
+            "10.1.0.50"
+        );
     }
 
     #[test]

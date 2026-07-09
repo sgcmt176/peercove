@@ -3,6 +3,7 @@ mod commands;
 mod control;
 mod daemon;
 mod dns;
+mod dnscfg;
 mod logbuf;
 mod service;
 mod upnp;

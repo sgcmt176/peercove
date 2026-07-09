@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context};
+use peercove_core::dns::DnsRecord;
 use peercove_core::ipc::{
     DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult, PeerSummary,
     TunnelInfo, TunnelRole, IPC_VERSION,
@@ -35,6 +36,12 @@ pub struct DaemonShared {
     active: tokio::sync::Mutex<HashMap<PathBuf, Active>>,
     bring_up: BringUp,
     shutdown_tx: watch::Sender<bool>,
+    /// 全ネットワーク合算の DNS ゾーン(M3-1)。トンネルごとの DNS サーバが参照し、
+    /// [`Self::refresh_zones`] が台帳の更新に合わせて書き換える。
+    zones: crate::dns::SharedZones,
+    /// OS のスプリット DNS 設定(NRPT / resolvectl)を触るか。
+    /// serve()(実デーモン)だけ true。テストでは OS を触らない
+    manage_os_dns: bool,
 }
 
 struct Active {
@@ -47,17 +54,21 @@ struct Active {
     if_name: String,
     stop_tx: watch::Sender<bool>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// 内蔵 DNS サーバ(トンネル IP の :53、M3-1)。停止時に abort する
+    dns_task: tokio::task::JoinHandle<()>,
     snapshot: SharedSnapshot,
 }
 
 impl DaemonShared {
-    fn new(bring_up: BringUp) -> (Arc<Self>, watch::Receiver<bool>) {
+    fn new(bring_up: BringUp, manage_os_dns: bool) -> (Arc<Self>, watch::Receiver<bool>) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         (
             Arc::new(Self {
                 active: tokio::sync::Mutex::new(HashMap::new()),
                 bring_up,
                 shutdown_tx,
+                zones: Default::default(),
+                manage_os_dns,
             }),
             shutdown_rx,
         )
@@ -129,6 +140,15 @@ impl DaemonShared {
         let subnet = tunnel.spec.address.trunc();
         let network = tunnel.network.clone();
         let if_name = tunnel.if_name.clone();
+        // 内蔵 DNS(M3-1): トンネル IP の :53 で待受け(準備でき次第 bind)
+        let dns_task = tokio::spawn(crate::dns::run_for_tunnel(address, Arc::clone(&self.zones)));
+        // Linux のスプリット DNS は per-link 設定(リンク消滅で自動解除)
+        if self.manage_os_dns {
+            let link = if_name.clone();
+            tokio::task::spawn_blocking(move || crate::dnscfg::register_link(&link, address))
+                .await
+                .ok();
+        }
         let (stop_tx, stop_rx) = watch::channel(false);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let task_snapshot = Arc::clone(&snapshot);
@@ -157,10 +177,59 @@ impl DaemonShared {
                 if_name,
                 stop_tx,
                 task,
+                dns_task,
                 snapshot,
             },
         );
+        drop(active);
+        self.sync_os_dns().await;
         Ok(())
+    }
+
+    /// OS のスプリット DNS 設定を現在の稼働トンネル一覧に同期する
+    /// (Windows の NRPT。Linux は per-link 設定なのでここでは何もしない)。
+    async fn sync_os_dns(&self) {
+        if !self.manage_os_dns {
+            return;
+        }
+        let mut servers: Vec<Ipv4Addr> = self
+            .active
+            .lock()
+            .await
+            .values()
+            .map(|a| a.address)
+            .collect();
+        servers.sort_unstable();
+        tokio::task::spawn_blocking(move || crate::dnscfg::apply_servers(&servers))
+            .await
+            .ok();
+    }
+
+    /// 全ネットワーク合算の DNS ゾーンを最新の台帳から作り直す(5 秒周期)。
+    async fn refresh_zones(&self) {
+        let data: Vec<(
+            String,
+            Vec<peercove_core::proto::LedgerEntry>,
+            Vec<DnsRecord>,
+        )> = {
+            let active = self.active.lock().await;
+            active
+                .values()
+                .map(|a| {
+                    let snapshot = a.snapshot.lock().unwrap();
+                    match snapshot.as_ref() {
+                        Some(s) => (
+                            a.network.clone(),
+                            s.ledger.clone().unwrap_or_default(),
+                            s.dns_records.clone(),
+                        ),
+                        None => (a.network.clone(), Vec::new(), Vec::new()),
+                    }
+                })
+                .collect()
+        };
+        let merged = crate::dns::merge_zones(&data);
+        *self.zones.write().unwrap() = merged;
     }
 
     /// `config` 指定でそのトンネルを、省略時は「1 本だけ稼働中」の場合に
@@ -196,12 +265,16 @@ impl DaemonShared {
             }
         };
         let network = active.network.clone();
+        active.dns_task.abort();
         let _ = active.stop_tx.send(true);
-        active
+        let stopped = active
             .task
             .await
-            .context("トンネルタスクの終了待ちに失敗しました")?
-            .context("トンネルの停止処理でエラーが発生しました")?;
+            .context("トンネルタスクの終了待ちに失敗しました")
+            .and_then(|r| r.context("トンネルの停止処理でエラーが発生しました"));
+        // DNS 側の後片付け(NRPT の同期)は停止の成否に関わらず行う
+        self.sync_os_dns().await;
+        stopped?;
         tracing::info!("トンネルを停止しました(network={network})");
         Ok(())
     }
@@ -211,6 +284,7 @@ impl DaemonShared {
         let all: Vec<Active> = self.active.lock().await.drain().map(|(_, a)| a).collect();
         for active in all {
             let network = active.network.clone();
+            active.dns_task.abort();
             let _ = active.stop_tx.send(true);
             match active.task.await {
                 Ok(Ok(())) => tracing::info!("トンネルを停止しました(network={network})"),
@@ -220,6 +294,7 @@ impl DaemonShared {
                 Err(e) => tracing::warn!("トンネルタスクの終了待ちに失敗: {e:#}"),
             }
         }
+        self.sync_os_dns().await;
     }
 
     async fn status(&self) -> DaemonStatus {
@@ -346,10 +421,23 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
         .enable_all()
         .build()
         .context("非同期ランタイムの初期化に失敗しました")?;
-    let (shared, shutdown_rx) = DaemonShared::new(Box::new(tunnel::bring_up));
+    let (shared, shutdown_rx) = DaemonShared::new(Box::new(tunnel::bring_up), true);
     // 「開始しました」は待受け開始後(accept_loop 内)に表示する。
     // 先に出すと、パイプ/ソケットの作成に失敗したときに紛らわしいため
     runtime.block_on(async {
+        // 前回異常終了の NRPT 残骸を掃除する(Linux は per-link なので残骸なし)
+        shared.sync_os_dns().await;
+        // DNS ゾーンを台帳の更新(5 秒周期)に合わせて作り直すループ(M3-1)
+        let zone_refresher = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    shared.refresh_zones().await;
+                }
+            }
+        });
         let stop_request = async {
             match external_stop {
                 Some(rx) => {
@@ -361,13 +449,15 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
                     .context("シグナル待機に失敗しました"),
             }
         };
-        tokio::select! {
+        let result = tokio::select! {
             result = accept_loop(Arc::clone(&shared)) => result,
             result = stop_request => result,
             _ = wait_shutdown(shutdown_rx) => Ok(()),
-        }
+        };
+        zone_refresher.abort();
+        result
     })?;
-    // 常駐終了時にトンネルが残っていれば必ず片付ける
+    // 常駐終了時にトンネルが残っていれば必ず片付ける(NRPT の掃除も stop_all 内)
     runtime.block_on(async {
         shared.stop_all().await;
     });
@@ -632,29 +722,33 @@ mod tests {
     use peercove_ipc::request_over;
 
     fn test_shared() -> (Arc<DaemonShared>, watch::Receiver<bool>) {
-        DaemonShared::new(Box::new(|config, role, _upnp, _limits| {
-            // 実トンネルの代わりにモックを起動する。複数トンネルのテストが
-            // できるよう、アドレスは設定パスから機械的に変える
-            let octet = (config
-                .to_string_lossy()
-                .bytes()
-                .fold(0u32, |acc, b| acc.wrapping_add(b as u32))
-                % 200
-                + 1) as u8;
-            let spec = TunnelSpec {
-                private_key: PrivateKey::generate(),
-                address: format!("10.99.{octet}.1/24").parse().unwrap(),
-                listen_port: Some(51820),
-                mtu: 1420,
-                forwarding: role == Role::Host,
-                peers: Vec::new(),
-            };
-            Ok(ActiveTunnel::new_for_test(
-                spec,
-                role,
-                Box::new(MockBackend::default()),
-            ))
-        }))
+        // manage_os_dns = false: テストで NRPT / resolvectl を触らない
+        DaemonShared::new(
+            Box::new(|config, role, _upnp, _limits| {
+                // 実トンネルの代わりにモックを起動する。複数トンネルのテストが
+                // できるよう、アドレスは設定パスから機械的に変える
+                let octet = (config
+                    .to_string_lossy()
+                    .bytes()
+                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32))
+                    % 200
+                    + 1) as u8;
+                let spec = TunnelSpec {
+                    private_key: PrivateKey::generate(),
+                    address: format!("10.99.{octet}.1/24").parse().unwrap(),
+                    listen_port: Some(51820),
+                    mtu: 1420,
+                    forwarding: role == Role::Host,
+                    peers: Vec::new(),
+                };
+                Ok(ActiveTunnel::new_for_test(
+                    spec,
+                    role,
+                    Box::new(MockBackend::default()),
+                ))
+            }),
+            false,
+        )
     }
 
     /// duplex ストリーム越しに start → status → stop → shutdown の一連を流す。
@@ -871,21 +965,24 @@ mod tests {
     async fn stop_tears_down_backend() {
         let ops: Arc<Mutex<Vec<String>>> = Default::default();
         let ops_for_factory = Arc::clone(&ops);
-        let (shared, _rx) = DaemonShared::new(Box::new(move |_config, role, _upnp, _limits| {
-            let spec = TunnelSpec {
-                private_key: PrivateKey::generate(),
-                address: "10.99.0.2/24".parse().unwrap(),
-                listen_port: None,
-                mtu: 1420,
-                forwarding: false,
-                peers: Vec::new(),
-            };
-            Ok(ActiveTunnel::new_for_test(
-                spec,
-                role,
-                Box::new(MockBackend::with_shared_ops(Arc::clone(&ops_for_factory))),
-            ))
-        }));
+        let (shared, _rx) = DaemonShared::new(
+            Box::new(move |_config, role, _upnp, _limits| {
+                let spec = TunnelSpec {
+                    private_key: PrivateKey::generate(),
+                    address: "10.99.0.2/24".parse().unwrap(),
+                    listen_port: None,
+                    mtu: 1420,
+                    forwarding: false,
+                    peers: Vec::new(),
+                };
+                Ok(ActiveTunnel::new_for_test(
+                    spec,
+                    role,
+                    Box::new(MockBackend::with_shared_ops(Arc::clone(&ops_for_factory))),
+                ))
+            }),
+            false,
+        );
         // Host ロールにする(Member は supervise 開始時に設定を読むため実ファイルが要る)
         shared
             .start(PathBuf::from("h.toml"), Role::Host, false)
