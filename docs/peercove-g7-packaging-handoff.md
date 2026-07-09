@@ -53,7 +53,9 @@
    「Session 0 の追加要件」参照)。Session 0 のサービスには許可ダイアログが
    出ないため、ルールを作らないと inbound UDP が黙って遮断される。
    - ルール名は **`PeerCove Daemon`**(`service.rs` の `FIREWALL_RULE` と同じ。
-     変えないこと)。対象 = インストールされたデーモン exe、protocol=UDP、dir=in
+     変えないこと)。対象 = インストールされたデーモン exe、dir=in、
+     **UDP と TCP の 2 本**(UDP = WG 待受、TCP = トンネル内コントロール
+     チャネル。TCP を忘れると「ping は通るのに台帳が来ない」になる)
    - 実現方法は要調査で 2 案: (a) WiX の FirewallExtension
      (`xmlns:fire` + `<fire:FirewallException>`。Tauri が WiX 拡張を
      渡せるかを確認)、(b) カスタムアクションで

@@ -191,30 +191,42 @@ mod windows_impl {
         Ok(())
     }
 
-    /// 受信許可ルールを追加する(このプログラム宛の UDP。待受ポートは設定で
-    /// 変わるためポート指定はしない)。再インストールで重複しないよう、
-    /// 同名ルールを消してから追加する。
+    /// 受信許可ルールを追加する(このプログラム宛の UDP と TCP のペア。
+    /// 対話プロセスなら初回 bind 時の許可ダイアログが作るのと同じ構成)。
+    ///
+    /// - UDP: WG の待受(既定 51820。設定で変わるためポート指定はしない)
+    /// - TCP: トンネル内コントロールチャネル(51821)。これが無いと
+    ///   ハンドシェイク・ping は通るのに**台帳だけ届かない**(PoC で発覚)
+    ///
+    /// 再インストールで重複しないよう、同名ルールを消してから追加する
+    /// (netsh の delete は同名ルールをまとめて消す)。
     fn add_firewall_rule(exe: &std::path::Path) {
         let _ = std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "delete", "rule"])
             .arg(format!("name={FIREWALL_RULE}"))
             .output();
-        let result = std::process::Command::new("netsh")
-            .args(["advfirewall", "firewall", "add", "rule"])
-            .arg(format!("name={FIREWALL_RULE}"))
-            .args(["dir=in", "action=allow", "protocol=UDP"])
-            .arg(format!("program={}", exe.display()))
-            .output();
-        match result {
-            Ok(output) if output.status.success() => {
-                println!("ファイアウォールの受信許可(UDP)を追加しました: {FIREWALL_RULE}");
+        let mut ok = true;
+        for protocol in ["UDP", "TCP"] {
+            let result = std::process::Command::new("netsh")
+                .args(["advfirewall", "firewall", "add", "rule"])
+                .arg(format!("name={FIREWALL_RULE}"))
+                .args(["dir=in", "action=allow"])
+                .arg(format!("protocol={protocol}"))
+                .arg(format!("program={}", exe.display()))
+                .output();
+            if !matches!(result, Ok(ref output) if output.status.success()) {
+                ok = false;
+                eprintln!(
+                    "警告: ファイアウォールルール({protocol})の追加に失敗しました。\
+                     手動で追加してください:\n  netsh advfirewall firewall add rule \
+                     name=\"{FIREWALL_RULE}\" dir=in action=allow protocol={protocol} \
+                     program=\"{}\"",
+                    exe.display()
+                );
             }
-            _ => eprintln!(
-                "警告: ファイアウォールルールの追加に失敗しました。メンバーからの接続が\
-                 通らない場合は手動で追加してください:\n  netsh advfirewall firewall add rule \
-                 name=\"{FIREWALL_RULE}\" dir=in action=allow protocol=UDP program=\"{}\"",
-                exe.display()
-            ),
+        }
+        if ok {
+            println!("ファイアウォールの受信許可(UDP/TCP)を追加しました: {FIREWALL_RULE}");
         }
     }
 

@@ -646,9 +646,10 @@ icacls "$env:APPDATA\app.peercove.desktop\*.psk" /grant "*S-1-5-18:F"
 #    (管理者ターミナルで)peercove-poc daemon shutdown
 
 # 4) サービス登録 + 起動(管理者 PowerShell)
-#    ファイアウォールの受信許可(UDP、この exe 宛)も一緒に追加されます。
+#    ファイアウォールの受信許可(この exe 宛の UDP + TCP)も一緒に追加されます。
 #    Session 0 のサービスには「許可しますか?」ダイアログが出ないため、
-#    ルールを作らないとハンドシェイクが黙って遮断されます
+#    UDP が無いとハンドシェイクが、TCP が無いと台帳配布(コントロール
+#    チャネル)が黙って遮断されます
 .\target\release\peercove-poc.exe daemon service-install
 ```
 
