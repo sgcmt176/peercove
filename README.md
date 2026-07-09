@@ -133,8 +133,14 @@ cargo build --release -p peercove-poc
 cd apps\peercove-ui
 npm install
 npm run tauri build
-#   → src-tauri\target\release\bundle\msi\PeerCove_0.1.0_x64_en-US.msi
+#   → src-tauri\target\release\bundle\msi\PeerCove_0.1.0_x64_ja-JP.msi
 ```
+
+インストーラは**日本語**です(`tauri.conf.json` の `wix.language = ja-JP`。
+標準ダイアログは WiX の ja-jp、独自文言は `windows/wix-ja-JP.wxl` で日本語化)。
+`bundle.targets` は `["msi", "deb"]` に絞ってあります(NSIS はサービス登録の
+WiX フラグメントが効かず、デーモンが登録されない壊れたインストーラになるため。
+ポータブル版は別途 `packaging/make-*.sh`)。
 
 MSI は UI 本体に加え、`peercove-poc.exe` / `wintun.dll` / `wintun-LICENSE.txt` を
 同梱し、インストール時に `daemon service-install`(サービス登録 + ファイア

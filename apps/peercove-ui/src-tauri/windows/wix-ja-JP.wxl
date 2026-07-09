@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI インストーラの日本語ローカライズ(M2-G7b)。
+
+  WiX 標準 UI(ようこそ / インストール先 / 進捗 / 完了、ボタン類)は
+  WixUIExtension の ja-jp カルチャで日本語になる(tauri.conf.json の
+  wix.language = ja-JP → light に -cultures:ja-jp;en-US が渡る)。
+
+  ここで上書きするのは Tauri 独自の文字列(default-locale-strings.xml で
+  既定は英語のもの)だけ。TauriLanguage / TauriCodepage は数値なので
+  Tauri の既定に任せる(ここで定義しない)。
+-->
+<WixLocalization Culture="ja-JP" xmlns="http://schemas.microsoft.com/wix/2006/localization">
+  <String Id="LaunchApp">PeerCove を起動</String>
+  <String Id="InstallAppFeature">PeerCove をインストールします。</String>
+  <String Id="PathEnvVarFeature">PeerCove の実行ファイルの場所を PATH 環境変数に追加します。どこからでも呼び出せるようになります。</String>
+  <String Id="DowngradeErrorMessage">より新しいバージョンの PeerCove が既にインストールされています。</String>
+</WixLocalization>
