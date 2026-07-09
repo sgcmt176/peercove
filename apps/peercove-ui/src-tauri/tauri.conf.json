@@ -42,6 +42,18 @@
           "WintunLicenseComponent"
         ]
       }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libayatana-appindicator3-1"],
+        "files": {
+          "/usr/bin/peercove-poc": "../../../target/release/peercove-poc",
+          "/usr/lib/systemd/system/peercove-daemon.service": "../../../packaging/systemd/peercove-daemon.service"
+        },
+        "preRemoveScript": "../../../packaging/deb/prerm.sh",
+        "postInstallScript": "../../../packaging/deb/postinst.sh",
+        "postRemoveScript": "../../../packaging/deb/postrm.sh"
+      }
     }
   }
 }

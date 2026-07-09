@@ -141,7 +141,22 @@ MSI は UI 本体に加え、`peercove-poc.exe` / `wintun.dll` / `wintun-LICENSE
 
 #### Ubuntu deb
 
-(下記「検証手順(M2-G7b: deb)」を参照。Linux 検証機でビルドします)
+**deb は Linux 上でしかビルドできません**(`dpkg-deb` が要る)。検証機で:
+
+```bash
+# 前提(トレイのビルド): sudo apt install libayatana-appindicator3-dev
+cargo build --release -p peercove-poc      # deb が /usr/bin/peercove-poc に入れる
+cd apps/peercove-ui
+npm install
+npm run tauri build
+#   → src-tauri/target/release/bundle/deb/PeerCove_0.1.0_amd64.deb
+```
+
+deb は UI 本体に加え、`peercove-poc` を `/usr/bin/` へ、systemd ユニットを
+`/usr/lib/systemd/system/peercove-daemon.service` へ入れ、postinst で
+`systemctl enable --now peercove-daemon`、prerm で `disable --now` します
+(`packaging/deb/*.sh`、`packaging/systemd/peercove-daemon.service`)。
+Linux は wintun 不要(カーネル WireGuard)なので DLL/ライセンスは同梱しません。
 
 ## 使い方
 
@@ -766,6 +781,27 @@ sudo ./target/release/peercove-poc daemon service-install
 > です(ADR-0010、`docs/peercove-g7b-msi-review-for-fable.md`)。失敗する場合は
 > インストールログ(`msiexec /i PeerCove_*.msi /l*v install.log`)を取得して
 > ください。
+
+## 検証手順(M2-G7b: Ubuntu deb インストーラ)
+
+準備: 上記「インストーラのビルド(Ubuntu deb)」で `.deb` を作る。
+
+1. `sudo apt install ./PeerCove_0.1.0_amd64.deb`(依存も解決される)
+2. `systemctl status peercove-daemon` が **active (running)**
+   (postinst が有効化 + 起動した)
+3. `which peercove-poc` が `/usr/bin/peercove-poc`、
+   `ls /usr/lib/systemd/system/peercove-daemon.service` が在ること
+4. アプリ一覧か `peer-cove`(UI)を起動 → ホスト/参加 → 疎通すること
+5. **OS 再起動** → `systemctl status peercove-daemon` が自動で running
+6. `sudo apt remove peercove`(パッケージ名は `dpkg -l | grep -i peercove` で確認)→
+   - `systemctl status peercove-daemon` が not-found(prerm が停止・無効化)
+   - `/usr/bin/peercove-poc` と unit ファイルが消えていること
+   - `ip link` に peercove0 が残っていないこと
+
+> **未検証の設計です**(Opus 実装)。Tauri の deb バンドラが生成する
+> maintainer script に `packaging/deb/*.sh` が正しく差し込まれるか(特に
+> postinst の重複や `$1` 引数の扱い)を実機で確認してください。失敗時は
+> `sudo dpkg -i ...` の出力と `journalctl -u peercove-daemon` を見てください。
 
 ## 検証手順(M2-G5/G6: 設定・ログ・RTT・トレイ常駐)
 
