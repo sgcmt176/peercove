@@ -1,0 +1,27 @@
+# PeerCove デーモンの systemd ユニット(M2-G7、ADR-0010)。
+#
+# 2 つの経路でインストールされる:
+# - deb パッケージ: このファイルをそのまま /usr/lib/systemd/system/ へ配置
+#   (ExecStart は /usr/bin/peercove-poc のまま)
+# - `peercove-poc daemon service-install`(上級者向け): ExecStart の
+#   バイナリパスを実行中の exe のパスに置換して /etc/systemd/system/ へ書く
+#
+# ログは journald へ(journalctl -u peercove-daemon)。UI のログビューは
+# デーモン内のリングバッファを IPC で読むので journald とは独立に動く。
+
+[Unit]
+Description=PeerCove daemon (P2P tunnel management)
+Documentation=https://github.com/peercove
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/peercove-poc daemon run
+Restart=on-failure
+RestartSec=5
+# トンネル操作(TUN 作成・ルーティング)に root が必要
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -247,8 +247,17 @@ pub use peercove_ipc::request;
 
 // ---- サーバー(OS 別トランスポート) ----
 
-/// `daemon run`: IPC サーバーを起動して常駐する。
+/// `daemon run`: IPC サーバーを起動して常駐する(コンソールモード。Ctrl+C で終了)。
 pub fn run_server() -> anyhow::Result<()> {
+    serve(None)
+}
+
+/// IPC サーバー本体。
+///
+/// `external_stop` は外部からの停止シグナル(Windows サービスの SCM からの
+/// Stop 等)。`None` ならコンソールモードとして Ctrl+C を待つ。
+/// どちらの場合も IPC の shutdown 要求では終了する。
+pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -258,12 +267,20 @@ pub fn run_server() -> anyhow::Result<()> {
     // 「開始しました」は待受け開始後(accept_loop 内)に表示する。
     // 先に出すと、パイプ/ソケットの作成に失敗したときに紛らわしいため
     runtime.block_on(async {
+        let stop_request = async {
+            match external_stop {
+                Some(rx) => {
+                    wait_shutdown(rx).await;
+                    Ok(())
+                }
+                None => tokio::signal::ctrl_c()
+                    .await
+                    .context("シグナル待機に失敗しました"),
+            }
+        };
         tokio::select! {
             result = accept_loop(Arc::clone(&shared)) => result,
-            result = tokio::signal::ctrl_c() => {
-                result.context("シグナル待機に失敗しました")?;
-                Ok(())
-            }
+            result = stop_request => result,
             _ = wait_shutdown(shutdown_rx) => Ok(()),
         }
     })?;

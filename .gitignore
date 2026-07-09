@@ -14,4 +14,7 @@
 /apps/peercove-ui/dist
 /apps/peercove-ui/src-tauri/target
 /apps/peercove-ui/src-tauri/gen
+# wintun.dll は再配布素材(wintun.net の署名済みバイナリ)。リポジトリには
+# 含めず、インストーラのビルド前に手で配置する(daemon-service.wxs 参照)
+/apps/peercove-ui/src-tauri/windows/wintun.dll
 *.psk

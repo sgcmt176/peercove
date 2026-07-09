@@ -3,6 +3,7 @@ mod commands;
 mod control;
 mod daemon;
 mod logbuf;
+mod service;
 mod upnp;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -163,6 +164,13 @@ enum Command {
 enum DaemonAction {
     /// デーモンを起動して常駐する(トンネル操作に管理者/root 権限が必要)
     Run,
+    /// (内部用)Windows サービスとして動く。SCM から起動される
+    #[command(hide = true)]
+    Service,
+    /// デーモンを OS サービスとして登録し起動する(Windows サービス / systemd。要管理者/root)
+    ServiceInstall,
+    /// OS サービスを停止して登録解除する(要管理者/root)
+    ServiceUninstall,
     /// デーモンとトンネルの状態を表示する
     Status,
     /// ホストとしてトンネルを開始する
@@ -295,6 +303,22 @@ fn run_daemon_action(action: DaemonAction) -> anyhow::Result<()> {
     };
     match action {
         DaemonAction::Run => daemon::run_server(),
+        DaemonAction::Service => {
+            #[cfg(windows)]
+            {
+                service::run_dispatch()
+            }
+            #[cfg(not(windows))]
+            {
+                // Linux では systemd が `daemon run` を直接起動する(特別なモード不要)
+                anyhow::bail!(
+                    "`daemon service` は Windows 専用です。Linux では \
+                     `daemon service-install` が systemd に `daemon run` を登録します"
+                )
+            }
+        }
+        DaemonAction::ServiceInstall => service::install(),
+        DaemonAction::ServiceUninstall => service::uninstall(),
         DaemonAction::Status => {
             if let IpcResponse::Status(status) = daemon::request(IpcRequest::Status)? {
                 daemon::print_status(&status);

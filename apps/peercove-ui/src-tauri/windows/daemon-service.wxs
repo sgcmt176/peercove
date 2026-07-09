@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PeerCove デーモンを Windows サービスとして登録する WiX フラグメント(M2-G7、ADR-0010)。
+
+  組み込み方(tauri.conf.json):
+    "bundle": { "windows": { "wix": {
+      "fragmentPaths": ["windows/daemon-service.wxs"],
+      "componentRefs": ["PeercoveDaemonComponent", "WintunDllComponent"]
+    }}}
+
+  注意:
+  - WiX の規則で、ServiceInstall は「サービス exe を KeyPath に持つ Component」の
+    中に置く必要がある。そのためデーモン exe は externalBin ではなく
+    このフラグメントが File として所有する
+  - Source のパスは candle 実行時の作業ディレクトリ(通常 src-tauri)基準。
+    ビルド前に `cargo build --release -p peercove-poc` を済ませておくこと
+  - wintun.dll は再配布条件(Prebuilt Binaries License、M2 handoff Q5 で確認済み)
+    により無改変で同梱する。リポジトリには含めないので、ビルド前に
+    src-tauri/windows/wintun.dll へ配置する
+  - サービス名・起動引数は crates/peercove-poc/src/service.rs の定数と一致させる
+    (`peercove-daemon` / `daemon service`)。変えるときは両方を変えること
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="PeercoveDaemonComponent" Guid="0f4a4e6e-7b2a-4c1e-9a54-3f4d1c2b8a01">
+        <File Id="PeercoveDaemonExe"
+              Name="peercove-poc.exe"
+              Source="..\..\..\target\release\peercove-poc.exe"
+              KeyPath="yes" />
+        <ServiceInstall Id="PeercoveDaemonServiceInstall"
+                        Name="peercove-daemon"
+                        DisplayName="PeerCove Daemon"
+                        Description="PeerCove の常駐デーモン。トンネルの作成・維持・破棄を行います。"
+                        Type="ownProcess"
+                        Start="auto"
+                        Account="LocalSystem"
+                        ErrorControl="normal"
+                        Arguments="daemon service"
+                        Vital="yes" />
+        <!-- install: インストール直後に起動 / both: アンインストール時と更新時に停止
+             (停止でトンネルのクリーンアップが走る) / uninstall: 登録も削除 -->
+        <ServiceControl Id="PeercoveDaemonServiceControl"
+                        Name="peercove-daemon"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+      <Component Id="WintunDllComponent" Guid="2c8d9b3a-5e17-4f60-b2c4-9a1e6d7f3b02">
+        <File Id="WintunDll"
+              Name="wintun.dll"
+              Source="windows\wintun.dll"
+              KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

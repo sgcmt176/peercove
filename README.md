@@ -35,7 +35,8 @@
 - [x] M2-G4: 招待・メンバー管理 UI ※実機検証待ち
 - [x] M2-G5: 設定編集・ログビュー・RTT 表示 ※実機検証待ち
 - [x] M2-G6: トレイ常駐・参加/切断の通知 ※実機検証待ち
-- [ ] M2-G7: インストーラ・自動起動
+- [x] M2-G7a: デーモンのサービス化(Windows サービス / systemd、ADR-0010)※実機検証待ち
+- [ ] M2-G7b: インストーラ(MSI / deb / ZIP)— Opus 担当(docs/peercove-g7-packaging-handoff.md)
 
 ## 必要環境
 
@@ -148,6 +149,10 @@ sudo ./target/debug/peercove-poc daemon run
 ./target/debug/peercove-poc daemon logs --follow # 新しい行を待ち続ける
 ./target/debug/peercove-poc daemon stop
 ./target/debug/peercove-poc daemon shutdown
+
+# OS サービスとして常駐させる場合(手動起動の代わり。要管理者/root)
+./target/debug/peercove-poc daemon service-install    # 登録 + 起動 + 自動起動
+./target/debug/peercove-poc daemon service-uninstall  # 停止 + 登録解除
 ```
 
 - 招待・参加・削除(invite / join / remove-peer)は**デーモンを介さず**
@@ -617,6 +622,63 @@ M1-G1 の構成(Host + join 済み Member A)をそのまま使います。
 
 失敗時: Windows ホストのファイアウォールで TCP 51821 の受信許可
 (初回ダイアログ)を確認。Tailscale 起動中なら停止(README 上部参照)。
+
+## 検証手順(M2-G7a: デーモンのサービス化 PoC)
+
+**G7 最大のリスク検証です**: Windows サービス(LocalSystem / Session 0)から
+wintun のトンネルが作れて疎通することを確認します。Linux は systemd で同等を確認します。
+
+### Windows(ホスト機)
+
+```powershell
+# 1) リリースビルド + wintun.dll を隣に置く
+cargo build --release -p peercove-poc
+copy <wintunの場所>\wintun.dll target\release\
+
+# 2) 既存の鍵ファイルに SYSTEM の読み取りを付与(1 回だけ。
+#    これから invite/init/join で作る鍵には自動で付きます)
+#    ホストの鍵と PSK(あれば)が対象:
+icacls host.key /grant "*S-1-5-18:F"
+# %APPDATA%\app.peercove.desktop\ 配下に host.key がある場合はそちらも
+
+# 3) 手動起動していたデーモンが残っていれば止める(パイプ名が衝突するため)
+#    (管理者ターミナルで)peercove-poc daemon shutdown
+
+# 4) サービス登録 + 起動(管理者 PowerShell)
+.\target\release\peercove-poc.exe daemon service-install
+```
+
+確認項目:
+
+1. `sc query peercove-daemon` が RUNNING であること
+2. **非管理者**のターミナルで `peercove-poc daemon status` が通ること
+   (SYSTEM のサービス ↔ 非特権クライアントのパイプ権限)
+3. UI(`npm run tauri dev` か通常起動)からホスト開始 →
+   **メンバーと ping が通ること(← これが Session 0 PoC の本丸)**
+4. UI のログビュー(☰)にサービスのログが出ること
+   (サービスの標準エラーはどこにも出ないので、ログビューが唯一の窓口です)
+5. **OS を再起動** → ログイン後、何もせず `sc query peercove-daemon` が RUNNING、
+   UI を開くと「待機中」表示 → そのまま「開始」で前回のネットワークに繋がること
+6. トンネル稼働中に(管理者で)`daemon service-uninstall` →
+   「停止しています…」の後に登録解除され、`ipconfig` に peercove0 が
+   残っていないこと(クリーンアップの確認)
+
+### Ubuntu(メンバー機)
+
+```bash
+cargo build --release -p peercove-poc
+sudo ./target/release/peercove-poc daemon service-install
+```
+
+7. `systemctl status peercove-daemon` が active (running) であること
+8. `journalctl -u peercove-daemon -f` にログが流れること
+9. UI から参加 → 疎通すること
+10. **OS を再起動** → 自動起動していること(`systemctl status`)
+11. `sudo ./target/release/peercove-poc daemon service-uninstall` →
+    ユニットが消え、`ip link` に peercove0 が残っていないこと
+
+> 手動の `daemon run`(コンソールモード)も従来どおり使えます。ただし
+> **サービスと同時には動かせません**(パイプ/ソケットが衝突します)。
 
 ## 検証手順(M2-G5/G6: 設定・ログ・RTT・トレイ常駐)
 
