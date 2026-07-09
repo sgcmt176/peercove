@@ -158,6 +158,23 @@ deb は UI 本体に加え、`peercove-poc` を `/usr/bin/` へ、systemd ユニ
 (`packaging/deb/*.sh`、`packaging/systemd/peercove-daemon.service`)。
 Linux は wintun 不要(カーネル WireGuard)なので DLL/ライセンスは同梱しません。
 
+#### ZIP / tar.gz(上級者向けポータブル版)
+
+インストーラを使わない配布。中身はバイナリ + `wintun.dll`(Windows)+
+使い方(`packaging/README-portable.md`)で、セットアップは手動です
+(`daemon service-install` か `daemon run`)。上の MSI / deb 用のビルドを
+済ませてから、組み立てスクリプトを実行します:
+
+```powershell
+# Windows: packaging\dist\PeerCove-portable-windows-x64.zip
+powershell -ExecutionPolicy Bypass -File packaging\make-zip.ps1
+```
+
+```bash
+# Linux: packaging/dist/PeerCove-portable-linux-x64.tar.gz
+sh packaging/make-tar.sh
+```
+
 ## 使い方
 
 ### ログの詳細度

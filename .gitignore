@@ -19,4 +19,6 @@
 /apps/peercove-ui/src-tauri/windows/wintun.dll
 # wintun のライセンス本文も同 zip 由来の再配布素材(packaging/licenses/README.md)
 /packaging/licenses/wintun-LICENSE.txt
+# ポータブル版 ZIP/tar の組み立て成果物
+/packaging/dist
 *.psk
