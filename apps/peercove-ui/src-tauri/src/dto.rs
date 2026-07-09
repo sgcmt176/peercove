@@ -60,6 +60,8 @@ pub struct Tunnel {
     pub address: String,
     pub members: Vec<Member>,
     pub peers: Vec<Peer>,
+    /// ホストからネットワーク削除された(M2-G6)。UI が明示して切断を促す。
+    pub removed: bool,
 }
 
 impl From<&TunnelInfo> for Tunnel {
@@ -69,6 +71,7 @@ impl From<&TunnelInfo> for Tunnel {
             address: info.address.to_string(),
             members: info.ledger.iter().map(Member::from).collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
+            removed: info.removed,
         }
     }
 }
@@ -283,6 +286,7 @@ mod tests {
                 is_host: false,
             }],
             peers: vec![],
+            removed: false,
         };
         let json = serde_json::to_value(Status::from(DaemonStatus::Hosting(info))).unwrap();
         assert_eq!(json["state"], "hosting");

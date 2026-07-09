@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -332,11 +333,16 @@ async fn host_reader(
 
 /// メンバー側クライアント。台帳を受信して `latest_ledger` に反映する。
 /// 切断されたら自動で再接続する。
+///
+/// ホストから削除された(`Removed`)ら `removed` を立てて**再接続をやめる**。
+/// 削除後はホストが WG ピアも消すので再接続は成功しないうえ、UI に「削除された」
+/// と出したまま無駄なリトライを続けないため(M2-G6 のフィードバック)。
 pub async fn run_member_client(
     host_ip: Ipv4Addr,
     display_name: Option<String>,
     latest_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>>,
     rtt: RttMap,
+    removed: Arc<AtomicBool>,
 ) {
     let target = SocketAddr::from((host_ip, CONTROL_PORT));
     let mut logged_wait = false;
@@ -345,11 +351,22 @@ pub async fn run_member_client(
             Ok(stream) => {
                 logged_wait = false;
                 tracing::info!("コントロールチャネルに接続しました({target})");
-                let session = member_session(stream, &display_name, &latest_ledger, host_ip, &rtt);
+                let session = member_session(
+                    stream,
+                    &display_name,
+                    &latest_ledger,
+                    host_ip,
+                    &rtt,
+                    &removed,
+                );
                 if let Err(e) = session.await {
                     tracing::debug!("制御接続が終了しました(再接続します): {e:#}");
                 }
                 rtt.lock().unwrap().remove(&host_ip);
+                if removed.load(Ordering::Relaxed) {
+                    tracing::info!("削除通知を受けたので再接続を停止します");
+                    return;
+                }
             }
             Err(e) => {
                 // トンネル確立前は失敗して当然なので、最初の 1 回だけ案内する
@@ -370,6 +387,7 @@ async fn member_session(
     latest_ledger: &Arc<Mutex<Option<Vec<LedgerEntry>>>>,
     host_ip: Ipv4Addr,
     rtt: &RttMap,
+    removed: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
@@ -388,6 +406,7 @@ async fn member_session(
         ping,
         Arc::clone(rtt),
         Arc::clone(latest_ledger),
+        Arc::clone(removed),
     ));
 
     // biased: 削除通知(Removed)を検知する読み側が「意味のある終了」なので先に見る。
@@ -431,6 +450,7 @@ async fn member_reader(
     ping: SharedPing,
     rtt: RttMap,
     latest_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>>,
+    removed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
     loop {
@@ -445,7 +465,9 @@ async fn member_reader(
             }
             Ok(ControlMessage::Removed { message }) => {
                 tracing::warn!("ホストから削除されました: {message}");
+                // 台帳はクリアし、削除フラグを立てる(UI が「削除された」と表示する)
                 *latest_ledger.lock().unwrap() = None;
+                removed.store(true, Ordering::Relaxed);
                 anyhow::bail!("削除通知を受信");
             }
             Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
@@ -505,6 +527,7 @@ mod tests {
                 &client_latest,
                 host_ip,
                 &client_rtt,
+                &Arc::new(AtomicBool::new(false)),
             )
             .await;
         });
@@ -564,10 +587,20 @@ mod tests {
         let latest: Arc<Mutex<Option<Vec<LedgerEntry>>>> = Arc::new(Mutex::new(None));
         let client_latest = Arc::clone(&latest);
         let client_rtt: RttMap = Default::default();
+        let client_removed = Arc::new(AtomicBool::new(false));
+        let removed_flag = Arc::clone(&client_removed);
         let client = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
             let host_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
-            member_session(stream, &None, &client_latest, host_ip, &client_rtt).await
+            member_session(
+                stream,
+                &None,
+                &client_latest,
+                host_ip,
+                &client_rtt,
+                &removed_flag,
+            )
+            .await
         });
 
         // 接続登録を待って Removed を送る
@@ -585,6 +618,10 @@ mod tests {
 
         let client_result = client.await.unwrap();
         assert!(client_result.is_err(), "削除通知でセッションが終わること");
+        assert!(
+            client_removed.load(Ordering::Relaxed),
+            "削除フラグが立つこと(UI に「削除された」と出す信号)"
+        );
         assert!(server.await.unwrap().is_ok());
     }
 

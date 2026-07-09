@@ -178,6 +178,8 @@ pub struct Snapshot {
     pub ledger: Option<Vec<LedgerEntry>>,
     /// 相手の仮想 IP → コントロールチャネルで測った RTT(ミリ秒、M2-G5)。
     pub rtt_ms: HashMap<std::net::Ipv4Addr, f64>,
+    /// (member のみ)ホストからネットワーク削除された(M2-G6)。UI が明示する。
+    pub removed: bool,
 }
 
 pub type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
@@ -211,6 +213,8 @@ pub async fn supervise(
         let connections: control::Connections = Default::default();
         let member_ledger: Arc<Mutex<Option<Vec<LedgerEntry>>>> = Default::default();
         let rtt: control::RttMap = Default::default();
+        // (member)ホストから削除されたら立つ。status に載せて UI が表示する
+        let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut tasks = Vec::new();
         match role {
             Role::Host => {
@@ -236,6 +240,7 @@ pub async fn supervise(
                             config.interface.display_name.clone(),
                             Arc::clone(&member_ledger),
                             Arc::clone(&rtt),
+                            Arc::clone(&removed),
                         )));
                     }
                     _ => tracing::warn!(
@@ -303,6 +308,7 @@ pub async fn supervise(
                             peers: stats,
                             ledger,
                             rtt_ms: rtt.lock().unwrap().clone(),
+                            removed: removed.load(std::sync::atomic::Ordering::Relaxed),
                         });
                     }
                 }

@@ -153,15 +153,16 @@ impl DaemonShared {
             return DaemonStatus::Idle;
         };
         // ロックはこのブロックの間だけ(status 応答の組み立ては外でやる)
-        let (peers, ledger, rtt_ms) = {
+        let (peers, ledger, rtt_ms, removed) = {
             let snapshot = active.snapshot.lock().unwrap();
             match snapshot.as_ref() {
                 Some(snapshot) => (
                     snapshot.peers.clone(),
                     snapshot.ledger.clone(),
                     snapshot.rtt_ms.clone(),
+                    snapshot.removed,
                 ),
-                None => (Vec::new(), None, HashMap::new()),
+                None => (Vec::new(), None, HashMap::new(), false),
             }
         };
         let ledger = ledger.unwrap_or_default();
@@ -192,6 +193,7 @@ impl DaemonShared {
                 })
                 .collect(),
             ledger,
+            removed,
         };
         match active.role {
             Role::Host => DaemonStatus::Hosting(info),

@@ -115,6 +115,10 @@ pub struct TunnelInfo {
     /// ピア統計の要約(公開鍵 base64 → (最終ハンドシェイク経過秒, rx, tx))。
     #[serde(default)]
     pub peers: Vec<PeerSummary>,
+    /// (member のみ)ホストからネットワーク削除された(M2-G6)。
+    /// トンネルはまだ張ったままだが通信は落ちている。UI が明示して切断を促す。
+    #[serde(default)]
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -14,12 +14,18 @@ export function Modal({
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
 
+  // フォーカスは開いた瞬間だけ当てる。ここに onClose を依存に入れると、親（App）が
+  // 2 秒ごとの状態ポーリングで再レンダーするたびに新しい onClose が渡り、この
+  // effect が再実行されて入力欄からフォーカスを奪ってしまう（設定編集で発覚）。
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
     document.addEventListener("keydown", onKey);
-    dialogRef.current?.focus();
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 

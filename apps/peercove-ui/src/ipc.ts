@@ -28,6 +28,8 @@ export interface Tunnel {
   address: string;
   members: Member[];
   peers: Peer[];
+  /** ホストからネットワーク削除された（M2-G6）。UI が明示して切断を促す。 */
+  removed: boolean;
 }
 
 /** 同時参加は 1 ネットワークまで(M2 handoff Q4)。 */

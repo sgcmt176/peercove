@@ -71,6 +71,24 @@ export function TunnelView({
 
   return (
     <>
+      {tunnel.removed && (
+        <section className="card card--error">
+          <h2>ホストから削除されました</h2>
+          <p>
+            このネットワークからあなたは削除されました。通信はすでに遮断されています。
+            「切断」してから、必要なら新しい招待トークンで参加し直してください。
+          </p>
+          <button
+            type="button"
+            className="button--danger"
+            onClick={() => void stop()}
+            disabled={busy}
+          >
+            切断する
+          </button>
+        </section>
+      )}
+
       <section className="card">
         <div className="card__head">
           <h2>{stateLabel(status.state)}</h2>

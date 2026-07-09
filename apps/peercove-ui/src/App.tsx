@@ -29,7 +29,10 @@ export default function App() {
         // 切断したら次回の接続を「初回」に戻す(全員分の通知が鳴るのを防ぐ)
         previousMembers.current = null;
       } else {
-        void notifyMemberEvents(diffMembers(previousMembers.current, members));
+        const selfAddress = status.tunnel?.address ?? null;
+        void notifyMemberEvents(
+          diffMembers(previousMembers.current, members, selfAddress),
+        );
         previousMembers.current = members;
       }
     } catch (error) {

@@ -15,18 +15,27 @@ export interface MemberEvent {
   member: Member;
 }
 
-/** 前回の台帳と比べて、オンライン状態が変わったメンバーを列挙する。 */
+/**
+ * 前回の台帳と比べて、オンライン状態が変わったメンバーを列挙する。
+ *
+ * - `selfAddress`: 自分の仮想 IP。自分自身の出入りは通知しない
+ *   (メンバーとして参加中、自分が台帳に載る／削除されるのを鳴らさないため)
+ */
 export function diffMembers(
   previous: Member[] | null,
   current: Member[],
+  selfAddress: string | null,
 ): MemberEvent[] {
   // 初回(baseline なし)は通知しない。起動時に全員分が鳴るのを避ける
   if (previous === null) return [];
 
+  const relevant = (m: Member) => !m.isHost && m.ip !== selfAddress;
+  const nowByKey = new Map(current.map((m) => [m.publicKey, m]));
   const wasOnline = new Map(previous.map((m) => [m.publicKey, m.online]));
   const events: MemberEvent[] = [];
+
   for (const member of current) {
-    if (member.isHost) continue; // ホスト自身は常にオンライン
+    if (!relevant(member)) continue;
     const before = wasOnline.get(member.publicKey);
     // 新しく台帳に載ったメンバーは、オンラインになるまで通知しない
     if (before === undefined) {
@@ -35,6 +44,15 @@ export function diffMembers(
     }
     if (!before && member.online) events.push({ kind: "joined", member });
     if (before && !member.online) events.push({ kind: "left", member });
+  }
+
+  // 台帳から消えたメンバー(ホストが削除した)は「切断」として扱う。
+  // online→offline を待たずに済むので、削除がすぐ通知される
+  for (const member of previous) {
+    if (!relevant(member)) continue;
+    if (member.online && !nowByKey.has(member.publicKey)) {
+      events.push({ kind: "left", member });
+    }
   }
   return events;
 }
