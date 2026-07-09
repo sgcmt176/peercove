@@ -21,4 +21,6 @@
 /packaging/licenses/wintun-LICENSE.txt
 # ポータブル版 ZIP/tar の組み立て成果物
 /packaging/dist
+# MSI 等のインストールログ
+*.log
 *.psk

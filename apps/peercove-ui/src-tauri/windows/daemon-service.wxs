@@ -25,10 +25,14 @@
     CustomAction / InstallExecuteSequence も一緒にリンクされる。
 
   ■ ビルド前の準備(README のビルド手順にも記載):
-    1. cargo build --release -p peercove-poc(target\release\peercove-poc.exe を作る)
+    1. peercove-poc をリリースビルドする(target\release\peercove-poc.exe を作る):
+       cargo build (release) -p peercove-poc
     2. wintun.dll を src-tauri\windows\wintun.dll へ(wintun.net の署名済み zip 由来)
     3. その zip の LICENSE.txt を packaging\licenses\wintun-LICENSE.txt へ
-    Source パスは candle 実行時の作業ディレクトリ(src-tauri)基準。
+    Source パスは $(sys.SOURCEFILEDIR)(このファイルの場所 = src-tauri\windows)基準
+    なので、candle/light の作業ディレクトリに依存しない。
+    ※ WiX/XML のコメント内に二重ハイフンを入れると candle が CNDL0104 で失敗する
+      (cargo のリリースフラグ等、ハイフン 2 連をコメントに書かないこと)。
 
   ■ 変えてはいけない:
     サービス名 peercove-daemon / 引数 daemon service / ルール名 PeerCove Daemon は
@@ -38,22 +42,25 @@
   <Fragment>
     <!-- 同梱ファイル: デーモン exe / wintun.dll / wintun ライセンス -->
     <DirectoryRef Id="INSTALLDIR">
+      <!-- Source は candle/light の作業ディレクトリに依存しないよう、
+           このフラグメントの場所($(sys.SOURCEFILEDIR) = src-tauri\windows\)基準。
+           そこから 4 つ上がリポジトリルート。 -->
       <Component Id="PeercoveDaemonComponent" Guid="0f4a4e6e-7b2a-4c1e-9a54-3f4d1c2b8a01">
         <File Id="PeercoveDaemonExe"
               Name="peercove-poc.exe"
-              Source="..\..\..\target\release\peercove-poc.exe"
+              Source="$(sys.SOURCEFILEDIR)..\..\..\..\target\release\peercove-poc.exe"
               KeyPath="yes" />
       </Component>
       <Component Id="WintunDllComponent" Guid="2c8d9b3a-5e17-4f60-b2c4-9a1e6d7f3b02">
         <File Id="WintunDll"
               Name="wintun.dll"
-              Source="windows\wintun.dll"
+              Source="$(sys.SOURCEFILEDIR)wintun.dll"
               KeyPath="yes" />
       </Component>
       <Component Id="WintunLicenseComponent" Guid="7d1b6c2f-9a83-4e05-8b41-2f6c9d0a7e03">
         <File Id="WintunLicense"
               Name="wintun-LICENSE.txt"
-              Source="..\..\..\packaging\licenses\wintun-LICENSE.txt"
+              Source="$(sys.SOURCEFILEDIR)..\..\..\..\packaging\licenses\wintun-LICENSE.txt"
               KeyPath="yes" />
       </Component>
     </DirectoryRef>
