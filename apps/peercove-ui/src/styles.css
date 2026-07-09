@@ -611,3 +611,24 @@ select {
 .button--link-danger {
   color: var(--danger, #d33);
 }
+
+/* ---- DNS 管理画面(M3-1c) ---- */
+
+.dns-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.dns-list__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.dns-list__row > .ellipsis {
+  flex: 1;
+  min-width: 0;
+}

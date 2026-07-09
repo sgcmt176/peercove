@@ -10,6 +10,7 @@ import {
 } from "../ipc";
 import { ConfirmModal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
+import { DnsDialog } from "./DnsDialog";
 import { t } from "../i18n";
 
 /** ネットワーク詳細(トンネル稼働中)。ホストのときだけ招待・削除・名前変更ができる。 */
@@ -26,6 +27,7 @@ export function TunnelView({
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
   const rttByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer.rttMs]));
   const [inviting, setInviting] = useState(false);
+  const [showDns, setShowDns] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -96,6 +98,13 @@ export function TunnelView({
             </span>
           </h2>
           <div className="row">
+            <button
+              type="button"
+              className="button--ghost"
+              onClick={() => setShowDns(true)}
+            >
+              {t.dns.button}
+            </button>
             <button type="button" className="button--ghost" onClick={onSettings}>
               {t.networks.settings}
             </button>
@@ -192,6 +201,18 @@ export function TunnelView({
         />
       )}
 
+      {showDns && (
+        <DnsDialog
+          configPath={tunnel.config}
+          members={tunnel.members}
+          isHost={isHost}
+          onClose={() => {
+            setShowDns(false);
+            onChanged();
+          }}
+        />
+      )}
+
       {removing && (
         <ConfirmModal
           title={t.tunnel.remove.title}
@@ -250,6 +271,11 @@ function MemberRow({
         <span className="member__name">{member.name ?? t.tunnel.member.noName}</span>
       )}
       <span className="mono muted">{member.ip}</span>
+      {member.dnsName && (
+        <span className="mono muted small ellipsis" title={member.dnsName}>
+          {member.dnsName}
+        </span>
+      )}
       {member.isHost && <span className="tag">host</span>}
       {rttMs !== null && (
         <span className="tag" title={t.tunnel.member.rttTitle}>

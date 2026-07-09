@@ -23,8 +23,8 @@ use peercove_ops::peers::Selector;
 use tauri::Manager;
 
 use crate::dto::{
-    InitResult, InviteResult, JoinResult, LogEntry, Logs, NetworkDto, SaveResult, Settings,
-    SettingsUpdate, Status,
+    DnsRecordDto, InitResult, InviteResult, JoinResult, LogEntry, Logs, NetworkDto, SaveResult,
+    Settings, SettingsUpdate, Status,
 };
 
 /// デフォルトの設定ディレクトリ(Windows: %APPDATA%\… / Linux: ~/.config/…)。
@@ -261,6 +261,48 @@ fn rename_member(config_path: String, public_key: String, new_name: String) -> R
     .map_err(to_message)
 }
 
+// ---- カスタム DNS レコード(M3-1c、ADR-0011 §1b) ----
+
+/// カスタム DNS レコードの一覧(fqdn は表示用に組み立て済み)。
+#[tauri::command]
+fn list_dns_records(config_path: String) -> Result<Vec<DnsRecordDto>, String> {
+    let config =
+        peercove_core::config::Config::load(Path::new(&config_path)).map_err(|e| e.to_string())?;
+    let network = config.network_name().to_string();
+    Ok(config
+        .dns_records
+        .iter()
+        .map(|record| DnsRecordDto {
+            name: record.name.clone(),
+            ip: record.ip.to_string(),
+            fqdn: format!(
+                "{}.{network}.{}",
+                record.name,
+                peercove_core::dns::DNS_SUFFIX
+            ),
+        })
+        .collect())
+}
+
+/// カスタム DNS レコードを追加する(ホストの設定のみ)。実行中のホストは
+/// 5 秒の再読込で拾い、台帳と一緒に全メンバーへ配布される。
+#[tauri::command]
+fn add_dns_record(config_path: String, name: String, ip: String) -> Result<(), String> {
+    let ip: std::net::Ipv4Addr = ip
+        .trim()
+        .parse()
+        .map_err(|_| format!("\"{ip}\" は IPv4 アドレスとして解釈できません"))?;
+    peercove_ops::dns::add_record(Path::new(&config_path), name.trim(), ip)
+        .map(|_| ())
+        .map_err(to_message)
+}
+
+/// カスタム DNS レコードを削除する。
+#[tauri::command]
+fn remove_dns_record(config_path: String, name: String) -> Result<(), String> {
+    peercove_ops::dns::remove_record(Path::new(&config_path), &name).map_err(to_message)
+}
+
 /// 設定ファイルの現在値を読む(M2-G5)。
 #[tauri::command]
 fn read_settings(config_path: String) -> Result<Settings, String> {
@@ -313,6 +355,9 @@ pub fn run() {
             join_network,
             remove_member,
             rename_member,
+            list_dns_records,
+            add_dns_record,
+            remove_dns_record,
             read_settings,
             save_settings,
         ])

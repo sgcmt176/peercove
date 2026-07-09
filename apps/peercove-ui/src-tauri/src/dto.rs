@@ -14,16 +14,20 @@ pub struct Member {
     pub public_key: String,
     pub online: bool,
     pub is_host: bool,
+    /// このメンバーの DNS 名(M3-1)。台帳から決定的に導出される
+    /// (`alice.game.peercove.internal` 等)。
+    pub dns_name: Option<String>,
 }
 
-impl From<&LedgerEntry> for Member {
-    fn from(entry: &LedgerEntry) -> Self {
+impl Member {
+    fn from_entry(entry: &LedgerEntry, dns_name: Option<String>) -> Self {
         Self {
             name: entry.name.clone(),
             ip: entry.ip.to_string(),
             public_key: entry.public_key.to_base64(),
             online: entry.online,
             is_host: entry.is_host,
+            dns_name,
         }
     }
 }
@@ -70,12 +74,33 @@ pub struct Tunnel {
 
 impl From<&TunnelInfo> for Tunnel {
     fn from(info: &TunnelInfo) -> Self {
+        // メンバーの DNS 名を台帳から導出(カスタムレコードはメンバー名を
+        // 奪えないので、ここでは台帳だけで決まる — ADR-0011 §2)
+        let zone = peercove_core::dns::zone_for(&info.network, &info.ledger, &[]);
+        let dns_by_key: std::collections::HashMap<&[u8; 32], &str> = zone
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .public_key
+                    .as_ref()
+                    .map(|key| (key.as_bytes(), entry.fqdn.as_str()))
+            })
+            .collect();
         Self {
             config: display_path(&info.config),
             network: info.network.clone(),
             role: role_str(info.role),
             address: info.address.to_string(),
-            members: info.ledger.iter().map(Member::from).collect(),
+            members: info
+                .ledger
+                .iter()
+                .map(|entry| {
+                    let dns_name = dns_by_key
+                        .get(entry.public_key.as_bytes())
+                        .map(|s| s.to_string());
+                    Member::from_entry(entry, dns_name)
+                })
+                .collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
             removed: info.removed,
         }
@@ -165,6 +190,15 @@ impl From<&peercove_ops::networks::NetworkEntry> for NetworkDto {
             address: entry.address.to_string(),
         }
     }
+}
+
+/// カスタム DNS レコード(M3-1c)。fqdn は表示用に組み立て済み。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsRecordDto {
+    pub name: String,
+    pub ip: String,
+    pub fqdn: String,
 }
 
 /// ホスト初期化の結果。
@@ -328,9 +362,17 @@ mod tests {
         assert_eq!(json["tunnel"]["members"][0]["name"], "alice");
         assert_eq!(json["tunnel"]["members"][0]["isHost"], false);
         assert!(json["tunnel"]["members"][0]["publicKey"].is_string());
+        assert_eq!(
+            json["tunnel"]["members"][0]["dnsName"], "alice.home.peercove.internal",
+            "DNS 名が台帳から導出される(M3-1c)"
+        );
         assert_eq!(json["tunnels"].as_array().unwrap().len(), 1);
 
-        let json = serde_json::to_value(Status::from(DaemonStatus { version: IPC_VERSION, tunnels: vec![] })).unwrap();
+        let json = serde_json::to_value(Status::from(DaemonStatus {
+            version: IPC_VERSION,
+            tunnels: vec![],
+        }))
+        .unwrap();
         assert_eq!(json["state"], "idle");
         assert!(json["tunnel"].is_null());
         assert_eq!(json["tunnels"].as_array().unwrap().len(), 0);

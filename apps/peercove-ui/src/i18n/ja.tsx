@@ -223,6 +223,34 @@ export const ja = {
     },
   },
 
+  // DNS 管理画面(M3-1c)
+  dns: {
+    title: "DNS",
+    button: "DNS",
+    intro: (
+      <>
+        メンバーは <code>名前.ネットワーク名.peercove.internal</code>{" "}
+        で呼べます。名前はメンバー一覧の表示名から自動で決まります。
+      </>
+    ),
+    autoHead: "自動レコード（メンバー）",
+    autoEmpty: "台帳をまだ受信していません。",
+    customHead: "カスタムレコード",
+    customEmpty: "カスタムレコードはありません。",
+    customNote:
+      "ホストだけが追加・削除できます。追加すると約 10 秒で全メンバーに配布されます。",
+    customNoteMember: "カスタムレコードはホストが管理します（ここでは閲覧のみ）。",
+    nameLabel: "名前（ラベル）",
+    namePlaceholder: "nas",
+    ipLabel: "IPv4 アドレス",
+    ipPlaceholder: "10.68.1.50",
+    add: "追加",
+    adding: "追加中…",
+    remove: "削除",
+    copy: "コピー",
+    copied: "コピーしました",
+  },
+
   invite: {
     resultTitle: (name: string) => `${name} さんの招待`,
     warn: (

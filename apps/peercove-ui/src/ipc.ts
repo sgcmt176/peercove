@@ -12,6 +12,15 @@ export interface Member {
   publicKey: string;
   online: boolean;
   isHost: boolean;
+  /** DNS 名（M3-1。例: alice.game.peercove.internal）。 */
+  dnsName: string | null;
+}
+
+/** カスタム DNS レコード（M3-1c）。 */
+export interface DnsRecord {
+  name: string;
+  ip: string;
+  fqdn: string;
 }
 
 export interface Peer {
@@ -159,6 +168,12 @@ export const api = {
   renameMember: (configPath: string, publicKey: string, newName: string) =>
     invoke<void>("rename_member", { configPath, publicKey, newName }),
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
+  listDnsRecords: (configPath: string) =>
+    invoke<DnsRecord[]>("list_dns_records", { configPath }),
+  addDnsRecord: (configPath: string, name: string, ip: string) =>
+    invoke<void>("add_dns_record", { configPath, name, ip }),
+  removeDnsRecord: (configPath: string, name: string) =>
+    invoke<void>("remove_dns_record", { configPath, name }),
   readSettings: (configPath: string) =>
     invoke<Settings>("read_settings", { configPath }),
   saveSettings: (configPath: string, update: SettingsUpdate) =>
