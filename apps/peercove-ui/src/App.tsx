@@ -120,6 +120,11 @@ export default function App() {
           }}
         />
       )}
+
+      <footer className="app__footer muted small">
+        wintun.dll © WireGuard LLC — Prebuilt Binaries License の下で無改変同梱
+        （インストール先の <span className="mono">wintun-LICENSE.txt</span> を参照）。
+      </footer>
     </main>
   );
 }

@@ -35,8 +35,9 @@
 - [x] M2-G4: 招待・メンバー管理 UI ※実機検証待ち
 - [x] M2-G5: 設定編集・ログビュー・RTT 表示 ※実機検証待ち
 - [x] M2-G6: トレイ常駐・参加/切断の通知 ※実機検証待ち
-- [x] M2-G7a: デーモンのサービス化(Windows サービス / systemd、ADR-0010)※実機検証待ち
-- [ ] M2-G7b: インストーラ(MSI / deb / ZIP)— Opus 担当(docs/peercove-g7-packaging-handoff.md)
+- [x] M2-G7a: デーモンのサービス化(Windows サービス / systemd、ADR-0010)✅ 実機検証済み
+- [ ] M2-G7b: インストーラ(MSI / deb / ZIP)— Opus 担当。**MSI 実装済み(検証待ち)**、
+  deb / ZIP は実装中(docs/peercove-g7-packaging-handoff.md)
 
 ## 必要環境
 
@@ -98,6 +99,49 @@ cargo test -p peercove-core
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+### インストーラのビルド(M2-G7b)
+
+配布物は **インストーラ主(Windows MSI / Ubuntu deb)+ ZIP(上級者向け)**
+です(ADR-0010)。再配布素材(wintun)はリポジトリに含めないので、
+ビルド前に手で配置します。
+
+#### 事前準備(wintun。Windows インストーラ / ZIP に必要)
+
+<https://www.wintun.net> の署名済み zip(現行 0.14.1)を展開し、**同じ zip の版**から:
+
+```powershell
+# DLL 本体
+copy <展開先>\bin\amd64\wintun.dll   apps\peercove-ui\src-tauri\windows\wintun.dll
+# ライセンス本文(同梱義務。DLL と同じ版を使う)
+copy <展開先>\LICENSE.txt            packaging\licenses\wintun-LICENSE.txt
+```
+
+どちらも gitignore 済み(コミットしない)。詳細は
+[packaging/licenses/README.md](packaging/licenses/README.md)。
+
+#### Windows MSI
+
+```powershell
+# 1) デーモンのリリースビルド(MSI が同梱・サービス登録する)
+cargo build --release -p peercove-poc
+# 2) 上の「事前準備」で wintun.dll と wintun-LICENSE.txt を配置済みにする
+# 3) UI + MSI をビルド(WiX v3 は Tauri が自動取得)
+cd apps\peercove-ui
+npm install
+npm run tauri build
+#   → src-tauri\target\release\bundle\msi\PeerCove_0.1.0_x64_en-US.msi
+```
+
+MSI は UI 本体に加え、`peercove-poc.exe` / `wintun.dll` / `wintun-LICENSE.txt` を
+同梱し、インストール時に `daemon service-install`(サービス登録 + ファイア
+ウォール許可)、アンインストール時に `daemon service-uninstall` を呼びます
+(WiX フラグメント `windows/daemon-service.wxs`。方式は ADR-0010、Fable への
+確認事項は `docs/peercove-g7b-msi-review-for-fable.md`)。
+
+#### Ubuntu deb
+
+(下記「検証手順(M2-G7b: deb)」を参照。Linux 検証機でビルドします)
 
 ## 使い方
 
@@ -692,6 +736,36 @@ sudo ./target/release/peercove-poc daemon service-install
 
 > 手動の `daemon run`(コンソールモード)も従来どおり使えます。ただし
 > **サービスと同時には動かせません**(パイプ/ソケットが衝突します)。
+
+## 検証手順(M2-G7b: Windows MSI インストーラ)
+
+**クリーンな Windows 環境(できれば別マシン / VM)で確認するのが理想**です。
+開発機で試す場合は、先に `daemon service-uninstall` と手動追加した
+ファイアウォールルール・鍵の ACL を元に戻してから(MSI が全部やり直すため)。
+
+準備: 上記「インストーラのビルド(Windows MSI)」で `.msi` を作る。
+
+1. `.msi` をダブルクリック → インストール(UAC で昇格)。完了まで進むこと
+2. `Get-Service peercove-daemon` が **Running**(MSI がサービス登録 + 起動した)
+3. `Get-NetFirewallRule -DisplayName "PeerCove Daemon"` が **2 本**(UDP/TCP)
+   返ること
+4. スタートメニューの **PeerCove** を起動(通常権限)→ 「待機中」表示
+5. ホスト開始 → 別マシンのメンバーと **ping + 台帳** が通ること
+   (通らないときの第一容疑者はファイアウォール)
+6. **通知の表示元が「PeerCove」**になっていること
+   (dev では「PowerShell」だったのがショートカット登録で解消)
+7. 「アプリと機能」から **アンインストール** →
+   - `Get-Service peercove-daemon` がエラー(サービス消滅)
+   - `Get-NetFirewallRule -DisplayName "PeerCove Daemon"` がエラー(ルール消滅)
+   - インストール先フォルダが残っていないこと
+   - `ipconfig` に peercove0 が無いこと
+8. インストール先に `wintun-LICENSE.txt` が含まれていたこと(同梱義務の確認)
+
+> **未検証の設計です**(Opus 実装 / Fable 確認待ち)。MSI は WiX の
+> カスタムアクションで `daemon service-install` / `service-uninstall` を呼ぶ方式
+> です(ADR-0010、`docs/peercove-g7b-msi-review-for-fable.md`)。失敗する場合は
+> インストールログ(`msiexec /i PeerCove_*.msi /l*v install.log`)を取得して
+> ください。
 
 ## 検証手順(M2-G5/G6: 設定・ログ・RTT・トレイ常駐)
 

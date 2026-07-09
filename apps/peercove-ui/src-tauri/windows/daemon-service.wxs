@@ -1,51 +1,48 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  PeerCove デーモンを Windows サービスとして登録する WiX フラグメント(M2-G7、ADR-0010)。
+  PeerCove デーモンを同梱し、Windows サービスとして登録する WiX フラグメント
+  (M2-G7、ADR-0010)。
 
-  組み込み方(tauri.conf.json):
+  ■ 方式(2026-07-09 変更、CLI 呼び出し方式):
+    サービス登録とファイアウォール許可は、インストールされた peercove-poc.exe の
+    `daemon service-install` / `service-uninstall` をカスタムアクションで呼んで行う。
+    これらは service.rs にあり(実機検証済み)、サービス名・引数・ファイアウォール
+    ルール名の唯一の正本。WiX 側に二重定義しない。
+    → 変更理由と Fable 確認事項は docs/peercove-g7b-msi-review-for-fable.md。
+
+  ■ なぜ WiX ネイティブ ServiceInstall にしないか:
+    Session 0 のサービスには初回 bind の許可ダイアログが出ず、ファイアウォールを
+    別途開ける必要がある(UDP=WG 待受 / TCP=コントロールチャネル)。しかし Tauri 2.x
+    の WiX 設定は WixFirewallExtension を渡せないため、どのみちカスタムアクションが
+    要る。それなら検証済み CLI を 1 回呼ぶ方が二重定義が無く堅い(ADR-0010)。
+
+  ■ 組み込み(tauri.conf.json):
     "bundle": { "windows": { "wix": {
       "fragmentPaths": ["windows/daemon-service.wxs"],
-      "componentRefs": ["PeercoveDaemonComponent", "WintunDllComponent"]
+      "componentRefs": ["PeercoveDaemonComponent", "WintunDllComponent", "WintunLicenseComponent"]
     }}}
+    componentRefs が External フィーチャへ挿入されると、同じ Fragment の
+    CustomAction / InstallExecuteSequence も一緒にリンクされる。
 
-  注意:
-  - WiX の規則で、ServiceInstall は「サービス exe を KeyPath に持つ Component」の
-    中に置く必要がある。そのためデーモン exe は externalBin ではなく
-    このフラグメントが File として所有する
-  - Source のパスは candle 実行時の作業ディレクトリ(通常 src-tauri)基準。
-    ビルド前に `cargo build --release -p peercove-poc` を済ませておくこと
-  - wintun.dll は再配布条件(Prebuilt Binaries License、M2 handoff Q5 で確認済み)
-    により無改変で同梱する。リポジトリには含めないので、ビルド前に
-    src-tauri/windows/wintun.dll へ配置する
-  - サービス名・起動引数は crates/peercove-poc/src/service.rs の定数と一致させる
-    (`peercove-daemon` / `daemon service`)。変えるときは両方を変えること
+  ■ ビルド前の準備(README のビルド手順にも記載):
+    1. cargo build --release -p peercove-poc(target\release\peercove-poc.exe を作る)
+    2. wintun.dll を src-tauri\windows\wintun.dll へ(wintun.net の署名済み zip 由来)
+    3. その zip の LICENSE.txt を packaging\licenses\wintun-LICENSE.txt へ
+    Source パスは candle 実行時の作業ディレクトリ(src-tauri)基準。
+
+  ■ 変えてはいけない:
+    サービス名 peercove-daemon / 引数 daemon service / ルール名 PeerCove Daemon は
+    service.rs の定数が正本。ここでは文字列を持たず CLI を呼ぶだけにしてある。
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Fragment>
+    <!-- 同梱ファイル: デーモン exe / wintun.dll / wintun ライセンス -->
     <DirectoryRef Id="INSTALLDIR">
       <Component Id="PeercoveDaemonComponent" Guid="0f4a4e6e-7b2a-4c1e-9a54-3f4d1c2b8a01">
         <File Id="PeercoveDaemonExe"
               Name="peercove-poc.exe"
               Source="..\..\..\target\release\peercove-poc.exe"
               KeyPath="yes" />
-        <ServiceInstall Id="PeercoveDaemonServiceInstall"
-                        Name="peercove-daemon"
-                        DisplayName="PeerCove Daemon"
-                        Description="PeerCove の常駐デーモン。トンネルの作成・維持・破棄を行います。"
-                        Type="ownProcess"
-                        Start="auto"
-                        Account="LocalSystem"
-                        ErrorControl="normal"
-                        Arguments="daemon service"
-                        Vital="yes" />
-        <!-- install: インストール直後に起動 / both: アンインストール時と更新時に停止
-             (停止でトンネルのクリーンアップが走る) / uninstall: 登録も削除 -->
-        <ServiceControl Id="PeercoveDaemonServiceControl"
-                        Name="peercove-daemon"
-                        Start="install"
-                        Stop="both"
-                        Remove="uninstall"
-                        Wait="yes" />
       </Component>
       <Component Id="WintunDllComponent" Guid="2c8d9b3a-5e17-4f60-b2c4-9a1e6d7f3b02">
         <File Id="WintunDll"
@@ -53,6 +50,46 @@
               Source="windows\wintun.dll"
               KeyPath="yes" />
       </Component>
+      <Component Id="WintunLicenseComponent" Guid="7d1b6c2f-9a83-4e05-8b41-2f6c9d0a7e03">
+        <File Id="WintunLicense"
+              Name="wintun-LICENSE.txt"
+              Source="..\..\..\packaging\licenses\wintun-LICENSE.txt"
+              KeyPath="yes" />
+      </Component>
     </DirectoryRef>
+
+    <!-- サービス登録 / 解除。type 18(FileKey)なので [INSTALLDIR] の遅延展開も
+         CustomActionData も不要。deferred + Impersonate="no" で昇格コンテキスト実行。 -->
+    <CustomAction Id="PeercoveServiceInstall"
+                  FileKey="PeercoveDaemonExe"
+                  ExeCommand="daemon service-install"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+    <!-- 上の install が失敗して MSI がロールバックしたら、登録を巻き戻す。
+         rollback CA は保護対象の直前に置き、逆順で実行される。 -->
+    <CustomAction Id="PeercoveServiceInstallRollback"
+                  FileKey="PeercoveDaemonExe"
+                  ExeCommand="daemon service-uninstall"
+                  Execute="rollback"
+                  Impersonate="no"
+                  Return="ignore" />
+    <!-- アンインストール時。停止でトンネルのクリーンアップが走る。
+         停止が遅れても撤去は続けたいので Return="ignore"。 -->
+    <CustomAction Id="PeercoveServiceUninstall"
+                  FileKey="PeercoveDaemonExe"
+                  ExeCommand="daemon service-uninstall"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- 新規/更新インストール時。ファイル配置後に登録(exe と wintun.dll が要る)。
+           rollback を install の直前に置く。 -->
+      <Custom Action="PeercoveServiceInstallRollback" After="InstallFiles">NOT Installed</Custom>
+      <Custom Action="PeercoveServiceInstall" After="PeercoveServiceInstallRollback">NOT Installed</Custom>
+      <!-- 完全アンインストール時。ファイル削除の前に(exe がまだ在る間に)解除。 -->
+      <Custom Action="PeercoveServiceUninstall" Before="RemoveFiles">Installed AND (REMOVE = "ALL")</Custom>
+    </InstallExecuteSequence>
   </Fragment>
 </Wix>
