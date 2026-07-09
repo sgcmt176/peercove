@@ -26,3 +26,6 @@
 # MSI 等のインストールログ
 *.log
 *.psk
+
+# Claude Code のローカル権限設定(マシン固有・共有しない)
+/.claude/settings.local.json
