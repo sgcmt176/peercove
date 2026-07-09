@@ -177,7 +177,9 @@ mod windows_impl {
         )?;
         println!("サービス {SERVICE_NAME} を登録して起動しました(自動起動: 有効)");
         println!("  実行ファイル: {}", exe.display());
-        println!("  状態確認: sc query {SERVICE_NAME} / 停止: sc stop {SERVICE_NAME}");
+        // PowerShell では `sc` が Set-Content のエイリアスなので、必ず sc.exe と書く
+        println!("  状態確認: Get-Service {SERVICE_NAME}(または sc.exe query {SERVICE_NAME})");
+        println!("  停止: sc.exe stop {SERVICE_NAME}");
         Ok(())
     }
 
@@ -211,7 +213,7 @@ mod windows_impl {
                 if std::time::Instant::now() > deadline {
                     anyhow::bail!(
                         "サービスが 30 秒以内に停止しませんでした。\
-                         `sc stop {SERVICE_NAME}` で停止してから再実行してください"
+                         `sc.exe stop {SERVICE_NAME}` で停止してから再実行してください"
                     );
                 }
                 std::thread::sleep(Duration::from_millis(500));

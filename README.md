@@ -648,16 +648,22 @@ icacls host.key /grant "*S-1-5-18:F"
 .\target\release\peercove-poc.exe daemon service-install
 ```
 
+> **PowerShell の注意**: `sc` は PowerShell では Set-Content(ファイル書き込み)の
+> エイリアスです。`sc query …` と打つと**何も表示されずに `query` という名前の
+> ファイルができます**。必ず `sc.exe` と拡張子まで書くか、`Get-Service` を
+> 使ってください。
+
 確認項目:
 
-1. `sc query peercove-daemon` が RUNNING であること
+1. `Get-Service peercove-daemon` が Running であること
+   (または `sc.exe query peercove-daemon`)
 2. **非管理者**のターミナルで `peercove-poc daemon status` が通ること
    (SYSTEM のサービス ↔ 非特権クライアントのパイプ権限)
 3. UI(`npm run tauri dev` か通常起動)からホスト開始 →
    **メンバーと ping が通ること(← これが Session 0 PoC の本丸)**
 4. UI のログビュー(☰)にサービスのログが出ること
    (サービスの標準エラーはどこにも出ないので、ログビューが唯一の窓口です)
-5. **OS を再起動** → ログイン後、何もせず `sc query peercove-daemon` が RUNNING、
+5. **OS を再起動** → ログイン後、何もせず `Get-Service peercove-daemon` が Running、
    UI を開くと「待機中」表示 → そのまま「開始」で前回のネットワークに繋がること
 6. トンネル稼働中に(管理者で)`daemon service-uninstall` →
    「停止しています…」の後に登録解除され、`ipconfig` に peercove0 が
