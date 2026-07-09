@@ -1,5 +1,7 @@
 # PeerCove
 
+[![CI](https://github.com/sgcmt176/peercove/actions/workflows/ci.yml/badge.svg)](https://github.com/sgcmt176/peercove/actions/workflows/ci.yml)
+
 事業者サーバーを持たない P2P 型 VPN(技術検証中)。ホスト PC がコーディネーター兼リレーを担い、トンネルには WireGuard プロトコルを使用します。
 
 現在のフェーズは **M0: 技術検証(PoC)** です。仕様は [docs/peercove-m0-handoff.md](docs/peercove-m0-handoff.md)、技術判断は [docs/decisions.md](docs/decisions.md) を参照してください。

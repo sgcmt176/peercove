@@ -202,7 +202,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 
 | # | タスク | 概要 | 難易度 | 担当目安 |
 |---|---|---|---|---|
-| C-1 | GitHub リポジトリ + CI | **前半完了(2026-07-09)**: 公開前クリーニング(target-smoke 除去等の履歴書き換え)+ https://github.com/sgcmt176/peercove へ push 済み。**残り**: GitHub Actions で fmt/clippy/test + zigbuild(Linux) | ★★ | Opus 可 |
+| C-1 | GitHub リポジトリ + CI | ✅ **完了(2026-07-09)**。公開前クリーニング(履歴書き換え)+ https://github.com/sgcmt176/peercove へ push。CI は `.github/workflows/ci.yml`: rust ジョブ(Ubuntu/Windows で fmt・clippy -D warnings・test)+ ui ジョブ(npm build + src-tauri test)。Linux は実ランナーで検証するため zigbuild は手元確認用に降格 | ★★ | 完了 |
 | C-2 | スループット実機計測 | VM でなく実機 3 台で iperf3 再計測(m0-report 更新) | — | 依頼者(検証) |
 | C-3 | Windows デバイス性能改善 | C-2 の結果次第。暗号処理の並列化・バッファ最適化・wireguard-nt 数値比較 | ★★★★ | Fable |
 | C-4 | 鍵ローテーション | ADR-0005 の将来課題。コントロールチャネル経由でメンバー鍵を更新 | ★★★★ | Fable |
@@ -210,8 +210,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 
 ### 推奨順序(2026-07-08 時点の現在地)
 
-1. **C-1(GitHub + CI)を最初に**: 前半(公開リポジトリへの push)は 2026-07-09 完了。
-   残る CI(GitHub Actions)が品質ゲートとして未整備
+1. ~~C-1(GitHub + CI)~~ → **完了(2026-07-09)**。公開リポジトリ + CI が品質ゲートとして稼働
 2. ~~A-1(M2 要件確認)~~ → 完了。A-2 / A-3 も完了
 3. **A-4 = M2-G7 は前後半とも実装済み**。前半(G7a: サービス化、ADR-0010)は
    Session 0 PoC まで実機検証済み。後半(G7b: MSI / deb / ZIP)は実装済みで

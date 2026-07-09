@@ -1,0 +1,101 @@
+# PeerCove CI(トラック C-1 後半)
+#
+# ゲート内容は docs/roadmap.md §7 の開発ワークフローと同一:
+#   - cargo fmt --check(1 OS で十分なので Ubuntu のみ)
+#   - cargo clippy --all-targets -- -D warnings(両 OS)
+#   - cargo test --workspace(両 OS。Windows ではデバイスのループバックテストも走る)
+#   - UI(apps/peercove-ui)はルートのワークスペースから独立しているため別ジョブ:
+#     npm run build(tsc + vite)と src-tauri の cargo test
+#
+# ローカルの cargo-zigbuild による Linux チェック(Windows 開発機向け)は、
+# CI では実 Ubuntu ランナーで代替される。zigbuild は push 前の手元確認用として継続。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一ブランチの古い実行は打ち切る(push 連打で詰まらないように)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  ui:
+    name: ui (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: apps/peercove-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2 のコンパイルに必要な Linux システム依存
+      # (deb が出荷ターゲットなので Ubuntu でもビルド可能なことを保証する)
+      - name: Install Tauri system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+        working-directory: .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/peercove-ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/peercove-ui/src-tauri
+
+      - name: npm ci
+        run: npm ci
+
+      # tsc の型チェック + vite ビルド(CLAUDE.md の UI 変更時ゲート)
+      - name: npm run build
+        run: npm run build
+
+      - name: cargo test (src-tauri)
+        run: cargo test --manifest-path src-tauri/Cargo.toml
