@@ -241,6 +241,8 @@ pub struct Snapshot {
     pub rtt_ms: HashMap<std::net::Ipv4Addr, f64>,
     /// (member のみ)ホストからネットワーク削除された(M2-G6)。UI が明示する。
     pub removed: bool,
+    /// (member のみ)相手の仮想 IP → 直接経路の状態(ADR-0013、M3-4)。
+    pub direct: HashMap<std::net::Ipv4Addr, peercove_core::ipc::DirectStatus>,
 }
 
 pub type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
@@ -349,6 +351,7 @@ pub async fn supervise(
                     };
                     // 台帳 + DNS レコード: host は設定+統計から構築して配布、
                     // member は受信済みを表示(M3-1 で dns_records が加わった)
+                    let mut direct_routes = HashMap::new();
                     let distribution = match role {
                         Role::Host => config.as_ref().map(|config| {
                             let dist = control::Distribution {
@@ -378,6 +381,7 @@ pub async fn supervise(
                                 &stats,
                                 backend,
                             );
+                            direct_routes = direct.routes();
                             received.map(|r| r.distribution)
                         }
                     };
@@ -396,6 +400,7 @@ pub async fn supervise(
                                 .unwrap_or_default(),
                             rtt_ms: rtt.lock().unwrap().clone(),
                             removed: removed.load(std::sync::atomic::Ordering::Relaxed),
+                            direct: direct_routes,
                         });
                     }
                 }

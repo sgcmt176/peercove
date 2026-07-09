@@ -123,6 +123,16 @@ pub enum TunnelRole {
     Member,
 }
 
+/// メンバー間直接通信の経路状態(ADR-0013、M3-4)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectStatus {
+    /// 直接ピアを張ってハンドシェイク待ち(確立中)。
+    Trying,
+    /// 直接通信中。
+    Direct,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelInfo {
     pub config: PathBuf,
@@ -141,6 +151,10 @@ pub struct TunnelInfo {
     /// トンネルはまだ張ったままだが通信は落ちている。UI が明示して切断を促す。
     #[serde(default)]
     pub removed: bool,
+    /// (member のみ)相手の仮想 IP → 直接経路の状態(ADR-0013、M3-4)。
+    /// 載っていない相手はホスト経由(中継)。旧デーモンの応答には無い(空)。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub direct: std::collections::HashMap<Ipv4Addr, DirectStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

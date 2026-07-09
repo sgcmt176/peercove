@@ -608,6 +608,17 @@ select {
   border-color: var(--danger, #d33);
 }
 
+/* メンバー間の経路バッジ(M3-4)。直接 = 良い状態なのでオンライン色 */
+.tag--route-direct {
+  color: var(--online);
+  border-color: var(--online);
+}
+
+.tag--route-trying {
+  color: var(--accent, #58a);
+  border-color: var(--accent, #58a);
+}
+
 .button--link-danger {
   color: var(--danger, #d33);
 }

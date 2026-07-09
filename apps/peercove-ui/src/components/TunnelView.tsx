@@ -155,6 +155,10 @@ export function TunnelView({
             ))}
           </ul>
         )}
+        {/* 直接通信の説明(M3-4)。経路バッジが出るメンバー視点でのみ表示 */}
+        {!isHost && tunnel.members.some((member) => member.route) && (
+          <p className="muted small">{t.tunnel.directNote}</p>
+        )}
       </section>
 
       {tunnel.peers.length > 0 && (
@@ -277,6 +281,14 @@ function MemberRow({
         </span>
       )}
       {member.isHost && <span className="tag">host</span>}
+      {member.route && (
+        <span
+          className={`tag tag--route-${member.route}`}
+          title={t.tunnel.member.route.title}
+        >
+          {t.tunnel.member.route[member.route]}
+        </span>
+      )}
       {rttMs !== null && (
         <span className="tag" title={t.tunnel.member.rttTitle}>
           {formatRtt(rttMs)}

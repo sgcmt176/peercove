@@ -14,6 +14,11 @@ export interface Member {
   isHost: boolean;
   /** DNS 名（M3-1。例: alice.game.peercove.internal）。 */
   dnsName: string | null;
+  /**
+   * このメンバーへの経路（M3-4）。メンバーとして参加中の他メンバーにのみ付く。
+   * direct = 直接通信中 / trying = 確立中 / relay = ホスト経由。
+   */
+  route: "direct" | "trying" | "relay" | null;
 }
 
 /** カスタム DNS レコード（M3-1c）。 */

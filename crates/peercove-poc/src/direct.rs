@@ -15,6 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime};
 
 use ipnet::Ipv4Net;
+use peercove_core::ipc::DirectStatus;
 use peercove_core::keys::PublicKey;
 
 use crate::backend::{PeerSpec, PeerStats, WgBackend};
@@ -29,9 +30,19 @@ const TRYING_TIMEOUT: Duration = Duration::from_secs(30);
 /// 最終ハンドシェイクがこれを超えたら直接経路は死んだとみなす
 /// (WG のセッション有効期限 180 秒。tunnel.rs の ONLINE_THRESHOLD と同値)。
 const HANDSHAKE_STALE: Duration = Duration::from_secs(180);
-/// 失敗した相手への再試行までの待ち。台帳のエンドポイントが変わったら
-/// 待たずに再試行する(M3-4 で指数バックオフに拡張予定)。
+/// 失敗した相手への再試行までの基本待ち時間。失敗を重ねるごとに 2 倍
+/// (上限 [`RETRY_MAX`]、M3-4)。台帳のエンドポイントが変わったら待たずに
+/// 再試行し、バックオフもリセットする。
 const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
+/// 再試行間隔の上限(指数バックオフの頭打ち)。
+const RETRY_MAX: Duration = Duration::from_secs(3600);
+
+/// `failures` 回連続で失敗した後の待ち時間(5 分 → 10 分 → … → 上限 1 時間)。
+fn backoff(failures: u32) -> Duration {
+    RETRY_COOLDOWN
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(4))
+        .min(RETRY_MAX)
+}
 /// 直接ピアの keepalive 秒(NAT マッピング維持 + パンチの継続)。
 const DIRECT_KEEPALIVE: u16 = 25;
 
@@ -47,6 +58,14 @@ struct DirectState {
     ip: Ipv4Addr,
     endpoint: SocketAddr,
     phase: Phase,
+}
+
+/// 失敗の記録。同じエンドポイントへの再試行を [`backoff`] だけ抑える。
+struct Cooldown {
+    endpoint: SocketAddr,
+    at: Instant,
+    /// 連続失敗回数(バックオフの指数)。成功またはエンドポイント変化でリセット。
+    failures: u32,
 }
 
 /// 次の周期でやること(状態の参照と変更を分けるための中間表現)。
@@ -65,9 +84,8 @@ pub struct DirectManager {
     /// トンネルのサブネット。台帳が壊れていても外の経路を奪わないためのガード。
     subnet: Ipv4Net,
     states: HashMap<[u8; 32], DirectState>,
-    /// 失敗した相手 → (失敗時のエンドポイント, 時刻)。同じエンドポイントへの
-    /// 再試行を [`RETRY_COOLDOWN`] だけ抑える。
-    cooldown: HashMap<[u8; 32], (SocketAddr, Instant)>,
+    /// 失敗した相手ごとのバックオフ状態。
+    cooldown: HashMap<[u8; 32], Cooldown>,
 }
 
 impl DirectManager {
@@ -91,9 +109,10 @@ impl DirectManager {
         stats: &[PeerStats],
         backend: &mut dyn WgBackend,
     ) {
-        // 期限切れのクールダウンを掃除する(残すと再試行を永遠に妨げる)
+        // 長く放置されたバックオフ記録を掃除する(メモリ衛生。上限バックオフの
+        // 2 倍以上経っていれば、忘れて 1 からやり直して問題ない)
         self.cooldown
-            .retain(|_, (_, at)| now.duration_since(*at) < RETRY_COOLDOWN);
+            .retain(|_, cd| now.duration_since(cd.at) < RETRY_MAX.saturating_mul(2));
 
         let desired = if enabled {
             self.desired(now, received)
@@ -141,15 +160,28 @@ impl DirectManager {
                     }
                 }
                 None => match self.cooldown.get(&key) {
-                    // 同じエンドポイントへの再試行はクールダウン中は控える。
+                    // 同じエンドポイントへの再試行はバックオフ中は控える。
                     // エンドポイントが変わったら即再試行(ADR-0013)
-                    Some((failed, _)) if *failed == endpoint => Act::Keep,
+                    Some(cd)
+                        if cd.endpoint == endpoint
+                            && now.duration_since(cd.at) < backoff(cd.failures) =>
+                    {
+                        Act::Keep
+                    }
                     _ => Act::Add,
                 },
             };
             match act {
                 Act::Add => {
-                    self.cooldown.remove(&key);
+                    // エンドポイントが変わっていたらバックオフをリセット
+                    // (同じままなら失敗回数を持ち越して待ちを伸ばす)
+                    if self
+                        .cooldown
+                        .get(&key)
+                        .is_some_and(|cd| cd.endpoint != endpoint)
+                    {
+                        self.cooldown.remove(&key);
+                    }
                     self.try_add(key, ip, endpoint, now, backend);
                 }
                 Act::Rebind => {
@@ -166,14 +198,41 @@ impl DirectManager {
                         state.phase = Phase::Direct;
                         tracing::info!("直接通信を確立しました({ip} = {endpoint})");
                     }
+                    self.cooldown.remove(&key); // 成功したらバックオフをリセット
                 }
                 Act::Fail(why) => {
-                    self.cooldown.insert(key, (endpoint, now));
+                    let failures = match self.cooldown.get(&key) {
+                        Some(cd) if cd.endpoint == endpoint => cd.failures + 1,
+                        _ => 1,
+                    };
+                    self.cooldown.insert(
+                        key,
+                        Cooldown {
+                            endpoint,
+                            at: now,
+                            failures,
+                        },
+                    );
                     self.drop_peer(&key, backend, why);
                 }
                 Act::Keep => {}
             }
         }
+    }
+
+    /// 現在の直接経路(相手の仮想 IP → 状態)。status / UI 表示用(M3-4)。
+    /// 載っていない相手はホスト経由(中継)。
+    pub fn routes(&self) -> HashMap<Ipv4Addr, DirectStatus> {
+        self.states
+            .values()
+            .map(|state| {
+                let status = match state.phase {
+                    Phase::Trying { .. } => DirectStatus::Trying,
+                    Phase::Direct => DirectStatus::Direct,
+                };
+                (state.ip, status)
+            })
+            .collect()
     }
 
     /// 台帳から「直接接続を試すべき相手」を導出する(自分・ホスト・オフライン・
@@ -524,6 +583,120 @@ mod tests {
             backend.ops,
             vec![format!("add:{peer}"), format!("remove:{peer}")]
         );
+    }
+
+    /// 失敗を重ねるとバックオフが 2 倍ずつ伸びる(5 分 → 10 分 → … → 上限 1 時間)。
+    /// 確立に成功するとリセットされる。
+    #[test]
+    fn backoff_doubles_after_repeated_failures_and_resets_on_success() {
+        assert_eq!(backoff(1), Duration::from_secs(300));
+        assert_eq!(backoff(2), Duration::from_secs(600));
+        assert_eq!(backoff(3), Duration::from_secs(1200));
+        assert_eq!(backoff(10), RETRY_MAX, "上限で頭打ち");
+
+        let me = PrivateKey::generate().public_key();
+        let peer = PrivateKey::generate().public_key();
+        let mut m = manager(&me);
+        let mut backend = MockBackend::default();
+        let t0 = Instant::now();
+        let dist_at = |at: Instant| {
+            received(
+                vec![entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0)],
+                at,
+            )
+        };
+
+        // 1 回目の失敗
+        m.tick(t0, true, Some(&dist_at(t0)), &[], &mut backend);
+        let t1 = t0 + TRYING_TIMEOUT + Duration::from_secs(1);
+        m.tick(t1, true, Some(&dist_at(t1)), &[], &mut backend);
+        // 5 分後に再試行 → 2 回目の失敗
+        let t2 = t1 + backoff(1) + Duration::from_secs(1);
+        m.tick(t2, true, Some(&dist_at(t2)), &[], &mut backend);
+        let t3 = t2 + TRYING_TIMEOUT + Duration::from_secs(1);
+        m.tick(t3, true, Some(&dist_at(t3)), &[], &mut backend);
+        backend.ops.clear();
+
+        // 2 回目の失敗後は 5 分では再試行せず、10 分待つ
+        let after_5min = t3 + backoff(1) + Duration::from_secs(1);
+        m.tick(
+            after_5min,
+            true,
+            Some(&dist_at(after_5min)),
+            &[],
+            &mut backend,
+        );
+        assert!(backend.ops.is_empty(), "バックオフが 10 分に伸びている");
+        let after_10min = t3 + backoff(2) + Duration::from_secs(1);
+        m.tick(
+            after_10min,
+            true,
+            Some(&dist_at(after_10min)),
+            &[],
+            &mut backend,
+        );
+        assert_eq!(backend.ops, vec![format!("add:{peer}")]);
+
+        // 今回は確立に成功 → バックオフはリセットされ、次の失敗はまた 5 分から
+        m.tick(
+            after_10min + Duration::from_secs(5),
+            true,
+            Some(&dist_at(after_10min)),
+            &fresh_stats(&peer),
+            &mut backend,
+        );
+        assert_eq!(
+            m.routes().get(&"10.100.42.3".parse().unwrap()),
+            Some(&DirectStatus::Direct)
+        );
+        backend.ops.clear();
+        let t4 = after_10min + Duration::from_secs(10);
+        // 経路が途絶える(失敗 1 回目扱い)
+        let refreshed = dist_at(t4);
+        m.tick(
+            t4,
+            true,
+            Some(&refreshed),
+            &stale_stats(&peer),
+            &mut backend,
+        );
+        assert_eq!(backend.ops, vec![format!("remove:{peer}")]);
+        let t5 = t4 + backoff(1) + Duration::from_secs(1);
+        m.tick(t5, true, Some(&dist_at(t5)), &[], &mut backend);
+        assert_eq!(
+            backend.ops,
+            vec![format!("remove:{peer}"), format!("add:{peer}")],
+            "リセット後は 5 分で再試行する"
+        );
+    }
+
+    /// routes(): 確立中は Trying、確立後は Direct、解除後は消える。
+    #[test]
+    fn routes_reflect_phase() {
+        let me = PrivateKey::generate().public_key();
+        let peer = PrivateKey::generate().public_key();
+        let ip: Ipv4Addr = "10.100.42.3".parse().unwrap();
+        let mut m = manager(&me);
+        let mut backend = MockBackend::default();
+        let t0 = Instant::now();
+        let dist = received(
+            vec![entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0)],
+            t0,
+        );
+
+        assert!(m.routes().is_empty());
+        m.tick(t0, true, Some(&dist), &[], &mut backend);
+        assert_eq!(m.routes().get(&ip), Some(&DirectStatus::Trying));
+        m.tick(
+            t0 + Duration::from_secs(5),
+            true,
+            Some(&dist),
+            &fresh_stats(&peer),
+            &mut backend,
+        );
+        assert_eq!(m.routes().get(&ip), Some(&DirectStatus::Direct));
+        m.tick(t0 + Duration::from_secs(10), true, None, &[], &mut backend);
+        assert!(m.routes().is_empty(), "台帳が無ければ解除される");
     }
 
     /// 相手がオフラインになったら(クールダウンなしで)解除する。

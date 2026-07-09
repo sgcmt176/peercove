@@ -17,10 +17,13 @@ pub struct Member {
     /// このメンバーの DNS 名(M3-1)。台帳から決定的に導出される
     /// (`alice.game.peercove.internal` 等)。
     pub dns_name: Option<String>,
+    /// このメンバーへの経路(ADR-0013、M3-4)。member ロールで他メンバーに
+    /// 対してのみ "direct" | "trying" | "relay"。ホスト・自分・host ロールでは null。
+    pub route: Option<&'static str>,
 }
 
 impl Member {
-    fn from_entry(entry: &LedgerEntry, dns_name: Option<String>) -> Self {
+    fn from_entry(entry: &LedgerEntry, dns_name: Option<String>, route: Option<&'static str>) -> Self {
         Self {
             name: entry.name.clone(),
             ip: entry.ip.to_string(),
@@ -28,6 +31,7 @@ impl Member {
             online: entry.online,
             is_host: entry.is_host,
             dns_name,
+            route,
         }
     }
 }
@@ -98,7 +102,21 @@ impl From<&TunnelInfo> for Tunnel {
                     let dns_name = dns_by_key
                         .get(entry.public_key.as_bytes())
                         .map(|s| s.to_string());
-                    Member::from_entry(entry, dns_name)
+                    // 経路(M3-4): member ロールで「ホストでも自分でもない相手」
+                    // にだけ意味がある。直接経路が無ければ中継(ホスト経由)
+                    let route = if info.role == TunnelRole::Member
+                        && !entry.is_host
+                        && entry.ip != info.address
+                    {
+                        Some(match info.direct.get(&entry.ip) {
+                            Some(peercove_core::ipc::DirectStatus::Direct) => "direct",
+                            Some(peercove_core::ipc::DirectStatus::Trying) => "trying",
+                            None => "relay",
+                        })
+                    } else {
+                        None
+                    };
+                    Member::from_entry(entry, dns_name, route)
                 })
                 .collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
@@ -350,6 +368,7 @@ mod tests {
             }],
             peers: vec![],
             removed: false,
+            direct: Default::default(),
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: peercove_core::ipc::IPC_VERSION,
@@ -367,6 +386,11 @@ mod tests {
         assert_eq!(
             json["tunnel"]["members"][0]["dnsName"], "alice.home.peercove.internal",
             "DNS 名が台帳から導出される(M3-1c)"
+        );
+        assert_eq!(
+            json["tunnel"]["members"][0]["route"],
+            serde_json::Value::Null,
+            "host ロールでは経路バッジなし(M3-4)"
         );
         assert_eq!(json["tunnels"].as_array().unwrap().len(), 1);
 
@@ -386,6 +410,58 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(json["daemonOutdated"], true);
+    }
+
+    /// member ロールでは他メンバーに経路(direct / trying / relay)が付き、
+    /// ホスト・自分には付かない(M3-4)。
+    #[test]
+    fn member_routes_are_derived_from_direct_map() {
+        let entry = |name: &str, ip: &str, is_host: bool| LedgerEntry {
+            name: Some(name.to_string()),
+            ip: ip.parse().unwrap(),
+            public_key: PrivateKey::generate().public_key(),
+            online: true,
+            is_host,
+            endpoint: None,
+            endpoint_age_secs: None,
+        };
+        let mut direct = std::collections::HashMap::new();
+        direct.insert(
+            "10.100.42.3".parse().unwrap(),
+            peercove_core::ipc::DirectStatus::Direct,
+        );
+        direct.insert(
+            "10.100.42.4".parse().unwrap(),
+            peercove_core::ipc::DirectStatus::Trying,
+        );
+        let info = TunnelInfo {
+            config: std::path::PathBuf::from("member.toml"),
+            network: "home".to_string(),
+            role: TunnelRole::Member,
+            address: "10.100.42.2".parse().unwrap(), // 自分
+            ledger: vec![
+                entry("host", "10.100.42.1", true),
+                entry("me", "10.100.42.2", false),
+                entry("bob", "10.100.42.3", false),
+                entry("carol", "10.100.42.4", false),
+                entry("dave", "10.100.42.5", false),
+            ],
+            peers: vec![],
+            removed: false,
+            direct,
+        };
+        let tunnel = Tunnel::from(&info);
+        let routes: Vec<Option<&str>> = tunnel.members.iter().map(|m| m.route).collect();
+        assert_eq!(
+            routes,
+            vec![
+                None,            // ホスト
+                None,            // 自分
+                Some("direct"),  // 直接通信中
+                Some("trying"),  // 確立中
+                Some("relay"),   // ホスト経由
+            ]
+        );
     }
 
     /// Windows の verbatim 接頭辞は表示から取り除く。

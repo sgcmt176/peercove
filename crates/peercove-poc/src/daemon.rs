@@ -311,7 +311,7 @@ impl DaemonShared {
 
 /// 1 トンネル分の status 応答を組み立てる。
 fn tunnel_info(active: &Active) -> TunnelInfo {
-    let (peers, ledger, rtt_ms, removed) = {
+    let (peers, ledger, rtt_ms, removed, direct) = {
         let snapshot = active.snapshot.lock().unwrap();
         match snapshot.as_ref() {
             Some(snapshot) => (
@@ -319,8 +319,9 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
                 snapshot.ledger.clone(),
                 snapshot.rtt_ms.clone(),
                 snapshot.removed,
+                snapshot.direct.clone(),
             ),
-            None => (Vec::new(), None, HashMap::new(), false),
+            None => (Vec::new(), None, HashMap::new(), false, HashMap::new()),
         }
     };
     let ledger = ledger.unwrap_or_default();
@@ -357,6 +358,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
             .collect(),
         ledger,
         removed,
+        direct,
     }
 }
 
