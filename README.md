@@ -108,12 +108,15 @@ cargo fmt --check
 
 #### 事前準備(wintun。Windows インストーラ / ZIP に必要)
 
-<https://www.wintun.net> の署名済み zip(現行 0.14.1)を展開し、**同じ zip の版**から:
+<https://www.wintun.net> の署名済み zip(現行 0.14.1)を展開し、**同じ zip の版**から
+**2 ファイルとも**下記の名前ぴったりで配置します(どちらか欠けると MSI ビルドが
+`LGHT0103 The system cannot find the file` で失敗します):
 
 ```powershell
 # DLL 本体
 copy <展開先>\bin\amd64\wintun.dll   apps\peercove-ui\src-tauri\windows\wintun.dll
-# ライセンス本文(同梱義務。DLL と同じ版を使う)
+# ライセンス本文(同梱義務)。zip 内は LICENSE.txt。
+# 置き先の名前は wintun-LICENSE.txt(× LICENCE。綴りは S)
 copy <展開先>\LICENSE.txt            packaging\licenses\wintun-LICENSE.txt
 ```
 
