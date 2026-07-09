@@ -4,6 +4,19 @@
 - **前提**: M2-G7a(デーモンのサービス化)は実装済み。この文書は**残り半分 =
   パッケージング**の指示書です
 
+## 実装状況(2026-07-09、Opus 追記)
+
+| タスク | 状態 |
+|---|---|
+| 1. Windows MSI | ✅ 実装済み・**実機検証待ち**。MSI は WiX ネイティブ ServiceInstall ではなく**カスタムアクションで `daemon service-install/uninstall` を呼ぶ方式に変更**(ADR-0010 改訂、理由と Fable 確認事項は `docs/peercove-g7b-msi-review-for-fable.md`)。ファイアウォールも CLI 内で処理 |
+| 2. Ubuntu deb | ✅ 実装済み・**実機検証待ち**。Tauri の `files` + maintainer script(`packaging/deb/*.sh`)で systemd unit 同梱・自動起動。dpkg 再組みは不要だった |
+| 3. wintun 同梱 + ライセンス | ✅ 実装済み。`packaging/licenses/`(本文は zip 由来・gitignore)、MSI が同梱、アプリにも謝辞フッター |
+| 4. ZIP / tar(上級者向け) | ✅ 実装済み。`packaging/make-zip.ps1` / `make-tar.sh` |
+| 5. UI 自動起動 | ⏸ **見送り**。デーモンはサービスで自動起動するため UI 自動起動の価値が低く、依存追加(要メンテ調査)を避けた。将来やるなら `tauri-plugin-autostart` |
+
+**残りは実機検証のみ**(README「検証手順(M2-G7b: …)」)。検証で問題が出たら
+下記の各タスクの指示に戻って修正。**MSI の方式変更は後日 Fable がレビュー予定**。
+
 ## 0. 最初に読むもの(この順で)
 
 1. `CLAUDE.md` — リポジトリ全体のルール(商標・秘密情報・コミット前チェック)
