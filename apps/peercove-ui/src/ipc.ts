@@ -47,6 +47,8 @@ export interface Status {
   tunnel: Tunnel | null;
   /** 稼働中の全トンネル（ADR-0012）。 */
   tunnels: Tunnel[];
+  /** デーモンが古い（IPC バージョン不一致）。状態表示は信用できない。 */
+  daemonOutdated: boolean;
 }
 
 /** 設定済みネットワーク 1 件（M3-0c）。稼働状態は Status.tunnels と configPath で突き合わせる。 */

@@ -17,7 +17,10 @@ pub const PIPE_NAME: &str = r"\\.\pipe\peercove-daemon";
 /// Linux の UDS パス(root 実行時の既定)。
 pub const SOCKET_PATH_ROOT: &str = "/run/peercove.sock";
 
-pub const IPC_VERSION: u32 = 1;
+/// IPC プロトコルのバージョン。互換性を壊す変更で上げる。
+/// - 1: M2-G1(単一トンネル)
+/// - 2: M3-0b(複数トンネル。DaemonStatus/TunnelInfo/Stop の形が変わった)
+pub const IPC_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcEnvelope {
@@ -103,6 +106,11 @@ pub const MAX_LOG_LINES_PER_REPLY: usize = 200;
 /// 空 = 待機中。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonStatus {
+    /// デーモン側の [`IPC_VERSION`]。旧デーモン(v1)の応答には無いので 0 になる。
+    /// UI/CLI はこれで**バージョン不一致を明示検出**する(旧デーモン + 新 UI は
+    /// 状態が「全部停止中」に見える事故が実機で起きた)。
+    #[serde(default)]
+    pub version: u32,
     #[serde(default)]
     pub tunnels: Vec<TunnelInfo>,
 }
@@ -187,7 +195,10 @@ mod tests {
             },
             IpcReply {
                 id: 2,
-                result: IpcResult::Ok(IpcResponse::Status(DaemonStatus { tunnels: vec![] })),
+                result: IpcResult::Ok(IpcResponse::Status(DaemonStatus {
+                    version: IPC_VERSION,
+                    tunnels: vec![],
+                })),
             },
             IpcReply {
                 id: 3,
@@ -213,10 +224,27 @@ mod tests {
 
         let json = serde_json::to_string(&IpcReply {
             id: 7,
-            result: IpcResult::Ok(IpcResponse::Status(DaemonStatus { tunnels: vec![] })),
+            result: IpcResult::Ok(IpcResponse::Status(DaemonStatus {
+                version: IPC_VERSION,
+                tunnels: vec![],
+            })),
         })
         .unwrap();
-        assert_eq!(json, r#"{"id":7,"ok":{"type":"status","tunnels":[]}}"#);
+        assert_eq!(
+            json,
+            r#"{"id":7,"ok":{"type":"status","version":2,"tunnels":[]}}"#
+        );
+
+        // 旧デーモン(v1)の応答は version 欠落 → 0 として読める(不一致検出用)
+        let old: IpcReply =
+            serde_json::from_str(r#"{"id":7,"ok":{"type":"status","state":"idle"}}"#).unwrap();
+        match old.result {
+            IpcResult::Ok(IpcResponse::Status(status)) => {
+                assert_eq!(status.version, 0);
+                assert!(status.tunnels.is_empty());
+            }
+            other => panic!("Status を期待: {other:?}"),
+        }
 
         // Stop は config 省略時に旧形式と同じワイヤ表現になる
         let json = serde_json::to_string(&IpcEnvelope {

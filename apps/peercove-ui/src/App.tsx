@@ -99,6 +99,15 @@ export default function App() {
         </div>
       </header>
 
+      {connection.kind === "ok" && connection.status.daemonOutdated && (
+        <section className="card card--error">
+          <h2>{t.daemonOutdated.title}</h2>
+          <p>{t.daemonOutdated.body}</p>
+          <p className="muted small mono">{t.daemonOutdated.windows}</p>
+          <p className="muted small mono">{t.daemonOutdated.linux}</p>
+        </section>
+      )}
+
       {connection.kind === "unreachable" ? (
         <DaemonUnreachable
           message={connection.message}

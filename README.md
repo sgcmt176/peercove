@@ -1047,6 +1047,31 @@ peercove-poc daemon stop            # 1 本だけ稼働中なら --config 省略
    ping が通ること。**ネットワークをまたいだ ping は通らない**こと(分離の確認)
 7. `daemon shutdown` → 残りのトンネルも片付いて終了すること
 
+### トラブルシューティング: デーモンが古い
+
+UI とデーモンは対で更新が必要です。**古いデーモン(サービス)が動いたまま**
+新しい UI を使うと、稼働中のトンネルが「停止中」に見える・接続時に
+「既にトンネルが動いています。先に stop してください」と言われる、
+といった症状になります(M3-0 の実機検証で発覚)。
+
+現在の UI は不一致を検出して「デーモンの更新が必要です」と警告します。
+サービスの入れ替え手順:
+
+```powershell
+# Windows(管理者 PowerShell)
+Stop-Service peercove-daemon
+cargo build --release -p peercove-poc
+.\target\release\peercove-poc.exe daemon service-uninstall
+.\target\release\peercove-poc.exe daemon service-install
+```
+
+```bash
+# Linux
+sudo systemctl stop peercove-daemon
+cargo build --release -p peercove-poc   # 新しいバイナリを /usr/bin 等へ配置
+sudo systemctl start peercove-daemon
+```
+
 ### 検証手順(M3-0c: ネットワーク一覧 UI)
 
 UI がネットワークのカード一覧になり、複数ネットワークを個別に操作できます。

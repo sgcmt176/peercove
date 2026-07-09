@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use peercove_core::ipc::{DaemonStatus, LogLine, PeerSummary, TunnelInfo, TunnelRole};
+use peercove_core::ipc::{DaemonStatus, LogLine, PeerSummary, TunnelInfo, TunnelRole, IPC_VERSION};
 use peercove_core::proto::LedgerEntry;
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +111,9 @@ pub struct Status {
     pub tunnel: Option<Tunnel>,
     /// 稼働中の全トンネル(ADR-0012)。
     pub tunnels: Vec<Tunnel>,
+    /// デーモンの IPC バージョンが UI と一致しない(旧デーモンが動いている)。
+    /// 状態表示が信用できないため、UI は警告を出して更新を促す。
+    pub daemon_outdated: bool,
 }
 
 impl From<DaemonStatus> for Status {
@@ -126,6 +129,7 @@ impl From<DaemonStatus> for Status {
             state,
             tunnel,
             tunnels,
+            daemon_outdated: status.version != IPC_VERSION,
         }
     }
 }
@@ -312,9 +316,11 @@ mod tests {
             removed: false,
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
+            version: peercove_core::ipc::IPC_VERSION,
             tunnels: vec![info],
         }))
         .unwrap();
+        assert_eq!(json["daemonOutdated"], false);
         assert_eq!(json["state"], "hosting");
         assert_eq!(json["tunnel"]["address"], "10.100.42.1");
         assert_eq!(json["tunnel"]["network"], "home");
@@ -324,10 +330,18 @@ mod tests {
         assert!(json["tunnel"]["members"][0]["publicKey"].is_string());
         assert_eq!(json["tunnels"].as_array().unwrap().len(), 1);
 
-        let json = serde_json::to_value(Status::from(DaemonStatus { tunnels: vec![] })).unwrap();
+        let json = serde_json::to_value(Status::from(DaemonStatus { version: IPC_VERSION, tunnels: vec![] })).unwrap();
         assert_eq!(json["state"], "idle");
         assert!(json["tunnel"].is_null());
         assert_eq!(json["tunnels"].as_array().unwrap().len(), 0);
+
+        // 旧デーモン(version 欠落 = 0)は明示フラグで検出できる
+        let json = serde_json::to_value(Status::from(DaemonStatus {
+            version: 0,
+            tunnels: vec![],
+        }))
+        .unwrap();
+        assert_eq!(json["daemonOutdated"], true);
     }
 
     /// Windows の verbatim 接頭辞は表示から取り除く。

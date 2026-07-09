@@ -62,6 +62,15 @@ export const ja = {
     </>
   ),
 
+  daemonOutdated: {
+    title: "デーモンの更新が必要です",
+    body: "動いているデーモンが古いバージョンのため、状態を正しく表示できません（トンネルが稼働中でも「停止中」に見えます）。サービスを入れ替えてください:",
+    windows:
+      "管理者 PowerShell: Stop-Service peercove-daemon → 新しい peercove-poc.exe で daemon service-uninstall → daemon service-install",
+    linux:
+      "sudo systemctl stop peercove-daemon → 新しいバイナリを配置 → sudo systemctl start peercove-daemon",
+  },
+
   daemonUnreachable: {
     title: "デーモンに接続できません",
     body: "トンネルの操作には管理者権限のデーモンが必要です。ターミナルで次を実行してください:",

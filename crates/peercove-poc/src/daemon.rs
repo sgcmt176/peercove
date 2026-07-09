@@ -17,7 +17,7 @@ use std::time::SystemTime;
 use anyhow::{bail, Context};
 use peercove_core::ipc::{
     DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult, PeerSummary,
-    TunnelInfo, TunnelRole,
+    TunnelInfo, TunnelRole, IPC_VERSION,
 };
 use peercove_ipc::MAX_LINE_LEN;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -227,7 +227,10 @@ impl DaemonShared {
         let mut tunnels: Vec<TunnelInfo> = active.values().map(tunnel_info).collect();
         // HashMap の順序は不定なので、表示が揺れないよう設定パスで安定させる
         tunnels.sort_by(|a, b| a.config.cmp(&b.config));
-        DaemonStatus { tunnels }
+        DaemonStatus {
+            version: IPC_VERSION,
+            tunnels,
+        }
     }
 }
 
@@ -668,7 +671,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             response,
-            IpcResponse::Status(DaemonStatus { tunnels: vec![] })
+            IpcResponse::Status(DaemonStatus {
+                version: IPC_VERSION,
+                tunnels: vec![]
+            })
         );
 
         // Start host → tunnels に 1 本(role = host)
@@ -718,7 +724,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             response,
-            IpcResponse::Status(DaemonStatus { tunnels: vec![] })
+            IpcResponse::Status(DaemonStatus {
+                version: IPC_VERSION,
+                tunnels: vec![]
+            })
         );
 
         // Shutdown シグナル
