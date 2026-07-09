@@ -1010,6 +1010,43 @@ sudo ./target/release/peercove-poc daemon service-install
    正規化されて表示されること
 5. 旧バージョンで発行済みのトークンでも参加できること(ネットワーク名は home)
 
+## 複数ネットワークの同時稼働(M3-0b)
+
+デーモンは複数のトンネルを同時に張れます。それぞれ別のインターフェース
+(`peercove0`, `peercove1`, …自動採番)・別のサブネットで動きます:
+
+```bash
+# 2 つのネットワークを順に開始(ホスト・メンバーの組み合わせは自由)
+peercove-poc daemon start-host --config networks/game-lan/host.toml
+peercove-poc daemon start-member --config networks/family/member.toml
+
+peercove-poc daemon status          # 稼働中の全ネットワークを表示
+peercove-poc daemon stop --config networks/game-lan/host.toml   # 個別に停止
+peercove-poc daemon stop            # 1 本だけ稼働中なら --config 省略可
+```
+
+- **サブネットが重複するネットワークは起動を拒否**します(init のランダム
+  サブネットなら実用上ぶつかりません。エラーが出たらどちらかを作り直し)
+- 同一マシンで複数ホストする場合、UI の init は**待受ポートを自動で
+  ずらします**(51820, 51821, …)。CLI は `init --port` で指定してください
+- UI は現状 1 ネットワークの表示のみ(一覧 UI は M3-0c)。「切断」は
+  表示中のネットワークだけを止めます
+
+### 検証手順(M3-0b: 多重トンネル)
+
+1. ホスト用設定を 2 つ作る(例: `init --dir n1 --name one` と
+   `init --dir n2 --name two --port 51821`)
+2. `daemon start-host` を 2 回(それぞれの設定で)→ 両方成功し、
+   `ip link`(Linux)/ `Get-NetAdapter`(Windows)に `peercove0` と
+   `peercove1` が見えること
+3. `daemon status` に 2 ネットワークが表示されること
+4. `daemon stop`(--config なし)→ 「複数のネットワークが稼働中です」の
+   エラーになること
+5. `daemon stop --config n1/host.toml` → one だけ止まり、two は生きていること
+6. 実通信: 別マシン 2 台がそれぞれ別ネットワークに参加し、ホスト経由で
+   ping が通ること。**ネットワークをまたいだ ping は通らない**こと(分離の確認)
+7. `daemon shutdown` → 残りのトンネルも片付いて終了すること
+
 ## 検証手順(M2-G2: デスクトップ UI の骨組み)
 
 UI(非特権)から、管理者/root のデーモンの状態が見えることを確認します。

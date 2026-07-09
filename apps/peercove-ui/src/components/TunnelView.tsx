@@ -35,7 +35,7 @@ export function TunnelView({
     setBusy(true);
     setError(null);
     try {
-      await api.stopTunnel();
+      await api.stopTunnel(tunnel.config);
       onChanged();
     } catch (e) {
       setError(errorMessage(e));

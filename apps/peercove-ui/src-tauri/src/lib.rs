@@ -66,10 +66,15 @@ async fn start_member(config_path: String) -> Result<(), String> {
     send(IpcRequest::StartMember { config }).await
 }
 
-/// トンネルを停止する(デーモンは常駐継続)。
+/// トンネルを停止する(デーモンは常駐継続)。複数ネットワーク対応(ADR-0012)の
+/// ため停止対象の設定パスを指定する。
 #[tauri::command]
-async fn stop_tunnel() -> Result<(), String> {
-    send(IpcRequest::Stop).await
+async fn stop_tunnel(config_path: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::Stop {
+        config: Some(config),
+    })
+    .await
 }
 
 // ---- 通知(M2-G6) ----
@@ -159,13 +164,9 @@ fn init_host(app: tauri::AppHandle, force: bool) -> Result<InitResult, String> {
     let base = config_dir(&app)?;
     let name = peercove_core::names::DEFAULT_NETWORK_NAME;
     let (_, dir) = peercove_ops::networks::network_dir(&base, name).map_err(to_message)?;
-    let result = peercove_ops::init::init_host(
-        &dir,
-        name,
-        peercove_core::config::DEFAULT_LISTEN_PORT,
-        force,
-    )
-    .map_err(to_message)?;
+    // 既にホスト中のネットワークと待受ポートが被らないよう自動選択(ADR-0012)
+    let port = peercove_ops::networks::next_listen_port(&base);
+    let result = peercove_ops::init::init_host(&dir, name, port, force).map_err(to_message)?;
     Ok(InitResult {
         config_path: result.config_path.display().to_string(),
         subnet: result.subnet.to_string(),

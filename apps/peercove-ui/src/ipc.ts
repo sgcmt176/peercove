@@ -26,6 +26,10 @@ export interface Peer {
 
 export interface Tunnel {
   config: string;
+  /** ネットワーク名（ADR-0012）。 */
+  network: string;
+  /** このトンネルでの役割。 */
+  role: "hosting" | "joined";
   address: string;
   members: Member[];
   peers: Peer[];
@@ -37,8 +41,12 @@ export interface Tunnel {
 export type TunnelState = "idle" | "hosting" | "joined";
 
 export interface Status {
+  /** 複数稼働時は先頭トンネルの状態（互換用。一覧 UI は M3-0c）。 */
   state: TunnelState;
+  /** 互換用: 先頭のトンネル。 */
   tunnel: Tunnel | null;
+  /** 稼働中の全トンネル（ADR-0012）。 */
+  tunnels: Tunnel[];
 }
 
 export interface ConfigSlot {
@@ -130,7 +138,8 @@ export const api = {
     invoke<void>("start_host", { configPath, upnp }),
   startMember: (configPath: string) =>
     invoke<void>("start_member", { configPath }),
-  stopTunnel: () => invoke<void>("stop_tunnel"),
+  stopTunnel: (configPath: string) =>
+    invoke<void>("stop_tunnel", { configPath }),
   configPaths: () => invoke<ConfigPaths>("config_paths"),
   initHost: (force: boolean) => invoke<InitResult>("init_host", { force }),
   createInvite: (

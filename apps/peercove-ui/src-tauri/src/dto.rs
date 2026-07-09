@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use peercove_core::ipc::{DaemonStatus, LogLine, PeerSummary, TunnelInfo};
+use peercove_core::ipc::{DaemonStatus, LogLine, PeerSummary, TunnelInfo, TunnelRole};
 use peercove_core::proto::LedgerEntry;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,10 @@ impl From<&PeerSummary> for Peer {
 #[serde(rename_all = "camelCase")]
 pub struct Tunnel {
     pub config: String,
+    /// ネットワーク名(ADR-0012)。
+    pub network: String,
+    /// "hosting" | "joined"
+    pub role: &'static str,
     pub address: String,
     pub members: Vec<Member>,
     pub peers: Vec<Peer>,
@@ -68,11 +72,20 @@ impl From<&TunnelInfo> for Tunnel {
     fn from(info: &TunnelInfo) -> Self {
         Self {
             config: display_path(&info.config),
+            network: info.network.clone(),
+            role: role_str(info.role),
             address: info.address.to_string(),
             members: info.ledger.iter().map(Member::from).collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
             removed: info.removed,
         }
+    }
+}
+
+fn role_str(role: TunnelRole) -> &'static str {
+    match role {
+        TunnelRole::Host => "hosting",
+        TunnelRole::Member => "joined",
     }
 }
 
@@ -91,26 +104,28 @@ fn display_path(path: &Path) -> String {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
-    /// "idle" | "hosting" | "joined"(同時参加は 1 ネットワークまで)
+    /// "idle" | "hosting" | "joined"。複数稼働時は先頭トンネルの状態
+    /// (現行 UI の単一表示との互換。M3-0c で tunnels の一覧表示に移行)。
     pub state: &'static str,
+    /// 互換用: 先頭のトンネル。
     pub tunnel: Option<Tunnel>,
+    /// 稼働中の全トンネル(ADR-0012)。
+    pub tunnels: Vec<Tunnel>,
 }
 
 impl From<DaemonStatus> for Status {
     fn from(status: DaemonStatus) -> Self {
-        match status {
-            DaemonStatus::Idle => Self {
-                state: "idle",
-                tunnel: None,
-            },
-            DaemonStatus::Hosting(info) => Self {
-                state: "hosting",
-                tunnel: Some(Tunnel::from(&info)),
-            },
-            DaemonStatus::Joined(info) => Self {
-                state: "joined",
-                tunnel: Some(Tunnel::from(&info)),
-            },
+        let tunnels: Vec<Tunnel> = status.tunnels.iter().map(Tunnel::from).collect();
+        let state = status
+            .tunnels
+            .first()
+            .map(|info| role_str(info.role))
+            .unwrap_or("idle");
+        let tunnel = status.tunnels.first().map(Tunnel::from);
+        Self {
+            state,
+            tunnel,
+            tunnels,
         }
     }
 }
@@ -277,6 +292,8 @@ mod tests {
     fn status_serializes_to_ui_shape() {
         let info = TunnelInfo {
             config: std::path::PathBuf::from("host.toml"),
+            network: "home".to_string(),
+            role: TunnelRole::Host,
             address: "10.100.42.1".parse().unwrap(),
             ledger: vec![LedgerEntry {
                 name: Some("alice".to_string()),
@@ -288,16 +305,23 @@ mod tests {
             peers: vec![],
             removed: false,
         };
-        let json = serde_json::to_value(Status::from(DaemonStatus::Hosting(info))).unwrap();
+        let json = serde_json::to_value(Status::from(DaemonStatus {
+            tunnels: vec![info],
+        }))
+        .unwrap();
         assert_eq!(json["state"], "hosting");
         assert_eq!(json["tunnel"]["address"], "10.100.42.1");
+        assert_eq!(json["tunnel"]["network"], "home");
+        assert_eq!(json["tunnel"]["role"], "hosting");
         assert_eq!(json["tunnel"]["members"][0]["name"], "alice");
         assert_eq!(json["tunnel"]["members"][0]["isHost"], false);
         assert!(json["tunnel"]["members"][0]["publicKey"].is_string());
+        assert_eq!(json["tunnels"].as_array().unwrap().len(), 1);
 
-        let json = serde_json::to_value(Status::from(DaemonStatus::Idle)).unwrap();
+        let json = serde_json::to_value(Status::from(DaemonStatus { tunnels: vec![] })).unwrap();
         assert_eq!(json["state"], "idle");
         assert!(json["tunnel"].is_null());
+        assert_eq!(json["tunnels"].as_array().unwrap().len(), 0);
     }
 
     /// Windows の verbatim 接頭辞は表示から取り除く。

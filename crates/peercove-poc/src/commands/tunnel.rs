@@ -30,11 +30,59 @@ pub struct ActiveTunnel {
     pub backend: Box<dyn WgBackend>,
     pub spec: TunnelSpec,
     pub role: Role,
+    /// 実際に使ったインターフェース名(複数ネットワーク時は自動採番 — ADR-0012)。
+    pub if_name: String,
+    /// ネットワーク名(設定の network_name、旧設定は既定名)。
+    pub network: String,
     upnp_lease: Option<crate::upnp::UpnpLease>,
 }
 
+/// 稼働中トンネルとの衝突検査に使う情報(ADR-0012 §3)。
+/// 単発 CLI(host / member コマンド)ではデーモンが居ないので空 = 検査なし。
+#[derive(Default)]
+pub struct StartLimits {
+    /// 稼働中の (サブネット, ネットワーク名)。重複はエラー。
+    pub used_subnets: Vec<(ipnet::Ipv4Net, String)>,
+    /// 稼働中のインターフェース名。既定名の場合は空き番号へ避ける。
+    pub used_if_names: Vec<String>,
+}
+
+/// 使うインターフェース名を決め、サブネットの重複を検査する(純関数)。
+///
+/// - サブネットが稼働中ネットワークと重なる → エラー(黙って壊れない)
+/// - 設定で明示されたインターフェース名が使用中 → エラー
+/// - 既定名(`peercove0`)が使用中 → `peercove1`, `peercove2`, …の空き番号
+pub fn plan_interface(config: &Config, limits: &StartLimits) -> anyhow::Result<String> {
+    let subnet = config.interface.address.trunc();
+    for (used, network) in &limits.used_subnets {
+        if used.contains(&subnet.addr()) || subnet.contains(&used.addr()) {
+            bail!(
+                "サブネット {subnet} は稼働中のネットワーク \"{network}\"({used})と重なっています。\
+                 どちらかを別のサブネットで作り直してください"
+            );
+        }
+    }
+    let name = &config.interface.name;
+    let in_use = |name: &str| limits.used_if_names.iter().any(|used| used == name);
+    if name != peercove_core::config::DEFAULT_IF_NAME {
+        if in_use(name) {
+            bail!("インターフェース名 {name} は稼働中のトンネルが使用しています");
+        }
+        return Ok(name.clone());
+    }
+    Ok((0..)
+        .map(|i| format!("peercove{i}"))
+        .find(|candidate| !in_use(candidate))
+        .expect("空き番号は必ずある"))
+}
+
 /// 設定を読み、UPnP(任意)→ トンネル作成までを行う(CLI / daemon 共通)。
-pub fn bring_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<ActiveTunnel> {
+pub fn bring_up(
+    config_path: &Path,
+    role: Role,
+    upnp: bool,
+    limits: &StartLimits,
+) -> anyhow::Result<ActiveTunnel> {
     let config = Config::load(config_path)?;
     if peercove_core::ipalloc::overlaps_cgnat(config.interface.address.trunc()) {
         tracing::warn!(
@@ -44,8 +92,9 @@ pub fn bring_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<Ac
             config.interface.address.trunc()
         );
     }
+    let if_name = plan_interface(&config, limits)?;
     let spec = build_spec(&config, role)?;
-    let mut backend = create_backend(&config.interface.name)?;
+    let mut backend = create_backend(&if_name)?;
 
     // UPnP はトンネル作成前に試行する(TUN のマルチキャスト経路が SSDP 探索を
     // 妨げないように)。失敗してもトンネルは起動する(手動ポートフォワードで代替可能)
@@ -73,8 +122,8 @@ pub fn bring_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<Ac
 
     backend.up(&spec)?;
     tracing::info!(
-        "トンネル {} を作成しました(address={} mtu={} peers={})",
-        config.interface.name,
+        "トンネル {if_name} を作成しました(network={} address={} mtu={} peers={})",
+        config.network_name(),
         config.interface.address,
         spec.mtu,
         spec.peers.len()
@@ -83,6 +132,8 @@ pub fn bring_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<Ac
         backend,
         spec,
         role,
+        if_name,
+        network: config.network_name().to_string(),
         upnp_lease,
     })
 }
@@ -112,6 +163,8 @@ impl ActiveTunnel {
             backend,
             spec,
             role,
+            if_name: "peercove-test".to_string(),
+            network: "test".to_string(),
             upnp_lease: None,
         }
     }
@@ -128,7 +181,8 @@ pub fn tear_down(mut tunnel: ActiveTunnel, config_path: &Path) -> anyhow::Result
 
 /// host / member 共通: トンネルを作成し、Ctrl+C まで維持して破棄する(CLI モード)。
 pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> {
-    let mut tunnel = bring_up(config_path, role, upnp)?;
+    // 単発 CLI はデーモンの稼働状況を知らないため衝突検査なし(従来どおり)
+    let mut tunnel = bring_up(config_path, role, upnp, &StartLimits::default())?;
     println!(
         "トンネルを作成しました(address={} peers={})",
         tunnel.spec.address,
@@ -570,6 +624,43 @@ mod tests {
             "[interface]\nprivate_key_file = \"host.key\"\naddress = \"10.100.42.1/24\"\nlisten_port = 51820\n{peers_toml}"
         );
         toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn plan_interface_checks_subnet_overlap_and_allocates_names() {
+        let config = host_config("");
+        // 制約なし: 既定名のまま
+        assert_eq!(
+            plan_interface(&config, &StartLimits::default()).unwrap(),
+            "peercove0"
+        );
+
+        // 既定名が使用中: 空き番号へ
+        let limits = StartLimits {
+            used_subnets: vec![("10.200.0.0/24".parse().unwrap(), "other".to_string())],
+            used_if_names: vec!["peercove0".to_string(), "peercove1".to_string()],
+        };
+        assert_eq!(plan_interface(&config, &limits).unwrap(), "peercove2");
+
+        // サブネット重複: ネットワーク名入りのエラー
+        let limits = StartLimits {
+            used_subnets: vec![("10.100.42.0/24".parse().unwrap(), "game".to_string())],
+            used_if_names: vec![],
+        };
+        let err = plan_interface(&config, &limits).unwrap_err().to_string();
+        assert!(
+            err.contains("game"),
+            "重複相手のネットワーク名を含む: {err}"
+        );
+
+        // 明示したインターフェース名が使用中: エラー(黙って別名にしない)
+        let mut config = host_config("");
+        config.interface.name = "mytun".to_string();
+        let limits = StartLimits {
+            used_subnets: vec![],
+            used_if_names: vec!["mytun".to_string()],
+        };
+        assert!(plan_interface(&config, &limits).is_err());
     }
 
     #[test]

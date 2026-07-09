@@ -190,7 +190,11 @@ enum DaemonAction {
         config: PathBuf,
     },
     /// トンネルを停止する(デーモンは常駐継続)
-    Stop,
+    Stop {
+        /// 停止するネットワークの設定ファイル(1 本だけ稼働中なら省略可)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// デーモンが保持する直近のログを表示する
     Logs {
         /// 新しい行を待ち続ける(Ctrl+C で終了)
@@ -348,8 +352,9 @@ fn run_daemon_action(action: DaemonAction) -> anyhow::Result<()> {
             println!("メンバーとしてトンネルを開始しました(daemon status で確認できます)");
             Ok(())
         }
-        DaemonAction::Stop => {
-            daemon::request(IpcRequest::Stop)?;
+        DaemonAction::Stop { config } => {
+            let config = config.map(canon).transpose()?;
+            daemon::request(IpcRequest::Stop { config })?;
             println!("トンネルを停止しました");
             Ok(())
         }

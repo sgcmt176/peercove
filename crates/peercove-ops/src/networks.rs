@@ -115,6 +115,30 @@ pub fn list(base: &Path) -> Vec<NetworkEntry> {
     entries
 }
 
+/// 新しくホストするネットワークの待受ポートを選ぶ(ADR-0012 §3)。
+///
+/// 既存ネットワークの listen_port(未指定は既定値扱い)を避けて、
+/// 51820 から数えた最小の空きポートを返す。同一マシンで複数ホストしても
+/// UDP バインドが衝突しないようにするための静的な回避で、他プロセスの
+/// 使用状況までは見ない(バインド失敗は起動時エラーで分かる)。
+pub fn next_listen_port(base: &Path) -> u16 {
+    let used: Vec<u16> = list(base)
+        .iter()
+        .filter_map(|entry| {
+            let config = Config::load(&entry.config_path).ok()?;
+            Some(
+                config
+                    .interface
+                    .listen_port
+                    .unwrap_or(peercove_core::config::DEFAULT_LISTEN_PORT),
+            )
+        })
+        .collect();
+    (peercove_core::config::DEFAULT_LISTEN_PORT..)
+        .find(|port| !used.contains(port))
+        .expect("空きポートは必ずある")
+}
+
 /// 旧配置(base 直下の host.toml / member.toml)を networks/ へ移す。
 /// 移した設定ファイルの新パスを返す(何もなければ空)。
 ///
@@ -289,6 +313,20 @@ mod tests {
             .as_ref()
             .unwrap()
             .exists());
+    }
+
+    #[test]
+    fn next_listen_port_skips_used_ports() {
+        let base = base("ports");
+        assert_eq!(next_listen_port(&base), 51820, "既存なしなら既定");
+
+        let (_, dir) = network_dir(&base, "one").unwrap();
+        crate::init::init_host(&dir, "one", 51820, false).unwrap();
+        assert_eq!(next_listen_port(&base), 51821);
+
+        let (_, dir) = network_dir(&base, "two").unwrap();
+        crate::init::init_host(&dir, "two", 51821, false).unwrap();
+        assert_eq!(next_listen_port(&base), 51822);
     }
 
     #[test]

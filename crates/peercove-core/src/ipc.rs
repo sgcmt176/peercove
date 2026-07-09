@@ -28,15 +28,19 @@ pub struct IpcEnvelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum IpcRequest {
-    /// デーモンと現在のトンネルの状態を返す。
+    /// デーモンと稼働中トンネルの状態を返す。
     Status,
-    /// ホストとしてトンネルを開始する。
+    /// ホストとしてトンネルを開始する(複数ネットワーク可 — ADR-0012)。
     StartHost { config: PathBuf, upnp: bool },
     /// メンバーとしてトンネルを開始する。
     StartMember { config: PathBuf },
     /// トンネルを停止する(デーモンは常駐継続)。
-    Stop,
-    /// デーモンを終了する(トンネルが動いていれば停止してから)。
+    /// `config` 省略時は「1 本だけ稼働中」の場合のみ止める(複数なら要指定)。
+    Stop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<PathBuf>,
+    },
+    /// デーモンを終了する(トンネルが動いていればすべて停止してから)。
     Shutdown,
     /// デーモンが保持する直近のログを取り出す(M2-G5)。
     /// `after_seq` より後の行だけを返す(0 なら持っている分すべて)。
@@ -95,18 +99,28 @@ pub struct LogLine {
 /// `peercove-ipc` の受信上限を超えないようにする)。
 pub const MAX_LOG_LINES_PER_REPLY: usize = 200;
 
-/// デーモンの状態モデル(M2 handoff Q4: 同時 1 ネットワーク)。
+/// デーモンの状態モデル(ADR-0012: 複数ネットワーク同時稼働)。
+/// 空 = 待機中。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum DaemonStatus {
-    Idle,
-    Hosting(TunnelInfo),
-    Joined(TunnelInfo),
+pub struct DaemonStatus {
+    #[serde(default)]
+    pub tunnels: Vec<TunnelInfo>,
+}
+
+/// トンネルの役割。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelRole {
+    Host,
+    Member,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelInfo {
     pub config: PathBuf,
+    /// ネットワーク名(ADR-0012。設定の network_name、旧設定は既定名)。
+    pub network: String,
+    pub role: TunnelRole,
     /// 自分の仮想 IP。
     pub address: Ipv4Addr,
     /// 台帳スナップショット(host: 自前構築 / member: 受信したもの)。
@@ -151,7 +165,10 @@ mod tests {
             IpcRequest::StartMember {
                 config: PathBuf::from("member.toml"),
             },
-            IpcRequest::Stop,
+            IpcRequest::Stop { config: None },
+            IpcRequest::Stop {
+                config: Some(PathBuf::from("host.toml")),
+            },
             IpcRequest::Shutdown,
             IpcRequest::Logs { after_seq: 42 },
         ];
@@ -170,7 +187,7 @@ mod tests {
             },
             IpcReply {
                 id: 2,
-                result: IpcResult::Ok(IpcResponse::Status(DaemonStatus::Idle)),
+                result: IpcResult::Ok(IpcResponse::Status(DaemonStatus { tunnels: vec![] })),
             },
             IpcReply {
                 id: 3,
@@ -196,10 +213,18 @@ mod tests {
 
         let json = serde_json::to_string(&IpcReply {
             id: 7,
-            result: IpcResult::Ok(IpcResponse::Status(DaemonStatus::Idle)),
+            result: IpcResult::Ok(IpcResponse::Status(DaemonStatus { tunnels: vec![] })),
         })
         .unwrap();
-        assert_eq!(json, r#"{"id":7,"ok":{"type":"status","state":"idle"}}"#);
+        assert_eq!(json, r#"{"id":7,"ok":{"type":"status","tunnels":[]}}"#);
+
+        // Stop は config 省略時に旧形式と同じワイヤ表現になる
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 10,
+            req: IpcRequest::Stop { config: None },
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"id":10,"req":{"method":"stop"}}"#);
 
         let json = serde_json::to_string(&IpcReply {
             id: 8,

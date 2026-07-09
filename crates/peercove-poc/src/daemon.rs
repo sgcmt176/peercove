@@ -17,20 +17,22 @@ use std::time::SystemTime;
 use anyhow::{bail, Context};
 use peercove_core::ipc::{
     DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult, PeerSummary,
-    TunnelInfo,
+    TunnelInfo, TunnelRole,
 };
 use peercove_ipc::MAX_LINE_LEN;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
-use crate::commands::tunnel::{self, ActiveTunnel, Role, SharedSnapshot};
+use crate::commands::tunnel::{self, ActiveTunnel, Role, SharedSnapshot, StartLimits};
 
 /// トンネルの起動方法(テストでは差し替える)。
-type BringUp = Box<dyn Fn(&Path, Role, bool) -> anyhow::Result<ActiveTunnel> + Send + Sync>;
+type BringUp =
+    Box<dyn Fn(&Path, Role, bool, &StartLimits) -> anyhow::Result<ActiveTunnel> + Send + Sync>;
 
-/// デーモンの共有状態。
+/// デーモンの共有状態。複数ネットワークを同時に張れる(ADR-0012)。
+/// キーは設定ファイルの絶対パス。
 pub struct DaemonShared {
-    active: tokio::sync::Mutex<Option<Active>>,
+    active: tokio::sync::Mutex<HashMap<PathBuf, Active>>,
     bring_up: BringUp,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -38,7 +40,11 @@ pub struct DaemonShared {
 struct Active {
     role: Role,
     config: PathBuf,
+    network: String,
     address: Ipv4Addr,
+    /// 衝突検査(StartLimits)用
+    subnet: ipnet::Ipv4Net,
+    if_name: String,
     stop_tx: watch::Sender<bool>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
     snapshot: SharedSnapshot,
@@ -49,7 +55,7 @@ impl DaemonShared {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         (
             Arc::new(Self {
-                active: tokio::sync::Mutex::new(None),
+                active: tokio::sync::Mutex::new(HashMap::new()),
                 bring_up,
                 shutdown_tx,
             }),
@@ -68,14 +74,12 @@ impl DaemonShared {
                 self.start(config, Role::Member, false).await?;
                 Ok(IpcResponse::Done)
             }
-            IpcRequest::Stop => {
-                self.stop().await?;
+            IpcRequest::Stop { config } => {
+                self.stop(config).await?;
                 Ok(IpcResponse::Done)
             }
             IpcRequest::Shutdown => {
-                if self.active.lock().await.is_some() {
-                    self.stop().await?;
-                }
+                self.stop_all().await;
                 let _ = self.shutdown_tx.send(true);
                 Ok(IpcResponse::Done)
             }
@@ -86,25 +90,45 @@ impl DaemonShared {
         }
     }
 
+    /// IPC で渡されたパスをキー用に正規化する。ファイルが消えている等で
+    /// 正規化できない場合は渡されたまま使う(停止要求を弾かないため)。
+    fn key_for(config: &Path) -> PathBuf {
+        std::fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf())
+    }
+
     async fn start(
         self: &Arc<Self>,
         config: PathBuf,
         role: Role,
         upnp: bool,
     ) -> anyhow::Result<()> {
+        let key = Self::key_for(&config);
         let mut active = self.active.lock().await;
-        if active.is_some() {
-            bail!("既にトンネルが動いています。先に stop してください");
+        if active.contains_key(&key) {
+            bail!("この設定のトンネルは既に動いています({})", config.display());
         }
+        // 稼働中トンネルとの衝突検査(サブネット重複・インターフェース名)は
+        // bring_up 内の plan_interface が行う。材料だけここで集める
+        let limits = StartLimits {
+            used_subnets: active
+                .values()
+                .map(|a| (a.subnet, a.network.clone()))
+                .collect(),
+            used_if_names: active.values().map(|a| a.if_name.clone()).collect(),
+        };
         // bring_up はブロッキング処理(netlink / netsh / UPnP)なので専用スレッドで
         let shared = Arc::clone(self);
         let config_for_up = config.clone();
-        let tunnel =
-            tokio::task::spawn_blocking(move || (shared.bring_up)(&config_for_up, role, upnp))
-                .await
-                .context("起動タスクの実行に失敗しました")??;
+        let tunnel = tokio::task::spawn_blocking(move || {
+            (shared.bring_up)(&config_for_up, role, upnp, &limits)
+        })
+        .await
+        .context("起動タスクの実行に失敗しました")??;
 
         let address = tunnel.spec.address.addr();
+        let subnet = tunnel.spec.address.trunc();
+        let network = tunnel.network.clone();
+        let if_name = tunnel.if_name.clone();
         let (stop_tx, stop_rx) = watch::channel(false);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let task_snapshot = Arc::clone(&snapshot);
@@ -121,84 +145,140 @@ impl DaemonShared {
                     .context("停止タスクの実行に失敗しました")?;
             supervise_result.and(down_result)
         });
-        *active = Some(Active {
-            role,
-            config,
-            address,
-            stop_tx,
-            task,
-            snapshot,
-        });
-        tracing::info!("トンネルを開始しました");
+        tracing::info!("トンネルを開始しました(network={network})");
+        active.insert(
+            key,
+            Active {
+                role,
+                config,
+                network,
+                address,
+                subnet,
+                if_name,
+                stop_tx,
+                task,
+                snapshot,
+            },
+        );
         Ok(())
     }
 
-    async fn stop(self: &Arc<Self>) -> anyhow::Result<()> {
-        let Some(active) = self.active.lock().await.take() else {
-            bail!("トンネルは動いていません");
+    /// `config` 指定でそのトンネルを、省略時は「1 本だけ稼働中」の場合に
+    /// そのトンネルを止める(複数稼働中の省略はエラー — 誤爆防止)。
+    async fn stop(self: &Arc<Self>, config: Option<PathBuf>) -> anyhow::Result<()> {
+        let active = {
+            let mut map = self.active.lock().await;
+            match config {
+                Some(config) => {
+                    let key = Self::key_for(&config);
+                    match map.remove(&key) {
+                        Some(active) => active,
+                        None => bail!("この設定のトンネルは動いていません({})", config.display()),
+                    }
+                }
+                None => {
+                    if map.is_empty() {
+                        bail!("トンネルは動いていません");
+                    }
+                    if map.len() > 1 {
+                        let running: Vec<String> = map
+                            .values()
+                            .map(|a| format!("{}({})", a.network, a.config.display()))
+                            .collect();
+                        bail!(
+                            "複数のネットワークが稼働中です。--config で指定してください: {}",
+                            running.join(", ")
+                        );
+                    }
+                    let key = map.keys().next().expect("len==1").clone();
+                    map.remove(&key).expect("直前に確認済み")
+                }
+            }
         };
+        let network = active.network.clone();
         let _ = active.stop_tx.send(true);
         active
             .task
             .await
             .context("トンネルタスクの終了待ちに失敗しました")?
             .context("トンネルの停止処理でエラーが発生しました")?;
-        tracing::info!("トンネルを停止しました");
+        tracing::info!("トンネルを停止しました(network={network})");
         Ok(())
+    }
+
+    /// 全トンネルを停止する(shutdown・常駐終了時)。エラーはログに落として続行。
+    async fn stop_all(self: &Arc<Self>) {
+        let all: Vec<Active> = self.active.lock().await.drain().map(|(_, a)| a).collect();
+        for active in all {
+            let network = active.network.clone();
+            let _ = active.stop_tx.send(true);
+            match active.task.await {
+                Ok(Ok(())) => tracing::info!("トンネルを停止しました(network={network})"),
+                Ok(Err(e)) => {
+                    tracing::warn!("トンネル(network={network})の停止でエラー: {e:#}")
+                }
+                Err(e) => tracing::warn!("トンネルタスクの終了待ちに失敗: {e:#}"),
+            }
+        }
     }
 
     async fn status(&self) -> DaemonStatus {
         let active = self.active.lock().await;
-        let Some(active) = active.as_ref() else {
-            return DaemonStatus::Idle;
-        };
-        // ロックはこのブロックの間だけ(status 応答の組み立ては外でやる)
-        let (peers, ledger, rtt_ms, removed) = {
-            let snapshot = active.snapshot.lock().unwrap();
-            match snapshot.as_ref() {
-                Some(snapshot) => (
-                    snapshot.peers.clone(),
-                    snapshot.ledger.clone(),
-                    snapshot.rtt_ms.clone(),
-                    snapshot.removed,
-                ),
-                None => (Vec::new(), None, HashMap::new(), false),
-            }
-        };
-        let ledger = ledger.unwrap_or_default();
-        // RTT は仮想 IP をキーに測っている。台帳が公開鍵 ↔ 仮想 IP を対応づける
-        let ip_by_key: HashMap<&[u8; 32], Ipv4Addr> = ledger
-            .iter()
-            .map(|entry| (entry.public_key.as_bytes(), entry.ip))
-            .collect();
-        let now = SystemTime::now();
-        let info = TunnelInfo {
-            config: active.config.clone(),
-            address: active.address,
-            peers: peers
-                .iter()
-                .map(|p| PeerSummary {
-                    public_key: p.public_key,
-                    endpoint: p.endpoint,
-                    last_handshake_age_secs: p
-                        .last_handshake
-                        .and_then(|t| now.duration_since(t).ok())
-                        .map(|d| d.as_secs()),
-                    rx_bytes: p.rx_bytes,
-                    tx_bytes: p.tx_bytes,
-                    rtt_ms: ip_by_key
-                        .get(p.public_key.as_bytes())
-                        .and_then(|ip| rtt_ms.get(ip))
-                        .copied(),
-                })
-                .collect(),
-            ledger,
-            removed,
-        };
-        match active.role {
-            Role::Host => DaemonStatus::Hosting(info),
-            Role::Member => DaemonStatus::Joined(info),
+        let mut tunnels: Vec<TunnelInfo> = active.values().map(tunnel_info).collect();
+        // HashMap の順序は不定なので、表示が揺れないよう設定パスで安定させる
+        tunnels.sort_by(|a, b| a.config.cmp(&b.config));
+        DaemonStatus { tunnels }
+    }
+}
+
+/// 1 トンネル分の status 応答を組み立てる。
+fn tunnel_info(active: &Active) -> TunnelInfo {
+    let (peers, ledger, rtt_ms, removed) = {
+        let snapshot = active.snapshot.lock().unwrap();
+        match snapshot.as_ref() {
+            Some(snapshot) => (
+                snapshot.peers.clone(),
+                snapshot.ledger.clone(),
+                snapshot.rtt_ms.clone(),
+                snapshot.removed,
+            ),
+            None => (Vec::new(), None, HashMap::new(), false),
         }
+    };
+    let ledger = ledger.unwrap_or_default();
+    // RTT は仮想 IP をキーに測っている。台帳が公開鍵 ↔ 仮想 IP を対応づける
+    let ip_by_key: HashMap<&[u8; 32], Ipv4Addr> = ledger
+        .iter()
+        .map(|entry| (entry.public_key.as_bytes(), entry.ip))
+        .collect();
+    let now = SystemTime::now();
+    TunnelInfo {
+        config: active.config.clone(),
+        network: active.network.clone(),
+        role: match active.role {
+            Role::Host => TunnelRole::Host,
+            Role::Member => TunnelRole::Member,
+        },
+        address: active.address,
+        peers: peers
+            .iter()
+            .map(|p| PeerSummary {
+                public_key: p.public_key,
+                endpoint: p.endpoint,
+                last_handshake_age_secs: p
+                    .last_handshake
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs()),
+                rx_bytes: p.rx_bytes,
+                tx_bytes: p.tx_bytes,
+                rtt_ms: ip_by_key
+                    .get(p.public_key.as_bytes())
+                    .and_then(|ip| rtt_ms.get(ip))
+                    .copied(),
+            })
+            .collect(),
+        ledger,
+        removed,
     }
 }
 
@@ -286,11 +366,7 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
     })?;
     // 常駐終了時にトンネルが残っていれば必ず片付ける
     runtime.block_on(async {
-        if shared.active.lock().await.is_some() {
-            if let Err(e) = shared.stop().await {
-                tracing::warn!("終了時のトンネル停止に失敗しました: {e:#}");
-            }
-        }
+        shared.stop_all().await;
     });
     // UDS のファイルは自動で消えないため、残骸を残さない(Windows のパイプは不要)
     #[cfg(unix)]
@@ -459,43 +535,46 @@ async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
 
 /// status 応答を人間向けに表示する。
 pub fn print_status(status: &DaemonStatus) {
-    match status {
-        DaemonStatus::Idle => println!("状態: 待機中(トンネルなし)"),
-        DaemonStatus::Hosting(info) | DaemonStatus::Joined(info) => {
-            let role = if matches!(status, DaemonStatus::Hosting(_)) {
-                "ホスト"
-            } else {
-                "メンバー"
-            };
-            println!("状態: {role}として稼働中");
-            println!("  設定: {}", info.config.display());
-            println!("  仮想 IP: {}", info.address);
-            if !info.ledger.is_empty() {
-                println!("  members:");
-                for entry in &info.ledger {
-                    println!(
-                        "    {} {}({}){}",
-                        if entry.online { "●" } else { "○" },
-                        entry.name.as_deref().unwrap_or("(名前なし)"),
-                        entry.ip,
-                        if entry.is_host { " [host]" } else { "" }
-                    );
-                }
-            }
-            for peer in &info.peers {
-                let handshake = match peer.last_handshake_age_secs {
-                    Some(age) => format!("{age} 秒前"),
-                    None => "なし".to_string(),
-                };
-                let rtt = match peer.rtt_ms {
-                    Some(ms) => format!(", rtt {ms:.1} ms"),
-                    None => String::new(),
-                };
+    if status.tunnels.is_empty() {
+        println!("状態: 待機中(トンネルなし)");
+        return;
+    }
+    if status.tunnels.len() > 1 {
+        println!("{} 個のネットワークが稼働中:", status.tunnels.len());
+    }
+    for info in &status.tunnels {
+        let role = match info.role {
+            TunnelRole::Host => "ホスト",
+            TunnelRole::Member => "メンバー",
+        };
+        println!("ネットワーク {}: {role}として稼働中", info.network);
+        println!("  設定: {}", info.config.display());
+        println!("  仮想 IP: {}", info.address);
+        if !info.ledger.is_empty() {
+            println!("  members:");
+            for entry in &info.ledger {
                 println!(
-                    "  peer {}: handshake {handshake}, rx {} B, tx {} B{rtt}",
-                    peer.public_key, peer.rx_bytes, peer.tx_bytes
+                    "    {} {}({}){}",
+                    if entry.online { "●" } else { "○" },
+                    entry.name.as_deref().unwrap_or("(名前なし)"),
+                    entry.ip,
+                    if entry.is_host { " [host]" } else { "" }
                 );
             }
+        }
+        for peer in &info.peers {
+            let handshake = match peer.last_handshake_age_secs {
+                Some(age) => format!("{age} 秒前"),
+                None => "なし".to_string(),
+            };
+            let rtt = match peer.rtt_ms {
+                Some(ms) => format!(", rtt {ms:.1} ms"),
+                None => String::new(),
+            };
+            println!(
+                "  peer {}: handshake {handshake}, rx {} B, tx {} B{rtt}",
+                peer.public_key, peer.rx_bytes, peer.tx_bytes
+            );
         }
     }
 }
@@ -550,17 +629,23 @@ mod tests {
     use peercove_ipc::request_over;
 
     fn test_shared() -> (Arc<DaemonShared>, watch::Receiver<bool>) {
-        DaemonShared::new(Box::new(|config, role, _upnp| {
-            // 実トンネルの代わりにモックを起動する
+        DaemonShared::new(Box::new(|config, role, _upnp, _limits| {
+            // 実トンネルの代わりにモックを起動する。複数トンネルのテストが
+            // できるよう、アドレスは設定パスから機械的に変える
+            let octet = (config
+                .to_string_lossy()
+                .bytes()
+                .fold(0u32, |acc, b| acc.wrapping_add(b as u32))
+                % 200
+                + 1) as u8;
             let spec = TunnelSpec {
                 private_key: PrivateKey::generate(),
-                address: "10.99.0.1/24".parse().unwrap(),
+                address: format!("10.99.{octet}.1/24").parse().unwrap(),
                 listen_port: Some(51820),
                 mtu: 1420,
                 forwarding: role == Role::Host,
                 peers: Vec::new(),
             };
-            let _ = config;
             Ok(ActiveTunnel::new_for_test(
                 spec,
                 role,
@@ -577,13 +662,16 @@ mod tests {
         let server = tokio::spawn(handle_connection(server_io, Arc::clone(&shared)));
         let mut client = client_io;
 
-        // Idle
+        // Idle(トンネルなし)
         let response = request_over(&mut client, 1, &IpcRequest::Status)
             .await
             .unwrap();
-        assert_eq!(response, IpcResponse::Status(DaemonStatus::Idle));
+        assert_eq!(
+            response,
+            IpcResponse::Status(DaemonStatus { tunnels: vec![] })
+        );
 
-        // Start host → Hosting
+        // Start host → tunnels に 1 本(role = host)
         let response = request_over(
             &mut client,
             2,
@@ -599,33 +687,39 @@ mod tests {
             .await
             .unwrap();
         match response {
-            IpcResponse::Status(DaemonStatus::Hosting(info)) => {
-                assert_eq!(info.address.to_string(), "10.99.0.1");
+            IpcResponse::Status(status) => {
+                assert_eq!(status.tunnels.len(), 1);
+                assert_eq!(status.tunnels[0].role, TunnelRole::Host);
+                assert_eq!(status.tunnels[0].network, "test");
             }
-            other => panic!("Hosting を期待: {other:?}"),
+            other => panic!("Status を期待: {other:?}"),
         }
 
-        // 二重起動は拒否
+        // 同じ設定の二重起動は拒否
         let err = request_over(
             &mut client,
             4,
-            &IpcRequest::StartMember {
-                config: PathBuf::from("member.toml"),
+            &IpcRequest::StartHost {
+                config: PathBuf::from("host.toml"),
+                upnp: false,
             },
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("既にトンネル"));
+        assert!(err.to_string().contains("既に動いています"));
 
-        // Stop → Idle
-        let response = request_over(&mut client, 5, &IpcRequest::Stop)
+        // Stop(1 本なら config 省略可)→ Idle
+        let response = request_over(&mut client, 5, &IpcRequest::Stop { config: None })
             .await
             .unwrap();
         assert_eq!(response, IpcResponse::Done);
         let response = request_over(&mut client, 6, &IpcRequest::Status)
             .await
             .unwrap();
-        assert_eq!(response, IpcResponse::Status(DaemonStatus::Idle));
+        assert_eq!(
+            response,
+            IpcResponse::Status(DaemonStatus { tunnels: vec![] })
+        );
 
         // Shutdown シグナル
         let response = request_over(&mut client, 7, &IpcRequest::Shutdown)
@@ -637,6 +731,63 @@ mod tests {
 
         drop(client);
         server.await.unwrap().unwrap();
+    }
+
+    /// 複数ネットワークの同時稼働(ADR-0012): 2 本張って個別に止める。
+    #[tokio::test]
+    async fn runs_multiple_tunnels_and_stops_individually() {
+        let (shared, _rx) = test_shared();
+        // どちらも Host ロール(Member は supervise 開始時に実ファイルが要る)
+        shared
+            .start(PathBuf::from("a.toml"), Role::Host, false)
+            .await
+            .unwrap();
+        shared
+            .start(PathBuf::from("b.toml"), Role::Host, false)
+            .await
+            .unwrap();
+
+        let status = shared.status().await;
+        assert_eq!(status.tunnels.len(), 2);
+        assert_eq!(status.tunnels[0].config, PathBuf::from("a.toml"));
+        assert_eq!(status.tunnels[0].role, TunnelRole::Host);
+        assert_ne!(
+            status.tunnels[0].address, status.tunnels[1].address,
+            "モックはパスごとに別サブネット"
+        );
+
+        // 複数稼働中の config 省略 stop は誤爆防止で拒否
+        let err = shared.stop(None).await.unwrap_err();
+        assert!(err.to_string().contains("複数のネットワーク"));
+
+        // 個別 stop
+        shared.stop(Some(PathBuf::from("a.toml"))).await.unwrap();
+        let status = shared.status().await;
+        assert_eq!(status.tunnels.len(), 1);
+        assert_eq!(status.tunnels[0].config, PathBuf::from("b.toml"));
+
+        // 残り 1 本なら省略で止められる
+        shared.stop(None).await.unwrap();
+        assert!(shared.status().await.tunnels.is_empty());
+
+        // 何も無い状態の stop はエラー
+        assert!(shared.stop(None).await.is_err());
+    }
+
+    /// stop_all は全トンネルを止める(shutdown・常駐終了時の後片付け)。
+    #[tokio::test]
+    async fn stop_all_clears_every_tunnel() {
+        let (shared, _rx) = test_shared();
+        shared
+            .start(PathBuf::from("a.toml"), Role::Host, false)
+            .await
+            .unwrap();
+        shared
+            .start(PathBuf::from("b.toml"), Role::Host, false)
+            .await
+            .unwrap();
+        shared.stop_all().await;
+        assert!(shared.status().await.tunnels.is_empty());
     }
 
     /// パイプに付けたセキュリティ記述子で、クライアントが接続できること。
@@ -711,7 +862,7 @@ mod tests {
     async fn stop_tears_down_backend() {
         let ops: Arc<Mutex<Vec<String>>> = Default::default();
         let ops_for_factory = Arc::clone(&ops);
-        let (shared, _rx) = DaemonShared::new(Box::new(move |_config, role, _upnp| {
+        let (shared, _rx) = DaemonShared::new(Box::new(move |_config, role, _upnp, _limits| {
             let spec = TunnelSpec {
                 private_key: PrivateKey::generate(),
                 address: "10.99.0.2/24".parse().unwrap(),
@@ -731,7 +882,7 @@ mod tests {
             .start(PathBuf::from("h.toml"), Role::Host, false)
             .await
             .unwrap();
-        shared.stop().await.unwrap();
+        shared.stop(None).await.unwrap();
         let ops = ops.lock().unwrap();
         assert!(
             ops.contains(&"down".to_string()),
