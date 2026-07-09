@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Connection, Member, api, errorMessage, stateLabel } from "./ipc";
+import { Connection, Member, NetworkInfo, api, errorMessage } from "./ipc";
 import { t } from "./i18n";
 import { diffMembers, notifyMemberEvents } from "./notify";
-import { StartView } from "./components/StartView";
+import { NetworksView } from "./components/NetworksView";
 import { TunnelView } from "./components/TunnelView";
 import { LogsDialog } from "./components/LogsDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -14,32 +14,50 @@ export default function App() {
   const [connection, setConnection] = useState<Connection>({
     kind: "connecting",
   });
-  const [dialog, setDialog] = useState<"logs" | "settings" | null>(null);
-  /** 設定編集の対象。トンネル稼働中はその設定、待機中は既定のホスト/参加設定。 */
-  const [idleConfig, setIdleConfig] = useState<string | null>(null);
+  /** 設定済みネットワークの一覧(M3-0c)。 */
+  const [networks, setNetworks] = useState<NetworkInfo[]>([]);
+  const [dialog, setDialog] = useState<"logs" | null>(null);
+  /** 設定ダイアログの対象(ネットワークごと — カード/詳細の「設定」から)。 */
+  const [settingsFor, setSettingsFor] = useState<string | null>(null);
+  /** 詳細表示中のネットワーク(configPath)。null なら一覧。 */
+  const [openConfig, setOpenConfig] = useState<string | null>(null);
 
-  // 通知の差分計算に使う前回の台帳。レンダーに関係しないので ref に置く
-  const previousMembers = useRef<Member[] | null>(null);
+  // 通知の差分計算に使う前回の台帳(ネットワークごと)。レンダー非依存なので ref
+  const previousMembers = useRef<Map<string, Member[]>>(new Map());
 
   const refresh = useCallback(async () => {
     try {
       const status = await api.daemonStatus();
       setConnection({ kind: "ok", status });
-      const members = status.tunnel?.members ?? null;
-      if (members === null) {
-        // 切断したら次回の接続を「初回」に戻す(全員分の通知が鳴るのを防ぐ)
-        previousMembers.current = null;
-      } else {
-        const selfAddress = status.tunnel?.address ?? null;
+      // ネットワークごとに前回の台帳と比べて参加・切断を通知する
+      const seen = new Set<string>();
+      for (const tunnel of status.tunnels) {
+        seen.add(tunnel.config);
         void notifyMemberEvents(
-          diffMembers(previousMembers.current, members, selfAddress),
+          diffMembers(
+            previousMembers.current.get(tunnel.config) ?? null,
+            tunnel.members,
+            tunnel.address,
+          ),
+          tunnel.network,
         );
-        previousMembers.current = members;
+        previousMembers.current.set(tunnel.config, tunnel.members);
+      }
+      // 止まったネットワークは次回接続を「初回」に戻す(全員分の通知を防ぐ)
+      for (const key of [...previousMembers.current.keys()]) {
+        if (!seen.has(key)) previousMembers.current.delete(key);
       }
     } catch (error) {
       setConnection({ kind: "unreachable", message: errorMessage(error) });
-      previousMembers.current = null;
+      previousMembers.current.clear();
     }
+  }, []);
+
+  const refreshNetworks = useCallback(() => {
+    api
+      .listNetworks()
+      .then(setNetworks)
+      .catch(() => setNetworks([]));
   }, []);
 
   useEffect(() => {
@@ -48,24 +66,20 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refresh]);
 
-  // 待機中に設定を編集できるよう、既定の設定ファイルの所在を調べておく
   useEffect(() => {
-    api
-      .configPaths()
-      .then((paths) => {
-        const slot = paths.host.exists
-          ? paths.host
-          : paths.member.exists
-            ? paths.member
-            : null;
-        setIdleConfig(slot?.path ?? null);
-      })
-      .catch(() => setIdleConfig(null));
-  }, [connection.kind]);
+    refreshNetworks();
+  }, [refreshNetworks, connection.kind]);
 
-  const tunnelConfig =
-    connection.kind === "ok" ? (connection.status.tunnel?.config ?? null) : null;
-  const settingsConfig = tunnelConfig ?? idleConfig;
+  const changed = () => {
+    void refresh();
+    refreshNetworks();
+  };
+
+  const tunnels = connection.kind === "ok" ? connection.status.tunnels : [];
+  const openTunnel =
+    openConfig === null
+      ? null
+      : (tunnels.find((tun) => tun.config === openConfig) ?? null);
 
   return (
     <main className="app">
@@ -73,17 +87,6 @@ export default function App() {
         <h1>PeerCove</h1>
         <div className="app__actions">
           <ConnectionBadge connection={connection} />
-          <button
-            type="button"
-            className="button--icon"
-            title={
-              settingsConfig ? t.header.settings : t.header.settingsUnavailable
-            }
-            disabled={settingsConfig === null}
-            onClick={() => setDialog("settings")}
-          >
-            ⚙
-          </button>
           <button
             type="button"
             className="button--icon"
@@ -103,19 +106,38 @@ export default function App() {
         />
       ) : connection.kind === "connecting" ? (
         <p className="muted">{t.state.connectingDaemon}</p>
-      ) : connection.status.state === "idle" || connection.status.tunnel === null ? (
-        <StartView onStarted={() => void refresh()} />
+      ) : openTunnel !== null ? (
+        <>
+          <button
+            type="button"
+            className="button--link"
+            onClick={() => setOpenConfig(null)}
+          >
+            {t.networks.back}
+          </button>
+          <TunnelView
+            tunnel={openTunnel}
+            onChanged={changed}
+            onSettings={() => setSettingsFor(openTunnel.config)}
+          />
+        </>
       ) : (
-        <TunnelView status={connection.status} onChanged={() => void refresh()} />
+        <NetworksView
+          networks={networks}
+          tunnels={tunnels}
+          onChanged={changed}
+          onOpen={(configPath) => setOpenConfig(configPath)}
+          onSettings={(configPath) => setSettingsFor(configPath)}
+        />
       )}
 
       {dialog === "logs" && <LogsDialog onClose={() => setDialog(null)} />}
-      {dialog === "settings" && settingsConfig && (
+      {settingsFor && (
         <SettingsDialog
-          configPath={settingsConfig}
+          configPath={settingsFor}
           onClose={() => {
-            setDialog(null);
-            void refresh();
+            setSettingsFor(null);
+            changed();
           }}
         />
       )}
@@ -129,10 +151,10 @@ function ConnectionBadge({ connection }: { connection: Connection }) {
   if (connection.kind !== "ok") {
     return <span className="badge badge--off">{t.state.daemonDisconnected}</span>;
   }
-  const { state } = connection.status;
+  const count = connection.status.tunnels.length;
   return (
-    <span className={state === "idle" ? "badge" : "badge badge--on"}>
-      {stateLabel(state)}
+    <span className={count === 0 ? "badge" : "badge badge--on"}>
+      {count === 0 ? t.state.idle : t.state.runningCount(count)}
     </span>
   );
 }

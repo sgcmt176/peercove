@@ -23,8 +23,8 @@ use peercove_ops::peers::Selector;
 use tauri::Manager;
 
 use crate::dto::{
-    ConfigPaths, ConfigSlot, InitResult, InviteResult, JoinResult, LogEntry, Logs, SaveResult,
-    Settings, SettingsUpdate, Status,
+    InitResult, InviteResult, JoinResult, LogEntry, Logs, NetworkDto, SaveResult, Settings,
+    SettingsUpdate, Status,
 };
 
 /// デフォルトの設定ディレクトリ(Windows: %APPDATA%\… / Linux: ~/.config/…)。
@@ -122,53 +122,44 @@ fn canonical(path: &str) -> Result<PathBuf, String> {
 
 // ---- 設定ファイル操作(ops) ----
 
-/// 既定の設定ファイルの所在と、存在するかどうか。
+/// 設定済みネットワークの一覧(M3-0c)。
 ///
-/// M3-0a: 実体は `networks/<スラッグ>/` 配下(ADR-0012)。旧配置(直下の
-/// host.toml / member.toml)はここで自動移行する。現在の UI は 1 ホスト +
-/// 1 メンバーの 2 スロット表示なので、一覧の先頭をスロットに割り当てる
-/// (一覧 UI 化は M3-0c)。
+/// 実体は `networks/<スラッグ>/` 配下(ADR-0012)。旧配置(直下の
+/// host.toml / member.toml)はここで自動移行する。
 #[tauri::command]
-fn config_paths(app: tauri::AppHandle) -> Result<ConfigPaths, String> {
+fn list_networks(app: tauri::AppHandle) -> Result<Vec<NetworkDto>, String> {
     let dir = config_dir(&app)?;
     // 旧配置からの移行。失敗しても UI を止めない(次回また試みる)
     if let Err(e) = peercove_ops::networks::migrate_legacy(&dir) {
         eprintln!("旧設定の移行に失敗しました: {e:#}");
     }
-    let networks = peercove_ops::networks::list(&dir);
-    let slot = |role: peercove_ops::networks::Role, fallback: &str| {
-        networks
-            .iter()
-            .find(|n| n.role == role)
-            .map(|n| ConfigSlot::of(&n.config_path))
-            .unwrap_or_else(|| {
-                ConfigSlot::of(
-                    &peercove_ops::networks::networks_dir(&dir)
-                        .join(peercove_core::names::DEFAULT_NETWORK_NAME)
-                        .join(fallback),
-                )
-            })
-    };
-    Ok(ConfigPaths {
-        host: slot(peercove_ops::networks::Role::Host, "host.toml"),
-        member: slot(peercove_ops::networks::Role::Member, "member.toml"),
-        dir: dir.display().to_string(),
-    })
+    Ok(peercove_ops::networks::list(&dir)
+        .iter()
+        .map(NetworkDto::from)
+        .collect())
 }
 
-/// ホストを初期化する(鍵とランダムサブネットの host.toml を生成)。
-///
-/// M3-0a: 書き込み先は `networks/<既定名>/`。名前の入力 UI は M3-0c で付ける。
+/// ネットワークを削除する(ディレクトリごと。鍵・PSK も消える)。
+/// 稼働中でないことは frontend 側が確認する(削除ボタンを無効化)。
 #[tauri::command]
-fn init_host(app: tauri::AppHandle, force: bool) -> Result<InitResult, String> {
+fn delete_network(app: tauri::AppHandle, slug: String) -> Result<(), String> {
     let base = config_dir(&app)?;
-    let name = peercove_core::names::DEFAULT_NETWORK_NAME;
-    let (_, dir) = peercove_ops::networks::network_dir(&base, name).map_err(to_message)?;
-    // 既にホスト中のネットワークと待受ポートが被らないよう自動選択(ADR-0012)
+    peercove_ops::networks::delete(&base, &slug).map_err(to_message)
+}
+
+/// 新しいネットワークをホストとして作る(鍵とランダムサブネットの host.toml)。
+///
+/// `name` はネットワーク名(M3-0c で UI から入力)。待受ポートは既存の
+/// ホストと被らないよう自動選択(ADR-0012)。
+#[tauri::command]
+fn init_host(app: tauri::AppHandle, name: String, force: bool) -> Result<InitResult, String> {
+    let base = config_dir(&app)?;
+    let (_, dir) = peercove_ops::networks::network_dir(&base, &name).map_err(to_message)?;
     let port = peercove_ops::networks::next_listen_port(&base);
-    let result = peercove_ops::init::init_host(&dir, name, port, force).map_err(to_message)?;
+    let result = peercove_ops::init::init_host(&dir, &name, port, force).map_err(to_message)?;
     Ok(InitResult {
         config_path: result.config_path.display().to_string(),
+        network: result.network,
         subnet: result.subnet.to_string(),
         host_ip: result.host_ip.to_string(),
         public_key: result.public_key.to_base64(),
@@ -315,7 +306,8 @@ pub fn run() {
             start_member,
             stop_tunnel,
             notify,
-            config_paths,
+            list_networks,
+            delete_network,
             init_host,
             create_invite,
             join_network,

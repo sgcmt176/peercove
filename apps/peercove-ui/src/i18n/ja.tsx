@@ -34,6 +34,7 @@ export const ja = {
     idle: "待機中",
     hosting: "ホストとして稼働中",
     joined: "メンバーとして参加中",
+    runningCount: (n: number) => (n === 1 ? "稼働中" : `${n} ネットワーク稼働中`),
     daemonDisconnected: "デーモン未接続",
     connectingDaemon: "デーモンに接続しています…",
   },
@@ -67,6 +68,53 @@ export const ja = {
     command: "peercove-poc daemon run",
     platforms: "Windows は管理者ターミナル、Linux は sudo で実行します。",
     details: "詳細",
+  },
+
+  // ネットワーク一覧(M3-0c)
+  networks: {
+    listHead: "ネットワーク",
+    empty: (
+      <>
+        まだネットワークがありません。自分が<strong>中心（ホスト）になって作る</strong>か、
+        招待トークンで<strong>既存のネットワークに参加</strong>してください。
+      </>
+    ),
+    running: "稼働中",
+    stopped: "停止中",
+    roleHost: "ホスト",
+    roleMember: "メンバー",
+    membersOnline: (n: number) => `オンライン ${n} 人`,
+    open: "開く",
+    connect: "接続",
+    connecting: "接続中…",
+    disconnecting: "切断中…",
+    removedBadge: "削除されました",
+    external: "（一覧外の設定で稼働中）",
+    back: "← 一覧へ",
+    settings: "設定",
+    delete: "削除",
+    deleteTitle: "ネットワークを削除",
+    deleteConfirm: "削除する",
+    deleteMessage: (name: string): ReactNode => (
+      <>
+        <p>
+          ネットワーク <strong>{name}</strong> の設定を削除します。
+        </p>
+        <p className="muted">
+          鍵ファイルも一緒に消えるため、元に戻せません。再参加には新しい
+          招待トークンが必要です。ホストしていた場合、メンバーは接続できなくなります。
+        </p>
+      </>
+    ),
+    addHost: "新しくホストする",
+    addJoin: "招待トークンで参加する",
+    addClose: "閉じる",
+    nameLabel: "ネットワーク名",
+    nameHint:
+      "半角英数字とハイフン。フォルダ名と、将来の DNS アドレス（〜.peercove.internal）に使われます。",
+    namePlaceholder: "home",
+    create: "作成してホスト開始",
+    creating: "作成中…",
   },
 
   start: {
@@ -241,6 +289,7 @@ export const ja = {
   notify: {
     joinedTitle: "メンバーが参加しました",
     leftTitle: "メンバーが切断しました",
-    body: (name: string, ip: string) => `${name}（${ip}）`,
+    body: (name: string, ip: string, network: string) =>
+      `${name}（${ip}）— ${network}`,
   },
 };

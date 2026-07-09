@@ -115,6 +115,25 @@ pub fn list(base: &Path) -> Vec<NetworkEntry> {
     entries
 }
 
+/// ネットワークを削除する(ディレクトリごと — 鍵・PSK も消える)。
+///
+/// 誤削除ガード: `networks/` 直下の、設定ファイルを持つディレクトリしか消さない。
+/// 稼働中かどうかはここでは分からないため、**呼び出し側が停止を確認**すること
+/// (UI は稼働中のネットワークの削除ボタンを無効にする)。
+pub fn delete(base: &Path, slug: &str) -> anyhow::Result<()> {
+    if !names::is_dns_label(slug) {
+        bail!("ネットワーク名 \"{slug}\" が不正です");
+    }
+    let dir = networks_dir(base).join(slug);
+    if !dir.join(HOST_FILE).exists() && !dir.join(MEMBER_FILE).exists() {
+        bail!(
+            "{} はネットワークのディレクトリではありません(設定ファイルなし)",
+            dir.display()
+        );
+    }
+    std::fs::remove_dir_all(&dir).with_context(|| format!("{} の削除に失敗しました", dir.display()))
+}
+
 /// 新しくホストするネットワークの待受ポートを選ぶ(ADR-0012 §3)。
 ///
 /// 既存ネットワークの listen_port(未指定は既定値扱い)を避けて、
@@ -313,6 +332,23 @@ mod tests {
             .as_ref()
             .unwrap()
             .exists());
+    }
+
+    #[test]
+    fn delete_removes_network_dir_and_guards_non_networks() {
+        let base = base("delete");
+        let (slug, dir) = network_dir(&base, "gone").unwrap();
+        crate::init::init_host(&dir, "gone", 51820, false).unwrap();
+        assert_eq!(list(&base).len(), 1);
+
+        delete(&base, &slug).unwrap();
+        assert!(!dir.exists());
+        assert!(list(&base).is_empty());
+
+        // 設定ファイルの無いディレクトリ・不正なスラッグは拒否
+        std::fs::create_dir_all(networks_dir(&base).join("not-a-network")).unwrap();
+        assert!(delete(&base, "not-a-network").is_err());
+        assert!(delete(&base, "../escape").is_err());
     }
 
     #[test]

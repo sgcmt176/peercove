@@ -58,18 +58,24 @@ export function diffMembers(
   return events;
 }
 
-export function describe(event: MemberEvent): { title: string; body: string } {
+export function describe(
+  event: MemberEvent,
+  network: string,
+): { title: string; body: string } {
   const name = event.member.name ?? event.member.ip;
-  const body = t.notify.body(name, event.member.ip);
+  const body = t.notify.body(name, event.member.ip, network);
   return event.kind === "joined"
     ? { title: t.notify.joinedTitle, body }
     : { title: t.notify.leftTitle, body };
 }
 
-export async function notifyMemberEvents(events: MemberEvent[]): Promise<void> {
+export async function notifyMemberEvents(
+  events: MemberEvent[],
+  network: string,
+): Promise<void> {
   for (const event of events) {
     try {
-      await invoke("notify", describe(event));
+      await invoke("notify", describe(event, network));
     } catch {
       // 通知の失敗で UI を止めない(通知デーモンが無い環境など)
     }

@@ -1,28 +1,28 @@
 import { useState } from "react";
 import {
   Member,
-  Status,
+  Tunnel,
   api,
   errorMessage,
   formatBytes,
   formatHandshake,
   formatRtt,
-  stateLabel,
 } from "../ipc";
 import { ConfirmModal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { t } from "../i18n";
 
-/** トンネル稼働中の画面。ホストのときだけ招待・削除・名前変更ができる。 */
+/** ネットワーク詳細(トンネル稼働中)。ホストのときだけ招待・削除・名前変更ができる。 */
 export function TunnelView({
-  status,
+  tunnel,
   onChanged,
+  onSettings,
 }: {
-  status: Status;
+  tunnel: Tunnel;
   onChanged: () => void;
+  onSettings: () => void;
 }) {
-  const tunnel = status.tunnel!;
-  const isHost = status.state === "hosting";
+  const isHost = tunnel.role === "hosting";
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
   const rttByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer.rttMs]));
   const [inviting, setInviting] = useState(false);
@@ -89,15 +89,25 @@ export function TunnelView({
 
       <section className="card">
         <div className="card__head">
-          <h2>{stateLabel(status.state)}</h2>
-          <button
-            type="button"
-            className="button--ghost"
-            onClick={() => void stop()}
-            disabled={busy}
-          >
-            {t.tunnel.disconnect}
-          </button>
+          <h2>
+            {tunnel.network}
+            <span className="tag">
+              {isHost ? t.networks.roleHost : t.networks.roleMember}
+            </span>
+          </h2>
+          <div className="row">
+            <button type="button" className="button--ghost" onClick={onSettings}>
+              {t.networks.settings}
+            </button>
+            <button
+              type="button"
+              className="button--ghost"
+              onClick={() => void stop()}
+              disabled={busy}
+            >
+              {t.tunnel.disconnect}
+            </button>
+          </div>
         </div>
         <dl className="facts">
           <dt>{t.common.virtualIp}</dt>

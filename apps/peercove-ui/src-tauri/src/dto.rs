@@ -130,32 +130,37 @@ impl From<DaemonStatus> for Status {
     }
 }
 
-/// UI が扱う設定ファイルの所在。
+/// 設定済みネットワーク 1 件(M3-0c)。稼働状態は含まない
+/// (frontend が daemon status の tunnels と configPath で突き合わせる)。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConfigSlot {
-    pub path: String,
-    pub exists: bool,
+pub struct NetworkDto {
+    pub slug: String,
+    pub name: String,
+    /// "hosting" | "joined"(設定上の役割)
+    pub role: &'static str,
+    /// 表示・突き合わせ用の正規化済みパス(daemon status の config と一致する)
+    pub config_path: String,
+    pub address: String,
 }
 
-impl ConfigSlot {
-    pub fn of(path: &Path) -> Self {
+impl From<&peercove_ops::networks::NetworkEntry> for NetworkDto {
+    fn from(entry: &peercove_ops::networks::NetworkEntry) -> Self {
+        // daemon へ渡すパスと同じ正規化(canonicalize)を経由させることで、
+        // status の config(display_path 済み)と文字列一致するようにする
+        let canonical =
+            std::fs::canonicalize(&entry.config_path).unwrap_or_else(|_| entry.config_path.clone());
         Self {
-            path: path.display().to_string(),
-            exists: path.exists(),
+            slug: entry.slug.clone(),
+            name: entry.name.clone(),
+            role: match entry.role {
+                peercove_ops::networks::Role::Host => "hosting",
+                peercove_ops::networks::Role::Member => "joined",
+            },
+            config_path: display_path(&canonical),
+            address: entry.address.to_string(),
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConfigPaths {
-    /// 既定のホスト設定(アプリのデータディレクトリ)
-    pub host: ConfigSlot,
-    /// 既定のメンバー設定
-    pub member: ConfigSlot,
-    /// 設定を置くディレクトリ
-    pub dir: String,
 }
 
 /// ホスト初期化の結果。
@@ -163,6 +168,7 @@ pub struct ConfigPaths {
 #[serde(rename_all = "camelCase")]
 pub struct InitResult {
     pub config_path: String,
+    pub network: String,
     pub subnet: String,
     pub host_ip: String,
     pub public_key: String,

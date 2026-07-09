@@ -49,19 +49,19 @@ export interface Status {
   tunnels: Tunnel[];
 }
 
-export interface ConfigSlot {
-  path: string;
-  exists: boolean;
-}
-
-export interface ConfigPaths {
-  host: ConfigSlot;
-  member: ConfigSlot;
-  dir: string;
+/** 設定済みネットワーク 1 件（M3-0c）。稼働状態は Status.tunnels と configPath で突き合わせる。 */
+export interface NetworkInfo {
+  slug: string;
+  name: string;
+  /** 設定上の役割。 */
+  role: "hosting" | "joined";
+  configPath: string;
+  address: string;
 }
 
 export interface InitResult {
   configPath: string;
+  network: string;
   subnet: string;
   hostIp: string;
   publicKey: string;
@@ -140,8 +140,10 @@ export const api = {
     invoke<void>("start_member", { configPath }),
   stopTunnel: (configPath: string) =>
     invoke<void>("stop_tunnel", { configPath }),
-  configPaths: () => invoke<ConfigPaths>("config_paths"),
-  initHost: (force: boolean) => invoke<InitResult>("init_host", { force }),
+  listNetworks: () => invoke<NetworkInfo[]>("list_networks"),
+  deleteNetwork: (slug: string) => invoke<void>("delete_network", { slug }),
+  initHost: (name: string, force: boolean) =>
+    invoke<InitResult>("init_host", { name, force }),
   createInvite: (
     configPath: string,
     name: string | null,

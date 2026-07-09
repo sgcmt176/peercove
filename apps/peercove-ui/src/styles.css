@@ -585,3 +585,29 @@ select {
 .logs__level-trace {
   color: var(--muted);
 }
+
+/* ---- ネットワーク一覧(M3-0c) ---- */
+
+.network__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.network--on {
+  border-color: var(--online);
+}
+
+.network__foot {
+  margin-top: 8px;
+  justify-content: flex-end;
+}
+
+.tag--danger {
+  color: var(--danger, #d33);
+  border-color: var(--danger, #d33);
+}
+
+.button--link-danger {
+  color: var(--danger, #d33);
+}
