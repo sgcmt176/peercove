@@ -43,6 +43,14 @@ pub struct Distribution {
     pub dns_records: Vec<DnsRecord>,
 }
 
+/// メンバーが受信した配布内容 + 受信時刻。エンドポイントの鮮度判定
+/// (ADR-0013: 配布時の `endpoint_age_secs` + 受信からの経過)に受信時刻が要る。
+#[derive(Debug, Clone)]
+pub struct ReceivedDistribution {
+    pub distribution: Distribution,
+    pub received_at: Instant,
+}
+
 /// 相手の仮想 IP → 直近の RTT(ミリ秒、M2-G5)。切断時にエントリを消す。
 pub type RttMap = Arc<Mutex<HashMap<Ipv4Addr, f64>>>;
 
@@ -348,7 +356,7 @@ async fn host_reader(
 pub async fn run_member_client(
     host_ip: Ipv4Addr,
     display_name: Option<String>,
-    latest_ledger: Arc<Mutex<Option<Distribution>>>,
+    latest_ledger: Arc<Mutex<Option<ReceivedDistribution>>>,
     rtt: RttMap,
     removed: Arc<AtomicBool>,
 ) {
@@ -392,7 +400,7 @@ pub async fn run_member_client(
 async fn member_session(
     stream: TcpStream,
     display_name: &Option<String>,
-    latest_ledger: &Arc<Mutex<Option<Distribution>>>,
+    latest_ledger: &Arc<Mutex<Option<ReceivedDistribution>>>,
     host_ip: Ipv4Addr,
     rtt: &RttMap,
     removed: &Arc<AtomicBool>,
@@ -457,7 +465,7 @@ async fn member_reader(
     out: Outbox,
     ping: SharedPing,
     rtt: RttMap,
-    latest_ledger: Arc<Mutex<Option<Distribution>>>,
+    latest_ledger: Arc<Mutex<Option<ReceivedDistribution>>>,
     removed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
@@ -476,9 +484,12 @@ async fn member_reader(
                     members.len(),
                     dns_records.len()
                 );
-                *latest_ledger.lock().unwrap() = Some(Distribution {
-                    members,
-                    dns_records,
+                *latest_ledger.lock().unwrap() = Some(ReceivedDistribution {
+                    distribution: Distribution {
+                        members,
+                        dns_records,
+                    },
+                    received_at: Instant::now(),
                 });
             }
             Ok(ControlMessage::Removed { message }) => {
@@ -537,7 +548,7 @@ mod tests {
             let _ = handle_member(stream, ip, ledger_rx, &server_connections, &server_rtt).await;
         });
 
-        let latest: Arc<Mutex<Option<Distribution>>> = Arc::new(Mutex::new(None));
+        let latest: Arc<Mutex<Option<ReceivedDistribution>>> = Arc::new(Mutex::new(None));
         let client_latest = Arc::clone(&latest);
         let member_rtt: RttMap = Default::default();
         let client_rtt = Arc::clone(&member_rtt);
@@ -556,7 +567,9 @@ mod tests {
         });
 
         // 初回スナップショットを受信
-        wait_for(&latest, |l| l.as_ref().map(|d| d.members.len()) == Some(1)).await;
+        let members_len =
+            |l: &Option<ReceivedDistribution>| l.as_ref().map(|r| r.distribution.members.len());
+        wait_for(&latest, |l| members_len(l) == Some(1)).await;
 
         // 台帳 + DNS レコードの変更が配布される
         ledger_tx
@@ -571,10 +584,15 @@ mod tests {
                 }],
             })
             .unwrap();
-        wait_for(&latest, |l| l.as_ref().map(|d| d.members.len()) == Some(2)).await;
+        wait_for(&latest, |l| members_len(l) == Some(2)).await;
         {
             let ledger = latest.lock().unwrap();
-            let dist = ledger.as_ref().unwrap();
+            let received = ledger.as_ref().unwrap();
+            assert!(
+                received.received_at.elapsed() < Duration::from_secs(10),
+                "受信時刻が付く(エンドポイントの鮮度判定用)"
+            );
+            let dist = &received.distribution;
             assert_eq!(dist.members[1].name.as_deref(), Some("bob"));
             assert!(!dist.members[1].online);
             assert_eq!(dist.dns_records.len(), 1, "DNS レコードも一緒に届く");
@@ -615,7 +633,7 @@ mod tests {
             handle_member(stream, ip, ledger_rx, &server_connections, &server_rtt).await
         });
 
-        let latest: Arc<Mutex<Option<Distribution>>> = Arc::new(Mutex::new(None));
+        let latest: Arc<Mutex<Option<ReceivedDistribution>>> = Arc::new(Mutex::new(None));
         let client_latest = Arc::clone(&latest);
         let client_rtt: RttMap = Default::default();
         let client_removed = Arc::new(AtomicBool::new(false));

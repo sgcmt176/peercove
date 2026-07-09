@@ -2,6 +2,7 @@ mod backend;
 mod commands;
 mod control;
 mod daemon;
+mod direct;
 mod dns;
 mod dnscfg;
 mod logbuf;

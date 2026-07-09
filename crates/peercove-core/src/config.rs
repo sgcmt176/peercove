@@ -50,6 +50,11 @@ pub struct InterfaceConfig {
     pub listen_port: Option<u16>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// メンバー間直接通信(ADR-0013)を試すか(既定 true)。false なら
+    /// このマシンは常にホスト経由(中継)で通信する。ADR-0013 追加条件 2:
+    /// 将来 UI の設定画面から切り替えられるようにするためのフラグ。
+    #[serde(default = "default_direct")]
+    pub direct: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +80,10 @@ pub struct PeerConfig {
 
 fn default_mtu() -> u16 {
     DEFAULT_MTU
+}
+
+fn default_direct() -> bool {
+    true
 }
 
 fn default_if_name() -> String {

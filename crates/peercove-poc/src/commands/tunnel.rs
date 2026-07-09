@@ -17,6 +17,11 @@ const SUPERVISE_INTERVAL: Duration = Duration::from_secs(5);
 /// 最終ハンドシェイクがこれ以内なら「オンライン」とみなす(WG の
 /// セッション有効期限 180 秒に合わせる)。
 const ONLINE_THRESHOLD: Duration = Duration::from_secs(180);
+/// 台帳に載せるエンドポイント観測経過秒の粒度(ADR-0013)。
+/// 生の経過秒だと毎周期(5 秒)値が変わり、台帳が「変更あり」として
+/// 全メンバーへ再配布され続けてしまう。60 秒粒度なら鮮度判定には十分で、
+/// 再配布も最大毎分 1 回に抑えられる。
+const ENDPOINT_AGE_STEP_SECS: u64 = 60;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -267,7 +272,11 @@ pub async fn supervise(
         // コントロールチャネル(M1-G2)
         let (ledger_tx, ledger_rx) = tokio::sync::watch::channel(control::Distribution::default());
         let connections: control::Connections = Default::default();
-        let member_ledger: Arc<Mutex<Option<control::Distribution>>> = Default::default();
+        let member_ledger: Arc<Mutex<Option<control::ReceivedDistribution>>> = Default::default();
+        // (member)直接ピアの管理(ADR-0013、M3-3)。host_public_key は
+        // member ロールでは「自分の公開鍵」(台帳の自エントリ除外に使う)
+        let mut direct =
+            crate::direct::DirectManager::new(*host_public_key.as_bytes(), spec.address.trunc());
         let rtt: control::RttMap = Default::default();
         // (member)ホストから削除されたら立つ。status に載せて UI が表示する
         let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -356,7 +365,21 @@ pub async fn supervise(
                             });
                             dist
                         }),
-                        Role::Member => member_ledger.lock().unwrap().clone(),
+                        Role::Member => {
+                            let received = member_ledger.lock().unwrap().clone();
+                            // 直接ピアの追加・確認・除去(ADR-0013、M3-3)。
+                            // 設定が読めない周期は現状維持(触らない)
+                            let enabled =
+                                config.as_ref().map(|c| c.interface.direct).unwrap_or(true);
+                            direct.tick(
+                                std::time::Instant::now(),
+                                enabled,
+                                received.as_ref(),
+                                &stats,
+                                backend,
+                            );
+                            received.map(|r| r.distribution)
+                        }
                     };
                     let ledger = distribution.as_ref().map(|dist| dist.members.clone());
                     if let Err(e) =
@@ -433,7 +456,9 @@ fn build_ledger(
             online,
             is_host: false,
             endpoint,
-            endpoint_age_secs: endpoint.and(handshake_age).map(|age| age.as_secs()),
+            endpoint_age_secs: endpoint
+                .and(handshake_age)
+                .map(|age| age.as_secs() / ENDPOINT_AGE_STEP_SECS * ENDPOINT_AGE_STEP_SECS),
         });
     }
     ledger
@@ -709,7 +734,7 @@ mod tests {
             &config,
             &host_key,
             &[
-                stats_for(&online_key, Duration::from_secs(30)),
+                stats_for(&online_key, Duration::from_secs(90)),
                 stats_for(&stale_key, ONLINE_THRESHOLD + Duration::from_secs(60)),
             ],
         );
@@ -720,8 +745,11 @@ mod tests {
         let alice = &ledger[1];
         assert!(alice.online);
         assert_eq!(alice.endpoint, Some("203.0.113.9:12345".parse().unwrap()));
-        let age = alice.endpoint_age_secs.expect("観測経過秒が付く");
-        assert!((30..40).contains(&age), "ハンドシェイク経過で近似: {age}");
+        assert_eq!(
+            alice.endpoint_age_secs,
+            Some(60),
+            "ハンドシェイク経過(90 秒)を 60 秒粒度へ量子化(再配布の抑制)"
+        );
 
         let bob = &ledger[2];
         assert!(!bob.online);
