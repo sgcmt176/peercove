@@ -150,6 +150,7 @@ impl ActiveTunnel {
         config_path: &Path,
         stop: tokio::sync::watch::Receiver<bool>,
         snapshot: Option<SharedSnapshot>,
+        transfers: crate::msg::TransferRegistry,
     ) -> anyhow::Result<()> {
         supervise(
             config_path,
@@ -158,6 +159,7 @@ impl ActiveTunnel {
             &self.spec,
             stop,
             snapshot,
+            transfers,
         )
         .await
     }
@@ -218,6 +220,7 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
             &tunnel.spec,
             stop_rx,
             None,
+            Default::default(),
         )
         .await;
         ctrl_c.abort();
@@ -258,6 +261,7 @@ pub async fn supervise(
     spec: &TunnelSpec,
     mut stop: tokio::sync::watch::Receiver<bool>,
     snapshot: Option<SharedSnapshot>,
+    transfers: crate::msg::TransferRegistry,
 ) -> anyhow::Result<()> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
@@ -288,6 +292,15 @@ pub async fn supervise(
         let mut member_extra: Vec<ipnet::Ipv4Net> = Vec::new();
         let mut router_error_logged = false;
         let mut tasks = Vec::new();
+        // メッセージング基盤(ADR-0015、M3-9): 両ロールとも自分の仮想 IP で
+        // 待受ける。接続元の照合に使うピア表は台帳から毎周期更新する
+        let msg_peers: crate::msg::SharedPeers = Default::default();
+        tasks.push(tokio::spawn(crate::msg::run_server(
+            spec.address.addr(),
+            Arc::clone(&msg_peers),
+            crate::msg::inbox_dir(config_path),
+            Arc::clone(&transfers),
+        )));
         match role {
             Role::Host => {
                 tasks.push(tokio::spawn(control::run_host_server(
@@ -446,6 +459,17 @@ pub async fn supervise(
                         }
                     };
                     let ledger = distribution.as_ref().map(|dist| dist.members.clone());
+                    // メッセージングのピア表(自分以外の 仮想 IP → 表示名)を台帳から更新
+                    if let Some(ledger) = &ledger {
+                        let map: HashMap<std::net::Ipv4Addr, String> = ledger
+                            .iter()
+                            .filter(|e| e.ip != spec.address.addr())
+                            .map(|e| {
+                                (e.ip, e.name.clone().unwrap_or_else(|| e.ip.to_string()))
+                            })
+                            .collect();
+                        *msg_peers.lock().unwrap() = map;
+                    }
                     if let Err(e) =
                         status::write_status_file(&status_path, &stats, ledger.as_deref())
                     {

@@ -9,6 +9,7 @@ pub mod dns;
 pub mod ipalloc;
 pub mod ipc;
 pub mod keys;
+pub mod msg;
 pub mod names;
 pub mod proto;
 pub mod token;

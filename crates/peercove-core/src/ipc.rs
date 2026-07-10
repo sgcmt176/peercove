@@ -51,6 +51,16 @@ pub enum IpcRequest {
         #[serde(default)]
         after_seq: u64,
     },
+    /// 稼働中トンネルのメンバーへファイルを送る(ADR-0015、M3-9)。
+    /// 進捗は Status 応答の [`TunnelInfo::transfers`] で追う。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない(旧デーモンは解析エラーを返す)。
+    SendFile {
+        config: PathBuf,
+        /// 宛先メンバーの仮想 IP。
+        peer: Ipv4Addr,
+        /// 送るファイルの絶対パス。
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +90,8 @@ pub enum IpcResponse {
         #[serde(default)]
         dropped: u64,
     },
+    /// SendFile への応答。`id` で [`TunnelInfo::transfers`] から進捗を引ける。
+    Transfer { id: String },
 }
 
 /// デーモンが保持する直近のログ 1 行(M2-G5)。
@@ -155,6 +167,37 @@ pub struct TunnelInfo {
     /// 載っていない相手はホスト経由(中継)。旧デーモンの応答には無い(空)。
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub direct: std::collections::HashMap<Ipv4Addr, DirectStatus>,
+    /// ファイル転送の進捗(ADR-0015、M3-9)。実行中 + 直近の完了/失敗分。
+    /// 旧デーモンの応答には無い(空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfers: Vec<TransferInfo>,
+}
+
+/// ファイル転送の向き(自分から見て)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Send,
+    Recv,
+}
+
+/// ファイル転送 1 件の進捗(ADR-0015、M3-9)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferInfo {
+    pub id: String,
+    pub direction: TransferDirection,
+    /// 相手の仮想 IP。
+    pub peer: Ipv4Addr,
+    /// ファイル名(パスは含めない)。
+    pub name: String,
+    /// 全体のバイト数。
+    pub size: u64,
+    /// 転送済みバイト数。
+    pub transferred: u64,
+    /// 完了した(エラーなら `error` が入る)。
+    pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -300,6 +343,54 @@ mod tests {
             json,
             r#"{"id":9,"ok":{"type":"logs","lines":[{"seq":1,"unix_ms":1700000000000,"level":"INFO","target":"peercove_poc::daemon","message":"トンネルを開始しました"}],"dropped":0}}"#
         );
+    }
+
+    /// SendFile / Transfer / transfers(ADR-0015、M3-9)のワイヤ表現。
+    /// transfers が空なら旧デーモンの応答とワイヤ表現が一致する(互換維持)。
+    #[test]
+    fn send_file_wire_format() {
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 11,
+            req: IpcRequest::SendFile {
+                config: PathBuf::from("host.toml"),
+                peer: "10.83.19.3".parse().unwrap(),
+                path: PathBuf::from("a.txt"),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":11,"req":{"method":"send_file","config":"host.toml","peer":"10.83.19.3","path":"a.txt"}}"#
+        );
+
+        let json = serde_json::to_string(&IpcReply {
+            id: 11,
+            result: IpcResult::Ok(IpcResponse::Transfer {
+                id: "ab12".to_string(),
+            }),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"id":11,"ok":{"type":"transfer","id":"ab12"}}"#);
+
+        let info = TransferInfo {
+            id: "ab12".to_string(),
+            direction: TransferDirection::Recv,
+            peer: "10.83.19.3".parse().unwrap(),
+            name: "a.txt".to_string(),
+            size: 10,
+            transferred: 4,
+            done: false,
+            error: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("error"), "エラーなしなら省略: {json}");
+        let parsed: TransferInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, info);
+
+        // 旧デーモンの TunnelInfo(transfers なし)も読める
+        let old = r#"{"config":"a.toml","network":"n","role":"host","address":"10.83.19.1"}"#;
+        let parsed: TunnelInfo = serde_json::from_str(old).unwrap();
+        assert!(parsed.transfers.is_empty());
     }
 
     /// `rtt_ms` は後方互換のため省略可能(旧デーモンの応答も読める)。

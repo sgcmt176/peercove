@@ -57,6 +57,9 @@ struct Active {
     /// 内蔵 DNS サーバ(トンネル IP の :53、M3-1)。停止時に abort する
     dns_task: tokio::task::JoinHandle<()>,
     snapshot: SharedSnapshot,
+    /// ファイル転送の進捗一覧(ADR-0015、M3-9)。supervise 内の受信サーバーと
+    /// SendFile の送信タスクが書き、status 応答に載せる
+    transfers: crate::msg::TransferRegistry,
 }
 
 impl DaemonShared {
@@ -98,7 +101,61 @@ impl DaemonShared {
                 let (lines, dropped) = crate::logbuf::ring().since(after_seq);
                 Ok(IpcResponse::Logs { lines, dropped })
             }
+            IpcRequest::SendFile { config, peer, path } => {
+                let id = self.send_file(config, peer, path).await?;
+                Ok(IpcResponse::Transfer { id })
+            }
         }
+    }
+
+    /// メンバーへのファイル送信を開始する(ADR-0015、M3-9)。送信自体は
+    /// バックグラウンドタスクで走り、進捗は status 応答の transfers で追う。
+    async fn send_file(
+        &self,
+        config: PathBuf,
+        peer: Ipv4Addr,
+        path: PathBuf,
+    ) -> anyhow::Result<String> {
+        let active = self.active.lock().await;
+        let active = active
+            .get(&Self::key_for(&config))
+            .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
+        if peer == active.address {
+            bail!("自分自身へは送れません");
+        }
+        // 台帳照合: 宛先はネットワークのメンバーで、オンラインであること
+        // (オフライン宛は V1 非対応 — ADR-0015)
+        let entry = {
+            let snapshot = active.snapshot.lock().unwrap();
+            snapshot
+                .as_ref()
+                .and_then(|s| s.ledger.as_ref())
+                .and_then(|ledger| ledger.iter().find(|e| e.ip == peer).cloned())
+        };
+        let entry =
+            entry.with_context(|| format!("{peer} はこのネットワークのメンバーにいません"))?;
+        if !entry.online {
+            bail!(
+                "{} はオフラインです(オフラインのメンバーへは送れません)",
+                entry.name.as_deref().unwrap_or(&peer.to_string())
+            );
+        }
+        if !path.is_file() {
+            bail!(
+                "{} が見つからないか、ファイルではありません",
+                path.display()
+            );
+        }
+        let id = crate::msg::new_transfer_id();
+        let transfers = Arc::clone(&active.transfers);
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            // ファイル名はログに出さない(秘匿ルール)。進捗一覧にはエラーが載る
+            if let Err(e) = crate::msg::send_file(peer, &path, transfers, task_id).await {
+                tracing::warn!("{peer} へのファイル送信に失敗しました: {e:#}");
+            }
+        });
+        Ok(id)
     }
 
     /// IPC で渡されたパスをキー用に正規化する。ファイルが消えている等で
@@ -151,12 +208,14 @@ impl DaemonShared {
         }
         let (stop_tx, stop_rx) = watch::channel(false);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
+        let transfers: crate::msg::TransferRegistry = Default::default();
         let task_snapshot = Arc::clone(&snapshot);
+        let task_transfers = Arc::clone(&transfers);
         let task_config = config.clone();
         let task = tokio::spawn(async move {
             let mut tunnel = tunnel;
             let supervise_result = tunnel
-                .supervise_run(&task_config, stop_rx, Some(task_snapshot))
+                .supervise_run(&task_config, stop_rx, Some(task_snapshot), task_transfers)
                 .await;
             // クリーンアップ(ブロッキング)は必ず実行する
             let down_result =
@@ -179,6 +238,7 @@ impl DaemonShared {
                 task,
                 dns_task,
                 snapshot,
+                transfers,
             },
         );
         drop(active);
@@ -359,6 +419,8 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         ledger,
         removed,
         direct,
+        // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)
+        transfers: active.transfers.lock().unwrap().clone(),
     }
 }
 

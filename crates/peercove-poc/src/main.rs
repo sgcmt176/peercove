@@ -6,6 +6,7 @@ mod direct;
 mod dns;
 mod dnscfg;
 mod logbuf;
+mod msg;
 mod service;
 mod upnp;
 
@@ -151,6 +152,16 @@ enum Command {
         ip: Option<Ipv4Addr>,
         /// 広告するサブネット(CIDR)。指定なしで解除
         subnets: Vec<ipnet::Ipv4Net>,
+    },
+    /// 稼働中トンネルのメンバーへファイルを送る(デーモン経由。ADR-0015)
+    SendFile {
+        #[arg(long)]
+        config: PathBuf,
+        /// 宛先(メンバーの表示名または仮想 IP)
+        #[arg(long)]
+        to: String,
+        /// 送るファイル
+        file: PathBuf,
     },
     /// UDP echo サーバー(G-5 検証用)
     UdpEcho {
@@ -346,6 +357,7 @@ fn run(command: Command) -> anyhow::Result<()> {
             println!("稼働中なら約 10 秒で全メンバーへ配布されます");
             Ok(())
         }
+        Command::SendFile { config, to, file } => commands::send_file::run(&config, &to, &file),
         Command::UdpEcho { listen } => commands::udp::run_echo(listen),
         Command::UdpPing { target, count } => commands::udp::run_ping(target, count),
         Command::Status { config } => commands::status::run(&config),
