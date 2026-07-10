@@ -5,9 +5,11 @@ import { t } from "./i18n";
 import {
   diffMembers,
   diffTransfers,
+  notifyChatEvents,
   notifyFileEvents,
   notifyMemberEvents,
 } from "./notify";
+import { clearChat, syncChat } from "./chat";
 import { clearHistory, recordStatus } from "./history";
 import { Theme, applyTheme, loadTheme, nextTheme } from "./theme";
 import { NetworksView } from "./components/NetworksView";
@@ -64,6 +66,18 @@ export default function App() {
   const refresh = useCallback(async () => {
     try {
       const status = await api.daemonStatus();
+      // チャットの差分フェッチ(M3-13b)。描画前に済ませて新着を即表示する。
+      // 新しく取れた受信分は OS 通知(いま見ている会話は鳴らさない)
+      await Promise.all(
+        status.tunnels.map(async (tunnel) => {
+          try {
+            const fresh = await syncChat(tunnel.config, tunnel.chatSeq);
+            void notifyChatEvents(fresh, tunnel, tunnel.members);
+          } catch {
+            // フェッチ失敗で状態表示を止めない(次のポーリングで再試行)
+          }
+        }),
+      );
       setConnection({ kind: "ok", status });
       recordStatus(status); // スパークライン用の時系列(M3-6)
       // ネットワークごとに前回の台帳と比べて参加・切断を通知する
@@ -95,6 +109,7 @@ export default function App() {
         if (!seen.has(key)) {
           previousMembers.current.delete(key);
           previousTransfers.current.delete(key);
+          clearChat(key);
         }
       }
     } catch (error) {

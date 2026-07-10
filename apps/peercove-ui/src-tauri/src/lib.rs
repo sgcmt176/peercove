@@ -23,8 +23,8 @@ use peercove_ops::peers::Selector;
 use tauri::Manager;
 
 use crate::dto::{
-    DnsRecordDto, InboxItem, InitResult, InviteResult, JoinResult, LogEntry, Logs, NetworkDto,
-    SaveResult, Settings, SettingsUpdate, Status,
+    ChatMessage, ChatPage, DnsRecordDto, InboxItem, InitResult, InviteResult, JoinResult, LogEntry,
+    Logs, NetworkDto, SaveResult, Settings, SettingsUpdate, Status,
 };
 
 /// デフォルトの設定ディレクトリ(Windows: %APPDATA%\… / Linux: ~/.config/…)。
@@ -142,6 +142,59 @@ async fn send_file(config_path: String, peer: String, path: String) -> Result<St
     .await
     {
         Ok(IpcResponse::Transfer { id }) => Ok(id),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+// ---- チャット(ADR-0016、M3-13b) ----
+
+/// チャットを送る(ADR-0016)。`peer` 指定で 1:1、省略でネットワーク全体宛。
+/// 戻り値は履歴に記録された 1 通(UI が即座に吹き出しへ足す)。
+#[tauri::command]
+async fn chat_send(
+    config_path: String,
+    peer: Option<String>,
+    text: String,
+) -> Result<ChatMessage, String> {
+    use peercove_core::msg::ChatScope;
+    let config = canonical(&config_path)?;
+    let (scope, peer) = match peer {
+        Some(peer) => {
+            let ip: std::net::Ipv4Addr = peer
+                .parse()
+                .map_err(|_| format!("宛先 {peer} は IPv4 アドレスではありません"))?;
+            (ChatScope::Direct, Some(ip))
+        }
+        None => (ChatScope::Network, None),
+    };
+    match peercove_ipc::request_async(IpcRequest::ChatSend {
+        config,
+        scope,
+        peer,
+        text,
+    })
+    .await
+    {
+        Ok(IpcResponse::Chat { messages, .. }) => messages
+            .first()
+            .map(ChatMessage::from)
+            .ok_or_else(|| "デーモンが送信結果を返しませんでした".to_string()),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+/// チャット履歴の差分を取る(`after_seq` より後)。1 応答には上限があるため、
+/// 返ったページの末尾 seq が `seq` に届くまで繰り返し呼ぶ。
+#[tauri::command]
+async fn chat_fetch(config_path: String, after_seq: u64) -> Result<ChatPage, String> {
+    let config = canonical(&config_path)?;
+    match peercove_ipc::request_async(IpcRequest::ChatFetch { config, after_seq }).await {
+        Ok(IpcResponse::Chat { seq, messages }) => Ok(ChatPage {
+            seq,
+            messages: messages.iter().map(ChatMessage::from).collect(),
+        }),
         Ok(other) => Err(format!("想定外の応答です: {other:?}")),
         Err(e) => Err(to_message(e)),
     }
@@ -550,6 +603,8 @@ pub fn run() {
             set_member_subnets,
             pick_file,
             send_file,
+            chat_send,
+            chat_fetch,
             list_inbox,
             save_inbox_file,
             delete_inbox_file,

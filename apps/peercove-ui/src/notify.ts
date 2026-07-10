@@ -8,7 +8,8 @@
 // を frontend から使うと npm 依存が 1 つ増え、許可の問い合わせも要るため。
 
 import { invoke } from "@tauri-apps/api/core";
-import { Member, Transfer } from "./ipc";
+import { ChatMessage, Member, Transfer } from "./ipc";
+import { conversationOf, isViewing } from "./chat";
 import { t } from "./i18n";
 
 export interface MemberEvent {
@@ -100,6 +101,32 @@ export function diffTransfers(
       tr.error === null &&
       wasDone.get(tr.id) !== true,
   );
+}
+
+/**
+ * チャット新着の OS 通知(M3-13b)。自分の送信分は鳴らさない。
+ * いま画面でその会話を見ている場合も鳴らさない(LINE と同じ)。
+ */
+export async function notifyChatEvents(
+  fresh: ChatMessage[],
+  tunnel: { config: string; address: string; network: string },
+  members: Member[],
+): Promise<void> {
+  for (const message of fresh) {
+    if (message.from === tunnel.address) continue;
+    const conversation = conversationOf(message, tunnel.address);
+    if (isViewing(tunnel.config, conversation)) continue;
+    const from =
+      members.find((m) => m.ip === message.from)?.name ?? message.from;
+    try {
+      await invoke("notify", {
+        title: t.notify.chatTitle(from, tunnel.network),
+        body: t.notify.chatBody(message.text, message.scope === "network"),
+      });
+    } catch {
+      // 通知の失敗で UI を止めない
+    }
+  }
 }
 
 /** 受信完了の OS 通知。送信者名は台帳(members)から引く。 */

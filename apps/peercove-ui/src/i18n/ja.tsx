@@ -188,8 +188,9 @@ export const ja = {
     disconnect: "切断",
     configFileLabel: "設定ファイル",
     membersHead: (n: number) => `メンバー（${n}）`,
-    // ネットワーク詳細のタブ(M3-6)。チャット(M3-13)もここに並ぶ予定
+    // ネットワーク詳細のタブ(M3-6)
     tabs: {
+      chat: "チャット",
       stats: "統計",
       inbox: "受信",
     },
@@ -249,6 +250,20 @@ export const ja = {
     // 直接通信の説明(M3-4)。外部 IP の共有について明記する(ADR-0013 条件 3)
     directNote:
       "メンバー同士は可能なら直接通信します(速く・ホスト回線の負荷なし)。このとき、あなたのグローバル IP アドレスが同じネットワークのメンバーに共有されます。使いたくない場合は「設定」で直接通信をオフにしてください。",
+  },
+
+  // チャット(M3-13b、ADR-0016)
+  chat: {
+    all: "全体",
+    allNote: "ネットワーク全員に届きます（送信時にオンラインのメンバーのみ）",
+    empty: "まだメッセージはありません。",
+    noMessages: "メッセージなし",
+    previewSelf: "自分: ",
+    placeholder: "メッセージを入力（Enter で送信、Shift+Enter で改行）",
+    offline: "オフラインのメンバーには送れません",
+    left: "このメンバーは現在ネットワークにいません（履歴のみ）",
+    send: "送信",
+    failed: "送信失敗",
   },
 
   // ファイル送信・受信ボックス(M3-9b、ADR-0015)
@@ -409,5 +424,9 @@ export const ja = {
     fileTitle: "ファイルを受信しました",
     fileBody: (file: string, from: string, network: string) =>
       `${file} — ${from} から（${network}）`,
+    // チャット新着(M3-13b)。LINE と同じく本文を通知に出す
+    chatTitle: (from: string, network: string) => `${from}（${network}）`,
+    chatBody: (text: string, isAll: boolean) =>
+      isAll ? `[全体] ${text}` : text,
   },
 };

@@ -13,11 +13,13 @@ import {
   formatRtt,
 } from "../ipc";
 import { rateSeries, rttSeries } from "../history";
+import { totalUnread } from "../chat";
 import { ConfirmModal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { DnsDialog } from "./DnsDialog";
 import { SubnetDialog } from "./SubnetDialog";
 import { Avatar } from "./Avatar";
+import { ChatPanel } from "./ChatPanel";
 import { Sparkline } from "./Sparkline";
 import { t } from "../i18n";
 
@@ -39,7 +41,9 @@ export function TunnelView({
   const isHost = tunnel.role === "hosting";
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
   const peerByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer]));
-  const [tab, setTab] = useState<"members" | "stats" | "inbox">("members");
+  const [tab, setTab] = useState<"members" | "chat" | "stats" | "inbox">(
+    "members",
+  );
   /** 受信ボックスの中身(M3-9b)。status のポーリングに合わせて読み直す。 */
   const [inbox, setInbox] = useState<InboxItem[]>([]);
   const [inviting, setInviting] = useState(false);
@@ -84,6 +88,8 @@ export function TunnelView({
   const activeTransfers = tunnel.transfers.filter(
     (transfer) => !transfer.done,
   ).length;
+  /** チャットの未読合計(M3-13b)。ストアは App のポーリングが同期済み。 */
+  const chatUnread = totalUnread(tunnel);
 
   const stop = async () => {
     setBusy(true);
@@ -193,6 +199,14 @@ export function TunnelView({
           </button>
           <button
             type="button"
+            className={tab === "chat" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
+            onClick={() => setTab("chat")}
+          >
+            {t.tunnel.tabs.chat}
+            {chatUnread > 0 && <span className="tabs__badge">{chatUnread}</span>}
+          </button>
+          <button
+            type="button"
             className={tab === "stats" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
             onClick={() => setTab("stats")}
           >
@@ -245,6 +259,8 @@ export function TunnelView({
               )}
             </>
           )
+        ) : tab === "chat" ? (
+          <ChatPanel tunnel={tunnel} />
         ) : tab === "inbox" ? (
           <InboxPanel
             tunnel={tunnel}

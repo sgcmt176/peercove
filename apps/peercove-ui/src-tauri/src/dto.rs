@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use peercove_core::ipc::{DaemonStatus, LogLine, PeerSummary, TunnelInfo, TunnelRole, IPC_VERSION};
+use peercove_core::ipc::{
+    ChatMessageInfo, DaemonStatus, LogLine, PeerSummary, TunnelInfo, TunnelRole, IPC_VERSION,
+};
 use peercove_core::proto::LedgerEntry;
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +108,52 @@ impl From<&peercove_core::ipc::TransferInfo> for Transfer {
     }
 }
 
+/// チャット履歴の 1 通(ADR-0016、M3-13b)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessage {
+    /// 履歴内の通し番号(差分フェッチに使う)。
+    pub seq: u64,
+    pub id: String,
+    /// "direct" | "network"
+    pub scope: &'static str,
+    /// 送信者の仮想 IP(自分が送った通は自分の IP)。
+    pub from: String,
+    /// (direct のみ)宛先の仮想 IP。
+    pub to: Option<String>,
+    pub text: String,
+    pub sent_at_ms: u64,
+    /// どの宛先にも届かなかった(デーモン再起動で消える)。
+    pub failed: bool,
+}
+
+impl From<&ChatMessageInfo> for ChatMessage {
+    fn from(info: &ChatMessageInfo) -> Self {
+        Self {
+            seq: info.seq,
+            id: info.id.clone(),
+            scope: match info.scope {
+                peercove_core::msg::ChatScope::Direct => "direct",
+                peercove_core::msg::ChatScope::Network => "network",
+            },
+            from: info.from.to_string(),
+            to: info.to.map(|ip| ip.to_string()),
+            text: info.text.clone(),
+            sent_at_ms: info.sent_at,
+            failed: info.failed,
+        }
+    }
+}
+
+/// ChatFetch の 1 ページ(ADR-0016)。`seq` は履歴全体の最新 seq。
+/// `messages` の末尾がそこへ届くまで繰り返し取る。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatPage {
+    pub seq: u64,
+    pub messages: Vec<ChatMessage>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tunnel {
@@ -121,6 +169,8 @@ pub struct Tunnel {
     pub removed: bool,
     /// ファイル転送の進捗(ADR-0015、M3-9)。実行中 + 直近の完了/失敗分。
     pub transfers: Vec<Transfer>,
+    /// チャット履歴の最新 seq(ADR-0016、M3-13b)。これが進んだら差分フェッチする。
+    pub chat_seq: u64,
 }
 
 impl From<&TunnelInfo> for Tunnel {
@@ -167,6 +217,7 @@ impl From<&TunnelInfo> for Tunnel {
             peers: info.peers.iter().map(Peer::from).collect(),
             removed: info.removed,
             transfers: info.transfers.iter().map(Transfer::from).collect(),
+            chat_seq: info.chat_seq,
         }
     }
 }
