@@ -266,13 +266,13 @@ function PeersTable({ config, peers }: { config: string; peers: Peer[] }) {
               <td title={t.tunnel.peers.rttTitle}>
                 <span className="cell-trend">
                   <Sparkline values={rtts} title={t.tunnel.peers.rttTitle} />
-                  {formatRtt(peer.rttMs)}
+                  <span className="stat stat--rtt">{formatRtt(peer.rttMs)}</span>
                 </span>
               </td>
               <td title={t.tunnel.peers.rateTitle}>
                 <span className="cell-trend">
                   <Sparkline values={rates} title={t.tunnel.peers.rateTitle} />
-                  {formatRate(rates.at(-1) ?? null)}
+                  <span className="stat">{formatRate(rates.at(-1) ?? null)}</span>
                 </span>
               </td>
               <td>{formatBytes(peer.rxBytes)}</td>

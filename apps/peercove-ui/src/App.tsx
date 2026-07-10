@@ -157,7 +157,7 @@ export default function App() {
             title={t.header.theme(theme)}
             onClick={() => setTheme(nextTheme(theme))}
           >
-            {theme === "light" ? "☀" : theme === "dark" ? "☾" : "◐"}
+            {theme === "light" ? "☀" : "☾"}
           </button>
           <button
             type="button"

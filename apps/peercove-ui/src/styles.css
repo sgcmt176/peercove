@@ -840,9 +840,24 @@ select {
   font-size: 12px;
   color: var(--muted);
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  min-width: 74px;
+  /* 桁数・単位が変わっても幅が動かない固定幅(最長は "1023.99 KiB/s")。
+     幅が揺れると隣の列がガタつく(検証フィードバック) */
+  min-width: 13ch;
+  display: inline-block;
   text-align: right;
+}
+
+/* RTT の値("< 1 ms" 〜 "999 ms")は速度より短い */
+.stat--rtt {
+  min-width: 6ch;
+}
+
+/* 統計テーブル内では表の文字サイズ・色に合わせる */
+.peers .stat {
+  font-size: inherit;
+  color: inherit;
 }
 
 /* ネットワーク詳細のタブ。チャット(M3-13)・ファイル送信(M3-9)は

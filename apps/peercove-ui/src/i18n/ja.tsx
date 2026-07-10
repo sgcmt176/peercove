@@ -52,15 +52,11 @@ export const ja = {
     settingsUnavailable:
       "設定ファイルがまだありません（ホストを始めるか参加してください）",
     logs: "デーモンのログ",
-    // 外観テーマの切替ボタン(M3-6)。クリックで巡回する
-    theme: (theme: "system" | "light" | "dark") => {
-      const label = {
-        system: "システムに合わせる",
-        light: "ライト",
-        dark: "ダーク",
-      }[theme];
-      return `外観: ${label}（クリックで切替）`;
-    },
+    // 外観テーマの切替ボタン(M3-6)。ライト ⇄ ダークの 2 状態
+    theme: (theme: "light" | "dark") =>
+      theme === "light"
+        ? "外観: ライト（クリックでダーク）"
+        : "外観: ダーク（クリックでライト）",
   },
 
   footer: (
