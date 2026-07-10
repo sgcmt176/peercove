@@ -261,6 +261,31 @@ fn rename_member(config_path: String, public_key: String, new_name: String) -> R
     .map_err(to_message)
 }
 
+/// メンバーの広告サブネット(ADR-0014、M3-7)を設定する。空配列で解除。
+/// ホスト設定(host.toml)に対してのみ有効。約 10 秒で全メンバーへ配布される。
+#[tauri::command]
+fn set_member_subnets(
+    config_path: String,
+    public_key: String,
+    subnets: Vec<String>,
+) -> Result<(), String> {
+    let parsed: Vec<ipnet::Ipv4Net> = subnets
+        .iter()
+        .map(|s| {
+            s.trim()
+                .parse()
+                .map_err(|_| format!("\"{s}\" は CIDR(例 192.168.10.0/24)として解釈できません"))
+        })
+        .collect::<Result<_, _>>()?;
+    peercove_ops::peers::set_subnets(
+        Path::new(&config_path),
+        &Selector::PublicKey(&public_key),
+        &parsed,
+    )
+    .map(|_| ())
+    .map_err(to_message)
+}
+
 // ---- カスタム DNS レコード(M3-1c、ADR-0011 §1b) ----
 
 /// カスタム DNS レコードの一覧(fqdn は表示用に組み立て済み)。
@@ -385,6 +410,7 @@ pub fn run() {
             join_network,
             remove_member,
             rename_member,
+            set_member_subnets,
             list_dns_records,
             add_dns_record,
             remove_dns_record,

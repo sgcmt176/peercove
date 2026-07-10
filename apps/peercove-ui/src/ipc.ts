@@ -21,6 +21,8 @@ export interface Member {
   route: "direct" | "trying" | "relay" | null;
   /** この行が自分自身か。 */
   isSelf: boolean;
+  /** このメンバーが広告する背後 LAN のサブネット（M3-7、ADR-0014）。 */
+  subnets: string[];
 }
 
 /** カスタム DNS レコード（M3-1c）。 */
@@ -177,6 +179,8 @@ export const api = {
     invoke<string>("remove_member", { configPath, publicKey }),
   renameMember: (configPath: string, publicKey: string, newName: string) =>
     invoke<void>("rename_member", { configPath, publicKey, newName }),
+  setMemberSubnets: (configPath: string, publicKey: string, subnets: string[]) =>
+    invoke<void>("set_member_subnets", { configPath, publicKey, subnets }),
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),

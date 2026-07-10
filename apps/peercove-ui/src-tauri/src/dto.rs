@@ -22,6 +22,8 @@ pub struct Member {
     pub route: Option<&'static str>,
     /// この行が自分自身か(仮想 IP の一致で判定)。UI が「自分」と表示する。
     pub is_self: bool,
+    /// このメンバーが広告する背後 LAN のサブネット(ADR-0014、M3-7)。
+    pub subnets: Vec<String>,
 }
 
 impl Member {
@@ -40,6 +42,7 @@ impl Member {
             dns_name,
             route,
             is_self,
+            subnets: entry.subnets.iter().map(|s| s.to_string()).collect(),
         }
     }
 }

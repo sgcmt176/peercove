@@ -14,6 +14,7 @@ import { rateSeries, rttSeries } from "../history";
 import { ConfirmModal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { DnsDialog } from "./DnsDialog";
+import { SubnetDialog } from "./SubnetDialog";
 import { Avatar } from "./Avatar";
 import { Sparkline } from "./Sparkline";
 import { t } from "../i18n";
@@ -40,6 +41,8 @@ export function TunnelView({
   const [inviting, setInviting] = useState(false);
   const [showDns, setShowDns] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
+  /** 広告サブネット編集の対象(M3-7b、ホストのみ)。 */
+  const [editingSubnets, setEditingSubnets] = useState<Member | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -183,6 +186,7 @@ export function TunnelView({
                     canManage={isHost && !member.isHost}
                     onRemove={() => setRemoving(member)}
                     onRename={(newName) => void rename(member, newName)}
+                    onSubnets={() => setEditingSubnets(member)}
                   />
                 ))}
               </ul>
@@ -216,6 +220,17 @@ export function TunnelView({
           isHost={isHost}
           onClose={() => {
             setShowDns(false);
+            onChanged();
+          }}
+        />
+      )}
+
+      {editingSubnets && (
+        <SubnetDialog
+          configPath={tunnel.config}
+          member={editingSubnets}
+          onClose={() => {
+            setEditingSubnets(null);
             onChanged();
           }}
         />
@@ -292,6 +307,7 @@ function MemberRow({
   canManage,
   onRemove,
   onRename,
+  onSubnets,
 }: {
   config: string;
   member: Member;
@@ -300,6 +316,8 @@ function MemberRow({
   canManage: boolean;
   onRemove: () => void;
   onRename: (newName: string) => void;
+  /** 広告サブネットの編集を開く(M3-7b、ホストのみ)。 */
+  onSubnets: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(member.name ?? "");
@@ -352,6 +370,11 @@ function MemberRow({
               {t.tunnel.member.route[member.route]}
             </span>
           )}
+          {member.subnets.map((subnet) => (
+            <span key={subnet} className="tag mono" title={t.subnet.badgeTitle}>
+              {subnet}
+            </span>
+          ))}
         </span>
         <span className="member__meta">
           <span className="mono">{member.ip}</span>
@@ -379,6 +402,14 @@ function MemberRow({
       </span>
       {canManage && !editing && (
         <span className="member__actions">
+          <button
+            type="button"
+            className="button--icon"
+            title={t.subnet.edit}
+            onClick={onSubnets}
+          >
+            🖧
+          </button>
           <button
             type="button"
             className="button--icon"
