@@ -1059,6 +1059,72 @@ select {
   color: #fff;
 }
 
+/* グループのアイコン(M3-13c) */
+.chat__group-icon {
+  background: var(--accent-soft);
+  font-size: 14px;
+}
+
+/* 会話リスト先頭の「グループ作成」(M3-13c) */
+.chat__new-group {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  text-align: left;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.chat__new-group:hover {
+  background: var(--accent-soft);
+}
+
+/* 会話ヘッダの「管理」ボタン(M3-13c)。ヘッダに収まる小ささにする */
+.chat__manage {
+  margin-left: auto;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+/* グループ作成・管理のメンバー選択(M3-13c) */
+.chat__pick {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.chat__pick li + li {
+  border-top: 1px solid var(--border);
+}
+
+.chat__pick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.chat__pick-row:hover {
+  background: var(--accent-soft);
+}
+
+/* ダイアログ内の小見出し(field のラベルと同じ見た目) */
+.field__label {
+  display: block;
+  margin-top: 10px;
+  color: var(--muted);
+}
+
 /* 右: 会話 */
 .chat__main {
   flex: 1;

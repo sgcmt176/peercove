@@ -152,6 +152,7 @@ impl ActiveTunnel {
         snapshot: Option<SharedSnapshot>,
         transfers: crate::msg::TransferRegistry,
         chat: crate::chat::SharedChatLog,
+        groups: crate::groups::SharedGroups,
     ) -> anyhow::Result<()> {
         supervise(
             config_path,
@@ -162,6 +163,7 @@ impl ActiveTunnel {
             snapshot,
             transfers,
             chat,
+            groups,
         )
         .await
     }
@@ -224,6 +226,7 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
             None,
             Default::default(),
             crate::chat::ChatLog::load(config_path),
+            crate::groups::GroupStore::load(config_path),
         )
         .await;
         ctrl_c.abort();
@@ -267,6 +270,7 @@ pub async fn supervise(
     snapshot: Option<SharedSnapshot>,
     transfers: crate::msg::TransferRegistry,
     chat: crate::chat::SharedChatLog,
+    groups: crate::groups::SharedGroups,
 ) -> anyhow::Result<()> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
@@ -312,7 +316,10 @@ pub async fn supervise(
             Arc::clone(&transfers),
             Arc::clone(&msg_limit),
             Arc::clone(&chat),
+            Arc::clone(&groups),
         )));
+        // オンライン復帰の検知(グループの追いつき再送 — ADR-0016、M3-13c)
+        let mut prev_online: HashSet<std::net::Ipv4Addr> = HashSet::new();
         match role {
             Role::Host => {
                 tasks.push(tokio::spawn(control::run_host_server(
@@ -486,6 +493,30 @@ pub async fn supervise(
                             })
                             .collect();
                         *msg_peers.lock().unwrap() = map;
+                        // オフライン → オンライン遷移を検知したら、そのピアが属する
+                        // 既知グループを送り直す(追いつき — ADR-0016、M3-13c)。
+                        // 起動直後の最初の台帳では全オンラインメンバーへ送る
+                        // (自分が落ちていた間の変更を配り直すきっかけになる)
+                        let online: HashSet<std::net::Ipv4Addr> = ledger
+                            .iter()
+                            .filter(|e| e.online && e.ip != spec.address.addr())
+                            .map(|e| e.ip)
+                            .collect();
+                        for ip in online.difference(&prev_online) {
+                            for group in groups.lock().unwrap().groups_with(*ip) {
+                                let ip = *ip;
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        crate::msg::send_group_update(ip, &group).await
+                                    {
+                                        tracing::debug!(
+                                            "{ip} へのグループ再送に失敗(次のオンライン復帰時に再試行): {e:#}"
+                                        );
+                                    }
+                                });
+                            }
+                        }
+                        prev_online = online;
                     }
                     if let Err(e) =
                         status::write_status_file(&status_path, &stats, ledger.as_deref())

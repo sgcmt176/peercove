@@ -70,7 +70,9 @@ export interface ChatMessage {
   /** 履歴内の通し番号（差分フェッチ・未読管理に使う）。 */
   seq: number;
   id: string;
-  scope: "direct" | "network";
+  scope: "direct" | "network" | "group";
+  /** (group のみ)宛先グループの ID（M3-13c）。 */
+  groupId: string | null;
   /** 送信者の仮想 IP（自分が送った通は自分の IP）。 */
   from: string;
   /** (direct のみ)宛先の仮想 IP。 */
@@ -79,6 +81,14 @@ export interface ChatMessage {
   sentAtMs: number;
   /** どの宛先にも届かなかった（デーモン再起動で消える）。 */
   failed: boolean;
+}
+
+/** グループ（ADR-0016、M3-13c）。members に自分が居なければ「退出済み」。 */
+export interface Group {
+  id: string;
+  name: string;
+  /** メンバーの仮想 IP。 */
+  members: string[];
 }
 
 /** チャット履歴の 1 ページ。messages の末尾が seq に届くまで繰り返し取る。 */
@@ -102,6 +112,8 @@ export interface Tunnel {
   transfers: Transfer[];
   /** チャット履歴の最新 seq（ADR-0016）。進んだら差分フェッチする。 */
   chatSeq: number;
+  /** 既知のグループ（M3-13c）。自分が抜けたグループも含む。 */
+  groups: Group[];
 }
 
 /** 同時参加は 1 ネットワークまで(M2 handoff Q4)。 */
@@ -234,11 +246,27 @@ export const api = {
     invoke<void>("rename_member", { configPath, publicKey, newName }),
   setMemberSubnets: (configPath: string, publicKey: string, subnets: string[]) =>
     invoke<void>("set_member_subnets", { configPath, publicKey, subnets }),
-  // チャット（ADR-0016、M3-13b）。peer = null でネットワーク全体宛
-  chatSend: (configPath: string, peer: string | null, text: string) =>
-    invoke<ChatMessage>("chat_send", { configPath, peer, text }),
+  // チャット（ADR-0016、M3-13b/c）。peer 指定で 1:1、group 指定でグループ宛、
+  // どちらも null でネットワーク全体宛
+  chatSend: (
+    configPath: string,
+    peer: string | null,
+    group: string | null,
+    text: string,
+  ) => invoke<ChatMessage>("chat_send", { configPath, peer, group, text }),
   chatFetch: (configPath: string, afterSeq: number) =>
     invoke<ChatPage>("chat_fetch", { configPath, afterSeq }),
+  // グループ（M3-13c）。members / add は相手の仮想 IP（自分は不要）
+  groupCreate: (configPath: string, name: string, members: string[]) =>
+    invoke<Group>("group_create", { configPath, name, members }),
+  groupUpdate: (
+    configPath: string,
+    id: string,
+    name: string | null,
+    add: string[],
+  ) => invoke<Group>("group_update", { configPath, id, name, add }),
+  groupLeave: (configPath: string, id: string) =>
+    invoke<void>("group_leave", { configPath, id }),
   // ファイル送信・受信ボックス（ADR-0015、M3-9b）
   pickFile: () => invoke<string | null>("pick_file"),
   sendFile: (configPath: string, peer: string, path: string) =>

@@ -147,31 +147,38 @@ async fn send_file(config_path: String, peer: String, path: String) -> Result<St
     }
 }
 
-// ---- チャット(ADR-0016、M3-13b) ----
+// ---- チャット(ADR-0016、M3-13b/c) ----
 
-/// チャットを送る(ADR-0016)。`peer` 指定で 1:1、省略でネットワーク全体宛。
-/// 戻り値は履歴に記録された 1 通(UI が即座に吹き出しへ足す)。
+/// チャットを送る(ADR-0016)。`peer` 指定で 1:1、`group` 指定でグループ宛、
+/// どちらも省略でネットワーク全体宛。戻り値は履歴に記録された 1 通
+/// (UI が即座に吹き出しへ足す)。
 #[tauri::command]
 async fn chat_send(
     config_path: String,
     peer: Option<String>,
+    group: Option<String>,
     text: String,
 ) -> Result<ChatMessage, String> {
     use peercove_core::msg::ChatScope;
     let config = canonical(&config_path)?;
-    let (scope, peer) = match peer {
-        Some(peer) => {
+    let (scope, peer, group_id) = match (peer, group) {
+        (Some(peer), None) => {
             let ip: std::net::Ipv4Addr = peer
                 .parse()
                 .map_err(|_| format!("宛先 {peer} は IPv4 アドレスではありません"))?;
-            (ChatScope::Direct, Some(ip))
+            (ChatScope::Direct, Some(ip), None)
         }
-        None => (ChatScope::Network, None),
+        (None, Some(group)) => (ChatScope::Group, None, Some(group)),
+        (None, None) => (ChatScope::Network, None, None),
+        (Some(_), Some(_)) => {
+            return Err("宛先は peer か group のどちらか 1 つにしてください".to_string())
+        }
     };
     match peercove_ipc::request_async(IpcRequest::ChatSend {
         config,
         scope,
         peer,
+        group_id,
         text,
     })
     .await
@@ -183,6 +190,69 @@ async fn chat_send(
         Ok(other) => Err(format!("想定外の応答です: {other:?}")),
         Err(e) => Err(to_message(e)),
     }
+}
+
+/// 仮想 IP 文字列の一覧を検証つきで変換する(グループ操作用)。
+fn parse_ips(list: Vec<String>) -> Result<Vec<std::net::Ipv4Addr>, String> {
+    list.iter()
+        .map(|ip| {
+            ip.parse()
+                .map_err(|_| format!("{ip} は IPv4 アドレスではありません"))
+        })
+        .collect()
+}
+
+/// グループを作る(ADR-0016、M3-13c)。members は相手の仮想 IP(自分は不要)。
+#[tauri::command]
+async fn group_create(
+    config_path: String,
+    name: String,
+    members: Vec<String>,
+) -> Result<dto::Group, String> {
+    let config = canonical(&config_path)?;
+    let members = parse_ips(members)?;
+    match peercove_ipc::request_async(IpcRequest::GroupCreate {
+        config,
+        name,
+        members,
+    })
+    .await
+    {
+        Ok(IpcResponse::Group { group }) => Ok(dto::Group::from(&group)),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+/// グループの改名・メンバー追加(どちらも省略可)。
+#[tauri::command]
+async fn group_update(
+    config_path: String,
+    id: String,
+    name: Option<String>,
+    add: Vec<String>,
+) -> Result<dto::Group, String> {
+    let config = canonical(&config_path)?;
+    let add = parse_ips(add)?;
+    match peercove_ipc::request_async(IpcRequest::GroupUpdate {
+        config,
+        id,
+        name,
+        add,
+    })
+    .await
+    {
+        Ok(IpcResponse::Group { group }) => Ok(dto::Group::from(&group)),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+/// 自分がグループから抜ける(履歴はローカルに残る)。
+#[tauri::command]
+async fn group_leave(config_path: String, id: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::GroupLeave { config, id }).await
 }
 
 /// チャット履歴の差分を取る(`after_seq` より後)。1 応答には上限があるため、
@@ -605,6 +675,9 @@ pub fn run() {
             send_file,
             chat_send,
             chat_fetch,
+            group_create,
+            group_update,
+            group_leave,
             list_inbox,
             save_inbox_file,
             delete_inbox_file,

@@ -115,8 +115,10 @@ pub struct ChatMessage {
     /// 履歴内の通し番号(差分フェッチに使う)。
     pub seq: u64,
     pub id: String,
-    /// "direct" | "network"
+    /// "direct" | "network" | "group"
     pub scope: &'static str,
+    /// (group のみ)宛先グループの ID(M3-13c)。
+    pub group_id: Option<String>,
     /// 送信者の仮想 IP(自分が送った通は自分の IP)。
     pub from: String,
     /// (direct のみ)宛先の仮想 IP。
@@ -135,12 +137,35 @@ impl From<&ChatMessageInfo> for ChatMessage {
             scope: match info.scope {
                 peercove_core::msg::ChatScope::Direct => "direct",
                 peercove_core::msg::ChatScope::Network => "network",
+                peercove_core::msg::ChatScope::Group => "group",
             },
+            group_id: info.group_id.clone(),
             from: info.from.to_string(),
             to: info.to.map(|ip| ip.to_string()),
             text: info.text.clone(),
             sent_at_ms: info.sent_at,
             failed: info.failed,
+        }
+    }
+}
+
+/// グループ(ADR-0016、M3-13c)。UI は members に自分が居るかで
+/// 「参加中/退出済み」を判定する。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    /// メンバーの仮想 IP。
+    pub members: Vec<String>,
+}
+
+impl From<&peercove_core::msg::GroupInfo> for Group {
+    fn from(info: &peercove_core::msg::GroupInfo) -> Self {
+        Self {
+            id: info.id.clone(),
+            name: info.name.clone(),
+            members: info.members.iter().map(|ip| ip.to_string()).collect(),
         }
     }
 }
@@ -171,6 +196,9 @@ pub struct Tunnel {
     pub transfers: Vec<Transfer>,
     /// チャット履歴の最新 seq(ADR-0016、M3-13b)。これが進んだら差分フェッチする。
     pub chat_seq: u64,
+    /// 既知のグループ(ADR-0016、M3-13c)。自分が抜けたグループも含む
+    /// (UI が履歴の表示名に使い、会話リストからは隠す)。
+    pub groups: Vec<Group>,
 }
 
 impl From<&TunnelInfo> for Tunnel {
@@ -218,6 +246,7 @@ impl From<&TunnelInfo> for Tunnel {
             removed: info.removed,
             transfers: info.transfers.iter().map(Transfer::from).collect(),
             chat_seq: info.chat_seq,
+            groups: info.groups.iter().map(Group::from).collect(),
         }
     }
 }
@@ -494,6 +523,7 @@ mod tests {
             direct: Default::default(),
             transfers: vec![],
             chat_seq: 0,
+            groups: vec![],
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: peercove_core::ipc::IPC_VERSION,
@@ -577,6 +607,7 @@ mod tests {
             direct,
             transfers: vec![],
             chat_seq: 0,
+            groups: vec![],
         };
         let tunnel = Tunnel::from(&info);
         let routes: Vec<Option<&str>> = tunnel.members.iter().map(|m| m.route).collect();

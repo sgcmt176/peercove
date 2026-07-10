@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::msg::ChatScope;
+use crate::msg::{ChatScope, GroupInfo};
 use crate::proto::LedgerEntry;
 
 /// Windows の名前付きパイプ名。
@@ -71,6 +71,9 @@ pub enum IpcRequest {
         /// 宛先メンバーの仮想 IP(scope = direct のとき必須)。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<Ipv4Addr>,
+        /// 宛先グループの ID(scope = group のとき必須 — M3-13c)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
         text: String,
     },
     /// チャット履歴の差分を取り出す(`after_seq` より後のエントリ)。
@@ -81,6 +84,25 @@ pub enum IpcRequest {
         #[serde(default)]
         after_seq: u64,
     },
+    /// グループを作る(ADR-0016、M3-13c)。`members` に自分は含めなくてよい
+    /// (デーモンが必ず足す)。応答は [`IpcResponse::Group`]。
+    GroupCreate {
+        config: PathBuf,
+        name: String,
+        members: Vec<Ipv4Addr>,
+    },
+    /// グループの改名・メンバー追加(どちらも省略可。V1 に「他人の除外」はない
+    /// — 抜けるのは本人の GroupLeave だけ)。
+    GroupUpdate {
+        config: PathBuf,
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        add: Vec<Ipv4Addr>,
+    },
+    /// 自分がグループから抜ける(履歴とグループ情報はローカルに残る)。
+    GroupLeave { config: PathBuf, id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +141,8 @@ pub enum IpcResponse {
         seq: u64,
         messages: Vec<ChatMessageInfo>,
     },
+    /// GroupCreate / GroupUpdate への応答(作成・更新後のグループ全量)。
+    Group { group: GroupInfo },
 }
 
 /// 1 応答で返すチャットの上限(IPC の 1 行上限 256 KiB に収めるため、
@@ -134,9 +158,12 @@ pub struct ChatMessageInfo {
     /// メッセージ ID(送信側が発行。認証には使わない)。
     pub id: String,
     pub scope: ChatScope,
+    /// (group のみ)宛先グループの ID(M3-13c)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     /// 送信者の仮想 IP(自分が送った通は自分の IP)。
     pub from: Ipv4Addr,
-    /// (direct のみ)宛先の仮想 IP。network 宛は `None`。
+    /// (direct のみ)宛先の仮想 IP。network / group 宛は `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Ipv4Addr>,
     pub text: String,
@@ -228,6 +255,11 @@ pub struct TunnelInfo {
     /// UI/CLI はこれが進んだときだけ ChatFetch する。旧デーモンの応答には無い(0)。
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub chat_seq: u64,
+    /// 既知のグループ(ADR-0016、M3-13c)。自分が抜けた/外されたグループも
+    /// 含む(UI が履歴の表示名に使う — 会話リストからは隠す)。
+    /// 旧デーモンの応答には無い(空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupInfo>,
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -453,6 +485,7 @@ mod tests {
         let parsed: TunnelInfo = serde_json::from_str(old).unwrap();
         assert!(parsed.transfers.is_empty());
         assert_eq!(parsed.chat_seq, 0, "chat_seq も省略可(旧デーモン互換)");
+        assert!(parsed.groups.is_empty(), "groups も省略可(旧デーモン互換)");
     }
 
     /// ChatSend / ChatFetch / Chat 応答(ADR-0016、M3-13)のワイヤ表現。
@@ -464,6 +497,7 @@ mod tests {
                 config: PathBuf::from("host.toml"),
                 scope: ChatScope::Direct,
                 peer: Some("10.83.19.3".parse().unwrap()),
+                group_id: None,
                 text: "やあ".to_string(),
             },
         })
@@ -480,6 +514,7 @@ mod tests {
                 config: PathBuf::from("host.toml"),
                 scope: ChatScope::Network,
                 peer: None,
+                group_id: None,
                 text: "全体".to_string(),
             },
         })
@@ -487,6 +522,23 @@ mod tests {
         assert_eq!(
             json,
             r#"{"id":13,"req":{"method":"chat_send","config":"host.toml","scope":"network","text":"全体"}}"#
+        );
+
+        // group 宛は group_id を付ける(M3-13c)
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 15,
+            req: IpcRequest::ChatSend {
+                config: PathBuf::from("host.toml"),
+                scope: ChatScope::Group,
+                peer: None,
+                group_id: Some("g1".to_string()),
+                text: "グループ".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":15,"req":{"method":"chat_send","config":"host.toml","scope":"group","group_id":"g1","text":"グループ"}}"#
         );
 
         let json = serde_json::to_string(&IpcEnvelope {
@@ -506,6 +558,7 @@ mod tests {
             seq: 8,
             id: "c1".to_string(),
             scope: ChatScope::Direct,
+            group_id: None,
             from: "10.83.19.1".parse().unwrap(),
             to: Some("10.83.19.3".parse().unwrap()),
             text: "やあ".to_string(),
@@ -539,6 +592,7 @@ mod tests {
             seq: 9,
             id: "c2".to_string(),
             scope: ChatScope::Network,
+            group_id: None,
             from: "10.83.19.1".parse().unwrap(),
             to: None,
             text: "x".to_string(),
@@ -547,9 +601,87 @@ mod tests {
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(!json.contains("\"to\""), "network 宛は to を省略: {json}");
+        assert!(
+            !json.contains("group_id"),
+            "group 宛以外は group_id を省略: {json}"
+        );
         assert!(json.contains(r#""failed":true"#), "{json}");
         let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, message);
+
+        // group 宛 + グループ操作(M3-13c)のワイヤ表現
+        let message = ChatMessageInfo {
+            seq: 10,
+            id: "c3".to_string(),
+            scope: ChatScope::Group,
+            group_id: Some("g1".to_string()),
+            from: "10.83.19.1".parse().unwrap(),
+            to: None,
+            text: "x".to_string(),
+            sent_at: 1,
+            failed: false,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains(r#""group_id":"g1""#), "{json}");
+        let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, message);
+
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 16,
+            req: IpcRequest::GroupCreate {
+                config: PathBuf::from("host.toml"),
+                name: "開発".to_string(),
+                members: vec!["10.83.19.3".parse().unwrap()],
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":16,"req":{"method":"group_create","config":"host.toml","name":"開発","members":["10.83.19.3"]}}"#
+        );
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 17,
+            req: IpcRequest::GroupUpdate {
+                config: PathBuf::from("host.toml"),
+                id: "g1".to_string(),
+                name: None,
+                add: vec![],
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json, r#"{"id":17,"req":{"method":"group_update","config":"host.toml","id":"g1"}}"#,
+            "name / add は省略可"
+        );
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 18,
+            req: IpcRequest::GroupLeave {
+                config: PathBuf::from("host.toml"),
+                id: "g1".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":18,"req":{"method":"group_leave","config":"host.toml","id":"g1"}}"#
+        );
+        let json = serde_json::to_string(&IpcReply {
+            id: 16,
+            result: IpcResult::Ok(IpcResponse::Group {
+                group: GroupInfo {
+                    id: "g1".to_string(),
+                    name: "開発".to_string(),
+                    members: vec!["10.83.19.1".parse().unwrap()],
+                    revision: 1,
+                    updated_by: "10.83.19.1".parse().unwrap(),
+                },
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":16,"ok":{"type":"group","group":{"id":"g1","name":"開発","members":["10.83.19.1"],"revision":1,"updated_by":"10.83.19.1"}}}"#
+        );
     }
 
     /// `rtt_ms` は後方互換のため省略可能(旧デーモンの応答も読める)。

@@ -252,7 +252,7 @@ export const ja = {
       "メンバー同士は可能なら直接通信します(速く・ホスト回線の負荷なし)。このとき、あなたのグローバル IP アドレスが同じネットワークのメンバーに共有されます。使いたくない場合は「設定」で直接通信をオフにしてください。",
   },
 
-  // チャット(M3-13b、ADR-0016)
+  // チャット(M3-13b/c、ADR-0016)
   chat: {
     all: "全体",
     allNote: "ネットワーク全員に届きます（送信時にオンラインのメンバーのみ）",
@@ -264,6 +264,27 @@ export const ja = {
     left: "このメンバーは現在ネットワークにいません（履歴のみ）",
     send: "送信",
     failed: "送信失敗",
+    // グループ(M3-13c)
+    groupCreate: "グループ作成",
+    groupTitle: "新しいグループ",
+    groupManage: "管理",
+    groupNameLabel: "グループ名",
+    groupNamePlaceholder: "例: 開発チーム",
+    groupMembersLabel: "メンバーを選ぶ",
+    groupAddLabel: "メンバーを追加",
+    groupMembersHead: "メンバー",
+    groupNoCandidates: "追加できるメンバーがいません。",
+    groupCount: (n: number) => `${n} 人`,
+    groupNote:
+      "グループの情報はメンバー同士で直接共有されます。オフラインのメンバーには、オンラインに戻ったときに自動で届きます。",
+    create: "作成",
+    save: "保存",
+    leave: "退出",
+    leaveTitle: "グループから退出",
+    leaveConfirm: (name: string) =>
+      `「${name}」から退出しますか？　これまでの履歴はこの端末に残ります。`,
+    leftGroup: "このグループからは退出済みです（履歴のみ）",
+    unknownGroup: "不明なグループ",
   },
 
   // ファイル送信・受信ボックス(M3-9b、ADR-0015)

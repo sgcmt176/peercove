@@ -170,6 +170,7 @@ mod tests {
             seq: 0, // append が振り直す
             id: "c".to_string(),
             scope: ChatScope::Direct,
+            group_id: None,
             from: "10.0.0.1".parse().unwrap(),
             to: Some("10.0.0.2".parse().unwrap()),
             text: text.to_string(),

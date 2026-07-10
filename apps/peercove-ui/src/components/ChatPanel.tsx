@@ -1,22 +1,37 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChatMessage, Member, Tunnel, api, errorMessage } from "../ipc";
+import { ChatMessage, Group, Member, Tunnel, api, errorMessage } from "../ipc";
 import {
   ConversationKey,
   NETWORK_CONVERSATION,
   appendLocal,
   chatMessages,
   conversationOf,
+  groupConversation,
+  groupIdOf,
   markRead,
   setActiveConversation,
   unreadCounts,
 } from "../chat";
 import { Avatar } from "./Avatar";
+import { ConfirmModal, Modal } from "./Modal";
 import { t } from "../i18n";
 
+/** 会話リストの 1 行(全体・グループ・メンバー 1:1)。 */
+interface ConversationItem {
+  key: ConversationKey;
+  name: string;
+  online: boolean;
+  member: Member | null;
+  group: Group | null;
+  /** 履歴にだけ残っている会話(退出済みメンバー・退出済みグループ)。 */
+  left: boolean;
+}
+
 /**
- * チャットタブ(M3-13b、ADR-0016)。LINE 風の 2 ペイン:
- * 左 = 会話リスト(全体 + メンバー 1:1、未読バッジ)、右 = 吹き出しの会話。
- * 履歴は chat.ts のストア(App の 2 秒ポーリングが差分フェッチ済み)を読む。
+ * チャットタブ(M3-13b/c、ADR-0016)。LINE 風の 2 ペイン:
+ * 左 = 会話リスト(全体 + グループ + メンバー 1:1、未読バッジ、グループ作成)、
+ * 右 = 吹き出しの会話。履歴は chat.ts のストア(App の 2 秒ポーリングが
+ * 差分フェッチ済み)を読む。
  */
 export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
   const [conversation, setConversation] = useState<ConversationKey>(
@@ -25,6 +40,10 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** グループ作成ダイアログ(M3-13c)。 */
+  const [creating, setCreating] = useState(false);
+  /** グループ管理ダイアログの対象。 */
+  const [managing, setManaging] = useState<Group | null>(null);
   // 送信直後・既読直後にポーリングを待たず再描画するためのカウンタ
   const [, setBump] = useState(0);
   const rerender = () => setBump((n) => n + 1);
@@ -33,22 +52,32 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
   const messages = chatMessages(tunnel.config);
   const unread = unreadCounts(tunnel);
   const memberByIp = new Map(tunnel.members.map((m) => [m.ip, m]));
+  const groupById = new Map(tunnel.groups.map((g) => [g.id, g]));
 
-  // 会話リスト: 全体 → メンバー(台帳順) → 履歴にだけ残っている相手(退出済み)
+  // 会話リスト: 全体 → 参加中のグループ → メンバー(台帳順)
+  // → 履歴にだけ残っている会話(退出済みグループ・居なくなった相手)
   const conversations = useMemo(() => {
-    const items: {
-      key: ConversationKey;
-      name: string;
-      online: boolean;
-      member: Member | null;
-    }[] = [
+    const items: ConversationItem[] = [
       {
         key: NETWORK_CONVERSATION,
         name: t.chat.all,
         online: true,
         member: null,
+        group: null,
+        left: false,
       },
     ];
+    for (const group of tunnel.groups) {
+      if (!group.members.includes(selfIp)) continue;
+      items.push({
+        key: groupConversation(group.id),
+        name: group.name,
+        online: true,
+        member: null,
+        group,
+        left: false,
+      });
+    }
     for (const member of tunnel.members) {
       if (member.isSelf) continue;
       items.push({
@@ -56,25 +85,40 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
         name: member.name ?? member.ip,
         online: member.online,
         member,
+        group: null,
+        left: false,
       });
     }
     const known = new Set(items.map((item) => item.key));
     for (const message of messages) {
       const key = conversationOf(message, selfIp);
-      if (!known.has(key)) {
-        known.add(key);
-        items.push({ key, name: key, online: false, member: null });
-      }
+      if (known.has(key)) continue;
+      known.add(key);
+      const groupId = groupIdOf(key);
+      const group = groupId ? (groupById.get(groupId) ?? null) : null;
+      items.push({
+        key,
+        name: groupId ? (group?.name ?? t.chat.unknownGroup) : key,
+        online: false,
+        member: null,
+        group,
+        left: true,
+      });
     }
     return items;
-  }, [tunnel.members, messages, selfIp]);
+    // groupById は tunnel.groups から導出されるので依存はそちらで足りる
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tunnel.members, tunnel.groups, messages, selfIp]);
 
   const current = messages.filter(
     (message) => conversationOf(message, selfIp) === conversation,
   );
   const selected = conversations.find((item) => item.key === conversation);
   const canSend =
-    conversation === NETWORK_CONVERSATION || (selected?.online ?? false);
+    conversation === NETWORK_CONVERSATION ||
+    (selected !== undefined &&
+      !selected.left &&
+      (selected.group !== null || selected.online));
 
   // いま見ている会話を申告する(新着通知を鳴らさないため — notify.ts)
   useEffect(() => {
@@ -108,9 +152,12 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
     setSending(true);
     setError(null);
     try {
+      const groupId = groupIdOf(conversation);
       const peer =
-        conversation === NETWORK_CONVERSATION ? null : conversation;
-      const message = await api.chatSend(tunnel.config, peer, text);
+        conversation === NETWORK_CONVERSATION || groupId !== null
+          ? null
+          : conversation;
+      const message = await api.chatSend(tunnel.config, peer, groupId, text);
       appendLocal(tunnel.config, message);
       markRead(tunnel.config, conversation, message.seq);
       setDraft("");
@@ -123,9 +170,19 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
     }
   };
 
+  const showNames =
+    conversation === NETWORK_CONVERSATION || groupIdOf(conversation) !== null;
+
   return (
     <div className="chat">
       <div className="chat__list">
+        <button
+          type="button"
+          className="chat__new-group"
+          onClick={() => setCreating(true)}
+        >
+          ＋ {t.chat.groupCreate}
+        </button>
         {conversations.map((item) => {
           const count = unread.get(item.key) ?? 0;
           const last = lastMessageOf(messages, selfIp, item.key);
@@ -151,6 +208,10 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
                       : t.tunnel.member.offline
                   }
                 />
+              ) : item.group !== null || groupIdOf(item.key) !== null ? (
+                <span className="avatar chat__group-icon" aria-hidden>
+                  👥
+                </span>
               ) : (
                 <span className="avatar chat__all-icon" aria-hidden>
                   {item.key === NETWORK_CONVERSATION ? "@" : "?"}
@@ -173,6 +234,21 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
           <strong>{selected?.name ?? conversation}</strong>
           {conversation === NETWORK_CONVERSATION ? (
             <span className="muted small">{t.chat.allNote}</span>
+          ) : selected?.group && !selected.left ? (
+            <>
+              <span className="muted small">
+                {t.chat.groupCount(selected.group.members.length)}
+              </span>
+              <button
+                type="button"
+                className="button--ghost chat__manage"
+                onClick={() => setManaging(selected.group)}
+              >
+                {t.chat.groupManage}
+              </button>
+            </>
+          ) : groupIdOf(conversation) !== null ? (
+            <span className="muted small">{t.chat.leftGroup}</span>
           ) : selected?.member ? (
             <span className="muted small">
               {selected.online
@@ -198,7 +274,7 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
               messages={current}
               selfIp={selfIp}
               memberByIp={memberByIp}
-              showNames={conversation === NETWORK_CONVERSATION}
+              showNames={showNames}
             />
           )}
         </div>
@@ -208,7 +284,13 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
           <textarea
             rows={2}
             value={draft}
-            placeholder={canSend ? t.chat.placeholder : t.chat.offline}
+            placeholder={
+              canSend
+                ? t.chat.placeholder
+                : groupIdOf(conversation) !== null
+                  ? t.chat.leftGroup
+                  : t.chat.offline
+            }
             disabled={!canSend || sending}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
@@ -232,7 +314,215 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
           </button>
         </div>
       </div>
+
+      {creating && (
+        <GroupDialog
+          tunnel={tunnel}
+          group={null}
+          onClose={() => setCreating(false)}
+          onDone={(group) => {
+            setCreating(false);
+            setConversation(groupConversation(group.id));
+          }}
+        />
+      )}
+      {managing && (
+        <GroupDialog
+          tunnel={tunnel}
+          group={managing}
+          onClose={() => setManaging(null)}
+          onDone={() => setManaging(null)}
+          onLeft={() => {
+            setManaging(null);
+            setConversation(NETWORK_CONVERSATION);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+/**
+ * グループの作成・管理ダイアログ(M3-13c)。`group` が null なら作成、
+ * あれば管理(改名・メンバー追加・退出)。
+ */
+function GroupDialog({
+  tunnel,
+  group,
+  onClose,
+  onDone,
+  onLeft,
+}: {
+  tunnel: Tunnel;
+  group: Group | null;
+  onClose: () => void;
+  onDone: (group: Group) => void;
+  onLeft?: () => void;
+}) {
+  const [name, setName] = useState(group?.name ?? "");
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+
+  // 作成 = 自分以外の全メンバー / 管理 = まだグループに居ないメンバーが候補
+  const candidates = tunnel.members.filter(
+    (member) =>
+      !member.isSelf && (group === null || !group.members.includes(member.ip)),
+  );
+  const memberByIp = new Map(tunnel.members.map((m) => [m.ip, m]));
+
+  const toggle = (ip: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(ip)) {
+        next.delete(ip);
+      } else {
+        next.add(ip);
+      }
+      return next;
+    });
+  };
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const result =
+        group === null
+          ? await api.groupCreate(tunnel.config, name.trim(), [...checked])
+          : await api.groupUpdate(
+              tunnel.config,
+              group.id,
+              name.trim() !== group.name ? name.trim() : null,
+              [...checked],
+            );
+      onDone(result);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const leave = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.groupLeave(tunnel.config, group!.id);
+      onLeft?.();
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(false);
+      setConfirmLeave(false);
+    }
+  };
+
+  return (
+    <Modal
+      title={group === null ? t.chat.groupTitle : t.chat.groupManage}
+      onClose={onClose}
+    >
+      <div className="modal__body">
+        <label className="field">
+          <span>{t.chat.groupNameLabel}</span>
+          <input
+            value={name}
+            autoFocus={group === null}
+            placeholder={t.chat.groupNamePlaceholder}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </label>
+
+        {group !== null && (
+          <>
+            <span className="muted small">
+              {t.chat.groupMembersHead}:{" "}
+              {group.members
+                .map((ip) => memberByIp.get(ip)?.name ?? ip)
+                .join("、")}
+            </span>
+          </>
+        )}
+
+        <span className="field__label">
+          {group === null ? t.chat.groupMembersLabel : t.chat.groupAddLabel}
+        </span>
+        {candidates.length === 0 ? (
+          <p className="muted small">{t.chat.groupNoCandidates}</p>
+        ) : (
+          <ul className="chat__pick">
+            {candidates.map((member) => (
+              <li key={member.ip}>
+                <label className="chat__pick-row">
+                  <input
+                    type="checkbox"
+                    checked={checked.has(member.ip)}
+                    onChange={() => toggle(member.ip)}
+                  />
+                  <Avatar
+                    publicKey={member.publicKey}
+                    name={member.name}
+                    online={member.online}
+                    onlineLabel={
+                      member.online
+                        ? t.tunnel.member.online
+                        : t.tunnel.member.offline
+                    }
+                  />
+                  <span className="ellipsis">{member.name ?? member.ip}</span>
+                  {!member.online && (
+                    <span className="muted small">
+                      {t.tunnel.member.offline}
+                    </span>
+                  )}
+                </label>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="muted small">{t.chat.groupNote}</p>
+        {error && <p className="error-text small">{error}</p>}
+      </div>
+      <div className="modal__actions">
+        {group !== null && (
+          <button
+            type="button"
+            className="button--danger"
+            onClick={() => setConfirmLeave(true)}
+            disabled={busy}
+          >
+            {t.chat.leave}
+          </button>
+        )}
+        <button type="button" className="button--ghost" onClick={onClose}>
+          {t.common.cancel}
+        </button>
+        <button
+          type="button"
+          onClick={() => void submit()}
+          disabled={
+            busy ||
+            name.trim() === "" ||
+            (group === null && checked.size === 0) ||
+            (group !== null && checked.size === 0 && name.trim() === group.name)
+          }
+        >
+          {group === null ? t.chat.create : t.chat.save}
+        </button>
+      </div>
+
+      {confirmLeave && group !== null && (
+        <ConfirmModal
+          title={t.chat.leaveTitle}
+          confirmLabel={t.chat.leave}
+          busy={busy}
+          onClose={() => setConfirmLeave(false)}
+          onConfirm={() => void leave()}
+          message={t.chat.leaveConfirm(group.name)}
+        />
+      )}
+    </Modal>
   );
 }
 

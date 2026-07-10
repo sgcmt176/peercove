@@ -6,6 +6,7 @@ mod daemon;
 mod direct;
 mod dns;
 mod dnscfg;
+mod groups;
 mod logbuf;
 mod msg;
 mod service;
@@ -168,12 +169,15 @@ enum Command {
     Chat {
         #[arg(long)]
         config: PathBuf,
-        /// 宛先(メンバーの表示名または仮想 IP)。--all と排他
+        /// 宛先(メンバーの表示名または仮想 IP)。--all / --group と排他
         #[arg(long)]
         to: Option<String>,
         /// ネットワーク全体(オンラインのメンバー全員)へ送る
         #[arg(long)]
         all: bool,
+        /// 宛先グループ(グループ名または ID。M3-13c)
+        #[arg(long)]
+        group: Option<String>,
         /// 本文
         text: String,
     },
@@ -384,8 +388,9 @@ fn run(command: Command) -> anyhow::Result<()> {
             config,
             to,
             all,
+            group,
             text,
-        } => commands::chat::send(&config, to.as_deref(), all, &text),
+        } => commands::chat::send(&config, to.as_deref(), all, group.as_deref(), &text),
         Command::ChatLog { config, follow } => commands::chat::log(&config, follow),
         Command::UdpEcho { listen } => commands::udp::run_echo(listen),
         Command::UdpPing { target, count } => commands::udp::run_ping(target, count),

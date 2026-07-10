@@ -12,21 +12,31 @@ use peercove_core::msg::ChatScope;
 use crate::commands::send_file::{find_tunnel, resolve_peer};
 use crate::daemon;
 
-/// `chat`: 1 通送る(`--to <名前|IP>` または `--all`)。
-pub fn send(config: &Path, to: Option<&str>, all: bool, text: &str) -> anyhow::Result<()> {
+/// `chat`: 1 通送る(`--to <名前|IP>` / `--all` / `--group <名前|ID>`)。
+pub fn send(
+    config: &Path,
+    to: Option<&str>,
+    all: bool,
+    group: Option<&str>,
+    text: &str,
+) -> anyhow::Result<()> {
     // デーモンとは作業ディレクトリが違うため、パスは絶対にして送る
     let config = std::fs::canonicalize(config)
         .with_context(|| format!("{} が見つかりません", config.display()))?;
     let tunnel = find_tunnel(&config)?;
-    let (scope, peer) = match (to, all) {
-        (Some(to), false) => (ChatScope::Direct, Some(resolve_peer(&tunnel, to)?)),
-        (None, true) => (ChatScope::Network, None),
-        _ => bail!("--to <名前|IP> か --all のどちらか 1 つを指定してください"),
+    let (scope, peer, group_id) = match (to, all, group) {
+        (Some(to), false, None) => (ChatScope::Direct, Some(resolve_peer(&tunnel, to)?), None),
+        (None, true, None) => (ChatScope::Network, None, None),
+        (None, false, Some(group)) => {
+            (ChatScope::Group, None, Some(resolve_group(&tunnel, group)?))
+        }
+        _ => bail!("--to <名前|IP> / --all / --group <名前|ID> のどれか 1 つを指定してください"),
     };
     let response = daemon::request(IpcRequest::ChatSend {
         config,
         scope,
         peer,
+        group_id,
         text: text.to_string(),
     })?;
     let IpcResponse::Chat { .. } = response else {
@@ -35,9 +45,25 @@ pub fn send(config: &Path, to: Option<&str>, all: bool, text: &str) -> anyhow::R
     match scope {
         ChatScope::Direct => println!("送信しました(相手へ配送中)"),
         ChatScope::Network => println!("送信しました(オンラインのメンバー全員へ配送中)"),
+        ChatScope::Group => {
+            println!("送信しました(オンラインのグループメンバーへ配送中)")
+        }
     }
     println!("配送に失敗した場合は chat-log に(送信失敗)と表示されます");
     Ok(())
+}
+
+/// グループ名(または ID)を ID に解決する。名前の重複時は ID 指定を促す。
+fn resolve_group(tunnel: &TunnelInfo, group: &str) -> anyhow::Result<String> {
+    if let Some(hit) = tunnel.groups.iter().find(|g| g.id == group) {
+        return Ok(hit.id.clone());
+    }
+    let hits: Vec<_> = tunnel.groups.iter().filter(|g| g.name == group).collect();
+    match hits.len() {
+        0 => bail!("グループ \"{group}\" は見つかりません"),
+        1 => Ok(hits[0].id.clone()),
+        _ => bail!("グループ名 \"{group}\" が複数あります。ID で指定してください"),
+    }
 }
 
 /// `chat-log`: 履歴を表示する。`--follow` は 1 秒ごとに新着を取りに行く。
@@ -92,6 +118,21 @@ fn format_message(message: &ChatMessageInfo, tunnel: &TunnelInfo) -> String {
             }
         }
         ChatScope::Network => "[全体] ".to_string(),
+        ChatScope::Group => {
+            let name = message
+                .group_id
+                .as_deref()
+                .map(|id| {
+                    tunnel
+                        .groups
+                        .iter()
+                        .find(|g| g.id == id)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_else(|| id.to_string())
+                })
+                .unwrap_or_else(|| "?".to_string());
+            format!("[{name}] ")
+        }
     };
     format!(
         "{:02}:{:02}:{:02} {scope}{who}: {}{}",

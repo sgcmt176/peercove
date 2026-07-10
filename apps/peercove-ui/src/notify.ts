@@ -8,7 +8,7 @@
 // を frontend から使うと npm 依存が 1 つ増え、許可の問い合わせも要るため。
 
 import { invoke } from "@tauri-apps/api/core";
-import { ChatMessage, Member, Transfer } from "./ipc";
+import { ChatMessage, Group, Member, Transfer } from "./ipc";
 import { conversationOf, isViewing } from "./chat";
 import { t } from "./i18n";
 
@@ -109,7 +109,7 @@ export function diffTransfers(
  */
 export async function notifyChatEvents(
   fresh: ChatMessage[],
-  tunnel: { config: string; address: string; network: string },
+  tunnel: { config: string; address: string; network: string; groups: Group[] },
   members: Member[],
 ): Promise<void> {
   for (const message of fresh) {
@@ -118,9 +118,15 @@ export async function notifyChatEvents(
     if (isViewing(tunnel.config, conversation)) continue;
     const from =
       members.find((m) => m.ip === message.from)?.name ?? message.from;
+    // グループ宛はネットワーク名の代わりにグループ名を出す(LINE と同じ)
+    const context =
+      message.scope === "group"
+        ? (tunnel.groups.find((g) => g.id === message.groupId)?.name ??
+          t.chat.unknownGroup)
+        : tunnel.network;
     try {
       await invoke("notify", {
-        title: t.notify.chatTitle(from, tunnel.network),
+        title: t.notify.chatTitle(from, context),
         body: t.notify.chatBody(message.text, message.scope === "network"),
       });
     } catch {

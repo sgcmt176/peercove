@@ -1348,6 +1348,10 @@ ADR-0015 承認時のチャットは 1:1 とネットワーク全体のみで、
    `ChatFetch { config, after_seq }`(応答: messages + groups + 最新 seq)/
    `GroupCreate { name, members }` / `GroupUpdate { id, name?, add? }` /
    `GroupLeave { id }`。既存 `SendFile` にチャット文脈パラメータを追加
+   (**実装時修正 2026-07-11**: groups は ChatFetch 応答でなく
+   `TunnelInfo.groups` に載せた。チャットが無いグループ変更(改名など)は
+   chat_seq が進まず UI が ChatFetch しないため、status ポーリングに
+   載せる方が確実で、追加のポーリング経路も要らない)
 7. **UI(LINE 風)**: チャットタブ = 会話リスト(全体・グループ・
    メンバー 1:1。最終メッセージプレビュー + 未読バッジ)→ 会話画面
    (自分は右・相手は左にアバター付き吹き出し、日付区切り、下部に

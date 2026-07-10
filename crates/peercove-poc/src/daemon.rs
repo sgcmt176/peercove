@@ -63,6 +63,9 @@ struct Active {
     /// チャット履歴(ADR-0016、M3-13)。supervise 内の受信サーバーと
     /// ChatSend が書き、ChatFetch / status 応答(chat_seq)が読む
     chat: crate::chat::SharedChatLog,
+    /// 既知のグループ(ADR-0016、M3-13c)。supervise 内の受信サーバーと
+    /// Group 系リクエストが書き、status 応答(groups)が読む
+    groups: crate::groups::SharedGroups,
 }
 
 impl DaemonShared {
@@ -112,8 +115,21 @@ impl DaemonShared {
                 config,
                 scope,
                 peer,
+                group_id,
                 text,
-            } => self.chat_send(config, scope, peer, text).await,
+            } => self.chat_send(config, scope, peer, group_id, text).await,
+            IpcRequest::GroupCreate {
+                config,
+                name,
+                members,
+            } => self.group_create(config, name, members).await,
+            IpcRequest::GroupUpdate {
+                config,
+                id,
+                name,
+                add,
+            } => self.group_update(config, id, name, add).await,
+            IpcRequest::GroupLeave { config, id } => self.group_leave(config, id).await,
             IpcRequest::ChatFetch { config, after_seq } => {
                 let active = self.active.lock().await;
                 let active = active.get(&Self::key_for(&config)).with_context(|| {
@@ -132,6 +148,7 @@ impl DaemonShared {
         config: PathBuf,
         scope: peercove_core::msg::ChatScope,
         peer: Option<Ipv4Addr>,
+        group_id: Option<String>,
         text: String,
     ) -> anyhow::Result<IpcResponse> {
         use peercove_core::msg::{ChatScope, MAX_CHAT_TEXT_BYTES};
@@ -179,6 +196,24 @@ impl DaemonShared {
                 .filter(|e| e.ip != active.address && e.online)
                 .map(|e| e.ip)
                 .collect(),
+            // グループ宛: オンラインのグループメンバーへ個別送信(M3-13c)
+            ChatScope::Group => {
+                let group_id = group_id
+                    .as_deref()
+                    .context("宛先グループ(group_id)が指定されていません")?;
+                let group =
+                    active.groups.lock().unwrap().get(group_id).context(
+                        "このグループはありません(退出したか、まだ情報が届いていません)",
+                    )?;
+                if !group.members.contains(&active.address) {
+                    bail!("このグループのメンバーではありません");
+                }
+                ledger
+                    .iter()
+                    .filter(|e| e.ip != active.address && e.online && group.members.contains(&e.ip))
+                    .map(|e| e.ip)
+                    .collect()
+            }
         };
         let id = crate::msg::new_transfer_id();
         let sent_at = std::time::SystemTime::now()
@@ -189,10 +224,14 @@ impl DaemonShared {
             seq: 0, // append が振る
             id: id.clone(),
             scope,
+            group_id: match scope {
+                ChatScope::Group => group_id.clone(),
+                _ => None,
+            },
             from: active.address,
             to: match scope {
                 ChatScope::Direct => peer,
-                ChatScope::Network => None,
+                ChatScope::Network | ChatScope::Group => None,
             },
             text: text.clone(),
             sent_at,
@@ -201,13 +240,23 @@ impl DaemonShared {
         let chat = Arc::clone(&active.chat);
         let seq = entry.seq;
         tokio::spawn(async move {
-            let mut delivered = targets.is_empty(); // 宛先ゼロの全体宛は失敗扱いにしない
+            let mut delivered = targets.is_empty(); // 宛先ゼロの全体/グループ宛は失敗扱いにしない
             let sends = targets.into_iter().map(|target| {
                 let id = id.clone();
+                let group_id = group_id.clone();
                 let text = text.clone();
                 tokio::spawn(async move {
                     // 本文はログに出さない(秘匿ルール)
-                    match crate::msg::send_chat(target, &id, scope, &text, sent_at).await {
+                    match crate::msg::send_chat(
+                        target,
+                        &id,
+                        scope,
+                        group_id.as_deref(),
+                        &text,
+                        sent_at,
+                    )
+                    .await
+                    {
                         Ok(()) => true,
                         Err(e) => {
                             tracing::warn!("{target} へのチャット送信に失敗しました: {e:#}");
@@ -227,6 +276,179 @@ impl DaemonShared {
             seq,
             messages: vec![entry],
         })
+    }
+
+    /// グループを作る(ADR-0016、M3-13c)。`members` に自分は含めなくてよい
+    /// (必ず足す)。オフラインのメンバーも入れられる(オンライン復帰時の
+    /// 追いつき再送で届く)。
+    async fn group_create(
+        &self,
+        config: PathBuf,
+        name: String,
+        members: Vec<Ipv4Addr>,
+    ) -> anyhow::Result<IpcResponse> {
+        use peercove_core::msg::{GroupInfo, MAX_GROUP_MEMBERS};
+
+        let name = Self::valid_group_name(&name)?;
+        let active = self.active.lock().await;
+        let active = active
+            .get(&Self::key_for(&config))
+            .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
+        let ledger = Self::ledger_of(active);
+        let mut group_members = vec![active.address];
+        for ip in members {
+            if ip == active.address || group_members.contains(&ip) {
+                continue;
+            }
+            if !ledger.iter().any(|e| e.ip == ip) {
+                bail!("{ip} はこのネットワークのメンバーにいません");
+            }
+            group_members.push(ip);
+        }
+        if group_members.len() < 2 {
+            bail!("グループに入れるメンバーを 1 人以上選んでください");
+        }
+        if group_members.len() > MAX_GROUP_MEMBERS {
+            bail!("グループのメンバーが多すぎます(上限 {MAX_GROUP_MEMBERS} 人)");
+        }
+        let group = GroupInfo {
+            id: crate::msg::new_transfer_id(),
+            name,
+            members: group_members,
+            revision: 1,
+            updated_by: active.address,
+        };
+        active.groups.lock().unwrap().apply(group.clone());
+        // グループ名はログに出さない(秘匿ルール)
+        tracing::info!(
+            "グループを作成しました(id={} members={})",
+            group.id,
+            group.members.len()
+        );
+        Self::propagate_group(&group, &ledger, active.address);
+        Ok(IpcResponse::Group { group })
+    }
+
+    /// グループの改名・メンバー追加(M3-13c)。全量 + リビジョンの置換として
+    /// 全メンバーへ配る。
+    async fn group_update(
+        &self,
+        config: PathBuf,
+        id: String,
+        name: Option<String>,
+        add: Vec<Ipv4Addr>,
+    ) -> anyhow::Result<IpcResponse> {
+        use peercove_core::msg::MAX_GROUP_MEMBERS;
+
+        let active = self.active.lock().await;
+        let active = active
+            .get(&Self::key_for(&config))
+            .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
+        let ledger = Self::ledger_of(active);
+        let mut group = active
+            .groups
+            .lock()
+            .unwrap()
+            .get(&id)
+            .context("このグループはありません")?;
+        if !group.members.contains(&active.address) {
+            bail!("このグループのメンバーではありません");
+        }
+        if let Some(name) = name {
+            group.name = Self::valid_group_name(&name)?;
+        }
+        for ip in add {
+            if group.members.contains(&ip) {
+                continue;
+            }
+            if !ledger.iter().any(|e| e.ip == ip) {
+                bail!("{ip} はこのネットワークのメンバーにいません");
+            }
+            group.members.push(ip);
+        }
+        if group.members.len() > MAX_GROUP_MEMBERS {
+            bail!("グループのメンバーが多すぎます(上限 {MAX_GROUP_MEMBERS} 人)");
+        }
+        group.revision += 1;
+        group.updated_by = active.address;
+        active.groups.lock().unwrap().apply(group.clone());
+        tracing::info!(
+            "グループを更新しました(id={} rev={})",
+            group.id,
+            group.revision
+        );
+        Self::propagate_group(&group, &ledger, active.address);
+        Ok(IpcResponse::Group { group })
+    }
+
+    /// 自分がグループから抜ける(M3-13c)。ローカルには「自分抜きの全量」が
+    /// 残る(履歴の表示名に使う。UI は会話リストから隠す)。
+    async fn group_leave(&self, config: PathBuf, id: String) -> anyhow::Result<IpcResponse> {
+        let active = self.active.lock().await;
+        let active = active
+            .get(&Self::key_for(&config))
+            .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
+        let mut group = active
+            .groups
+            .lock()
+            .unwrap()
+            .get(&id)
+            .context("このグループはありません")?;
+        if !group.members.contains(&active.address) {
+            bail!("このグループのメンバーではありません");
+        }
+        group.members.retain(|ip| *ip != active.address);
+        group.revision += 1;
+        group.updated_by = active.address;
+        active.groups.lock().unwrap().apply(group.clone());
+        tracing::info!("グループから退出しました(id={})", group.id);
+        Self::propagate_group(&group, &Self::ledger_of(active), active.address);
+        Ok(IpcResponse::Done)
+    }
+
+    /// グループ名の検証(空・上限)。
+    fn valid_group_name(name: &str) -> anyhow::Result<String> {
+        use peercove_core::msg::MAX_GROUP_NAME_BYTES;
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("グループ名が空です");
+        }
+        if name.len() > MAX_GROUP_NAME_BYTES {
+            bail!("グループ名が長すぎます");
+        }
+        Ok(name.to_string())
+    }
+
+    /// 台帳スナップショットの複製(宛先検証用)。
+    fn ledger_of(active: &Active) -> Vec<peercove_core::proto::LedgerEntry> {
+        let snapshot = active.snapshot.lock().unwrap();
+        snapshot
+            .as_ref()
+            .and_then(|s| s.ledger.clone())
+            .unwrap_or_default()
+    }
+
+    /// グループ全量をオンラインの対象メンバーへ配る(バックグラウンド)。
+    /// 失敗はオンライン復帰時の追いつき再送に任せる。
+    fn propagate_group(
+        group: &peercove_core::msg::GroupInfo,
+        ledger: &[peercove_core::proto::LedgerEntry],
+        self_ip: Ipv4Addr,
+    ) {
+        for entry in ledger {
+            if entry.ip == self_ip || !entry.online || !group.members.contains(&entry.ip) {
+                continue;
+            }
+            let group = group.clone();
+            let ip = entry.ip;
+            tokio::spawn(async move {
+                if let Err(e) = crate::msg::send_group_update(ip, &group).await {
+                    tracing::warn!(
+                        "{ip} へのグループ更新の送信に失敗しました(オンライン復帰時に再送): {e:#}"
+                    );
+                }
+            });
+        }
     }
 
     /// メンバーへのファイル送信を開始する(ADR-0015、M3-9)。送信自体は
@@ -330,11 +552,13 @@ impl DaemonShared {
         let (stop_tx, stop_rx) = watch::channel(false);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let transfers: crate::msg::TransferRegistry = Default::default();
-        // チャット履歴の読み込み(数 MB 程度の同期 I/O。起動時のみ)
+        // チャット履歴・グループ情報の読み込み(数 MB 程度の同期 I/O。起動時のみ)
         let chat = crate::chat::ChatLog::load(&config);
+        let groups = crate::groups::GroupStore::load(&config);
         let task_snapshot = Arc::clone(&snapshot);
         let task_transfers = Arc::clone(&transfers);
         let task_chat = Arc::clone(&chat);
+        let task_groups = Arc::clone(&groups);
         let task_config = config.clone();
         let task = tokio::spawn(async move {
             let mut tunnel = tunnel;
@@ -345,6 +569,7 @@ impl DaemonShared {
                     Some(task_snapshot),
                     task_transfers,
                     task_chat,
+                    task_groups,
                 )
                 .await;
             // クリーンアップ(ブロッキング)は必ず実行する
@@ -370,6 +595,7 @@ impl DaemonShared {
                 snapshot,
                 transfers,
                 chat,
+                groups,
             },
         );
         drop(active);
@@ -553,6 +779,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)
         transfers: active.transfers.lock().unwrap().clone(),
         chat_seq: active.chat.lock().unwrap().latest_seq(),
+        groups: active.groups.lock().unwrap().list(),
     }
 }
 

@@ -23,7 +23,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use peercove_core::ipc::{ChatMessageInfo, TransferDirection, TransferInfo};
-use peercove_core::msg::{ChatScope, MsgFrame, MAX_CHAT_TEXT_BYTES, MSG_PORT, MSG_VERSION};
+use peercove_core::msg::{
+    ChatScope, GroupInfo, MsgFrame, MAX_CHAT_TEXT_BYTES, MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES,
+    MSG_PORT, MSG_VERSION,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -158,6 +161,7 @@ pub async fn run_server(
     transfers: TransferRegistry,
     limit: SharedLimit,
     chat: crate::chat::SharedChatLog,
+    groups: crate::groups::SharedGroups,
 ) {
     // トンネル作成直後は Windows が仮想 IP を数秒間「準備中」として扱うため、
     // bind できるまでリトライする(control.rs と同じ事情)
@@ -188,6 +192,7 @@ pub async fn run_server(
                 let transfers = Arc::clone(&transfers);
                 let limit = *limit.lock().unwrap();
                 let chat = Arc::clone(&chat);
+                let groups = Arc::clone(&groups);
                 tokio::spawn(async move {
                     if let Err(e) = handle_incoming(
                         stream,
@@ -198,6 +203,7 @@ pub async fn run_server(
                         &transfers,
                         limit,
                         &chat,
+                        &groups,
                     )
                     .await
                     {
@@ -224,6 +230,7 @@ async fn handle_incoming(
     transfers: &TransferRegistry,
     limit: u64,
     chat: &crate::chat::SharedChatLog,
+    groups: &crate::groups::SharedGroups,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = line_reader(read_half);
@@ -278,6 +285,7 @@ async fn handle_incoming(
         MsgFrame::Chat {
             id,
             scope,
+            group_id,
             text,
             sent_at,
         } => {
@@ -285,14 +293,18 @@ async fn handle_incoming(
             if text.len() > MAX_CHAT_TEXT_BYTES {
                 bail!("本文が上限({MAX_CHAT_TEXT_BYTES} バイト)を超えています({peer_ip})");
             }
+            if scope == ChatScope::Group && group_id.is_none() {
+                bail!("group 宛なのに group_id がありません({peer_ip})");
+            }
             let entry = ChatMessageInfo {
                 seq: 0, // append が振る
                 id: id.clone(),
                 scope,
+                group_id,
                 from: peer_ip,
                 to: match scope {
                     ChatScope::Direct => Some(own_ip),
-                    ChatScope::Network => None,
+                    ChatScope::Network | ChatScope::Group => None,
                 },
                 text,
                 sent_at,
@@ -304,6 +316,27 @@ async fn handle_incoming(
             tracing::info!("{sender_name}({peer_ip})からチャットを受信しました(id={id})");
             Ok(())
         }
+        MsgFrame::GroupUpdate { group } => {
+            // グループ名はログに出さない(秘匿ルール)。上限はフレームの
+            // 1 行上限に収める安全弁(正規のデーモンは送信側でも検査する)
+            if group.id.is_empty()
+                || group.name.is_empty()
+                || group.name.len() > MAX_GROUP_NAME_BYTES
+                || group.members.len() > MAX_GROUP_MEMBERS
+            {
+                bail!("不正なグループ更新を拒否しました({peer_ip})");
+            }
+            let id = group.id.clone();
+            let revision = group.revision;
+            let applied = groups.lock().unwrap().apply(group);
+            send_frame(&mut write_half, &MsgFrame::GroupAck { id: id.clone() }).await?;
+            if applied {
+                tracing::info!(
+                    "{sender_name}({peer_ip})からグループ更新を受信しました(id={id} rev={revision})"
+                );
+            }
+            Ok(())
+        }
         other => bail!("想定外のフレームが届きました: {other:?}"),
     }
 }
@@ -313,6 +346,7 @@ pub async fn send_chat(
     peer_ip: Ipv4Addr,
     id: &str,
     scope: ChatScope,
+    group_id: Option<&str>,
     text: &str,
     sent_at: u64,
 ) -> anyhow::Result<()> {
@@ -320,6 +354,7 @@ pub async fn send_chat(
         SocketAddr::from((peer_ip, MSG_PORT)),
         id,
         scope,
+        group_id,
         text,
         sent_at,
     )
@@ -331,9 +366,55 @@ async fn send_chat_to(
     target: SocketAddr,
     id: &str,
     scope: ChatScope,
+    group_id: Option<&str>,
     text: &str,
     sent_at: u64,
 ) -> anyhow::Result<()> {
+    let (mut reader, mut write_half) = connect_and_hello(target).await?;
+    let mut line = String::new();
+    send_frame(
+        &mut write_half,
+        &MsgFrame::Chat {
+            id: id.to_string(),
+            scope,
+            group_id: group_id.map(str::to_string),
+            text: text.to_string(),
+            sent_at,
+        },
+    )
+    .await?;
+    match expect_frame(&mut reader, &mut line).await? {
+        MsgFrame::ChatAck { id: ack_id } if ack_id == id => Ok(()),
+        other => bail!("ChatAck を期待しましたが別のフレームが届きました: {other:?}"),
+    }
+}
+
+/// 送信側: 相手の仮想 IP へグループ全量を送り、ack を確認する(M3-13c)。
+pub async fn send_group_update(peer_ip: Ipv4Addr, group: &GroupInfo) -> anyhow::Result<()> {
+    send_group_update_to(SocketAddr::from((peer_ip, MSG_PORT)), group).await
+}
+
+/// 実装本体(テストではエフェメラルポートへ接続するため分離)。
+async fn send_group_update_to(target: SocketAddr, group: &GroupInfo) -> anyhow::Result<()> {
+    let (mut reader, mut write_half) = connect_and_hello(target).await?;
+    let mut line = String::new();
+    send_frame(
+        &mut write_half,
+        &MsgFrame::GroupUpdate {
+            group: group.clone(),
+        },
+    )
+    .await?;
+    match expect_frame(&mut reader, &mut line).await? {
+        MsgFrame::GroupAck { id } if id == group.id => Ok(()),
+        other => bail!("GroupAck を期待しましたが別のフレームが届きました: {other:?}"),
+    }
+}
+
+/// 接続して Hello まで送る(チャット・グループ更新の共通前半)。
+async fn connect_and_hello(
+    target: SocketAddr,
+) -> anyhow::Result<(LineReader, tokio::net::tcp::OwnedWriteHalf)> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
         .await
         .map_err(|_| anyhow::anyhow!("接続がタイムアウトしました"))?
@@ -344,9 +425,7 @@ async fn send_chat_to(
             )
         })?;
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = line_reader(read_half);
-    let mut line = String::new();
-
+    let reader = line_reader(read_half);
     send_frame(
         &mut write_half,
         &MsgFrame::Hello {
@@ -354,20 +433,7 @@ async fn send_chat_to(
         },
     )
     .await?;
-    send_frame(
-        &mut write_half,
-        &MsgFrame::Chat {
-            id: id.to_string(),
-            scope,
-            text: text.to_string(),
-            sent_at,
-        },
-    )
-    .await?;
-    match expect_frame(&mut reader, &mut line).await? {
-        MsgFrame::ChatAck { id: ack_id } if ack_id == id => Ok(()),
-        other => bail!("ChatAck を期待しましたが別のフレームが届きました: {other:?}"),
-    }
+    Ok((reader, write_half))
 }
 
 /// ファイルを受信ボックスへ保存する。書きかけは `.part`、完了時に本名へ
@@ -745,6 +811,11 @@ mod tests {
         crate::chat::ChatLog::load(&temp_dir("chatlog").join("net.toml"))
     }
 
+    /// テスト用のグループ保存(一時ディレクトリに書く)。
+    fn test_groups() -> crate::groups::SharedGroups {
+        crate::groups::GroupStore::load(&temp_dir("groups").join("net.toml"))
+    }
+
     #[test]
     fn sanitize_strips_paths_and_bad_names() {
         assert_eq!(
@@ -820,6 +891,7 @@ mod tests {
                 &server_transfers,
                 limit_bytes(100),
                 &test_chat_log(),
+                &test_groups(),
             )
             .await
         });
@@ -891,6 +963,7 @@ mod tests {
                 &server_transfers,
                 limit_bytes(1), // 上限 1 MB
                 &test_chat_log(),
+                &test_groups(),
             )
             .await
         });
@@ -942,6 +1015,7 @@ mod tests {
                 &server_transfers,
                 0,
                 &test_chat_log(),
+                &test_groups(),
             )
             .await
         });
@@ -1007,11 +1081,12 @@ mod tests {
                 &Default::default(),
                 0,
                 &server_chat,
+                &test_groups(),
             )
             .await
         });
 
-        send_chat_to(addr, "c-1", ChatScope::Direct, "こんにちは 🎉", 1_234)
+        send_chat_to(addr, "c-1", ChatScope::Direct, None, "こんにちは 🎉", 1_234)
             .await
             .unwrap();
         server.await.unwrap().unwrap();
@@ -1060,16 +1135,125 @@ mod tests {
                 &Default::default(),
                 0,
                 &server_chat,
+                &test_groups(),
             )
             .await
         });
-        send_chat_to(addr, "c-2", ChatScope::Network, "全体宛", 1)
+        send_chat_to(addr, "c-2", ChatScope::Network, None, "全体宛", 1)
             .await
             .unwrap();
         server.await.unwrap().unwrap();
         let entry = chat.lock().unwrap().fetch(0).1.pop().unwrap();
         assert_eq!(entry.scope, ChatScope::Network);
         assert_eq!(entry.to, None);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// group 宛のチャットは group_id 付きで履歴に残る(M3-13c)。
+    #[tokio::test]
+    async fn group_chat_records_group_id() {
+        let inbox = temp_dir("chatgroup");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chat = test_chat_log();
+        let server_chat = Arc::clone(&chat);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                ip,
+                "carol".to_string(),
+                &server_inbox,
+                &Default::default(),
+                0,
+                &server_chat,
+                &test_groups(),
+            )
+            .await
+        });
+        send_chat_to(addr, "c-4", ChatScope::Group, Some("g1"), "グループ宛", 1)
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+        let entry = chat.lock().unwrap().fetch(0).1.pop().unwrap();
+        assert_eq!(entry.scope, ChatScope::Group);
+        assert_eq!(entry.group_id.as_deref(), Some("g1"));
+        assert_eq!(entry.to, None);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// グループ更新の送信 → 受信側の保存に取り込まれ、ack が返る E2E(M3-13c)。
+    /// 古い revision の再送は取り込まれない(が ack は返る)。
+    #[tokio::test]
+    async fn group_update_roundtrip() {
+        let inbox = temp_dir("groupupd");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let groups = test_groups();
+        {
+            let mut store = groups.lock().unwrap();
+            store.apply(GroupInfo {
+                id: "g1".to_string(),
+                name: "旧名".to_string(),
+                members: vec!["10.0.0.1".parse().unwrap()],
+                revision: 1,
+                updated_by: "10.0.0.1".parse().unwrap(),
+            });
+        }
+        // 2 接続受ける(新しい revision → 古い revision)
+        let server_groups = Arc::clone(&groups);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, peer) = listener.accept().await.unwrap();
+                let ip = match peer.ip() {
+                    IpAddr::V4(ip) => ip,
+                    _ => unreachable!(),
+                };
+                handle_incoming(
+                    stream,
+                    ip,
+                    ip,
+                    "alice".to_string(),
+                    &server_inbox,
+                    &Default::default(),
+                    0,
+                    &test_chat_log(),
+                    &server_groups,
+                )
+                .await?;
+            }
+            anyhow::Ok(())
+        });
+
+        let newer = GroupInfo {
+            id: "g1".to_string(),
+            name: "新名".to_string(),
+            members: vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
+            revision: 2,
+            updated_by: "10.0.0.2".parse().unwrap(),
+        };
+        send_group_update_to(addr, &newer).await.unwrap();
+        let stale = GroupInfo {
+            revision: 1,
+            name: "巻き戻し".to_string(),
+            ..newer.clone()
+        };
+        send_group_update_to(addr, &stale).await.unwrap();
+        server.await.unwrap().unwrap();
+
+        let store = groups.lock().unwrap();
+        let current = store.get("g1").unwrap();
+        assert_eq!(current.revision, 2, "古い再送では巻き戻らない");
+        assert_eq!(current.name, "新名");
+        assert_eq!(current.members.len(), 2);
+        drop(store);
         let _ = std::fs::remove_dir_all(&inbox);
     }
 
@@ -1097,11 +1281,12 @@ mod tests {
                 &Default::default(),
                 0,
                 &server_chat,
+                &test_groups(),
             )
             .await
         });
         let big = "a".repeat(MAX_CHAT_TEXT_BYTES + 1);
-        let err = send_chat_to(addr, "c-3", ChatScope::Direct, &big, 1)
+        let err = send_chat_to(addr, "c-3", ChatScope::Direct, None, &big, 1)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("切断"), "ack が返らない: {err:#}");
@@ -1137,6 +1322,7 @@ mod tests {
                 &server_transfers,
                 0,
                 &test_chat_log(),
+                &test_groups(),
             )
             .await
         });

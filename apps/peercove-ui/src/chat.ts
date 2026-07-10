@@ -9,9 +9,26 @@
 
 import { ChatMessage, Tunnel, api } from "./ipc";
 
-/** 会話のキー。ネットワーク全体は "network"、1:1 は相手の仮想 IP。 */
+/**
+ * 会話のキー。ネットワーク全体は "network"、グループは "g:<グループID>"、
+ * 1:1 は相手の仮想 IP。
+ */
 export type ConversationKey = string;
 export const NETWORK_CONVERSATION: ConversationKey = "network";
+
+const GROUP_PREFIX = "g:";
+
+/** グループの会話キー（M3-13c）。 */
+export function groupConversation(groupId: string): ConversationKey {
+  return `${GROUP_PREFIX}${groupId}`;
+}
+
+/** 会話キーがグループならそのグループ ID、それ以外は null。 */
+export function groupIdOf(key: ConversationKey): string | null {
+  return key.startsWith(GROUP_PREFIX)
+    ? key.slice(GROUP_PREFIX.length)
+    : null;
+}
 
 interface ChatState {
   messages: ChatMessage[];
@@ -27,6 +44,7 @@ export function conversationOf(
   selfAddress: string,
 ): ConversationKey {
   if (message.scope === "network") return NETWORK_CONVERSATION;
+  if (message.scope === "group") return groupConversation(message.groupId ?? "?");
   return message.from === selfAddress ? (message.to ?? "?") : message.from;
 }
 
