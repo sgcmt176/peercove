@@ -282,6 +282,11 @@ pub async fn supervise(
         let rtt: control::RttMap = Default::default();
         // (member)ホストから削除されたら立つ。status に載せて UI が表示する
         let removed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // サブネットルーター(ADR-0014): 適用済みの OS ルート、member の
+        // ホストピアに足した AllowedIPs、ルーター役エラーのスパム防止フラグ
+        let mut routes: std::collections::BTreeSet<ipnet::Ipv4Net> = Default::default();
+        let mut member_extra: Vec<ipnet::Ipv4Net> = Vec::new();
+        let mut router_error_logged = false;
         let mut tasks = Vec::new();
         match role {
             Role::Host => {
@@ -340,6 +345,15 @@ pub async fn supervise(
                                 &mut pending_removal,
                                 &connections,
                             );
+                            // ホスト自身が広告サブネットへ届くための OS ルート
+                            // (メンバー間のリレーは AllowedIPs / デバイス内
+                            // 最長一致で成立する — ADR-0014)
+                            let desired = config
+                                .peers
+                                .iter()
+                                .flat_map(|p| p.subnets.iter().copied())
+                                .collect();
+                            sync_routes(backend, &desired, &mut routes);
                         }
                     }
                     let stats = match backend.stats() {
@@ -382,6 +396,52 @@ pub async fn supervise(
                                 backend,
                             );
                             direct_routes = direct.routes();
+                            // サブネットルーター(ADR-0014): 他メンバーの広告は
+                            // ホスト経由の経路として反映し、自分の広告は
+                            // ルーター役(転送 + SNAT)として反映する
+                            if let Some(received) = &received {
+                                let my_key = host_public_key.as_bytes();
+                                let mut extra: Vec<ipnet::Ipv4Net> = Vec::new();
+                                let mut mine: Vec<ipnet::Ipv4Net> = Vec::new();
+                                for entry in &received.distribution.members {
+                                    if entry.public_key.as_bytes() == my_key {
+                                        mine.extend(entry.subnets.iter().copied());
+                                    } else {
+                                        extra.extend(entry.subnets.iter().copied());
+                                    }
+                                }
+                                extra.sort_unstable();
+                                extra.dedup();
+                                mine.sort_unstable();
+                                mine.dedup();
+                                if extra != member_extra {
+                                    if let Some(config) = &config {
+                                        match rebind_host_peer(config, &extra, backend) {
+                                            Ok(()) => {
+                                                tracing::info!(
+                                                    "ホスト経由のサブネット経路を更新しました: {extra:?}"
+                                                );
+                                                member_extra = extra.clone();
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                "サブネットの AllowedIPs 反映に失敗しました: {e:#}"
+                                            ),
+                                        }
+                                    }
+                                }
+                                let desired = extra.iter().copied().collect();
+                                sync_routes(backend, &desired, &mut routes);
+                                match backend.sync_subnet_router(spec.address.trunc(), &mine, true)
+                                {
+                                    Ok(()) => router_error_logged = false,
+                                    Err(e) => {
+                                        if !router_error_logged {
+                                            tracing::warn!("ルーター役の設定に失敗しました: {e:#}");
+                                            router_error_logged = true;
+                                        }
+                                    }
+                                }
+                            }
                             received.map(|r| r.distribution)
                         }
                     };
@@ -435,6 +495,7 @@ fn build_ledger(
         // ホスト自身のエンドポイントは載せない(メンバーは設定で持っている)
         endpoint: None,
         endpoint_age_secs: None,
+        subnets: vec![],
     }];
     for peer in &config.peers {
         let stats = by_key.get(peer.public_key.as_bytes());
@@ -464,6 +525,7 @@ fn build_ledger(
             endpoint_age_secs: endpoint
                 .and(handshake_age)
                 .map(|age| age.as_secs() / ENDPOINT_AGE_STEP_SECS * ENDPOINT_AGE_STEP_SECS),
+            subnets: peer.subnets.clone(),
         });
     }
     ledger
@@ -622,7 +684,8 @@ pub fn build_spec(config: &Config, role: Role) -> anyhow::Result<TunnelSpec> {
         .map(|peer| build_peer_spec(peer, role))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    for peer in &peers {
+    // 広告サブネット(peer.subnets)は意図的にサブネット外なので対象にしない
+    for peer in &config.peers {
         for net in &peer.allowed_ips {
             if !config.interface.address.trunc().contains(net) {
                 tracing::warn!(
@@ -657,13 +720,64 @@ fn build_peer_spec(peer: &PeerConfig, role: Role) -> anyhow::Result<PeerSpec> {
         }
         (_, value) => value,
     };
+    // 広告サブネット(ADR-0014)は AllowedIPs に足して cryptokey routing に
+    // 載せる(ホスト側のみ。member のホストピアは台帳受信時にランタイムで足す)
+    let mut allowed_ips = peer.allowed_ips.clone();
+    if role == Role::Host {
+        allowed_ips.extend(peer.subnets.iter().copied());
+    }
     Ok(PeerSpec {
         public_key: peer.public_key,
         endpoint: peer.endpoint,
-        allowed_ips: peer.allowed_ips.clone(),
+        allowed_ips,
         persistent_keepalive,
         preshared_key,
     })
+}
+
+/// member のホストピアへ広告サブネット分の AllowedIPs を足して再登録する
+/// (ADR-0014)。削除→再追加のため再ハンドシェイクの数秒間は断がある
+/// (コントロールチャネルの TCP は再送で生き残る)。
+fn rebind_host_peer(
+    config: &Config,
+    extra: &[ipnet::Ipv4Net],
+    backend: &mut dyn WgBackend,
+) -> anyhow::Result<()> {
+    let peer = config
+        .peers
+        .first()
+        .context("member 設定に [[peer]] がありません")?;
+    let mut spec = build_peer_spec(peer, Role::Member)?;
+    spec.allowed_ips.extend(extra.iter().copied());
+    backend.remove_peer(&peer.public_key)?;
+    backend.add_peer(&spec)
+}
+
+/// OS ルートを望ましい集合へ同期する(ADR-0014)。失敗した分は集合に
+/// 反映せず、次の周期で再試行される。
+fn sync_routes(
+    backend: &mut dyn WgBackend,
+    desired: &std::collections::BTreeSet<ipnet::Ipv4Net>,
+    current: &mut std::collections::BTreeSet<ipnet::Ipv4Net>,
+) {
+    for subnet in desired.difference(current).copied().collect::<Vec<_>>() {
+        match backend.add_route(subnet) {
+            Ok(()) => {
+                current.insert(subnet);
+                tracing::info!("サブネット {subnet} への経路を追加しました");
+            }
+            Err(e) => tracing::warn!("経路 {subnet} の追加に失敗しました: {e:#}"),
+        }
+    }
+    for subnet in current.difference(desired).copied().collect::<Vec<_>>() {
+        match backend.remove_route(subnet) {
+            Ok(()) => {
+                current.remove(&subnet);
+                tracing::info!("サブネット {subnet} への経路を削除しました");
+            }
+            Err(e) => tracing::warn!("経路 {subnet} の削除に失敗しました: {e:#}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -671,6 +785,21 @@ mod tests {
     use super::*;
     use crate::backend::mock::MockBackend;
     use peercove_core::keys::PrivateKey;
+
+    /// 広告サブネット(ADR-0014)はホスト側の AllowedIPs にだけ足される
+    /// (member のホストピアは台帳受信時にランタイムで足す)。
+    #[test]
+    fn host_peer_spec_includes_subnets() {
+        let key = PrivateKey::generate().public_key().to_base64();
+        let config = host_config(&format!(
+            "[[peer]]\nname = \"alice\"\npublic_key = \"{key}\"\nallowed_ips = [\"10.100.42.2/32\"]\nsubnets = [\"192.168.10.0/24\"]\n"
+        ));
+        let subnet: ipnet::Ipv4Net = "192.168.10.0/24".parse().unwrap();
+        let host = build_peer_spec(&config.peers[0], Role::Host).unwrap();
+        assert!(host.allowed_ips.contains(&subnet));
+        let member = build_peer_spec(&config.peers[0], Role::Member).unwrap();
+        assert!(!member.allowed_ips.contains(&subnet));
+    }
 
     fn host_config(peers_toml: &str) -> Config {
         let text = format!(

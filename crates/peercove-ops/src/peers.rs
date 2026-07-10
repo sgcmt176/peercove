@@ -233,6 +233,45 @@ pub fn rename_peer(config_path: &Path, selector: &Selector, new_name: &str) -> a
     write_validated(config_path, &doc.to_string())
 }
 
+/// メンバーの広告サブネット(ADR-0014、M3-7)を設定する。空スライスで解除。
+/// 重複・仮想サブネットとの衝突などの検証は `write_validated`(Config::validate)
+/// に任せる。戻り値は表示名(CLI / UI のメッセージ用)。
+pub fn set_subnets(
+    config_path: &Path,
+    selector: &Selector,
+    subnets: &[ipnet::Ipv4Net],
+) -> anyhow::Result<String> {
+    let config = Config::load(config_path)?;
+    let target = find_peer(&config, selector)?;
+    let target_key = target.public_key.to_base64();
+    let display = target.name.clone().unwrap_or_else(|| target_key.clone());
+
+    let mut doc = load_doc(config_path)?;
+    let mut updated = false;
+    for table in peer_tables(&mut doc)?.iter_mut() {
+        let matches = table
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            == Some(target_key.as_str());
+        if matches {
+            if subnets.is_empty() {
+                table.remove("subnets");
+            } else {
+                let array: toml_edit::Array =
+                    subnets.iter().map(|subnet| subnet.to_string()).collect();
+                table["subnets"] = toml_edit::value(array);
+            }
+            updated = true;
+        }
+    }
+    if !updated {
+        bail!("host.toml から対象ピアを特定できませんでした");
+    }
+    write_validated(config_path, &doc.to_string())?;
+    Ok(display)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

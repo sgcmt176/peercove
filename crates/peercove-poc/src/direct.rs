@@ -341,6 +341,7 @@ mod tests {
             is_host: false,
             endpoint: endpoint.map(|e| e.parse().unwrap()),
             endpoint_age_secs: endpoint.map(|_| age),
+            subnets: vec![],
         }
     }
 

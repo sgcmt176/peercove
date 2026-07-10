@@ -71,6 +71,12 @@ pub struct PeerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<SocketAddr>,
     pub allowed_ips: Vec<Ipv4Net>,
+    /// このメンバーが広告する背後 LAN のサブネット(ADR-0014、M3-7)。
+    /// ホスト設定が正本で、台帳経由で全メンバーへ配布される。
+    /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
+    /// 読めない(明示エラーになる)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subnets: Vec<Ipv4Net>,
     /// 秒。NAT 維持のためメンバー→ホストでは 25 を推奨。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistent_keepalive: Option<u16>,
@@ -140,6 +146,39 @@ impl Config {
         for (i, peer) in self.peers.iter().enumerate() {
             if peer.allowed_ips.is_empty() {
                 return invalid(format!("peer[{i}] の allowed_ips が空です"));
+            }
+        }
+        // 広告サブネット(ADR-0014)。仮想サブネットやピア間で重なると
+        // 経路が奪い合いになるため、設定段階で拒否する
+        let virtual_subnet = self.interface.address.trunc();
+        let mut seen_subnets: Vec<(usize, Ipv4Net)> = Vec::new();
+        for (i, peer) in self.peers.iter().enumerate() {
+            for subnet in &peer.subnets {
+                if subnet.prefix_len() < 8 {
+                    return invalid(format!(
+                        "peer[{i}] の subnet {subnet} が広すぎます(/8 以上にしてください)"
+                    ));
+                }
+                if *subnet != subnet.trunc() {
+                    return invalid(format!(
+                        "peer[{i}] の subnet {subnet} はネットワークアドレスで指定してください({})",
+                        subnet.trunc()
+                    ));
+                }
+                if virtual_subnet.contains(subnet) || subnet.contains(&virtual_subnet) {
+                    return invalid(format!(
+                        "peer[{i}] の subnet {subnet} が仮想サブネット {virtual_subnet} と重なっています"
+                    ));
+                }
+                if let Some((j, other)) = seen_subnets
+                    .iter()
+                    .find(|(_, other)| other.contains(subnet) || subnet.contains(other))
+                {
+                    return invalid(format!(
+                        "peer[{i}] の subnet {subnet} が peer[{j}] の {other} と重なっています"
+                    ));
+                }
+                seen_subnets.push((i, *subnet));
             }
         }
         let mut keys: Vec<_> = self.peers.iter().map(|p| p.public_key).collect();
@@ -266,6 +305,22 @@ typo_field = 1
     fn validate_rejects_network_address() {
         let mut config = parse(MEMBER_TOML);
         config.interface.address = "100.100.42.0/24".parse().unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_checks_subnet_overlaps() {
+        // 仮想サブネットと重なる広告は拒否、外の RFC1918 は許可(ADR-0014)
+        let mut config = parse(MEMBER_TOML);
+        config.peers[0].subnets = vec!["100.100.42.0/28".parse().unwrap()];
+        assert!(config.validate().is_err());
+        config.peers[0].subnets = vec!["192.168.10.0/24".parse().unwrap()];
+        assert!(config.validate().is_ok());
+        // ピア間の重複も拒否
+        let mut other = config.peers[0].clone();
+        other.public_key = crate::keys::PrivateKey::generate().public_key();
+        other.subnets = vec!["192.168.10.128/25".parse().unwrap()];
+        config.peers.push(other);
         assert!(config.validate().is_err());
     }
 

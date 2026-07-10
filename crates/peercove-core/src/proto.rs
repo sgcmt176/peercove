@@ -72,6 +72,11 @@ pub struct LedgerEntry {
     /// 「この値 + 受信からの経過」で鮮度を判定する(ADR-0013 追加条件 1)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_age_secs: Option<u64>,
+    /// このメンバーが広告する背後 LAN のサブネット(ADR-0014、M3-7)。
+    /// ホスト設定([[peer]] の subnets)が正本。互換規則は endpoint と同じ
+    /// (追加フィールド — 旧バージョンとは互いに無視し合う)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subnets: Vec<ipnet::Ipv4Net>,
 }
 
 #[cfg(test)]
@@ -88,7 +93,20 @@ mod tests {
             is_host: false,
             endpoint: Some("203.0.113.5:51820".parse().unwrap()),
             endpoint_age_secs: Some(3),
+            subnets: vec![],
         }
+    }
+
+    /// subnets は追加フィールド(ADR-0014)。空ならワイヤに現れず、
+    /// 旧バージョンの台帳(フィールドなし)も読める。
+    #[test]
+    fn ledger_entry_subnets_are_optional_on_the_wire() {
+        let mut e = entry();
+        assert!(!serde_json::to_string(&e).unwrap().contains("subnets"));
+        e.subnets = vec!["192.168.10.0/24".parse().unwrap()];
+        let json = serde_json::to_string(&e).unwrap();
+        let back: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subnets, e.subnets);
     }
 
     #[test]

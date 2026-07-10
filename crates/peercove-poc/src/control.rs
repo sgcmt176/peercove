@@ -519,6 +519,7 @@ mod tests {
             is_host: false,
             endpoint: None,
             endpoint_age_secs: None,
+            subnets: vec![],
         }
     }
 

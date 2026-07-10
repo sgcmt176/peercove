@@ -67,6 +67,24 @@ pub trait WgBackend: Send {
     /// トンネルと関連設定を破棄する。`up` していないインスタンスで呼んだ場合は
     /// 残骸クリーンアップとして動作する(存在しなければ成功扱い)。
     fn down(&mut self) -> anyhow::Result<()>;
+
+    /// 広告サブネット(ADR-0014、M3-7)宛の OS ルートをトンネル IF へ向ける。
+    /// トンネル IF の消滅で OS が経路も消すため、down での明示削除は保険。
+    fn add_route(&mut self, subnet: Ipv4Net) -> anyhow::Result<()>;
+
+    /// [`WgBackend::add_route`] の対。存在しない経路の削除は成功扱い(冪等)。
+    fn remove_route(&mut self, subnet: Ipv4Net) -> anyhow::Result<()>;
+
+    /// ルーター役(自分の背後 LAN を広告している)としての転送設定を同期する。
+    /// 冪等で、`subnets` が空なら全解除。`snat` は将来「LAN 側静的ルート前提」
+    /// モードを設定で切るための入口(ADR-0014 追加条件。現状は常に true)。
+    /// V1 は Linux のみ実装で、Windows は subnets が空でない場合に警告する。
+    fn sync_subnet_router(
+        &mut self,
+        virtual_subnet: Ipv4Net,
+        subnets: &[Ipv4Net],
+        snat: bool,
+    ) -> anyhow::Result<()>;
 }
 
 /// 現在の OS 用のバックエンドを返す。

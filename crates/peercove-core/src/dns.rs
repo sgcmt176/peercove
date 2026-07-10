@@ -124,6 +124,7 @@ mod tests {
             is_host,
             endpoint: None,
             endpoint_age_secs: None,
+            subnets: vec![],
         }
     }
 

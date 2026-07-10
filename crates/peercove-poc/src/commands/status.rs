@@ -181,6 +181,7 @@ mod tests {
                 is_host: true,
                 endpoint: None,
                 endpoint_age_secs: None,
+                subnets: vec![],
             },
             LedgerEntry {
                 name: Some("alice".to_string()),
@@ -190,6 +191,7 @@ mod tests {
                 is_host: false,
                 endpoint: None,
                 endpoint_age_secs: None,
+                subnets: vec![],
             },
         ];
         let text = render(&[], Some(&ledger));

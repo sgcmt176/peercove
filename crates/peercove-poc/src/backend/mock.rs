@@ -49,4 +49,21 @@ impl WgBackend for MockBackend {
         self.record("down".to_string());
         Ok(())
     }
+    fn add_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
+        self.record(format!("route-add:{subnet}"));
+        Ok(())
+    }
+    fn remove_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
+        self.record(format!("route-del:{subnet}"));
+        Ok(())
+    }
+    fn sync_subnet_router(
+        &mut self,
+        _virtual_subnet: ipnet::Ipv4Net,
+        subnets: &[ipnet::Ipv4Net],
+        snat: bool,
+    ) -> anyhow::Result<()> {
+        self.record(format!("router:{subnets:?}:snat={snat}"));
+        Ok(())
+    }
 }

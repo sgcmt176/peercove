@@ -16,6 +16,64 @@ use super::{PeerSpec, PeerStats, TunnelSpec, WgBackend};
 pub struct LinuxBackend {
     if_name: String,
     api: WGApi<Kernel>,
+    /// ルーター役(ADR-0014)として適用中の状態。down で対解除する。
+    router: RouterState,
+}
+
+/// ルーター役の適用済み状態(サブネットごとの NAT ルールと、
+/// 転送を有効化した LAN 側 IF)。
+#[derive(Default)]
+struct RouterState {
+    /// 適用済みサブネット(NAT ルールの -d と一致)。
+    subnets: Vec<(ipnet::Ipv4Net, bool)>, // (subnet, snat 適用済みか)
+    /// 仮想サブネット(NAT ルールの -s。解除時に同じ引数が要る)。
+    virtual_subnet: Option<ipnet::Ipv4Net>,
+    /// このプロセスが 0→1 にした LAN 側 IF(down で 0 に戻す)。
+    enabled_forwarding: Vec<String>,
+}
+
+/// 外部コマンドを実行し、失敗なら stderr 込みでエラーにする。
+fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("{program} を実行できません(インストールされていますか?)"))?;
+    if !output.status.success() {
+        bail!(
+            "{program} {} が失敗しました: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// MASQUERADE ルールの引数(追加 -A / 確認 -C / 削除 -D で共通)。
+fn nat_rule_args(op: &str, virt: &str, subnet: &str) -> Vec<String> {
+    [
+        "-t",
+        "nat",
+        op,
+        "POSTROUTING",
+        "-s",
+        virt,
+        "-d",
+        subnet,
+        "-j",
+        "MASQUERADE",
+        "-m",
+        "comment",
+        "--comment",
+        "peercove-subnet-router",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn iptables(args: &[String]) -> anyhow::Result<String> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run("iptables", &args)
 }
 
 impl LinuxBackend {
@@ -25,7 +83,76 @@ impl LinuxBackend {
         Ok(Self {
             if_name: if_name.to_string(),
             api,
+            router: RouterState::default(),
         })
+    }
+
+    /// サブネットへの経路が向く LAN 側 IF を特定する(`ip route get`)。
+    fn lan_interface_for(&self, subnet: &ipnet::Ipv4Net) -> anyhow::Result<String> {
+        let probe = subnet
+            .hosts()
+            .next()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| subnet.addr().to_string());
+        let out = run("ip", &["-4", "route", "get", &probe])?;
+        let mut tokens = out.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token == "dev" {
+                if let Some(dev) = tokens.next() {
+                    if dev == self.if_name {
+                        bail!(
+                            "サブネット {subnet} への経路がトンネル {} を向いています。\
+                             ルーター役のマシンから直接届く LAN を指定してください",
+                            self.if_name
+                        );
+                    }
+                    return Ok(dev.to_string());
+                }
+            }
+        }
+        bail!("サブネット {subnet} への経路(LAN 側 IF)を特定できません: {out}")
+    }
+
+    /// LAN 側 IF の per-IF forwarding を有効化する(0→1 にしたときだけ記録し、
+    /// down で戻す)。
+    fn ensure_forwarding(&mut self, if_name: &str) -> anyhow::Result<()> {
+        let path = format!("/proc/sys/net/ipv4/conf/{if_name}/forwarding");
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        if current.trim() != "1" {
+            std::fs::write(&path, "1")
+                .with_context(|| format!("IP フォワーディングの有効化に失敗しました({path})"))?;
+            if !self
+                .router
+                .enabled_forwarding
+                .contains(&if_name.to_string())
+            {
+                self.router.enabled_forwarding.push(if_name.to_string());
+            }
+            tracing::info!("IP フォワーディングを有効化しました({path} = 1)");
+        }
+        Ok(())
+    }
+
+    /// ルーター役の適用済み状態をすべて解除する(down・全撤回の共通処理)。
+    fn clear_router(&mut self) {
+        if let Some(virt) = self.router.virtual_subnet {
+            for (subnet, snat) in std::mem::take(&mut self.router.subnets) {
+                if snat {
+                    if let Err(e) =
+                        iptables(&nat_rule_args("-D", &virt.to_string(), &subnet.to_string()))
+                    {
+                        tracing::warn!("NAT ルールの削除に失敗しました({subnet}): {e:#}");
+                    }
+                }
+            }
+        }
+        for if_name in std::mem::take(&mut self.router.enabled_forwarding) {
+            let path = format!("/proc/sys/net/ipv4/conf/{if_name}/forwarding");
+            if let Err(e) = std::fs::write(&path, "0") {
+                tracing::warn!("IP フォワーディングの復元に失敗しました({path}): {e:#}");
+            }
+        }
+        self.router.virtual_subnet = None;
     }
 
     fn ensure_root() -> anyhow::Result<()> {
@@ -143,8 +270,96 @@ impl WgBackend for LinuxBackend {
         Ok(stats)
     }
 
+    fn add_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
+        run(
+            "ip",
+            &[
+                "route",
+                "replace",
+                &subnet.to_string(),
+                "dev",
+                &self.if_name,
+            ],
+        )
+        .map(|_| ())
+        .with_context(|| format!("経路 {subnet} の追加に失敗しました"))
+    }
+
+    fn remove_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
+        match run(
+            "ip",
+            &["route", "del", &subnet.to_string(), "dev", &self.if_name],
+        ) {
+            Ok(_) => Ok(()),
+            // 既に無い経路の削除は成功扱い(冪等)
+            Err(e) if format!("{e:#}").contains("No such") => Ok(()),
+            Err(e) => Err(e.context(format!("経路 {subnet} の削除に失敗しました"))),
+        }
+    }
+
+    fn sync_subnet_router(
+        &mut self,
+        virtual_subnet: ipnet::Ipv4Net,
+        subnets: &[ipnet::Ipv4Net],
+        snat: bool,
+    ) -> anyhow::Result<()> {
+        // 撤回されたサブネットの解除
+        let desired: std::collections::HashSet<_> = subnets.iter().copied().collect();
+        if let Some(virt) = self.router.virtual_subnet {
+            let (keep, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.router.subnets)
+                .into_iter()
+                .partition(|(subnet, _)| desired.contains(subnet));
+            self.router.subnets = keep;
+            for (subnet, applied_snat) in gone {
+                if applied_snat {
+                    if let Err(e) =
+                        iptables(&nat_rule_args("-D", &virt.to_string(), &subnet.to_string()))
+                    {
+                        tracing::warn!("NAT ルールの削除に失敗しました({subnet}): {e:#}");
+                    }
+                }
+                tracing::info!("サブネット {subnet} の広告を解除しました");
+            }
+        }
+        if subnets.is_empty() {
+            self.clear_router();
+            return Ok(());
+        }
+        self.router.virtual_subnet = Some(virtual_subnet);
+
+        // 新しく広告されたサブネットの適用
+        let wg_if = self.if_name.clone();
+        for subnet in subnets {
+            if self.router.subnets.iter().any(|(s, _)| s == subnet) {
+                continue;
+            }
+            let lan_if = self.lan_interface_for(subnet)?;
+            self.ensure_forwarding(&wg_if)?;
+            self.ensure_forwarding(&lan_if)?;
+            if snat {
+                let args_check =
+                    nat_rule_args("-C", &virtual_subnet.to_string(), &subnet.to_string());
+                if iptables(&args_check).is_err() {
+                    iptables(&nat_rule_args(
+                        "-A",
+                        &virtual_subnet.to_string(),
+                        &subnet.to_string(),
+                    ))
+                    .context(
+                        "SNAT(MASQUERADE)の設定に失敗しました。iptables が必要です \
+                         (sudo apt install iptables)",
+                    )?;
+                }
+            }
+            self.router.subnets.push((*subnet, snat));
+            tracing::info!("サブネットルーターを有効化しました({subnet} → {lan_if}、SNAT={snat})");
+        }
+        Ok(())
+    }
+
     fn down(&mut self) -> anyhow::Result<()> {
         Self::ensure_root()?;
+        self.clear_router();
         match self.api.remove_interface() {
             Ok(()) => Ok(()),
             // 存在しない場合は成功扱い(クリーンアップの冪等性)

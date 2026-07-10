@@ -21,6 +21,8 @@ const TUNNEL_TYPE: &str = "PeerCove";
 pub struct WindowsBackend {
     if_name: String,
     running: Option<Running>,
+    /// ルーター役未対応の警告を出したか(毎周期のスパム防止、ADR-0014)。
+    router_warned: bool,
 }
 
 struct Running {
@@ -35,7 +37,37 @@ impl WindowsBackend {
         Self {
             if_name: if_name.to_string(),
             running: None,
+            router_warned: false,
         }
+    }
+
+    /// netsh でトンネル IF への経路を操作する(ADR-0014)。
+    fn netsh_route(&self, op: &str, subnet: &ipnet::Ipv4Net) -> anyhow::Result<()> {
+        let subnet = subnet.to_string();
+        let args = [
+            "interface",
+            "ipv4",
+            op,
+            "route",
+            &subnet,
+            &self.if_name,
+            "store=active",
+        ];
+        let output = std::process::Command::new("netsh")
+            .args(args)
+            .output()
+            .context("netsh を実行できません")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stdout);
+            // 既に無い経路の削除は成功扱い(冪等)。netsh は日本語環境だと
+            // 文言がローカライズされるため、終了コードとメッセージの両方を見る
+            if op == "delete" && (stderr.contains("見つかりません") || stderr.contains("not found"))
+            {
+                return Ok(());
+            }
+            bail!("netsh {} が失敗しました: {}", args.join(" "), stderr.trim());
+        }
+        Ok(())
     }
 
     fn load_wintun() -> anyhow::Result<wintun::Wintun> {
@@ -211,6 +243,36 @@ impl WgBackend for WindowsBackend {
                 }
             })
             .collect())
+    }
+
+    fn add_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
+        self.netsh_route("add", &subnet)
+            .with_context(|| format!("経路 {subnet} の追加に失敗しました"))
+    }
+
+    fn remove_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
+        self.netsh_route("delete", &subnet)
+            .with_context(|| format!("経路 {subnet} の削除に失敗しました"))
+    }
+
+    fn sync_subnet_router(
+        &mut self,
+        _virtual_subnet: ipnet::Ipv4Net,
+        subnets: &[ipnet::Ipv4Net],
+        _snat: bool,
+    ) -> anyhow::Result<()> {
+        // V1 では Windows はルーター役非対応(ADR-0014。利用側としては対応)
+        if !subnets.is_empty() && !self.router_warned {
+            self.router_warned = true;
+            tracing::warn!(
+                "このマシンにサブネット {subnets:?} が割り当てられていますが、\
+                 Windows でのルーター役は未対応です(Linux のマシンを使ってください)"
+            );
+        }
+        if subnets.is_empty() {
+            self.router_warned = false;
+        }
+        Ok(())
     }
 
     fn down(&mut self) -> anyhow::Result<()> {

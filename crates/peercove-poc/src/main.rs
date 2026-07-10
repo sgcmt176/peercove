@@ -136,6 +136,22 @@ enum Command {
         #[arg(long)]
         ip: Option<Ipv4Addr>,
     },
+    /// メンバーの背後 LAN(広告サブネット)を設定する(ADR-0014、ホスト設定)
+    Subnet {
+        #[arg(long)]
+        config: PathBuf,
+        /// 表示名で指定
+        #[arg(long)]
+        name: Option<String>,
+        /// 公開鍵(base64)で指定
+        #[arg(long)]
+        pubkey: Option<String>,
+        /// 仮想 IP で指定
+        #[arg(long)]
+        ip: Option<Ipv4Addr>,
+        /// 広告するサブネット(CIDR)。指定なしで解除
+        subnets: Vec<ipnet::Ipv4Net>,
+    },
     /// UDP echo サーバー(G-5 検証用)
     UdpEcho {
         #[arg(long, default_value = "0.0.0.0:9999")]
@@ -300,6 +316,35 @@ fn run(command: Command) -> anyhow::Result<()> {
                 }
             };
             commands::remove_peer::run(&config, &selector)
+        }
+        Command::Subnet {
+            config,
+            name,
+            pubkey,
+            ip,
+            subnets,
+        } => {
+            use peercove_ops::peers::Selector;
+            let selector = match (&name, &pubkey, ip) {
+                (Some(name), None, None) => Selector::Name(name),
+                (None, Some(key), None) => Selector::PublicKey(key),
+                (None, None, Some(ip)) => Selector::Ip(ip),
+                _ => {
+                    anyhow::bail!("--name / --pubkey / --ip のいずれか 1 つだけを指定してください")
+                }
+            };
+            let display = peercove_ops::peers::set_subnets(&config, &selector, &subnets)?;
+            if subnets.is_empty() {
+                println!("{display} の広告サブネットを解除しました");
+            } else {
+                let list: Vec<String> = subnets.iter().map(|s| s.to_string()).collect();
+                println!(
+                    "{display} の広告サブネットを設定しました: {}",
+                    list.join(", ")
+                );
+            }
+            println!("稼働中なら約 10 秒で全メンバーへ配布されます");
+            Ok(())
         }
         Command::UdpEcho { listen } => commands::udp::run_echo(listen),
         Command::UdpPing { target, count } => commands::udp::run_ping(target, count),
