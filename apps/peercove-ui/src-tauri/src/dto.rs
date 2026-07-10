@@ -376,6 +376,7 @@ mod tests {
                 is_host: false,
                 endpoint: None,
                 endpoint_age_secs: None,
+                subnets: vec![],
             }],
             peers: vec![],
             removed: false,
@@ -435,6 +436,7 @@ mod tests {
             is_host,
             endpoint: None,
             endpoint_age_secs: None,
+            subnets: vec![],
         };
         let mut direct = std::collections::HashMap::new();
         direct.insert(
