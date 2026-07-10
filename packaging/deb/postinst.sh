@@ -14,6 +14,11 @@ if [ "$1" = "configure" ]; then
         # 新規は開始、更新は新バイナリで再起動(restart は停止中でも開始する)
         systemctl restart peercove-daemon.service || true
     fi
+    # peercove:// スキームのハンドラ登録を確実にする(M3-5)。
+    # 多くのディストリでは dpkg トリガが自動で走るが、無い環境に備えて明示する
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database /usr/share/applications || true
+    fi
 fi
 
 exit 0

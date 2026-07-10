@@ -351,6 +351,13 @@ pub fn run() {
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 if let Err(e) = app.deep_link().register_all() {
+                    #[cfg(target_os = "linux")]
+                    eprintln!(
+                        "URL スキームの登録に失敗しました(ディープリンクは無効)。\
+                         desktop-file-utils と xdg-utils がインストールされているか\
+                         確認してください: {e}"
+                    );
+                    #[cfg(not(target_os = "linux"))]
                     eprintln!("URL スキームの登録に失敗しました(ディープリンクは無効): {e}");
                 }
             }

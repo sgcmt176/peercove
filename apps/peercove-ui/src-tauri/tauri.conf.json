@@ -58,6 +58,7 @@
     "linux": {
       "deb": {
         "depends": ["libayatana-appindicator3-1"],
+        "desktopTemplate": "linux/peercove.desktop",
         "files": {
           "/usr/bin/peercove-poc": "../../../target/release/peercove-poc",
           "/usr/lib/systemd/system/peercove-daemon.service": "../../../packaging/systemd/peercove-daemon.service"
