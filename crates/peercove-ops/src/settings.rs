@@ -42,6 +42,9 @@ pub struct Settings {
     /// メンバー間直接通信を試すか(ADR-0013、既定 true)。
     /// 反映は次の supervisor 周期(約 5 秒)— 再起動不要。
     pub direct: bool,
+    /// 受信するファイルサイズの上限(MB、ADR-0015 / M3-9)。0 で無制限。
+    /// 反映は次の supervisor 周期(約 5 秒)— 再起動不要。
+    pub max_recv_file_mb: u64,
 }
 
 impl Settings {
@@ -65,6 +68,8 @@ pub struct Update {
     pub host_endpoint: Option<String>,
     /// メンバー間直接通信を試すか(ADR-0013)。
     pub direct: bool,
+    /// 受信するファイルサイズの上限(MB)。0 で無制限。
+    pub max_recv_file_mb: u64,
 }
 
 /// 現在の設定を読む。
@@ -85,6 +90,7 @@ pub fn read(config_path: &Path) -> anyhow::Result<Settings> {
         is_member: host_endpoint.is_some(),
         host_endpoint,
         direct: config.interface.direct,
+        max_recv_file_mb: config.interface.max_recv_file_mb,
     })
 }
 
@@ -142,6 +148,16 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         true => interface.remove("direct"),
         false => interface.insert("direct", toml_edit::value(false)),
     };
+    // 受信サイズ上限(ADR-0015)も既定(100 MB)なら書かない。
+    // 既定以外を書いた設定は旧バージョンの peercove-poc では読めなくなる点に注意
+    if update.max_recv_file_mb == peercove_core::config::DEFAULT_MAX_RECV_FILE_MB {
+        interface.remove("max_recv_file_mb");
+    } else {
+        interface.insert(
+            "max_recv_file_mb",
+            toml_edit::value(i64::try_from(update.max_recv_file_mb).unwrap_or(i64::MAX)),
+        );
+    }
 
     // endpoint はメンバー設定(ピア 1 つ)のときだけ触る。ホスト設定のピアは
     // メンバーの登録なので、ここから書き換えてはいけない
@@ -225,6 +241,7 @@ allowed_ips = ["10.119.96.2/32"]
                 mtu: 1380,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
                 direct: false,
+                max_recv_file_mb: 500,
             },
         )
         .unwrap();
@@ -233,6 +250,10 @@ allowed_ips = ["10.119.96.2/32"]
         assert!(text.contains("# 参加設定"), "コメントが保持される");
         assert!(text.contains("persistent_keepalive = 25"), "他項目は不変");
         assert!(text.contains("direct = false"), "false なら書かれる");
+        assert!(
+            text.contains("max_recv_file_mb = 500"),
+            "既定以外なら書かれる"
+        );
 
         let after = read(&path).unwrap();
         assert_eq!(after.display_name.as_deref(), Some("alice2"), "trim される");
@@ -240,8 +261,9 @@ allowed_ips = ["10.119.96.2/32"]
         assert_eq!(after.mtu, 1380);
         assert_eq!(after.host_endpoint.as_deref(), Some("198.51.100.7:51820"));
         assert!(!after.direct);
+        assert_eq!(after.max_recv_file_mb, 500);
 
-        // true に戻すと行ごと消える(既定なので書かない)
+        // 既定値に戻すと行ごと消える(既定なので書かない)
         update(
             &path,
             &Update {
@@ -250,12 +272,19 @@ allowed_ips = ["10.119.96.2/32"]
                 mtu: 1380,
                 host_endpoint: None,
                 direct: true,
+                max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
             },
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("direct"), "既定値なら書かない");
-        assert!(read(&path).unwrap().direct);
+        assert!(!text.contains("max_recv_file_mb"), "既定値なら書かない");
+        let after = read(&path).unwrap();
+        assert!(after.direct);
+        assert_eq!(
+            after.max_recv_file_mb,
+            peercove_core::config::DEFAULT_MAX_RECV_FILE_MB
+        );
     }
 
     /// ホスト設定では endpoint を渡されても `[[peer]]`(= メンバー登録)を触らない。
@@ -270,6 +299,7 @@ allowed_ips = ["10.119.96.2/32"]
                 mtu: 1400,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
                 direct: true,
+                max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
             },
         )
         .unwrap();
@@ -288,6 +318,7 @@ allowed_ips = ["10.119.96.2/32"]
             mtu: 1420,
             host_endpoint: None,
             direct: true,
+            max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
         };
 
         let bad_mtu = Update {
@@ -330,6 +361,7 @@ allowed_ips = ["10.119.96.2/32"]
             mtu: current.mtu,
             host_endpoint: current.host_endpoint.clone(),
             direct: current.direct,
+            max_recv_file_mb: current.max_recv_file_mb,
         };
         assert!(!current.restart_required(&same));
         assert!(
@@ -338,6 +370,13 @@ allowed_ips = ["10.119.96.2/32"]
                 ..same.clone()
             }),
             "direct は約 5 秒で反映されるので再起動不要"
+        );
+        assert!(
+            !current.restart_required(&Update {
+                max_recv_file_mb: 500,
+                ..same.clone()
+            }),
+            "受信サイズ上限も約 5 秒で反映されるので再起動不要"
         );
         assert!(!current.restart_required(&Update {
             display_name: Some("bob".to_string()),

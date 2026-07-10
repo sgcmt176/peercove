@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
-import { Connection, Member, NetworkInfo, api, errorMessage } from "./ipc";
+import { Connection, Member, NetworkInfo, Transfer, api, errorMessage } from "./ipc";
 import { t } from "./i18n";
-import { diffMembers, notifyMemberEvents } from "./notify";
+import {
+  diffMembers,
+  diffTransfers,
+  notifyFileEvents,
+  notifyMemberEvents,
+} from "./notify";
 import { clearHistory, recordStatus } from "./history";
 import { Theme, applyTheme, loadTheme, nextTheme } from "./theme";
 import { NetworksView } from "./components/NetworksView";
@@ -53,6 +58,8 @@ export default function App() {
 
   // 通知の差分計算に使う前回の台帳(ネットワークごと)。レンダー非依存なので ref
   const previousMembers = useRef<Map<string, Member[]>>(new Map());
+  // ファイル受信通知(M3-9b)の差分計算に使う前回の転送一覧
+  const previousTransfers = useRef<Map<string, Transfer[]>>(new Map());
 
   const refresh = useCallback(async () => {
     try {
@@ -72,14 +79,28 @@ export default function App() {
           tunnel.network,
         );
         previousMembers.current.set(tunnel.config, tunnel.members);
+        // ファイルの受信完了を通知する(M3-9b)
+        void notifyFileEvents(
+          diffTransfers(
+            previousTransfers.current.get(tunnel.config) ?? null,
+            tunnel.transfers,
+          ),
+          tunnel.members,
+          tunnel.network,
+        );
+        previousTransfers.current.set(tunnel.config, tunnel.transfers);
       }
       // 止まったネットワークは次回接続を「初回」に戻す(全員分の通知を防ぐ)
       for (const key of [...previousMembers.current.keys()]) {
-        if (!seen.has(key)) previousMembers.current.delete(key);
+        if (!seen.has(key)) {
+          previousMembers.current.delete(key);
+          previousTransfers.current.delete(key);
+        }
       }
     } catch (error) {
       setConnection({ kind: "unreachable", message: errorMessage(error) });
       previousMembers.current.clear();
+      previousTransfers.current.clear();
       clearHistory();
     }
   }, []);

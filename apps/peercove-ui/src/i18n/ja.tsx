@@ -188,9 +188,10 @@ export const ja = {
     disconnect: "切断",
     configFileLabel: "設定ファイル",
     membersHead: (n: number) => `メンバー（${n}）`,
-    // ネットワーク詳細のタブ(M3-6)。チャット・ファイル送信もここに並ぶ予定
+    // ネットワーク詳細のタブ(M3-6)。チャット(M3-13)もここに並ぶ予定
     tabs: {
       stats: "統計",
+      inbox: "受信",
     },
     invite: "メンバーを招待",
     ledgerPending: "台帳をまだ受信していません（接続直後は数秒かかります）。",
@@ -233,6 +234,7 @@ export const ja = {
       rateTitle: "このメンバーとの転送速度（受信+送信、直近約 90 秒の推移）",
       rename: "名前を変更",
       remove: "削除",
+      sendFile: "ファイルを送る",
       self: "自分",
       selfTitle: "このマシン自身です",
       // メンバー間の経路(M3-4、ADR-0013)
@@ -247,6 +249,28 @@ export const ja = {
     // 直接通信の説明(M3-4)。外部 IP の共有について明記する(ADR-0013 条件 3)
     directNote:
       "メンバー同士は可能なら直接通信します(速く・ホスト回線の負荷なし)。このとき、あなたのグローバル IP アドレスが同じネットワークのメンバーに共有されます。使いたくない場合は「設定」で直接通信をオフにしてください。",
+  },
+
+  // ファイル送信・受信ボックス(M3-9b、ADR-0015)
+  transfer: {
+    head: "転送",
+    // 一覧の行頭に出す向き
+    direction: (d: "send" | "recv") => (d === "send" ? "送信" : "受信"),
+    started: (name: string) =>
+      `${name} への送信を開始しました（進捗はこのタブに出ます）。`,
+    done: "完了",
+    failed: (reason: string) => `失敗: ${reason}`,
+    progress: (transferred: string, size: string) => `${transferred} / ${size}`,
+  },
+  inbox: {
+    head: "受信ボックス",
+    note: "受け取ったファイルは自動でここに入ります。「保存」で好きな場所へ移動してください。",
+    empty: "受信したファイルはありません。",
+    from: (who: string) => `${who} から`,
+    save: "保存",
+    delete: "削除",
+    savedTo: (path: string) => `保存しました: ${path}`,
+    deleted: (name: string) => `${name} を削除しました。`,
   },
 
   // 広告サブネットの編集(M3-7b、ADR-0014)
@@ -364,6 +388,11 @@ export const ja = {
     directLabel: "メンバーと直接通信する（推奨）",
     directHint:
       "— 可能なら相手と直接つなぎます（速く・ホスト回線の負荷なし）。あなたのグローバル IP がネットワーク内のメンバーに共有されます。オフにすると常にホスト経由。約 10 秒で反映されます",
+    // 受信ファイルサイズ上限(ADR-0015、M3-9)
+    maxFileLabel: "受信ファイルの上限（MB）",
+    maxFileHint: (defaultMb: number) =>
+      ` — 既定 ${defaultMb}。0 で無制限。これを超えるファイルの受信は拒否されます（約 10 秒で反映）`,
+    maxFileInteger: "受信ファイルの上限には 0 以上の整数を入力してください",
     restartHint: (isMember: boolean) =>
       `待受ポート・MTU${
         isMember ? "・ホストのエンドポイント" : ""
@@ -376,5 +405,9 @@ export const ja = {
     leftTitle: "メンバーが切断しました",
     body: (name: string, ip: string, network: string) =>
       `${name}（${ip}）— ${network}`,
+    // ファイル受信(M3-9b)
+    fileTitle: "ファイルを受信しました",
+    fileBody: (file: string, from: string, network: string) =>
+      `${file} — ${from} から（${network}）`,
   },
 };

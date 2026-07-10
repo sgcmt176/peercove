@@ -8,7 +8,7 @@
 // を frontend から使うと npm 依存が 1 つ増え、許可の問い合わせも要るため。
 
 import { invoke } from "@tauri-apps/api/core";
-import { Member } from "./ipc";
+import { Member, Transfer } from "./ipc";
 import { t } from "./i18n";
 
 export interface MemberEvent {
@@ -78,6 +78,46 @@ export async function notifyMemberEvents(
       await invoke("notify", describe(event, network));
     } catch {
       // 通知の失敗で UI を止めない(通知デーモンが無い環境など)
+    }
+  }
+}
+
+/**
+ * 前回の転送一覧と比べて、新しく「受信完了」になった転送を列挙する(M3-9b)。
+ * 初回(baseline なし)は通知しない(起動時にまとめて鳴るのを避ける。
+ * 見逃した分は受信タブのバッジで分かる)。
+ */
+export function diffTransfers(
+  previous: Transfer[] | null,
+  current: Transfer[],
+): Transfer[] {
+  if (previous === null) return [];
+  const wasDone = new Map(previous.map((tr) => [tr.id, tr.done]));
+  return current.filter(
+    (tr) =>
+      tr.direction === "recv" &&
+      tr.done &&
+      tr.error === null &&
+      wasDone.get(tr.id) !== true,
+  );
+}
+
+/** 受信完了の OS 通知。送信者名は台帳(members)から引く。 */
+export async function notifyFileEvents(
+  events: Transfer[],
+  members: Member[],
+  network: string,
+): Promise<void> {
+  for (const transfer of events) {
+    const from =
+      members.find((m) => m.ip === transfer.peer)?.name ?? transfer.peer;
+    try {
+      await invoke("notify", {
+        title: t.notify.fileTitle,
+        body: t.notify.fileBody(transfer.name, from, network),
+      });
+    } catch {
+      // 通知の失敗で UI を止めない
     }
   }
 }

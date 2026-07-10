@@ -23,8 +23,8 @@ use peercove_ops::peers::Selector;
 use tauri::Manager;
 
 use crate::dto::{
-    DnsRecordDto, InitResult, InviteResult, JoinResult, LogEntry, Logs, NetworkDto, SaveResult,
-    Settings, SettingsUpdate, Status,
+    DnsRecordDto, InboxItem, InitResult, InviteResult, JoinResult, LogEntry, Logs, NetworkDto,
+    SaveResult, Settings, SettingsUpdate, Status,
 };
 
 /// デフォルトの設定ディレクトリ(Windows: %APPDATA%\… / Linux: ~/.config/…)。
@@ -106,6 +106,143 @@ async fn daemon_logs(after_seq: u64) -> Result<Logs, String> {
         Ok(other) => Err(format!("想定外の応答です: {other:?}")),
         Err(e) => Err(to_message(e)),
     }
+}
+
+// ---- ファイル送信・受信ボックス(ADR-0015、M3-9b) ----
+
+/// 送るファイルを選ぶ(OS のファイルダイアログ)。キャンセルで None。
+///
+/// ダイアログはブロッキングなので専用スレッドで開く(status ポーリング等の
+/// 非同期コマンドを塞がない)。
+#[tauri::command]
+async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .blocking_pick_file()
+            .map(|path| path.to_string())
+    })
+    .await
+    .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))
+}
+
+/// メンバーへファイルを送る(デーモンが送信し、進捗は status の transfers)。
+#[tauri::command]
+async fn send_file(config_path: String, peer: String, path: String) -> Result<String, String> {
+    let config = canonical(&config_path)?;
+    let peer: std::net::Ipv4Addr = peer
+        .parse()
+        .map_err(|_| format!("宛先 {peer} は IPv4 アドレスではありません"))?;
+    match peercove_ipc::request_async(IpcRequest::SendFile {
+        config,
+        peer,
+        path: PathBuf::from(path),
+    })
+    .await
+    {
+        Ok(IpcResponse::Transfer { id }) => Ok(id),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+/// 受信ボックスのディレクトリ(`networks/<net>.inbox/`。デーモン側と同じ規則)。
+fn inbox_dir_for(config_path: &str) -> PathBuf {
+    Path::new(config_path).with_extension("inbox")
+}
+
+/// 受信ボックス内のファイルを名前で引く。パス区切りや `..` は拒否する
+/// (名前は list_inbox が返したものに限る)。
+fn inbox_file(config_path: &str, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err("ファイル名が不正です".to_string());
+    }
+    Ok(inbox_dir_for(config_path).join(name))
+}
+
+/// 受信ボックスの一覧(新しい順)。ディレクトリが無ければ空。
+#[tauri::command]
+fn list_inbox(config_path: String) -> Result<Vec<InboxItem>, String> {
+    let dir = inbox_dir_for(&config_path);
+    let mut items = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(items); // まだ何も受信していない
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 書きかけ(.part)と受信メタ(.pcvmeta)は一覧に出さない
+        if name.ends_with(".part") || name.ends_with(".pcvmeta") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let sidecar = std::fs::read_to_string(dir.join(format!("{name}.pcvmeta")))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let field = |key: &str| {
+            sidecar
+                .as_ref()
+                .and_then(|v| v[key].as_str())
+                .map(String::from)
+        };
+        items.push(InboxItem {
+            size: meta.len(),
+            from_name: field("from_name"),
+            from_ip: field("from_ip"),
+            received_unix_ms: sidecar
+                .as_ref()
+                .and_then(|v| v["received_unix_ms"].as_u64()),
+            name,
+        });
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item.received_unix_ms));
+    Ok(items)
+}
+
+/// 受信ボックスのファイルを保存する(保存先ダイアログ → コピー →
+/// 受信ボックスから削除)。キャンセルで None。
+#[tauri::command]
+async fn save_inbox_file(
+    app: tauri::AppHandle,
+    config_path: String,
+    name: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let source = inbox_file(&config_path, &name)?;
+    let suggested = name.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(&suggested)
+            .blocking_save_file()
+            .map(|path| path.to_string())
+    })
+    .await
+    .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))?;
+    let Some(dest) = picked else {
+        return Ok(None);
+    };
+    std::fs::copy(&source, Path::new(&dest)).map_err(|e| format!("保存に失敗しました: {e}"))?;
+    // 保存できたら受信ボックスから消す(メタ情報も対で)
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(inbox_dir_for(&config_path).join(format!("{name}.pcvmeta")));
+    Ok(Some(dest))
+}
+
+/// 受信ボックスのファイルを削除する(メタ情報も対で)。
+#[tauri::command]
+fn delete_inbox_file(config_path: String, name: String) -> Result<(), String> {
+    let source = inbox_file(&config_path, &name)?;
+    if let Err(e) = std::fs::remove_file(&source) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("削除に失敗しました: {e}"));
+        }
+    }
+    let _ = std::fs::remove_file(inbox_dir_for(&config_path).join(format!("{name}.pcvmeta")));
+    Ok(())
 }
 
 async fn send(request: IpcRequest) -> Result<(), String> {
@@ -411,6 +548,11 @@ pub fn run() {
             remove_member,
             rename_member,
             set_member_subnets,
+            pick_file,
+            send_file,
+            list_inbox,
+            save_inbox_file,
+            delete_inbox_file,
             list_dns_records,
             add_dns_record,
             remove_dns_record,

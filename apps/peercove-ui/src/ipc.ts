@@ -42,6 +42,29 @@ export interface Peer {
   rttMs: number | null;
 }
 
+/** ファイル転送の進捗 1 件（ADR-0015、M3-9b）。 */
+export interface Transfer {
+  id: string;
+  /** 自分から見た向き。 */
+  direction: "send" | "recv";
+  /** 相手の仮想 IP。 */
+  peer: string;
+  name: string;
+  size: number;
+  transferred: number;
+  done: boolean;
+  error: string | null;
+}
+
+/** 受信ボックスの 1 ファイル（ADR-0015、M3-9b）。 */
+export interface InboxItem {
+  name: string;
+  size: number;
+  fromName: string | null;
+  fromIp: string | null;
+  receivedUnixMs: number | null;
+}
+
 export interface Tunnel {
   config: string;
   /** ネットワーク名（ADR-0012）。 */
@@ -53,6 +76,8 @@ export interface Tunnel {
   peers: Peer[];
   /** ホストからネットワーク削除された（M2-G6）。UI が明示して切断を促す。 */
   removed: boolean;
+  /** ファイル転送の進捗（実行中 + 直近の完了/失敗分）。 */
+  transfers: Transfer[];
 }
 
 /** 同時参加は 1 ネットワークまで(M2 handoff Q4)。 */
@@ -116,8 +141,11 @@ export interface Settings {
   isMember: boolean;
   /** メンバー間直接通信を試すか（ADR-0013、既定 true）。 */
   direct: boolean;
+  /** 受信するファイルサイズの上限（MB、ADR-0015）。0 で無制限。 */
+  maxRecvFileMb: number;
   defaultMtu: number;
   defaultListenPort: number;
+  defaultMaxRecvFileMb: number;
 }
 
 export interface SettingsUpdate {
@@ -126,6 +154,7 @@ export interface SettingsUpdate {
   mtu: number;
   hostEndpoint: string | null;
   direct: boolean;
+  maxRecvFileMb: number;
 }
 
 export interface SaveResult {
@@ -181,6 +210,16 @@ export const api = {
     invoke<void>("rename_member", { configPath, publicKey, newName }),
   setMemberSubnets: (configPath: string, publicKey: string, subnets: string[]) =>
     invoke<void>("set_member_subnets", { configPath, publicKey, subnets }),
+  // ファイル送信・受信ボックス（ADR-0015、M3-9b）
+  pickFile: () => invoke<string | null>("pick_file"),
+  sendFile: (configPath: string, peer: string, path: string) =>
+    invoke<string>("send_file", { configPath, peer, path }),
+  listInbox: (configPath: string) =>
+    invoke<InboxItem[]>("list_inbox", { configPath }),
+  saveInboxFile: (configPath: string, name: string) =>
+    invoke<string | null>("save_inbox_file", { configPath, name }),
+  deleteInboxFile: (configPath: string, name: string) =>
+    invoke<void>("delete_inbox_file", { configPath, name }),
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),

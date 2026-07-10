@@ -67,6 +67,9 @@ function SettingsForm({
   const [mtu, setMtu] = useState(String(settings.mtu));
   const [hostEndpoint, setHostEndpoint] = useState(settings.hostEndpoint ?? "");
   const [direct, setDirect] = useState(settings.direct);
+  const [maxRecvFileMb, setMaxRecvFileMb] = useState(
+    String(settings.maxRecvFileMb),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -82,6 +85,10 @@ function SettingsForm({
       if (portValue !== null && !Number.isInteger(portValue)) {
         throw t.settings.portInteger;
       }
+      const maxFileValue = Number(maxRecvFileMb);
+      if (!Number.isInteger(maxFileValue) || maxFileValue < 0) {
+        throw t.settings.maxFileInteger;
+      }
       const result = await api.saveSettings(configPath, {
         displayName: displayName.trim() === "" ? null : displayName.trim(),
         listenPort: portValue,
@@ -91,6 +98,7 @@ function SettingsForm({
             ? hostEndpoint.trim()
             : null,
         direct,
+        maxRecvFileMb: maxFileValue,
       });
       setNotice(
         result.restartRequired
@@ -175,6 +183,22 @@ function SettingsForm({
             />
           </label>
         )}
+
+        <label className="field">
+          <span>
+            {t.settings.maxFileLabel}
+            <small className="muted">
+              {t.settings.maxFileHint(settings.defaultMaxRecvFileMb)}
+            </small>
+          </span>
+          <input
+            type="text"
+            inputMode="numeric"
+            value={maxRecvFileMb}
+            placeholder={String(settings.defaultMaxRecvFileMb)}
+            onChange={(event) => setMaxRecvFileMb(event.target.value)}
+          />
+        </label>
 
         {settings.isMember && (
           <label className="field--check">

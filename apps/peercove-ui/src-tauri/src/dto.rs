@@ -72,6 +72,40 @@ impl From<&PeerSummary> for Peer {
     }
 }
 
+/// ファイル転送の進捗 1 件(ADR-0015、M3-9b)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transfer {
+    pub id: String,
+    /// "send" | "recv"(自分から見た向き)
+    pub direction: &'static str,
+    /// 相手の仮想 IP。
+    pub peer: String,
+    pub name: String,
+    pub size: u64,
+    pub transferred: u64,
+    pub done: bool,
+    pub error: Option<String>,
+}
+
+impl From<&peercove_core::ipc::TransferInfo> for Transfer {
+    fn from(info: &peercove_core::ipc::TransferInfo) -> Self {
+        Self {
+            id: info.id.clone(),
+            direction: match info.direction {
+                peercove_core::ipc::TransferDirection::Send => "send",
+                peercove_core::ipc::TransferDirection::Recv => "recv",
+            },
+            peer: info.peer.to_string(),
+            name: info.name.clone(),
+            size: info.size,
+            transferred: info.transferred,
+            done: info.done,
+            error: info.error.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tunnel {
@@ -85,6 +119,8 @@ pub struct Tunnel {
     pub peers: Vec<Peer>,
     /// ホストからネットワーク削除された(M2-G6)。UI が明示して切断を促す。
     pub removed: bool,
+    /// ファイル転送の進捗(ADR-0015、M3-9)。実行中 + 直近の完了/失敗分。
+    pub transfers: Vec<Transfer>,
 }
 
 impl From<&TunnelInfo> for Tunnel {
@@ -130,8 +166,22 @@ impl From<&TunnelInfo> for Tunnel {
                 .collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
             removed: info.removed,
+            transfers: info.transfers.iter().map(Transfer::from).collect(),
         }
     }
+}
+
+/// 受信ボックスの 1 ファイル(ADR-0015、M3-9b)。メタ情報は受信時に
+/// デーモンが置いた `.pcvmeta`(無ければ null)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxItem {
+    /// ファイル名(受信ボックス内で一意)。
+    pub name: String,
+    pub size: u64,
+    pub from_name: Option<String>,
+    pub from_ip: Option<String>,
+    pub received_unix_ms: Option<u64>,
 }
 
 fn role_str(role: TunnelRole) -> &'static str {
@@ -276,9 +326,12 @@ pub struct Settings {
     pub is_member: bool,
     /// メンバー間直接通信を試すか(ADR-0013)。
     pub direct: bool,
+    /// 受信するファイルサイズの上限(MB、ADR-0015)。0 で無制限。
+    pub max_recv_file_mb: u64,
     /// 既定値。UI の入力欄のプレースホルダに使う。
     pub default_mtu: u16,
     pub default_listen_port: u16,
+    pub default_max_recv_file_mb: u64,
 }
 
 impl From<peercove_ops::settings::Settings> for Settings {
@@ -292,8 +345,10 @@ impl From<peercove_ops::settings::Settings> for Settings {
             host_endpoint: settings.host_endpoint,
             is_member: settings.is_member,
             direct: settings.direct,
+            max_recv_file_mb: settings.max_recv_file_mb,
             default_mtu: peercove_core::config::DEFAULT_MTU,
             default_listen_port: peercove_core::config::DEFAULT_LISTEN_PORT,
+            default_max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
         }
     }
 }
@@ -306,6 +361,7 @@ pub struct SettingsUpdate {
     pub mtu: u16,
     pub host_endpoint: Option<String>,
     pub direct: bool,
+    pub max_recv_file_mb: u64,
 }
 
 impl From<SettingsUpdate> for peercove_ops::settings::Update {
@@ -316,6 +372,7 @@ impl From<SettingsUpdate> for peercove_ops::settings::Update {
             mtu: update.mtu,
             host_endpoint: update.host_endpoint,
             direct: update.direct,
+            max_recv_file_mb: update.max_recv_file_mb,
         }
     }
 }
@@ -536,6 +593,7 @@ mod tests {
             host_endpoint: Some("203.0.113.5:51820".to_string()),
             is_member: true,
             direct: true,
+            max_recv_file_mb: 100,
         }))
         .unwrap();
         assert_eq!(json["hostEndpoint"], "203.0.113.5:51820");
@@ -543,6 +601,8 @@ mod tests {
         assert_eq!(json["direct"], true);
         assert!(json["listenPort"].is_null());
         assert_eq!(json["defaultMtu"], 1420);
+        assert_eq!(json["maxRecvFileMb"], 100);
+        assert_eq!(json["defaultMaxRecvFileMb"], 100);
 
         let update: SettingsUpdate = serde_json::from_value(serde_json::json!({
             "displayName": "bob",
@@ -550,6 +610,7 @@ mod tests {
             "mtu": 1380,
             "hostEndpoint": null,
             "direct": false,
+            "maxRecvFileMb": 500,
         }))
         .unwrap();
         let update: peercove_ops::settings::Update = update.into();
@@ -557,6 +618,7 @@ mod tests {
         assert_eq!(update.listen_port, Some(51900));
         assert_eq!(update.host_endpoint, None);
         assert!(!update.direct);
+        assert_eq!(update.max_recv_file_mb, 500);
     }
 
     #[test]

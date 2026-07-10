@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
+  InboxItem,
   Member,
   Peer,
+  Transfer,
   Tunnel,
   api,
   errorMessage,
@@ -37,7 +39,9 @@ export function TunnelView({
   const isHost = tunnel.role === "hosting";
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
   const peerByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer]));
-  const [tab, setTab] = useState<"members" | "stats">("members");
+  const [tab, setTab] = useState<"members" | "stats" | "inbox">("members");
+  /** 受信ボックスの中身(M3-9b)。status のポーリングに合わせて読み直す。 */
+  const [inbox, setInbox] = useState<InboxItem[]>([]);
   const [inviting, setInviting] = useState(false);
   const [showDns, setShowDns] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
@@ -46,6 +50,40 @@ export function TunnelView({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+
+  // 受信ボックス(ディレクトリ)は tunnel が 2 秒ごとに更新されるのに合わせて
+  // 読み直す。一覧はタブのバッジにも使うので、タブが閉じていても読む
+  useEffect(() => {
+    let alive = true;
+    api
+      .listInbox(tunnel.config)
+      .then((items) => {
+        if (alive) setInbox(items);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [tunnel]);
+
+  /** ファイル送信(M3-9b): ファイルを選んで、進捗の見える受信タブへ。 */
+  const sendFile = async (member: Member) => {
+    setError(null);
+    try {
+      const path = await api.pickFile();
+      if (!path) return;
+      await api.sendFile(tunnel.config, member.ip, path);
+      setTab("inbox");
+      setNotice(t.transfer.started(member.name ?? member.ip));
+      setTimeout(() => setNotice(null), 8000);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
+  const activeTransfers = tunnel.transfers.filter(
+    (transfer) => !transfer.done,
+  ).length;
 
   const stop = async () => {
     setBusy(true);
@@ -160,6 +198,16 @@ export function TunnelView({
           >
             {t.tunnel.tabs.stats}
           </button>
+          <button
+            type="button"
+            className={tab === "inbox" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
+            onClick={() => setTab("inbox")}
+          >
+            {t.tunnel.tabs.inbox}
+            {inbox.length + activeTransfers > 0 && (
+              <span className="tabs__badge">{inbox.length + activeTransfers}</span>
+            )}
+          </button>
           {isHost && tab === "members" && (
             <button
               type="button"
@@ -187,6 +235,7 @@ export function TunnelView({
                     onRemove={() => setRemoving(member)}
                     onRename={(newName) => void rename(member, newName)}
                     onSubnets={() => setEditingSubnets(member)}
+                    onSendFile={() => void sendFile(member)}
                   />
                 ))}
               </ul>
@@ -196,6 +245,17 @@ export function TunnelView({
               )}
             </>
           )
+        ) : tab === "inbox" ? (
+          <InboxPanel
+            tunnel={tunnel}
+            inbox={inbox}
+            onInboxChanged={(items) => setInbox(items)}
+            onNotice={(text) => {
+              setNotice(text);
+              setTimeout(() => setNotice(null), 8000);
+            }}
+            onError={(text) => setError(text)}
+          />
         ) : tunnel.peers.length === 0 ? (
           <p className="muted">{t.tunnel.peers.empty}</p>
         ) : (
@@ -247,6 +307,162 @@ export function TunnelView({
         />
       )}
     </>
+  );
+}
+
+/**
+ * 受信タブ(M3-9b): 転送の進捗と受信ボックス。
+ * 受信は自動(ADR-0015)なので、ここでは「保存」か「削除」だけを選ぶ。
+ */
+function InboxPanel({
+  tunnel,
+  inbox,
+  onInboxChanged,
+  onNotice,
+  onError,
+}: {
+  tunnel: Tunnel;
+  inbox: InboxItem[];
+  onInboxChanged: (items: InboxItem[]) => void;
+  onNotice: (text: string) => void;
+  onError: (text: string) => void;
+}) {
+  const nameByIp = new Map(
+    tunnel.members.map((member) => [member.ip, member.name ?? member.ip]),
+  );
+  // 新しいものを上に(レジストリは開始順で並んでいる)
+  const transfers = [...tunnel.transfers].reverse();
+
+  const refresh = () => {
+    api
+      .listInbox(tunnel.config)
+      .then(onInboxChanged)
+      .catch(() => {});
+  };
+
+  const save = async (item: InboxItem) => {
+    onError("");
+    try {
+      const saved = await api.saveInboxFile(tunnel.config, item.name);
+      if (saved) onNotice(t.inbox.savedTo(saved));
+      refresh();
+    } catch (e) {
+      onError(errorMessage(e));
+    }
+  };
+
+  const remove = async (item: InboxItem) => {
+    onError("");
+    try {
+      await api.deleteInboxFile(tunnel.config, item.name);
+      onNotice(t.inbox.deleted(item.name));
+      refresh();
+    } catch (e) {
+      onError(errorMessage(e));
+    }
+  };
+
+  return (
+    <>
+      {transfers.length > 0 && (
+        <>
+          <h3 className="section-head">{t.transfer.head}</h3>
+          <ul className="transfers">
+            {transfers.map((transfer) => (
+              <TransferRow
+                key={transfer.id}
+                transfer={transfer}
+                peerName={nameByIp.get(transfer.peer) ?? transfer.peer}
+              />
+            ))}
+          </ul>
+        </>
+      )}
+      <h3 className="section-head">{t.inbox.head}</h3>
+      {inbox.length === 0 ? (
+        <p className="muted">{t.inbox.empty}</p>
+      ) : (
+        <>
+          <ul className="inbox">
+            {inbox.map((item) => (
+              <li key={item.name} className="inbox__item">
+                <span className="inbox__id">
+                  <span className="mono ellipsis" title={item.name}>
+                    {item.name}
+                  </span>
+                  <span className="muted small">
+                    {item.fromName && t.inbox.from(item.fromName)}
+                    {" · "}
+                    {formatBytes(item.size)}
+                    {item.receivedUnixMs !== null &&
+                      ` · ${new Date(item.receivedUnixMs).toLocaleString()}`}
+                  </span>
+                </span>
+                <span className="row">
+                  <button type="button" onClick={() => void save(item)}>
+                    {t.inbox.save}
+                  </button>
+                  <button
+                    type="button"
+                    className="button--ghost"
+                    onClick={() => void remove(item)}
+                  >
+                    {t.inbox.delete}
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="muted small">{t.inbox.note}</p>
+        </>
+      )}
+    </>
+  );
+}
+
+/** 転送 1 件の行: 向き・相手・ファイル名・進捗バー(または結果)。 */
+function TransferRow({
+  transfer,
+  peerName,
+}: {
+  transfer: Transfer;
+  peerName: string;
+}) {
+  const percent =
+    transfer.size === 0
+      ? 100
+      : Math.min(100, Math.floor((transfer.transferred * 100) / transfer.size));
+  return (
+    <li className="transfer">
+      <span className="transfer__id">
+        <span>
+          <span className="tag">{t.transfer.direction(transfer.direction)}</span>{" "}
+          <span className="mono ellipsis" title={transfer.name}>
+            {transfer.name}
+          </span>
+        </span>
+        <span className="muted small">{peerName}</span>
+      </span>
+      <span className="transfer__state">
+        {transfer.error ? (
+          <span className="error-text small">{t.transfer.failed(transfer.error)}</span>
+        ) : transfer.done ? (
+          <span className="muted small">{t.transfer.done}</span>
+        ) : (
+          <>
+            <span className="progress" title={`${percent}%`}>
+              <span className="progress__bar" style={{ width: `${percent}%` }} />
+            </span>
+            <span className="muted small stat">
+              {t.transfer.progress(
+                formatBytes(transfer.transferred),
+                formatBytes(transfer.size),
+              )}
+            </span>
+          </>
+        )}
+      </span>
+    </li>
   );
 }
 
@@ -308,6 +524,7 @@ function MemberRow({
   onRemove,
   onRename,
   onSubnets,
+  onSendFile,
 }: {
   config: string;
   member: Member;
@@ -318,10 +535,14 @@ function MemberRow({
   onRename: (newName: string) => void;
   /** 広告サブネットの編集を開く(M3-7b、ホストのみ)。 */
   onSubnets: () => void;
+  /** このメンバーへファイルを送る(M3-9b)。 */
+  onSendFile: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(member.name ?? "");
   const rates = peer ? rateSeries(config, peer.publicKey) : [];
+  // 送れるのはオンラインの他人だけ(オフライン宛は V1 非対応 — ADR-0015)
+  const canSend = member.online && !member.isSelf;
 
   const commit = () => {
     const trimmed = draft.trim();
@@ -400,35 +621,49 @@ function MemberRow({
           </span>
         )}
       </span>
-      {canManage && !editing && (
+      {(canManage || canSend) && !editing && (
         <span className="member__actions">
-          <button
-            type="button"
-            className="button--icon"
-            title={t.subnet.edit}
-            onClick={onSubnets}
-          >
-            🖧
-          </button>
-          <button
-            type="button"
-            className="button--icon"
-            title={t.tunnel.member.rename}
-            onClick={() => {
-              setDraft(member.name ?? "");
-              setEditing(true);
-            }}
-          >
-            ✎
-          </button>
-          <button
-            type="button"
-            className="button--icon button--icon-danger"
-            title={t.tunnel.member.remove}
-            onClick={onRemove}
-          >
-            ×
-          </button>
+          {canSend && (
+            <button
+              type="button"
+              className="button--icon"
+              title={t.tunnel.member.sendFile}
+              onClick={onSendFile}
+            >
+              📤
+            </button>
+          )}
+          {canManage && (
+            <>
+              <button
+                type="button"
+                className="button--icon"
+                title={t.subnet.edit}
+                onClick={onSubnets}
+              >
+                🖧
+              </button>
+              <button
+                type="button"
+                className="button--icon"
+                title={t.tunnel.member.rename}
+                onClick={() => {
+                  setDraft(member.name ?? "");
+                  setEditing(true);
+                }}
+              >
+                ✎
+              </button>
+              <button
+                type="button"
+                className="button--icon button--icon-danger"
+                title={t.tunnel.member.remove}
+                onClick={onRemove}
+              >
+                ×
+              </button>
+            </>
+          )}
         </span>
       )}
     </li>
