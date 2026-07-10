@@ -71,6 +71,29 @@ fn nat_rule_args(op: &str, virt: &str, subnet: &str) -> Vec<String> {
     .collect()
 }
 
+/// FORWARD 許可ルールの引数。Docker 等が FORWARD の既定ポリシーを DROP に
+/// している環境では、これが無いとトンネル ↔ LAN の転送が落ちる。
+/// `-I`(先頭挿入)で Docker の隔離ルールより先に評価させる。
+fn forward_rule_args(op: &str, src: &str, dst: &str) -> Vec<String> {
+    [
+        op,
+        "FORWARD",
+        "-s",
+        src,
+        "-d",
+        dst,
+        "-j",
+        "ACCEPT",
+        "-m",
+        "comment",
+        "--comment",
+        "peercove-subnet-router",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 fn iptables(args: &[String]) -> anyhow::Result<String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run("iptables", &args)
@@ -133,17 +156,26 @@ impl LinuxBackend {
         Ok(())
     }
 
+    /// 1 サブネット分の iptables ルール(NAT + FORWARD 両方向)を削除する。
+    fn remove_subnet_rules(virt: &ipnet::Ipv4Net, subnet: &ipnet::Ipv4Net, snat: bool) {
+        let (virt, subnet) = (virt.to_string(), subnet.to_string());
+        if snat {
+            if let Err(e) = iptables(&nat_rule_args("-D", &virt, &subnet)) {
+                tracing::warn!("NAT ルールの削除に失敗しました({subnet}): {e:#}");
+            }
+        }
+        for (src, dst) in [(&virt, &subnet), (&subnet, &virt)] {
+            if let Err(e) = iptables(&forward_rule_args("-D", src, dst)) {
+                tracing::warn!("FORWARD ルールの削除に失敗しました({src}→{dst}): {e:#}");
+            }
+        }
+    }
+
     /// ルーター役の適用済み状態をすべて解除する(down・全撤回の共通処理)。
     fn clear_router(&mut self) {
         if let Some(virt) = self.router.virtual_subnet {
             for (subnet, snat) in std::mem::take(&mut self.router.subnets) {
-                if snat {
-                    if let Err(e) =
-                        iptables(&nat_rule_args("-D", &virt.to_string(), &subnet.to_string()))
-                    {
-                        tracing::warn!("NAT ルールの削除に失敗しました({subnet}): {e:#}");
-                    }
-                }
+                Self::remove_subnet_rules(&virt, &subnet, snat);
             }
         }
         for if_name in std::mem::take(&mut self.router.enabled_forwarding) {
@@ -311,13 +343,7 @@ impl WgBackend for LinuxBackend {
                 .partition(|(subnet, _)| desired.contains(subnet));
             self.router.subnets = keep;
             for (subnet, applied_snat) in gone {
-                if applied_snat {
-                    if let Err(e) =
-                        iptables(&nat_rule_args("-D", &virt.to_string(), &subnet.to_string()))
-                    {
-                        tracing::warn!("NAT ルールの削除に失敗しました({subnet}): {e:#}");
-                    }
-                }
+                Self::remove_subnet_rules(&virt, &subnet, applied_snat);
                 tracing::info!("サブネット {subnet} の広告を解除しました");
             }
         }
@@ -336,6 +362,17 @@ impl WgBackend for LinuxBackend {
             let lan_if = self.lan_interface_for(subnet)?;
             self.ensure_forwarding(&wg_if)?;
             self.ensure_forwarding(&lan_if)?;
+            // FORWARD の明示許可(両方向)。Docker が入っている環境は FORWARD の
+            // 既定ポリシーが DROP のため、これが無いと転送が黙って落ちる
+            let (virt_str, subnet_str) = (virtual_subnet.to_string(), subnet.to_string());
+            for (src, dst) in [(&virt_str, &subnet_str), (&subnet_str, &virt_str)] {
+                if iptables(&forward_rule_args("-C", src, dst)).is_err() {
+                    iptables(&forward_rule_args("-I", src, dst)).context(
+                        "FORWARD 許可ルールの設定に失敗しました。iptables が必要です \
+                         (sudo apt install iptables)",
+                    )?;
+                }
+            }
             if snat {
                 let args_check =
                     nat_rule_args("-C", &virtual_subnet.to_string(), &subnet.to_string());
