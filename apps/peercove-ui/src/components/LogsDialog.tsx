@@ -105,11 +105,11 @@ export function LogsDialog({ onClose }: { onClose: () => void }) {
           ) : (
             visible.map((line) => (
               <div key={line.seq} className="logs__line">
-                <span className="muted">{formatLogTime(line.unixMs)}</span>
+                <span className="muted logs__time">{formatLogTime(line.unixMs)}</span>
                 <span className={`logs__level-${line.level.toLowerCase()}`}>
                   {line.level}
                 </span>
-                <span>{line.message}</span>
+                <span className="logs__message">{line.message}</span>
               </div>
             ))
           )}

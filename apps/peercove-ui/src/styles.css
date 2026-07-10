@@ -562,9 +562,19 @@ select {
 }
 
 .logs__line {
+  /* 時刻・レベル列は内容幅に合わせ、折り返しはメッセージ列だけに限定する。
+     固定幅 + overflow-wrap: anywhere だと時刻の末尾桁が列内で折り返して
+     「行頭に数字だけの行」が挟まって見える(検証フィードバック) */
   display: grid;
-  grid-template-columns: 84px 44px minmax(0, 1fr);
+  grid-template-columns: max-content max-content minmax(0, 1fr);
   gap: 8px;
+}
+
+.logs__time {
+  white-space: nowrap;
+}
+
+.logs__message {
   overflow-wrap: anywhere;
 }
 
@@ -606,6 +616,18 @@ select {
 .tag--danger {
   color: var(--danger, #d33);
   border-color: var(--danger, #d33);
+}
+
+/* 長いパスなどを枠内で折り返す(設定画面の設定ファイルパス等) */
+.wrap-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+/* 自分自身の行の印 */
+.tag--self {
+  color: var(--accent, #58a);
+  border-color: var(--accent, #58a);
 }
 
 /* メンバー間の経路バッジ(M3-4)。直接 = 良い状態なのでオンライン色 */

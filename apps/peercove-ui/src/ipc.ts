@@ -19,6 +19,8 @@ export interface Member {
    * direct = 直接通信中 / trying = 確立中 / relay = ホスト経由。
    */
   route: "direct" | "trying" | "relay" | null;
+  /** この行が自分自身か。 */
+  isSelf: boolean;
 }
 
 /** カスタム DNS レコード（M3-1c）。 */
@@ -110,6 +112,8 @@ export interface Settings {
   mtu: number;
   hostEndpoint: string | null;
   isMember: boolean;
+  /** メンバー間直接通信を試すか（ADR-0013、既定 true）。 */
+  direct: boolean;
   defaultMtu: number;
   defaultListenPort: number;
 }
@@ -119,6 +123,7 @@ export interface SettingsUpdate {
   listenPort: number | null;
   mtu: number;
   hostEndpoint: string | null;
+  direct: boolean;
 }
 
 export interface SaveResult {

@@ -66,6 +66,7 @@ function SettingsForm({
   );
   const [mtu, setMtu] = useState(String(settings.mtu));
   const [hostEndpoint, setHostEndpoint] = useState(settings.hostEndpoint ?? "");
+  const [direct, setDirect] = useState(settings.direct);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -89,6 +90,7 @@ function SettingsForm({
           settings.isMember && hostEndpoint.trim() !== ""
             ? hostEndpoint.trim()
             : null,
+        direct,
       });
       setNotice(
         result.restartRequired
@@ -111,7 +113,7 @@ function SettingsForm({
           <dt>{t.common.virtualIp}</dt>
           <dd className="mono">{settings.address}</dd>
           <dt>{t.common.configFile}</dt>
-          <dd className="mono ellipsis" title={configPath}>
+          <dd className="mono wrap-anywhere" title={configPath}>
             {configPath}
           </dd>
         </dl>
@@ -171,6 +173,20 @@ function SettingsForm({
               placeholder={t.settings.hostEndpointPlaceholder}
               onChange={(event) => setHostEndpoint(event.target.value)}
             />
+          </label>
+        )}
+
+        {settings.isMember && (
+          <label className="field--check">
+            <input
+              type="checkbox"
+              checked={direct}
+              onChange={(event) => setDirect(event.target.checked)}
+            />
+            <span>
+              {t.settings.directLabel}
+              <small className="muted"> {t.settings.directHint}</small>
+            </span>
           </label>
         )}
 

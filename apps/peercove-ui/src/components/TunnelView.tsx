@@ -280,6 +280,11 @@ function MemberRow({
           {member.dnsName}
         </span>
       )}
+      {member.isSelf && (
+        <span className="tag tag--self" title={t.tunnel.member.selfTitle}>
+          {t.tunnel.member.self}
+        </span>
+      )}
       {member.isHost && <span className="tag">host</span>}
       {member.route && (
         <span

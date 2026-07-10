@@ -39,6 +39,9 @@ pub struct Settings {
     pub host_endpoint: Option<String>,
     /// この設定がメンバー設定か(= ピアが 1 つで endpoint を持つ)。
     pub is_member: bool,
+    /// メンバー間直接通信を試すか(ADR-0013、既定 true)。
+    /// 反映は次の supervisor 周期(約 5 秒)— 再起動不要。
+    pub direct: bool,
 }
 
 impl Settings {
@@ -60,6 +63,8 @@ pub struct Update {
     pub mtu: u16,
     /// メンバー設定のときだけ意味を持つ。ホスト設定では無視する。
     pub host_endpoint: Option<String>,
+    /// メンバー間直接通信を試すか(ADR-0013)。
+    pub direct: bool,
 }
 
 /// 現在の設定を読む。
@@ -79,6 +84,7 @@ pub fn read(config_path: &Path) -> anyhow::Result<Settings> {
         mtu: config.interface.mtu,
         is_member: host_endpoint.is_some(),
         host_endpoint,
+        direct: config.interface.direct,
     })
 }
 
@@ -131,6 +137,11 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         None => interface.remove("listen_port"),
     };
     interface.insert("mtu", toml_edit::value(i64::from(update.mtu)));
+    // direct は既定(true)なら書かない(設定ファイルを汚さない)
+    match update.direct {
+        true => interface.remove("direct"),
+        false => interface.insert("direct", toml_edit::value(false)),
+    };
 
     // endpoint はメンバー設定(ピア 1 つ)のときだけ触る。ホスト設定のピアは
     // メンバーの登録なので、ここから書き換えてはいけない
@@ -195,6 +206,7 @@ allowed_ips = ["10.119.96.2/32"]
         assert_eq!(member.host_endpoint.as_deref(), Some("203.0.113.5:51820"));
         assert_eq!(member.display_name.as_deref(), Some("alice"));
         assert_eq!(member.listen_port, None);
+        assert!(member.direct, "未指定なら既定 true");
 
         let host = read(&write("read-host", HOST)).unwrap();
         assert!(!host.is_member, "ホストのピアは endpoint を持たない");
@@ -212,6 +224,7 @@ allowed_ips = ["10.119.96.2/32"]
                 listen_port: Some(51900),
                 mtu: 1380,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
+                direct: false,
             },
         )
         .unwrap();
@@ -219,12 +232,30 @@ allowed_ips = ["10.119.96.2/32"]
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# 参加設定"), "コメントが保持される");
         assert!(text.contains("persistent_keepalive = 25"), "他項目は不変");
+        assert!(text.contains("direct = false"), "false なら書かれる");
 
         let after = read(&path).unwrap();
         assert_eq!(after.display_name.as_deref(), Some("alice2"), "trim される");
         assert_eq!(after.listen_port, Some(51900));
         assert_eq!(after.mtu, 1380);
         assert_eq!(after.host_endpoint.as_deref(), Some("198.51.100.7:51820"));
+        assert!(!after.direct);
+
+        // true に戻すと行ごと消える(既定なので書かない)
+        update(
+            &path,
+            &Update {
+                display_name: Some("alice2".to_string()),
+                listen_port: Some(51900),
+                mtu: 1380,
+                host_endpoint: None,
+                direct: true,
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("direct"), "既定値なら書かない");
+        assert!(read(&path).unwrap().direct);
     }
 
     /// ホスト設定では endpoint を渡されても `[[peer]]`(= メンバー登録)を触らない。
@@ -238,6 +269,7 @@ allowed_ips = ["10.119.96.2/32"]
                 listen_port: None,
                 mtu: 1400,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
+                direct: true,
             },
         )
         .unwrap();
@@ -255,6 +287,7 @@ allowed_ips = ["10.119.96.2/32"]
             listen_port: None,
             mtu: 1420,
             host_endpoint: None,
+            direct: true,
         };
 
         let bad_mtu = Update {
@@ -296,8 +329,16 @@ allowed_ips = ["10.119.96.2/32"]
             listen_port: current.listen_port,
             mtu: current.mtu,
             host_endpoint: current.host_endpoint.clone(),
+            direct: current.direct,
         };
         assert!(!current.restart_required(&same));
+        assert!(
+            !current.restart_required(&Update {
+                direct: false,
+                ..same.clone()
+            }),
+            "direct は約 5 秒で反映されるので再起動不要"
+        );
         assert!(!current.restart_required(&Update {
             display_name: Some("bob".to_string()),
             ..same.clone()

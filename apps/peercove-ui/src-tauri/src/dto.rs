@@ -20,10 +20,17 @@ pub struct Member {
     /// このメンバーへの経路(ADR-0013、M3-4)。member ロールで他メンバーに
     /// 対してのみ "direct" | "trying" | "relay"。ホスト・自分・host ロールでは null。
     pub route: Option<&'static str>,
+    /// この行が自分自身か(仮想 IP の一致で判定)。UI が「自分」と表示する。
+    pub is_self: bool,
 }
 
 impl Member {
-    fn from_entry(entry: &LedgerEntry, dns_name: Option<String>, route: Option<&'static str>) -> Self {
+    fn from_entry(
+        entry: &LedgerEntry,
+        dns_name: Option<String>,
+        route: Option<&'static str>,
+        is_self: bool,
+    ) -> Self {
         Self {
             name: entry.name.clone(),
             ip: entry.ip.to_string(),
@@ -32,6 +39,7 @@ impl Member {
             is_host: entry.is_host,
             dns_name,
             route,
+            is_self,
         }
     }
 }
@@ -102,12 +110,10 @@ impl From<&TunnelInfo> for Tunnel {
                     let dns_name = dns_by_key
                         .get(entry.public_key.as_bytes())
                         .map(|s| s.to_string());
+                    let is_self = entry.ip == info.address;
                     // 経路(M3-4): member ロールで「ホストでも自分でもない相手」
                     // にだけ意味がある。直接経路が無ければ中継(ホスト経由)
-                    let route = if info.role == TunnelRole::Member
-                        && !entry.is_host
-                        && entry.ip != info.address
-                    {
+                    let route = if info.role == TunnelRole::Member && !entry.is_host && !is_self {
                         Some(match info.direct.get(&entry.ip) {
                             Some(peercove_core::ipc::DirectStatus::Direct) => "direct",
                             Some(peercove_core::ipc::DirectStatus::Trying) => "trying",
@@ -116,7 +122,7 @@ impl From<&TunnelInfo> for Tunnel {
                     } else {
                         None
                     };
-                    Member::from_entry(entry, dns_name, route)
+                    Member::from_entry(entry, dns_name, route, is_self)
                 })
                 .collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
@@ -265,6 +271,8 @@ pub struct Settings {
     pub mtu: u16,
     pub host_endpoint: Option<String>,
     pub is_member: bool,
+    /// メンバー間直接通信を試すか(ADR-0013)。
+    pub direct: bool,
     /// 既定値。UI の入力欄のプレースホルダに使う。
     pub default_mtu: u16,
     pub default_listen_port: u16,
@@ -280,6 +288,7 @@ impl From<peercove_ops::settings::Settings> for Settings {
             mtu: settings.mtu,
             host_endpoint: settings.host_endpoint,
             is_member: settings.is_member,
+            direct: settings.direct,
             default_mtu: peercove_core::config::DEFAULT_MTU,
             default_listen_port: peercove_core::config::DEFAULT_LISTEN_PORT,
         }
@@ -293,6 +302,7 @@ pub struct SettingsUpdate {
     pub listen_port: Option<u16>,
     pub mtu: u16,
     pub host_endpoint: Option<String>,
+    pub direct: bool,
 }
 
 impl From<SettingsUpdate> for peercove_ops::settings::Update {
@@ -302,6 +312,7 @@ impl From<SettingsUpdate> for peercove_ops::settings::Update {
             listen_port: update.listen_port,
             mtu: update.mtu,
             host_endpoint: update.host_endpoint,
+            direct: update.direct,
         }
     }
 }
@@ -455,12 +466,18 @@ mod tests {
         assert_eq!(
             routes,
             vec![
-                None,            // ホスト
-                None,            // 自分
-                Some("direct"),  // 直接通信中
-                Some("trying"),  // 確立中
-                Some("relay"),   // ホスト経由
+                None,           // ホスト
+                None,           // 自分
+                Some("direct"), // 直接通信中
+                Some("trying"), // 確立中
+                Some("relay"),  // ホスト経由
             ]
+        );
+        let selves: Vec<bool> = tunnel.members.iter().map(|m| m.is_self).collect();
+        assert_eq!(
+            selves,
+            vec![false, true, false, false, false],
+            "仮想 IP が一致する行だけ自分(UI の「自分」タグ)"
         );
     }
 
@@ -511,10 +528,12 @@ mod tests {
             mtu: 1420,
             host_endpoint: Some("203.0.113.5:51820".to_string()),
             is_member: true,
+            direct: true,
         }))
         .unwrap();
         assert_eq!(json["hostEndpoint"], "203.0.113.5:51820");
         assert_eq!(json["isMember"], true);
+        assert_eq!(json["direct"], true);
         assert!(json["listenPort"].is_null());
         assert_eq!(json["defaultMtu"], 1420);
 
@@ -523,12 +542,14 @@ mod tests {
             "listenPort": 51900,
             "mtu": 1380,
             "hostEndpoint": null,
+            "direct": false,
         }))
         .unwrap();
         let update: peercove_ops::settings::Update = update.into();
         assert_eq!(update.display_name.as_deref(), Some("bob"));
         assert_eq!(update.listen_port, Some(51900));
         assert_eq!(update.host_endpoint, None);
+        assert!(!update.direct);
     }
 
     #[test]
