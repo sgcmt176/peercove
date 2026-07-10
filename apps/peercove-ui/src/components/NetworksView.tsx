@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NetworkInfo, Tunnel, api, errorMessage } from "../ipc";
 import { ConfirmModal } from "./Modal";
 import { t } from "../i18n";
@@ -9,6 +9,7 @@ import { t } from "../i18n";
  * 設定済みネットワーク(listNetworks)と稼働中トンネル(Status.tunnels)を
  * configPath で突き合わせ、カードごとに接続/切断/削除できる。
  * 「+ 追加」からホスト新規作成(名前入力)と招待トークンでの参加ができる。
+ * 招待ディープリンク(M3-5)は pendingJoin 経由で参加フォームを事前入力で開く。
  */
 export function NetworksView({
   networks,
@@ -16,6 +17,8 @@ export function NetworksView({
   onChanged,
   onOpen,
   onSettings,
+  pendingJoin,
+  onPendingJoinHandled,
 }: {
   networks: NetworkInfo[];
   tunnels: Tunnel[];
@@ -23,11 +26,24 @@ export function NetworksView({
   /** 稼働中ネットワークの詳細を開く(configPath)。 */
   onOpen: (configPath: string) => void;
   onSettings: (configPath: string) => void;
+  /** ディープリンクで受けた招待トークン(M3-5)。 */
+  pendingJoin: { token: string } | null;
+  onPendingJoinHandled: () => void;
 }) {
   const [adding, setAdding] = useState<"host" | "join" | null>(null);
   const [removing, setRemoving] = useState<NetworkInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** 参加フォームへ事前入力するトークン(ディープリンク経由)。 */
+  const [prefillToken, setPrefillToken] = useState("");
+
+  useEffect(() => {
+    if (pendingJoin) {
+      setPrefillToken(pendingJoin.token);
+      setAdding("join");
+      onPendingJoinHandled();
+    }
+  }, [pendingJoin, onPendingJoinHandled]);
 
   const byConfig = new Map(tunnels.map((tun) => [tun.config, tun]));
   // 一覧に無い設定で稼働しているトンネル(CLI で任意パス起動など)も見せる
@@ -81,8 +97,10 @@ export function NetworksView({
         )}
         {adding === "join" && (
           <JoinForm
+            initialToken={prefillToken}
             onJoined={() => {
               setAdding(null);
+              setPrefillToken("");
               onChanged();
             }}
           />
@@ -324,11 +342,23 @@ function CreateHostForm({ onCreated }: { onCreated: () => void }) {
 }
 
 /** 招待トークンでの参加フォーム(StartView から移設)。 */
-function JoinForm({ onJoined }: { onJoined: () => void }) {
-  const [token, setToken] = useState("");
+function JoinForm({
+  initialToken,
+  onJoined,
+}: {
+  /** ディープリンク(M3-5)からの事前入力。空文字なら手入力。 */
+  initialToken: string;
+  onJoined: () => void;
+}) {
+  const [token, setToken] = useState(initialToken);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [overwrite, setOverwrite] = useState(false);
+
+  // フォームを開いたまま別のディープリンクが届いたら差し替える
+  useEffect(() => {
+    if (initialToken) setToken(initialToken);
+  }, [initialToken]);
 
   const join = async () => {
     setError(null);

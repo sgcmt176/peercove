@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { Connection, Member, NetworkInfo, api, errorMessage } from "./ipc";
 import { t } from "./i18n";
 import { diffMembers, notifyMemberEvents } from "./notify";
@@ -9,6 +10,25 @@ import { SettingsDialog } from "./components/SettingsDialog";
 
 /** デーモンの状態を取りに行く間隔。CLI の status(5 秒)より短くしておく。 */
 const POLL_INTERVAL_MS = 2000;
+
+/**
+ * 招待ディープリンク `peercove://join?token=…` からトークンを取り出す(M3-5)。
+ * 該当しない URL は null(黙って無視する)。
+ */
+export function parseJoinUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "peercove:") return null;
+    // `peercove://join` はパーサによって hostname になったり pathname に
+    // なったりするため両方を見る
+    const action = parsed.hostname || parsed.pathname.replace(/^\/+/, "");
+    if (action !== "join") return null;
+    const token = parsed.searchParams.get("token")?.trim();
+    return token ? token : null;
+  } catch {
+    return null;
+  }
+}
 
 export default function App() {
   const [connection, setConnection] = useState<Connection>({
@@ -21,6 +41,11 @@ export default function App() {
   const [settingsFor, setSettingsFor] = useState<string | null>(null);
   /** 詳細表示中のネットワーク(configPath)。null なら一覧。 */
   const [openConfig, setOpenConfig] = useState<string | null>(null);
+  /**
+   * ディープリンクで受けた招待トークン(M3-5)。オブジェクトで包むのは、
+   * 同じリンクを 2 回クリックしても再度フォームを開くため(参照が変わる)。
+   */
+  const [pendingJoin, setPendingJoin] = useState<{ token: string } | null>(null);
 
   // 通知の差分計算に使う前回の台帳(ネットワークごと)。レンダー非依存なので ref
   const previousMembers = useRef<Map<string, Member[]>>(new Map());
@@ -65,6 +90,29 @@ export default function App() {
     const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [refresh]);
+
+  // 招待ディープリンク(M3-5)。起動時の URL と、稼働中に届いた URL の両方が
+  // ここへ来る(single-instance が二重起動分を転送する)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let closed = false;
+    void onOpenUrl((urls) => {
+      for (const url of urls) {
+        const token = parseJoinUrl(url);
+        if (token) {
+          setPendingJoin({ token });
+          setOpenConfig(null); // 参加フォームのある一覧画面へ
+        }
+      }
+    }).then((fn) => {
+      if (closed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      closed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     refreshNetworks();
@@ -137,6 +185,8 @@ export default function App() {
           onChanged={changed}
           onOpen={(configPath) => setOpenConfig(configPath)}
           onSettings={(configPath) => setSettingsFor(configPath)}
+          pendingJoin={pendingJoin}
+          onPendingJoinHandled={() => setPendingJoin(null)}
         />
       )}
 

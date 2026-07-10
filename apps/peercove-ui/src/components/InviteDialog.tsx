@@ -23,7 +23,7 @@ export function InviteDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<InviteResult | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"token" | "link" | null>(null);
 
   const submit = async () => {
     setBusy(true);
@@ -40,12 +40,18 @@ export function InviteDialog({
     }
   };
 
-  const copy = async () => {
+  const copy = async (kind: "token" | "link") => {
     if (!result) return;
     try {
-      await writeText(result.token);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      // 参加リンク(M3-5): クリックすると PeerCove が開いて参加フォームに
+      // トークンが入る。アプリ未導入の相手にはトークンをそのまま渡す
+      const text =
+        kind === "token"
+          ? result.token
+          : `peercove://join?token=${encodeURIComponent(result.token)}`;
+      await writeText(text);
+      setCopied(kind);
+      setTimeout(() => setCopied(null), 2000);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -72,9 +78,20 @@ export function InviteDialog({
                 <dd>{result.psk ? t.invite.yes : t.invite.no}</dd>
               </dl>
               <textarea className="token" readOnly value={result.token} rows={3} />
-              <button type="button" onClick={() => void copy()}>
-                {copied ? t.invite.copied : t.invite.copy}
-              </button>
+              <div className="row">
+                <button type="button" onClick={() => void copy("token")}>
+                  {copied === "token" ? t.invite.copied : t.invite.copy}
+                </button>
+                <button
+                  type="button"
+                  className="button--ghost"
+                  title={t.invite.copyLinkHint}
+                  onClick={() => void copy("link")}
+                >
+                  {copied === "link" ? t.invite.copied : t.invite.copyLink}
+                </button>
+              </div>
+              <p className="muted small">{t.invite.copyLinkHint}</p>
               {error && <p className="error-text">{error}</p>}
             </div>
           </div>

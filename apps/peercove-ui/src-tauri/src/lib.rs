@@ -326,11 +326,34 @@ fn save_settings(config_path: String, update: SettingsUpdate) -> Result<SaveResu
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 単一インスタンス(M3-5)。**必ず最初に登録する**(公式ドキュメントの指定)。
+        // 二重起動されたら既存ウィンドウを前面に出す。deep-link feature により、
+        // 二重起動側が受けた peercove:// URL は既存インスタンスの
+        // onOpenUrl イベントとして配送される
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             tray::setup(app.handle())?;
+            // peercove:// スキームを OS に登録(M3-5)。インストーラも登録するが、
+            // 開発ビルド・手動配置でも動くようランタイムでも登録する
+            // (Windows: HKCU レジストリ / Linux: ~/.local の .desktop)。
+            // 失敗してもディープリンクが使えないだけなので起動は続ける
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    eprintln!("URL スキームの登録に失敗しました(ディープリンクは無効): {e}");
+                }
+            }
             Ok(())
         })
         // ウィンドウを閉じてもプロセスは残す(トレイ常駐 — M2-G6)。
