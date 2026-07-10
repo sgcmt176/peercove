@@ -17,8 +17,8 @@ use std::time::SystemTime;
 use anyhow::{bail, Context};
 use peercove_core::dns::DnsRecord;
 use peercove_core::ipc::{
-    DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult, PeerSummary,
-    TunnelInfo, TunnelRole, IPC_VERSION,
+    ChatMessageInfo, DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult,
+    PeerSummary, TunnelInfo, TunnelRole, IPC_VERSION,
 };
 use peercove_ipc::MAX_LINE_LEN;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -60,6 +60,9 @@ struct Active {
     /// ファイル転送の進捗一覧(ADR-0015、M3-9)。supervise 内の受信サーバーと
     /// SendFile の送信タスクが書き、status 応答に載せる
     transfers: crate::msg::TransferRegistry,
+    /// チャット履歴(ADR-0016、M3-13)。supervise 内の受信サーバーと
+    /// ChatSend が書き、ChatFetch / status 応答(chat_seq)が読む
+    chat: crate::chat::SharedChatLog,
 }
 
 impl DaemonShared {
@@ -105,7 +108,125 @@ impl DaemonShared {
                 let id = self.send_file(config, peer, path).await?;
                 Ok(IpcResponse::Transfer { id })
             }
+            IpcRequest::ChatSend {
+                config,
+                scope,
+                peer,
+                text,
+            } => self.chat_send(config, scope, peer, text).await,
+            IpcRequest::ChatFetch { config, after_seq } => {
+                let active = self.active.lock().await;
+                let active = active.get(&Self::key_for(&config)).with_context(|| {
+                    format!("この設定のトンネルは動いていません({})", config.display())
+                })?;
+                let (seq, messages) = active.chat.lock().unwrap().fetch(after_seq);
+                Ok(IpcResponse::Chat { seq, messages })
+            }
         }
+    }
+
+    /// チャットを送る(ADR-0016、M3-13)。履歴への記録は即時、相手への配送は
+    /// バックグラウンド(全宛先に失敗したら履歴に失敗の印が付く)。
+    async fn chat_send(
+        &self,
+        config: PathBuf,
+        scope: peercove_core::msg::ChatScope,
+        peer: Option<Ipv4Addr>,
+        text: String,
+    ) -> anyhow::Result<IpcResponse> {
+        use peercove_core::msg::{ChatScope, MAX_CHAT_TEXT_BYTES};
+
+        if text.trim().is_empty() {
+            bail!("本文が空です");
+        }
+        if text.len() > MAX_CHAT_TEXT_BYTES {
+            bail!("本文が長すぎます(上限 {} KB)", MAX_CHAT_TEXT_BYTES / 1024);
+        }
+        let active = self.active.lock().await;
+        let active = active
+            .get(&Self::key_for(&config))
+            .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
+        let ledger = {
+            let snapshot = active.snapshot.lock().unwrap();
+            snapshot
+                .as_ref()
+                .and_then(|s| s.ledger.clone())
+                .unwrap_or_default()
+        };
+        // 宛先の決定(オフライン宛は V1 非対応 — ADR-0015/0016)
+        let targets: Vec<Ipv4Addr> = match scope {
+            ChatScope::Direct => {
+                let peer = peer.context("宛先(peer)が指定されていません")?;
+                if peer == active.address {
+                    bail!("自分自身へは送れません");
+                }
+                let entry = ledger
+                    .iter()
+                    .find(|e| e.ip == peer)
+                    .with_context(|| format!("{peer} はこのネットワークのメンバーにいません"))?;
+                if !entry.online {
+                    bail!(
+                        "{} はオフラインです(オフラインのメンバーへは送れません)",
+                        entry.name.as_deref().unwrap_or(&peer.to_string())
+                    );
+                }
+                vec![peer]
+            }
+            // 全体宛: 送信時にオンラインのメンバー全員へ個別送信。全員オフライン
+            // でも履歴には残す(誰にも届かないことは README に明記)
+            ChatScope::Network => ledger
+                .iter()
+                .filter(|e| e.ip != active.address && e.online)
+                .map(|e| e.ip)
+                .collect(),
+        };
+        let id = crate::msg::new_transfer_id();
+        let sent_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let entry = active.chat.lock().unwrap().append(ChatMessageInfo {
+            seq: 0, // append が振る
+            id: id.clone(),
+            scope,
+            from: active.address,
+            to: match scope {
+                ChatScope::Direct => peer,
+                ChatScope::Network => None,
+            },
+            text: text.clone(),
+            sent_at,
+            failed: false,
+        });
+        let chat = Arc::clone(&active.chat);
+        let seq = entry.seq;
+        tokio::spawn(async move {
+            let mut delivered = targets.is_empty(); // 宛先ゼロの全体宛は失敗扱いにしない
+            let sends = targets.into_iter().map(|target| {
+                let id = id.clone();
+                let text = text.clone();
+                tokio::spawn(async move {
+                    // 本文はログに出さない(秘匿ルール)
+                    match crate::msg::send_chat(target, &id, scope, &text, sent_at).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!("{target} へのチャット送信に失敗しました: {e:#}");
+                            false
+                        }
+                    }
+                })
+            });
+            for send in sends.collect::<Vec<_>>() {
+                delivered |= send.await.unwrap_or(false);
+            }
+            if !delivered {
+                chat.lock().unwrap().mark_failed(seq);
+            }
+        });
+        Ok(IpcResponse::Chat {
+            seq,
+            messages: vec![entry],
+        })
     }
 
     /// メンバーへのファイル送信を開始する(ADR-0015、M3-9)。送信自体は
@@ -209,13 +330,22 @@ impl DaemonShared {
         let (stop_tx, stop_rx) = watch::channel(false);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let transfers: crate::msg::TransferRegistry = Default::default();
+        // チャット履歴の読み込み(数 MB 程度の同期 I/O。起動時のみ)
+        let chat = crate::chat::ChatLog::load(&config);
         let task_snapshot = Arc::clone(&snapshot);
         let task_transfers = Arc::clone(&transfers);
+        let task_chat = Arc::clone(&chat);
         let task_config = config.clone();
         let task = tokio::spawn(async move {
             let mut tunnel = tunnel;
             let supervise_result = tunnel
-                .supervise_run(&task_config, stop_rx, Some(task_snapshot), task_transfers)
+                .supervise_run(
+                    &task_config,
+                    stop_rx,
+                    Some(task_snapshot),
+                    task_transfers,
+                    task_chat,
+                )
                 .await;
             // クリーンアップ(ブロッキング)は必ず実行する
             let down_result =
@@ -239,6 +369,7 @@ impl DaemonShared {
                 dns_task,
                 snapshot,
                 transfers,
+                chat,
             },
         );
         drop(active);
@@ -421,6 +552,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         direct,
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)
         transfers: active.transfers.lock().unwrap().clone(),
+        chat_seq: active.chat.lock().unwrap().latest_seq(),
     }
 }
 

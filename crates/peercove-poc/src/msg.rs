@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use peercove_core::ipc::{TransferDirection, TransferInfo};
-use peercove_core::msg::{MsgFrame, MSG_PORT, MSG_VERSION};
+use peercove_core::ipc::{ChatMessageInfo, TransferDirection, TransferInfo};
+use peercove_core::msg::{ChatScope, MsgFrame, MAX_CHAT_TEXT_BYTES, MSG_PORT, MSG_VERSION};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -157,6 +157,7 @@ pub async fn run_server(
     inbox: PathBuf,
     transfers: TransferRegistry,
     limit: SharedLimit,
+    chat: crate::chat::SharedChatLog,
 ) {
     // トンネル作成直後は Windows が仮想 IP を数秒間「準備中」として扱うため、
     // bind できるまでリトライする(control.rs と同じ事情)
@@ -186,10 +187,19 @@ pub async fn run_server(
                 let inbox = inbox.clone();
                 let transfers = Arc::clone(&transfers);
                 let limit = *limit.lock().unwrap();
+                let chat = Arc::clone(&chat);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_incoming(stream, peer_ip, sender_name, &inbox, &transfers, limit)
-                            .await
+                    if let Err(e) = handle_incoming(
+                        stream,
+                        peer_ip,
+                        bind_ip,
+                        sender_name,
+                        &inbox,
+                        &transfers,
+                        limit,
+                        &chat,
+                    )
+                    .await
                     {
                         tracing::debug!("{peer_ip} からのメッセージング接続が終了: {e:#}");
                     }
@@ -203,14 +213,17 @@ pub async fn run_server(
     }
 }
 
-/// 受信側 1 接続: Hello → 本題のフレーム(現状はファイルの申し出のみ)。
+/// 受信側 1 接続: Hello → 本題のフレーム(ファイルの申し出、またはチャット)。
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     stream: TcpStream,
     peer_ip: Ipv4Addr,
+    own_ip: Ipv4Addr,
     sender_name: String,
     inbox: &Path,
     transfers: &TransferRegistry,
     limit: u64,
+    chat: &crate::chat::SharedChatLog,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = line_reader(read_half);
@@ -262,7 +275,98 @@ async fn handle_incoming(
             )
             .await
         }
+        MsgFrame::Chat {
+            id,
+            scope,
+            text,
+            sent_at,
+        } => {
+            // 送信側も検査するので、超過は不正なクライアントだけ(ack を返さず切る)
+            if text.len() > MAX_CHAT_TEXT_BYTES {
+                bail!("本文が上限({MAX_CHAT_TEXT_BYTES} バイト)を超えています({peer_ip})");
+            }
+            let entry = ChatMessageInfo {
+                seq: 0, // append が振る
+                id: id.clone(),
+                scope,
+                from: peer_ip,
+                to: match scope {
+                    ChatScope::Direct => Some(own_ip),
+                    ChatScope::Network => None,
+                },
+                text,
+                sent_at,
+                failed: false,
+            };
+            chat.lock().unwrap().append(entry);
+            send_frame(&mut write_half, &MsgFrame::ChatAck { id: id.clone() }).await?;
+            // 本文はログに出さない(秘匿ルール)
+            tracing::info!("{sender_name}({peer_ip})からチャットを受信しました(id={id})");
+            Ok(())
+        }
         other => bail!("想定外のフレームが届きました: {other:?}"),
+    }
+}
+
+/// 送信側: 相手の仮想 IP へチャット 1 通を送り、ack を確認する。
+pub async fn send_chat(
+    peer_ip: Ipv4Addr,
+    id: &str,
+    scope: ChatScope,
+    text: &str,
+    sent_at: u64,
+) -> anyhow::Result<()> {
+    send_chat_to(
+        SocketAddr::from((peer_ip, MSG_PORT)),
+        id,
+        scope,
+        text,
+        sent_at,
+    )
+    .await
+}
+
+/// 実装本体(テストではエフェメラルポートへ接続するため分離)。
+async fn send_chat_to(
+    target: SocketAddr,
+    id: &str,
+    scope: ChatScope,
+    text: &str,
+    sent_at: u64,
+) -> anyhow::Result<()> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| anyhow::anyhow!("接続がタイムアウトしました"))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "相手に接続できません(相手のトンネルが動いていないか、\
+                 相手の PeerCove が旧バージョンです): {e}"
+            )
+        })?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = line_reader(read_half);
+    let mut line = String::new();
+
+    send_frame(
+        &mut write_half,
+        &MsgFrame::Hello {
+            version: MSG_VERSION,
+        },
+    )
+    .await?;
+    send_frame(
+        &mut write_half,
+        &MsgFrame::Chat {
+            id: id.to_string(),
+            scope,
+            text: text.to_string(),
+            sent_at,
+        },
+    )
+    .await?;
+    match expect_frame(&mut reader, &mut line).await? {
+        MsgFrame::ChatAck { id: ack_id } if ack_id == id => Ok(()),
+        other => bail!("ChatAck を期待しましたが別のフレームが届きました: {other:?}"),
     }
 }
 
@@ -636,6 +740,11 @@ mod tests {
         dir
     }
 
+    /// テスト用のチャット履歴(一時ディレクトリに書く)。
+    fn test_chat_log() -> crate::chat::SharedChatLog {
+        crate::chat::ChatLog::load(&temp_dir("chatlog").join("net.toml"))
+    }
+
     #[test]
     fn sanitize_strips_paths_and_bad_names() {
         assert_eq!(
@@ -705,10 +814,12 @@ mod tests {
             handle_incoming(
                 stream,
                 ip,
+                ip,
                 "alice".to_string(),
                 &server_inbox,
                 &server_transfers,
                 limit_bytes(100),
+                &test_chat_log(),
             )
             .await
         });
@@ -774,10 +885,12 @@ mod tests {
             handle_incoming(
                 stream,
                 ip,
+                ip,
                 "alice".to_string(),
                 &server_inbox,
                 &server_transfers,
                 limit_bytes(1), // 上限 1 MB
+                &test_chat_log(),
             )
             .await
         });
@@ -823,10 +936,12 @@ mod tests {
             handle_incoming(
                 stream,
                 ip,
+                ip,
                 "mallory".to_string(),
                 &server_inbox,
                 &server_transfers,
                 0,
+                &test_chat_log(),
             )
             .await
         });
@@ -868,6 +983,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&inbox);
     }
 
+    /// チャット送信 → 受信側の履歴に記録され、ack が返る E2E。
+    #[tokio::test]
+    async fn chat_roundtrip() {
+        let inbox = temp_dir("chatinbox");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chat = test_chat_log();
+        let server_chat = Arc::clone(&chat);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                "10.9.9.9".parse().unwrap(), // 受信側(自分)の仮想 IP に見立てる
+                "alice".to_string(),
+                &server_inbox,
+                &Default::default(),
+                0,
+                &server_chat,
+            )
+            .await
+        });
+
+        send_chat_to(addr, "c-1", ChatScope::Direct, "こんにちは 🎉", 1_234)
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+
+        let log = chat.lock().unwrap();
+        let (seq, messages) = log.fetch(0);
+        assert_eq!(seq, 1);
+        assert_eq!(messages.len(), 1);
+        let entry = &messages[0];
+        assert_eq!(entry.id, "c-1");
+        assert_eq!(entry.scope, ChatScope::Direct);
+        assert_eq!(entry.from, "127.0.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            entry.to,
+            Some("10.9.9.9".parse().unwrap()),
+            "direct は宛先 = 自分"
+        );
+        assert_eq!(entry.text, "こんにちは 🎉");
+        assert_eq!(entry.sent_at, 1_234);
+        assert!(!entry.failed);
+        drop(log);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// network 宛のチャットは to が付かない(会話の区別は scope で行う)。
+    #[tokio::test]
+    async fn network_chat_has_no_recipient() {
+        let inbox = temp_dir("chatnet");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chat = test_chat_log();
+        let server_chat = Arc::clone(&chat);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                ip,
+                "bob".to_string(),
+                &server_inbox,
+                &Default::default(),
+                0,
+                &server_chat,
+            )
+            .await
+        });
+        send_chat_to(addr, "c-2", ChatScope::Network, "全体宛", 1)
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+        let entry = chat.lock().unwrap().fetch(0).1.pop().unwrap();
+        assert_eq!(entry.scope, ChatScope::Network);
+        assert_eq!(entry.to, None);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// 本文が上限を超えるチャットは記録されず、送信側はエラーになる。
+    #[tokio::test]
+    async fn oversized_chat_is_rejected() {
+        let inbox = temp_dir("chatbig");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chat = test_chat_log();
+        let server_chat = Arc::clone(&chat);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                ip,
+                "mallory".to_string(),
+                &server_inbox,
+                &Default::default(),
+                0,
+                &server_chat,
+            )
+            .await
+        });
+        let big = "a".repeat(MAX_CHAT_TEXT_BYTES + 1);
+        let err = send_chat_to(addr, "c-3", ChatScope::Direct, &big, 1)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("切断"), "ack が返らない: {err:#}");
+        assert!(server.await.unwrap().is_err());
+        assert!(chat.lock().unwrap().fetch(0).1.is_empty(), "履歴に残らない");
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
     /// 受け入れられないファイル名は FileReject が返り、送信側はエラーになる。
     #[tokio::test]
     async fn invalid_name_is_rejected() {
@@ -889,10 +1131,12 @@ mod tests {
             handle_incoming(
                 stream,
                 ip,
+                ip,
                 "eve".to_string(),
                 &server_inbox,
                 &server_transfers,
                 0,
+                &test_chat_log(),
             )
             .await
         });

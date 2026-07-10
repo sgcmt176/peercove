@@ -151,6 +151,7 @@ impl ActiveTunnel {
         stop: tokio::sync::watch::Receiver<bool>,
         snapshot: Option<SharedSnapshot>,
         transfers: crate::msg::TransferRegistry,
+        chat: crate::chat::SharedChatLog,
     ) -> anyhow::Result<()> {
         supervise(
             config_path,
@@ -160,6 +161,7 @@ impl ActiveTunnel {
             stop,
             snapshot,
             transfers,
+            chat,
         )
         .await
     }
@@ -221,6 +223,7 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
             stop_rx,
             None,
             Default::default(),
+            crate::chat::ChatLog::load(config_path),
         )
         .await;
         ctrl_c.abort();
@@ -254,6 +257,7 @@ pub type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
 /// - (host のみ)設定を再読込し、ピアの追加・変更・削除を同期(ADR-0002 / M1-G3/7)
 /// - (host)台帳を更新してコントロールチャネルへ配布 /(member)受信台帳の反映
 /// - ステータスファイルと共有スナップショットの書き出し
+#[allow(clippy::too_many_arguments)]
 pub async fn supervise(
     config_path: &Path,
     role: Role,
@@ -262,6 +266,7 @@ pub async fn supervise(
     mut stop: tokio::sync::watch::Receiver<bool>,
     snapshot: Option<SharedSnapshot>,
     transfers: crate::msg::TransferRegistry,
+    chat: crate::chat::SharedChatLog,
 ) -> anyhow::Result<()> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
@@ -306,6 +311,7 @@ pub async fn supervise(
             crate::msg::inbox_dir(config_path),
             Arc::clone(&transfers),
             Arc::clone(&msg_limit),
+            Arc::clone(&chat),
         )));
         match role {
             Role::Host => {

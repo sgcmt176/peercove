@@ -52,7 +52,7 @@ pub fn run(config: &Path, to: &str, file: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn find_tunnel(config: &Path) -> anyhow::Result<TunnelInfo> {
+pub(crate) fn find_tunnel(config: &Path) -> anyhow::Result<TunnelInfo> {
     let IpcResponse::Status(status) = daemon::request(IpcRequest::Status)? else {
         bail!("デーモンから想定外の応答が返りました");
     };
@@ -64,7 +64,7 @@ fn find_tunnel(config: &Path) -> anyhow::Result<TunnelInfo> {
 }
 
 /// 宛先の解決: 仮想 IP 直指定、または台帳の表示名。
-fn resolve_peer(tunnel: &TunnelInfo, to: &str) -> anyhow::Result<Ipv4Addr> {
+pub(crate) fn resolve_peer(tunnel: &TunnelInfo, to: &str) -> anyhow::Result<Ipv4Addr> {
     if let Ok(ip) = to.parse::<Ipv4Addr>() {
         return Ok(ip);
     }

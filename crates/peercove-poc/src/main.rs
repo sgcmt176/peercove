@@ -1,4 +1,5 @@
 mod backend;
+mod chat;
 mod commands;
 mod control;
 mod daemon;
@@ -162,6 +163,27 @@ enum Command {
         to: String,
         /// 送るファイル
         file: PathBuf,
+    },
+    /// 稼働中トンネルのメンバーへチャットを送る(デーモン経由。ADR-0016)
+    Chat {
+        #[arg(long)]
+        config: PathBuf,
+        /// 宛先(メンバーの表示名または仮想 IP)。--all と排他
+        #[arg(long)]
+        to: Option<String>,
+        /// ネットワーク全体(オンラインのメンバー全員)へ送る
+        #[arg(long)]
+        all: bool,
+        /// 本文
+        text: String,
+    },
+    /// チャット履歴を表示する(デーモン経由)
+    ChatLog {
+        #[arg(long)]
+        config: PathBuf,
+        /// 新着を待ち続ける(Ctrl+C で終了)
+        #[arg(long, short)]
+        follow: bool,
     },
     /// UDP echo サーバー(G-5 検証用)
     UdpEcho {
@@ -358,6 +380,13 @@ fn run(command: Command) -> anyhow::Result<()> {
             Ok(())
         }
         Command::SendFile { config, to, file } => commands::send_file::run(&config, &to, &file),
+        Command::Chat {
+            config,
+            to,
+            all,
+            text,
+        } => commands::chat::send(&config, to.as_deref(), all, &text),
+        Command::ChatLog { config, follow } => commands::chat::log(&config, follow),
         Command::UdpEcho { listen } => commands::udp::run_echo(listen),
         Command::UdpPing { target, count } => commands::udp::run_ping(target, count),
         Command::Status { config } => commands::status::run(&config),

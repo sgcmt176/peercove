@@ -442,6 +442,7 @@ mod tests {
             removed: false,
             direct: Default::default(),
             transfers: vec![],
+            chat_seq: 0,
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: peercove_core::ipc::IPC_VERSION,
@@ -524,6 +525,7 @@ mod tests {
             removed: false,
             direct,
             transfers: vec![],
+            chat_seq: 0,
         };
         let tunnel = Tunnel::from(&info);
         let routes: Vec<Option<&str>> = tunnel.members.iter().map(|m| m.route).collect();

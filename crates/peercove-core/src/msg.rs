@@ -16,6 +16,20 @@ use serde::{Deserialize, Serialize};
 pub const MSG_PORT: u16 = 51822;
 pub const MSG_VERSION: u32 = 1;
 
+/// チャット本文の上限(バイト)。フレームの 1 行上限(64 KiB)と IPC の
+/// 1 応答上限(256 KiB)に収まるよう、送信側・受信側の両方で検査する。
+pub const MAX_CHAT_TEXT_BYTES: usize = 8 * 1024;
+
+/// チャットの宛先種別(ADR-0016)。グループは M3-13c で追加する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatScope {
+    /// 1:1(特定メンバー宛)。
+    Direct,
+    /// ネットワーク全体宛(送信側がオンラインメンバー全員へ個別送信)。
+    Network,
+}
+
 /// 1 行 1 メッセージでやり取りする制御フレーム。
 ///
 /// ファイル転送の流れ(ADR-0015):
@@ -38,6 +52,16 @@ pub enum MsgFrame {
     FileHash { id: String, sha256: String },
     /// 受信側: 検証まで完了した。
     FileDone { id: String },
+    /// チャット 1 通(ADR-0016、M3-13)。`sent_at` は送信側時計の UNIX ミリ秒。
+    /// network 宛も 1 通ずつ個別送信される(scope で「全体宛」と分かる)。
+    Chat {
+        id: String,
+        scope: ChatScope,
+        text: String,
+        sent_at: u64,
+    },
+    /// 受信側: チャットを受け取り履歴に記録した。
+    ChatAck { id: String },
 }
 
 #[cfg(test)]
@@ -70,6 +94,21 @@ mod tests {
             MsgFrame::FileDone {
                 id: "t1".to_string(),
             },
+            MsgFrame::Chat {
+                id: "c1".to_string(),
+                scope: ChatScope::Direct,
+                text: "こんにちは 🎉".to_string(),
+                sent_at: 1_700_000_000_000,
+            },
+            MsgFrame::Chat {
+                id: "c2".to_string(),
+                scope: ChatScope::Network,
+                text: "全体宛".to_string(),
+                sent_at: 1,
+            },
+            MsgFrame::ChatAck {
+                id: "c1".to_string(),
+            },
         ];
         for frame in frames {
             let json = serde_json::to_string(&frame).unwrap();
@@ -94,5 +133,21 @@ mod tests {
             json,
             r#"{"type":"file_offer","id":"a","name":"b.txt","size":3}"#
         );
+        let json = serde_json::to_string(&MsgFrame::Chat {
+            id: "a".to_string(),
+            scope: ChatScope::Direct,
+            text: "hi".to_string(),
+            sent_at: 5,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"chat","id":"a","scope":"direct","text":"hi","sent_at":5}"#
+        );
+        let json = serde_json::to_string(&MsgFrame::ChatAck {
+            id: "a".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"chat_ack","id":"a"}"#);
     }
 }

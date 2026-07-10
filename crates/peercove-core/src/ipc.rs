@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::msg::ChatScope;
 use crate::proto::LedgerEntry;
 
 /// Windows の名前付きパイプ名。
@@ -61,6 +62,25 @@ pub enum IpcRequest {
         /// 送るファイルの絶対パス。
         path: PathBuf,
     },
+    /// 稼働中トンネルのメンバーへチャットを送る(ADR-0016、M3-13)。
+    /// 応答は [`IpcResponse::Chat`](送った 1 通だけを載せる)。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    ChatSend {
+        config: PathBuf,
+        scope: ChatScope,
+        /// 宛先メンバーの仮想 IP(scope = direct のとき必須)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<Ipv4Addr>,
+        text: String,
+    },
+    /// チャット履歴の差分を取り出す(`after_seq` より後のエントリ)。
+    /// 新着の有無は Status 応答の [`TunnelInfo::chat_seq`] で判定する
+    /// (新しいポーリング経路を作らない — ADR-0016)。
+    ChatFetch {
+        config: PathBuf,
+        #[serde(default)]
+        after_seq: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +112,39 @@ pub enum IpcResponse {
     },
     /// SendFile への応答。`id` で [`TunnelInfo::transfers`] から進捗を引ける。
     Transfer { id: String },
+    /// ChatSend / ChatFetch への応答(ADR-0016、M3-13)。`seq` は履歴全体の
+    /// 最新 seq。1 応答に載る件数・バイト数には上限があるため、`messages` の
+    /// 末尾が `seq` に達するまで ChatFetch を繰り返して差分を取り切る。
+    Chat {
+        seq: u64,
+        messages: Vec<ChatMessageInfo>,
+    },
+}
+
+/// 1 応答で返すチャットの上限(IPC の 1 行上限 256 KiB に収めるため、
+/// 件数と本文合計バイトの両方で打ち切る)。
+pub const MAX_CHAT_MESSAGES_PER_REPLY: usize = 200;
+pub const MAX_CHAT_BYTES_PER_REPLY: usize = 128 * 1024;
+
+/// チャット履歴の 1 通(ADR-0016、M3-13)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessageInfo {
+    /// 履歴内の単調増加の通し番号(ChatFetch の `after_seq` に使う)。
+    pub seq: u64,
+    /// メッセージ ID(送信側が発行。認証には使わない)。
+    pub id: String,
+    pub scope: ChatScope,
+    /// 送信者の仮想 IP(自分が送った通は自分の IP)。
+    pub from: Ipv4Addr,
+    /// (direct のみ)宛先の仮想 IP。network 宛は `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Ipv4Addr>,
+    pub text: String,
+    /// 送信側時計の UNIX ミリ秒。
+    pub sent_at: u64,
+    /// どの宛先にも届かなかった(揮発 — デーモン再起動で消える)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 /// デーモンが保持する直近のログ 1 行(M2-G5)。
@@ -171,6 +224,14 @@ pub struct TunnelInfo {
     /// 旧デーモンの応答には無い(空)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transfers: Vec<TransferInfo>,
+    /// チャット履歴の最新 seq(ADR-0016、M3-13)。0 = 履歴なし。
+    /// UI/CLI はこれが進んだときだけ ChatFetch する。旧デーモンの応答には無い(0)。
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub chat_seq: u64,
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// ファイル転送の向き(自分から見て)。
@@ -391,6 +452,104 @@ mod tests {
         let old = r#"{"config":"a.toml","network":"n","role":"host","address":"10.83.19.1"}"#;
         let parsed: TunnelInfo = serde_json::from_str(old).unwrap();
         assert!(parsed.transfers.is_empty());
+        assert_eq!(parsed.chat_seq, 0, "chat_seq も省略可(旧デーモン互換)");
+    }
+
+    /// ChatSend / ChatFetch / Chat 応答(ADR-0016、M3-13)のワイヤ表現。
+    #[test]
+    fn chat_wire_format() {
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 12,
+            req: IpcRequest::ChatSend {
+                config: PathBuf::from("host.toml"),
+                scope: ChatScope::Direct,
+                peer: Some("10.83.19.3".parse().unwrap()),
+                text: "やあ".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":12,"req":{"method":"chat_send","config":"host.toml","scope":"direct","peer":"10.83.19.3","text":"やあ"}}"#
+        );
+
+        // network 宛は peer を省略する
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 13,
+            req: IpcRequest::ChatSend {
+                config: PathBuf::from("host.toml"),
+                scope: ChatScope::Network,
+                peer: None,
+                text: "全体".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":13,"req":{"method":"chat_send","config":"host.toml","scope":"network","text":"全体"}}"#
+        );
+
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 14,
+            req: IpcRequest::ChatFetch {
+                config: PathBuf::from("host.toml"),
+                after_seq: 7,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":14,"req":{"method":"chat_fetch","config":"host.toml","after_seq":7}}"#
+        );
+
+        let message = ChatMessageInfo {
+            seq: 8,
+            id: "c1".to_string(),
+            scope: ChatScope::Direct,
+            from: "10.83.19.1".parse().unwrap(),
+            to: Some("10.83.19.3".parse().unwrap()),
+            text: "やあ".to_string(),
+            sent_at: 1_700_000_000_000,
+            failed: false,
+        };
+        let json = serde_json::to_string(&IpcReply {
+            id: 14,
+            result: IpcResult::Ok(IpcResponse::Chat {
+                seq: 8,
+                messages: vec![message.clone()],
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":14,"ok":{"type":"chat","seq":8,"messages":[{"seq":8,"id":"c1","scope":"direct","from":"10.83.19.1","to":"10.83.19.3","text":"やあ","sent_at":1700000000000}]}}"#,
+            "failed = false と to = None は省略される"
+        );
+        let parsed: IpcReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.result,
+            IpcResult::Ok(IpcResponse::Chat {
+                seq: 8,
+                messages: vec![message]
+            })
+        );
+
+        // network 宛 + 失敗フラグ
+        let message = ChatMessageInfo {
+            seq: 9,
+            id: "c2".to_string(),
+            scope: ChatScope::Network,
+            from: "10.83.19.1".parse().unwrap(),
+            to: None,
+            text: "x".to_string(),
+            sent_at: 1,
+            failed: true,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(!json.contains("\"to\""), "network 宛は to を省略: {json}");
+        assert!(json.contains(r#""failed":true"#), "{json}");
+        let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, message);
     }
 
     /// `rtt_ms` は後方互換のため省略可能(旧デーモンの応答も読める)。
