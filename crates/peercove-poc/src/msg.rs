@@ -46,6 +46,15 @@ pub type SharedPeers = Arc<Mutex<HashMap<Ipv4Addr, String>>>;
 /// ファイル転送の進捗一覧(IPC の status 応答に載る)。
 pub type TransferRegistry = Arc<Mutex<Vec<TransferInfo>>>;
 
+/// 受信ファイルサイズの上限(バイト)。0 は無制限。supervisor が設定
+/// (`[interface] max_recv_file_mb`)から毎周期更新する(2026-07-11 依頼者指定)。
+pub type SharedLimit = Arc<Mutex<u64>>;
+
+/// 設定値(MB)→ バイト。
+pub fn limit_bytes(mb: u64) -> u64 {
+    mb.saturating_mul(1024 * 1024)
+}
+
 /// 受信ボックスの場所: 設定ファイルの拡張子を差し替える
 /// (`networks/game.toml` → `networks/game.inbox/`。status ファイルと同じ規則)。
 pub fn inbox_dir(config_path: &Path) -> PathBuf {
@@ -147,6 +156,7 @@ pub async fn run_server(
     peers: SharedPeers,
     inbox: PathBuf,
     transfers: TransferRegistry,
+    limit: SharedLimit,
 ) {
     // トンネル作成直後は Windows が仮想 IP を数秒間「準備中」として扱うため、
     // bind できるまでリトライする(control.rs と同じ事情)
@@ -175,9 +185,11 @@ pub async fn run_server(
                 };
                 let inbox = inbox.clone();
                 let transfers = Arc::clone(&transfers);
+                let limit = *limit.lock().unwrap();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_incoming(stream, peer_ip, sender_name, &inbox, &transfers).await
+                        handle_incoming(stream, peer_ip, sender_name, &inbox, &transfers, limit)
+                            .await
                     {
                         tracing::debug!("{peer_ip} からのメッセージング接続が終了: {e:#}");
                     }
@@ -198,6 +210,7 @@ async fn handle_incoming(
     sender_name: String,
     inbox: &Path,
     transfers: &TransferRegistry,
+    limit: u64,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = line_reader(read_half);
@@ -221,6 +234,21 @@ async fn handle_incoming(
 
     match expect_frame(&mut reader, &mut line).await? {
         MsgFrame::FileOffer { id, name, size } => {
+            // 受信サイズ上限(0 は無制限)。受け取る側の設定として効く
+            if limit > 0 && size > limit {
+                send_frame(
+                    &mut write_half,
+                    &MsgFrame::FileReject {
+                        id,
+                        reason: format!(
+                            "サイズが受信側の上限({} MB)を超えています",
+                            limit / (1024 * 1024)
+                        ),
+                    },
+                )
+                .await?;
+                bail!("上限を超える申し出を拒否しました({peer_ip}、{size} バイト)");
+            }
             receive_file(
                 &mut reader,
                 &mut write_half,
@@ -680,6 +708,7 @@ mod tests {
                 "alice".to_string(),
                 &server_inbox,
                 &server_transfers,
+                limit_bytes(100),
             )
             .await
         });
@@ -722,6 +751,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src_dir);
     }
 
+    /// 受信サイズ上限(受け取る側の設定)を超える申し出は拒否され、
+    /// 送信側には上限入りの理由が返る。
+    #[tokio::test]
+    async fn oversize_offer_is_rejected() {
+        let inbox = temp_dir("limit");
+        let src_dir = temp_dir("limitsrc");
+        let src = src_dir.join("big.bin");
+        std::fs::write(&src, vec![0u8; 2 * 1024 * 1024]).unwrap(); // 2 MB
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let transfers: TransferRegistry = Default::default();
+        let server_transfers = Arc::clone(&transfers);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                "alice".to_string(),
+                &server_inbox,
+                &server_transfers,
+                limit_bytes(1), // 上限 1 MB
+            )
+            .await
+        });
+
+        let send_transfers: TransferRegistry = Default::default();
+        let err = send_file_to(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            &src,
+            Arc::clone(&send_transfers),
+            "t-4".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("上限(1 MB)"),
+            "上限入りの理由が送信側へ届く: {err:#}"
+        );
+        assert!(server.await.unwrap().is_err());
+        assert!(
+            std::fs::read_dir(&inbox).map(|d| d.count()).unwrap_or(0) == 0,
+            "受信ボックスには何も作られない"
+        );
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_dir_all(&src_dir);
+    }
+
     /// チェックサム不一致: 受信側はエラーになり、.part も本体も残らない。
     #[tokio::test]
     async fn hash_mismatch_discards_the_file() {
@@ -743,6 +826,7 @@ mod tests {
                 "mallory".to_string(),
                 &server_inbox,
                 &server_transfers,
+                0,
             )
             .await
         });
@@ -808,6 +892,7 @@ mod tests {
                 "eve".to_string(),
                 &server_inbox,
                 &server_transfers,
+                0,
             )
             .await
         });

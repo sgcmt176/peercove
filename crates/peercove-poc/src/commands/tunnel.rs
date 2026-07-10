@@ -293,13 +293,19 @@ pub async fn supervise(
         let mut router_error_logged = false;
         let mut tasks = Vec::new();
         // メッセージング基盤(ADR-0015、M3-9): 両ロールとも自分の仮想 IP で
-        // 待受ける。接続元の照合に使うピア表は台帳から毎周期更新する
+        // 待受ける。接続元の照合に使うピア表と受信サイズ上限は毎周期更新する
         let msg_peers: crate::msg::SharedPeers = Default::default();
+        let msg_limit: crate::msg::SharedLimit = Arc::new(Mutex::new(crate::msg::limit_bytes(
+            Config::load(config_path)
+                .map(|c| c.interface.max_recv_file_mb)
+                .unwrap_or(peercove_core::config::DEFAULT_MAX_RECV_FILE_MB),
+        )));
         tasks.push(tokio::spawn(crate::msg::run_server(
             spec.address.addr(),
             Arc::clone(&msg_peers),
             crate::msg::inbox_dir(config_path),
             Arc::clone(&transfers),
+            Arc::clone(&msg_limit),
         )));
         match role {
             Role::Host => {
@@ -349,6 +355,11 @@ pub async fn supervise(
                             None
                         }
                     };
+                    // 受信サイズ上限(ADR-0015)を設定に追随させる(両ロール)
+                    if let Some(config) = &config {
+                        *msg_limit.lock().unwrap() =
+                            crate::msg::limit_bytes(config.interface.max_recv_file_mb);
+                    }
                     if role == Role::Host {
                         if let Some(config) = &config {
                             sync_peers(

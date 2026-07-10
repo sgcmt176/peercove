@@ -50,6 +50,12 @@ pub struct InterfaceConfig {
     pub listen_port: Option<u16>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// 受信するファイルサイズの上限(MB、ADR-0015 / M3-9)。0 で無制限。
+    /// **受け取る側**の設定として効く(超える申し出は拒否する)。
+    /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
+    /// 読めない(明示エラーになる)。
+    #[serde(default = "default_max_recv_file_mb")]
+    pub max_recv_file_mb: u64,
     /// メンバー間直接通信(ADR-0013)を試すか(既定 true)。false なら
     /// このマシンは常にホスト経由(中継)で通信する。ADR-0013 追加条件 2:
     /// 将来 UI の設定画面から切り替えられるようにするためのフラグ。
@@ -90,6 +96,13 @@ fn default_mtu() -> u16 {
 
 fn default_direct() -> bool {
     true
+}
+
+/// 受信ファイルサイズ上限の既定(100 MB、2026-07-11 依頼者指定)。
+pub const DEFAULT_MAX_RECV_FILE_MB: u64 = 100;
+
+fn default_max_recv_file_mb() -> u64 {
+    DEFAULT_MAX_RECV_FILE_MB
 }
 
 fn default_if_name() -> String {
