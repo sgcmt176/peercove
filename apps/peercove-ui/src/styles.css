@@ -1,19 +1,32 @@
 /* シンプル実用(OS ネイティブ寄り)。M2 handoff Q2 の方針。
-   ノート PC(1280x800)で全機能が収まるレイアウト(Q6)。 */
+   ノート PC(1280x800)で全機能が収まるレイアウト(Q6)。
+
+   M3-6: テーマは 3 状態(システム / ライト / ダーク)。<html data-theme> が
+   無ければ OS 設定(prefers-color-scheme)に従い、"light" / "dark" が付いて
+   いれば OS 設定より優先する。ダーク用の変数ブロックが 2 か所にあるのは
+   このため(CSS はセレクタ違いのブロックを共有できない)。値を変えるときは
+   両方を揃えること。 */
 
 :root {
-  --bg: #f6f6f7;
+  --bg: #f3f4f6;
   --card: #ffffff;
   --text: #1c1c1e;
   --muted: #6b6b70;
-  --border: #dcdce0;
+  --border: #dfe0e4;
   --accent: #2f6feb;
+  /* accent の淡い版(タブの選択状態・ホバーの下地) */
+  --accent-soft: #e8effd;
   --online: #1a9c53;
   --offline: #a5a5aa;
+  --danger: #c0392b;
   --error-bg: #fff5f5;
   --error-border: #f0b4b4;
+  --shadow: 0 1px 2px rgb(16 20 30 / 0.05), 0 1px 6px rgb(16 20 30 / 0.04);
+  /* アバターの彩度・明度(色相はメンバーごとに JS が --hue で与える) */
+  --avatar-s: 52%;
+  --avatar-l: 46%;
 
-  color-scheme: light dark;
+  color-scheme: light;
   font-family:
     system-ui,
     -apple-system,
@@ -26,16 +39,37 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #1b1b1d;
-    --card: #252528;
+  :root:not([data-theme="light"]) {
+    --bg: #17181b;
+    --card: #232427;
     --text: #ececee;
     --muted: #9a9aa0;
-    --border: #3a3a3e;
+    --border: #38393e;
     --accent: #5b8dfb;
+    --accent-soft: #26314d;
     --error-bg: #332323;
     --error-border: #6b3d3d;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+    --avatar-s: 45%;
+    --avatar-l: 55%;
+    color-scheme: dark;
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #17181b;
+  --card: #232427;
+  --text: #ececee;
+  --muted: #9a9aa0;
+  --border: #38393e;
+  --accent: #5b8dfb;
+  --accent-soft: #26314d;
+  --error-bg: #332323;
+  --error-border: #6b3d3d;
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+  --avatar-s: 45%;
+  --avatar-l: 55%;
+  color-scheme: dark;
 }
 
 * {
@@ -46,6 +80,10 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
+  /* テーマ切替時に全体がふわっと変わる(初回描画には効かない) */
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
 }
 
 .app {
@@ -133,8 +171,12 @@ body {
 .card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 16px 18px;
+  box-shadow: var(--shadow);
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
 }
 
 .card h2 {
@@ -187,9 +229,14 @@ button {
   color: #fff;
   background: var(--accent);
   border: none;
-  border-radius: 6px;
+  border-radius: 7px;
   padding: 7px 16px;
   cursor: pointer;
+  transition:
+    filter 0.12s ease,
+    background-color 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease;
 }
 
 button:hover {
@@ -406,7 +453,7 @@ textarea.token {
 }
 
 .member__actions {
-  margin-left: auto;
+  /* 右端への押し出しは .member__stats(margin-left: auto)が担う(M3-6) */
   display: flex;
   gap: 2px;
 }
@@ -664,4 +711,182 @@ select {
 .dns-list__row > .ellipsis {
   flex: 1;
   min-width: 0;
+}
+
+/* ---- UI デザインパス(M3-6) ---- */
+
+/* ヘッダーのブランドマーク */
+.app__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.app__logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), #7c4dea);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 14px;
+  flex: none;
+  user-select: none;
+}
+
+/* メンバーの色分けアバター。色相はメンバーごとに JS が --hue で与え、
+   彩度・明度はテーマ側(:root の --avatar-s / --avatar-l)で揃える */
+.avatar {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: hsl(var(--hue) var(--avatar-s) var(--avatar-l));
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  flex: none;
+  user-select: none;
+}
+
+.avatar--offline {
+  filter: grayscale(0.7);
+  opacity: 0.55;
+}
+
+/* オンライン状態はアバター右下の小さなドットで示す */
+.avatar__status {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--offline);
+  border: 2px solid var(--card);
+}
+
+.avatar__status--online {
+  background: var(--online);
+}
+
+/* メンバー行: アバター + 2 行(名前 / IP・DNS)+ 右端に統計と操作。
+   行の余白と hover は、将来ここにチャット・ファイル送信の導線を足しても
+   成り立つように広めに取ってある(M3-9 / M3-13) */
+.member {
+  padding: 5px 8px;
+  border-radius: 8px;
+  transition: background-color 0.12s ease;
+}
+
+.member:hover {
+  background: var(--bg);
+}
+
+.member__id {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.4;
+}
+
+.member__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.member__meta {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.member__stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  margin-left: auto;
+}
+
+/* スパークライン(転送速度・RTT の推移) */
+.sparkline {
+  flex: none;
+  display: block;
+}
+
+.sparkline polyline {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  opacity: 0.9;
+}
+
+.stat {
+  font-size: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  white-space: nowrap;
+  min-width: 74px;
+  text-align: right;
+}
+
+/* ネットワーク詳細のタブ。チャット(M3-13)・ファイル送信(M3-9)は
+   ここへタブを 1 つ足すだけで収まる */
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin: 0 0 12px;
+}
+
+.tabs__tab {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 5px 12px;
+  margin-bottom: -1px;
+  font-weight: 500;
+}
+
+.tabs__tab:hover {
+  filter: none;
+  color: var(--text);
+}
+
+.tabs__tab--active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* タブ行の右端に置く操作(招待など) */
+.tabs__action {
+  margin-left: auto;
+  margin-bottom: 5px;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+
+/* 統計テーブルの「推移 + 現在値」セル */
+.cell-trend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
 }

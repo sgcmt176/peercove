@@ -1,19 +1,29 @@
 import { useState } from "react";
 import {
   Member,
+  Peer,
   Tunnel,
   api,
   errorMessage,
   formatBytes,
   formatHandshake,
+  formatRate,
   formatRtt,
 } from "../ipc";
+import { rateSeries, rttSeries } from "../history";
 import { ConfirmModal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { DnsDialog } from "./DnsDialog";
+import { Avatar } from "./Avatar";
+import { Sparkline } from "./Sparkline";
 import { t } from "../i18n";
 
-/** ネットワーク詳細(トンネル稼働中)。ホストのときだけ招待・削除・名前変更ができる。 */
+/**
+ * ネットワーク詳細(トンネル稼働中)。ホストのときだけ招待・削除・名前変更ができる。
+ *
+ * 中身はタブ構成(M3-6)。「メンバー」「統計」に加えて、チャット(M3-13)や
+ * ファイル送信(M3-9)は将来ここへタブを足して収める。
+ */
 export function TunnelView({
   tunnel,
   onChanged,
@@ -25,7 +35,8 @@ export function TunnelView({
 }) {
   const isHost = tunnel.role === "hosting";
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
-  const rttByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer.rttMs]));
+  const peerByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer]));
+  const [tab, setTab] = useState<"members" | "stats">("members");
   const [inviting, setInviting] = useState(false);
   const [showDns, setShowDns] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
@@ -131,69 +142,62 @@ export function TunnelView({
       </section>
 
       <section className="card">
-        <div className="card__head">
-          <h2>{t.tunnel.membersHead(tunnel.members.length)}</h2>
-          {isHost && (
-            <button type="button" onClick={() => setInviting(true)}>
+        <div className="tabs">
+          <button
+            type="button"
+            className={tab === "members" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
+            onClick={() => setTab("members")}
+          >
+            {t.tunnel.membersHead(tunnel.members.length)}
+          </button>
+          <button
+            type="button"
+            className={tab === "stats" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
+            onClick={() => setTab("stats")}
+          >
+            {t.tunnel.tabs.stats}
+          </button>
+          {isHost && tab === "members" && (
+            <button
+              type="button"
+              className="tabs__action"
+              onClick={() => setInviting(true)}
+            >
               {t.tunnel.invite}
             </button>
           )}
         </div>
-        {tunnel.members.length === 0 ? (
-          <p className="muted">{t.tunnel.ledgerPending}</p>
+
+        {tab === "members" ? (
+          tunnel.members.length === 0 ? (
+            <p className="muted">{t.tunnel.ledgerPending}</p>
+          ) : (
+            <>
+              <ul className="members">
+                {tunnel.members.map((member) => (
+                  <MemberRow
+                    key={member.publicKey}
+                    config={tunnel.config}
+                    member={member}
+                    peer={peerByKey.get(member.publicKey) ?? null}
+                    canManage={isHost && !member.isHost}
+                    onRemove={() => setRemoving(member)}
+                    onRename={(newName) => void rename(member, newName)}
+                  />
+                ))}
+              </ul>
+              {/* 直接通信の説明(M3-4)。経路バッジが出るメンバー視点でのみ表示 */}
+              {!isHost && tunnel.members.some((member) => member.route) && (
+                <p className="muted small">{t.tunnel.directNote}</p>
+              )}
+            </>
+          )
+        ) : tunnel.peers.length === 0 ? (
+          <p className="muted">{t.tunnel.peers.empty}</p>
         ) : (
-          <ul className="members">
-            {tunnel.members.map((member) => (
-              <MemberRow
-                key={member.publicKey}
-                member={member}
-                rttMs={rttByKey.get(member.publicKey) ?? null}
-                canManage={isHost && !member.isHost}
-                onRemove={() => setRemoving(member)}
-                onRename={(newName) => void rename(member, newName)}
-              />
-            ))}
-          </ul>
-        )}
-        {/* 直接通信の説明(M3-4)。経路バッジが出るメンバー視点でのみ表示 */}
-        {!isHost && tunnel.members.some((member) => member.route) && (
-          <p className="muted small">{t.tunnel.directNote}</p>
+          <PeersTable config={tunnel.config} peers={tunnel.peers} />
         )}
       </section>
-
-      {tunnel.peers.length > 0 && (
-        <section className="card">
-          <h2>{t.tunnel.peers.head}</h2>
-          <table className="peers">
-            <thead>
-              <tr>
-                <th>{t.tunnel.peers.publicKey}</th>
-                <th>{t.tunnel.peers.endpoint}</th>
-                <th>{t.tunnel.peers.lastHandshake}</th>
-                <th>{t.tunnel.peers.rtt}</th>
-                <th>{t.tunnel.peers.rx}</th>
-                <th>{t.tunnel.peers.tx}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tunnel.peers.map((peer) => (
-                <tr key={peer.publicKey}>
-                  <td className="mono ellipsis" title={peer.publicKey}>
-                    {peer.publicKey.slice(0, 12)}…
-                  </td>
-                  <td className="mono">
-                    {peer.endpoint ?? t.tunnel.peers.notConnected}
-                  </td>
-                  <td>{formatHandshake(peer.lastHandshakeAgeSecs)}</td>
-                  <td title={t.tunnel.peers.rttTitle}>{formatRtt(peer.rttMs)}</td>
-                  <td>{formatBytes(peer.rxBytes)}</td>
-                  <td>{formatBytes(peer.txBytes)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
 
       {inviting && (
         <InviteDialog
@@ -231,21 +235,75 @@ export function TunnelView({
   );
 }
 
+/** WG のピア統計(暗号セッション単位)。転送速度は履歴バッファから出す。 */
+function PeersTable({ config, peers }: { config: string; peers: Peer[] }) {
+  return (
+    <table className="peers">
+      <thead>
+        <tr>
+          <th>{t.tunnel.peers.publicKey}</th>
+          <th>{t.tunnel.peers.endpoint}</th>
+          <th>{t.tunnel.peers.lastHandshake}</th>
+          <th>{t.tunnel.peers.rtt}</th>
+          <th>{t.tunnel.peers.rate}</th>
+          <th>{t.tunnel.peers.rx}</th>
+          <th>{t.tunnel.peers.tx}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {peers.map((peer) => {
+          const rates = rateSeries(config, peer.publicKey);
+          const rtts = rttSeries(config, peer.publicKey);
+          return (
+            <tr key={peer.publicKey}>
+              <td className="mono ellipsis" title={peer.publicKey}>
+                {peer.publicKey.slice(0, 12)}…
+              </td>
+              <td className="mono">
+                {peer.endpoint ?? t.tunnel.peers.notConnected}
+              </td>
+              <td>{formatHandshake(peer.lastHandshakeAgeSecs)}</td>
+              <td title={t.tunnel.peers.rttTitle}>
+                <span className="cell-trend">
+                  <Sparkline values={rtts} title={t.tunnel.peers.rttTitle} />
+                  {formatRtt(peer.rttMs)}
+                </span>
+              </td>
+              <td title={t.tunnel.peers.rateTitle}>
+                <span className="cell-trend">
+                  <Sparkline values={rates} title={t.tunnel.peers.rateTitle} />
+                  {formatRate(rates.at(-1) ?? null)}
+                </span>
+              </td>
+              <td>{formatBytes(peer.rxBytes)}</td>
+              <td>{formatBytes(peer.txBytes)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
 function MemberRow({
+  config,
   member,
-  rttMs,
+  peer,
   canManage,
   onRemove,
   onRename,
 }: {
+  config: string;
   member: Member;
-  rttMs: number | null;
+  /** この行のメンバーと張っている WG ピア(統計)。無ければ null。 */
+  peer: Peer | null;
   canManage: boolean;
   onRemove: () => void;
   onRename: (newName: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(member.name ?? "");
+  const rates = peer ? rateSeries(config, peer.publicKey) : [];
 
   const commit = () => {
     const trimmed = draft.trim();
@@ -255,50 +313,70 @@ function MemberRow({
 
   return (
     <li className="member">
-      <span
-        className={member.online ? "dot dot--online" : "dot dot--offline"}
-        aria-label={member.online ? t.tunnel.member.online : t.tunnel.member.offline}
+      <Avatar
+        publicKey={member.publicKey}
+        name={member.name}
+        online={member.online}
+        onlineLabel={member.online ? t.tunnel.member.online : t.tunnel.member.offline}
       />
-      {editing ? (
-        <input
-          className="member__edit"
-          value={draft}
-          autoFocus
-          onChange={(event) => setDraft(event.target.value)}
-          onBlur={commit}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") commit();
-            if (event.key === "Escape") setEditing(false);
-          }}
-        />
-      ) : (
-        <span className="member__name">{member.name ?? t.tunnel.member.noName}</span>
-      )}
-      <span className="mono muted">{member.ip}</span>
-      {member.dnsName && (
-        <span className="mono muted small ellipsis" title={member.dnsName}>
-          {member.dnsName}
+      <span className="member__id">
+        <span className="member__title">
+          {editing ? (
+            <input
+              className="member__edit"
+              value={draft}
+              autoFocus
+              onChange={(event) => setDraft(event.target.value)}
+              onBlur={commit}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") commit();
+                if (event.key === "Escape") setEditing(false);
+              }}
+            />
+          ) : (
+            <span className="member__name">
+              {member.name ?? t.tunnel.member.noName}
+            </span>
+          )}
+          {member.isSelf && (
+            <span className="tag tag--self" title={t.tunnel.member.selfTitle}>
+              {t.tunnel.member.self}
+            </span>
+          )}
+          {member.isHost && <span className="tag">host</span>}
+          {member.route && (
+            <span
+              className={`tag tag--route-${member.route}`}
+              title={t.tunnel.member.route.title}
+            >
+              {t.tunnel.member.route[member.route]}
+            </span>
+          )}
         </span>
-      )}
-      {member.isSelf && (
-        <span className="tag tag--self" title={t.tunnel.member.selfTitle}>
-          {t.tunnel.member.self}
+        <span className="member__meta">
+          <span className="mono">{member.ip}</span>
+          {member.dnsName && (
+            <span className="mono ellipsis" title={member.dnsName}>
+              {member.dnsName}
+            </span>
+          )}
         </span>
-      )}
-      {member.isHost && <span className="tag">host</span>}
-      {member.route && (
-        <span
-          className={`tag tag--route-${member.route}`}
-          title={t.tunnel.member.route.title}
-        >
-          {t.tunnel.member.route[member.route]}
-        </span>
-      )}
-      {rttMs !== null && (
-        <span className="tag" title={t.tunnel.member.rttTitle}>
-          {formatRtt(rttMs)}
-        </span>
-      )}
+      </span>
+      <span className="member__stats">
+        {peer && (
+          <>
+            <Sparkline values={rates} title={t.tunnel.member.rateTitle} />
+            <span className="stat" title={t.tunnel.member.rateTitle}>
+              {formatRate(rates.at(-1) ?? null)}
+            </span>
+          </>
+        )}
+        {peer?.rttMs != null && (
+          <span className="tag" title={t.tunnel.member.rttTitle}>
+            {formatRtt(peer.rttMs)}
+          </span>
+        )}
+      </span>
       {canManage && !editing && (
         <span className="member__actions">
           <button

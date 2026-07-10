@@ -29,3 +29,5 @@
 
 # Claude Code のローカル権限設定(マシン固有・共有しない)
 /.claude/settings.local.json
+# Claude Code のブラウザプレビュー設定(開発機ローカル)
+/.claude/launch.json

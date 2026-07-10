@@ -222,6 +222,12 @@ export function formatHandshake(ageSecs: number | null): string {
   return t.format.hoursAgo(Math.floor(minutes / 60));
 }
 
+/** 転送速度(バイト/秒)。まだ差分が取れないうちは「—」(M3-6)。 */
+export function formatRate(bytesPerSec: number | null): string {
+  if (bytesPerSec === null) return "—";
+  return `${formatBytes(Math.round(bytesPerSec))}/s`;
+}
+
 /** 1 ミリ秒未満は「< 1 ms」。ローカルの検証で 0.0 ms と出るのを避ける。 */
 export function formatRtt(rttMs: number | null): string {
   if (rttMs === null) return "—";

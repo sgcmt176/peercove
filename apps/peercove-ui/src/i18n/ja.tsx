@@ -52,6 +52,15 @@ export const ja = {
     settingsUnavailable:
       "設定ファイルがまだありません（ホストを始めるか参加してください）",
     logs: "デーモンのログ",
+    // 外観テーマの切替ボタン(M3-6)。クリックで巡回する
+    theme: (theme: "system" | "light" | "dark") => {
+      const label = {
+        system: "システムに合わせる",
+        light: "ライト",
+        dark: "ダーク",
+      }[theme];
+      return `外観: ${label}（クリックで切替）`;
+    },
   },
 
   footer: (
@@ -183,6 +192,10 @@ export const ja = {
     disconnect: "切断",
     configFileLabel: "設定ファイル",
     membersHead: (n: number) => `メンバー（${n}）`,
+    // ネットワーク詳細のタブ(M3-6)。チャット・ファイル送信もここに並ぶ予定
+    tabs: {
+      stats: "統計",
+    },
     invite: "メンバーを招待",
     ledgerPending: "台帳をまだ受信していません（接続直後は数秒かかります）。",
     removeNotice: (name: string) =>
@@ -193,10 +206,13 @@ export const ja = {
       endpoint: "エンドポイント",
       lastHandshake: "最終ハンドシェイク",
       rtt: "RTT",
+      rate: "速度",
       rx: "受信",
       tx: "送信",
       notConnected: "(未接続)",
-      rttTitle: "トンネル内のコントロールチャネルで測った往復時間",
+      rttTitle: "トンネル内のコントロールチャネルで測った往復時間（線は直近約 90 秒の推移）",
+      rateTitle: "受信+送信の合計速度（線は直近約 90 秒の推移）",
+      empty: "まだ統計がありません（接続直後は数秒かかります）。",
     },
     remove: {
       title: "メンバーを削除",
@@ -218,6 +234,7 @@ export const ja = {
       offline: "オフライン",
       noName: "(名前なし)",
       rttTitle: "トンネル内の往復時間",
+      rateTitle: "このメンバーとの転送速度（受信+送信、直近約 90 秒の推移）",
       rename: "名前を変更",
       remove: "削除",
       self: "自分",

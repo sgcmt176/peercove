@@ -3,6 +3,8 @@ import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { Connection, Member, NetworkInfo, api, errorMessage } from "./ipc";
 import { t } from "./i18n";
 import { diffMembers, notifyMemberEvents } from "./notify";
+import { clearHistory, recordStatus } from "./history";
+import { Theme, applyTheme, loadTheme, nextTheme } from "./theme";
 import { NetworksView } from "./components/NetworksView";
 import { TunnelView } from "./components/TunnelView";
 import { LogsDialog } from "./components/LogsDialog";
@@ -46,6 +48,8 @@ export default function App() {
    * 同じリンクを 2 回クリックしても再度フォームを開くため(参照が変わる)。
    */
   const [pendingJoin, setPendingJoin] = useState<{ token: string } | null>(null);
+  /** 外観テーマ(M3-6)。localStorage に保存され、このマシンだけに効く。 */
+  const [theme, setTheme] = useState<Theme>(loadTheme);
 
   // 通知の差分計算に使う前回の台帳(ネットワークごと)。レンダー非依存なので ref
   const previousMembers = useRef<Map<string, Member[]>>(new Map());
@@ -54,6 +58,7 @@ export default function App() {
     try {
       const status = await api.daemonStatus();
       setConnection({ kind: "ok", status });
+      recordStatus(status); // スパークライン用の時系列(M3-6)
       // ネットワークごとに前回の台帳と比べて参加・切断を通知する
       const seen = new Set<string>();
       for (const tunnel of status.tunnels) {
@@ -75,6 +80,7 @@ export default function App() {
     } catch (error) {
       setConnection({ kind: "unreachable", message: errorMessage(error) });
       previousMembers.current.clear();
+      clearHistory();
     }
   }, []);
 
@@ -118,6 +124,11 @@ export default function App() {
     refreshNetworks();
   }, [refreshNetworks, connection.kind]);
 
+  // テーマの適用(M3-6)。初回マウント時と切替時の両方でここを通る
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
+
   const changed = () => {
     void refresh();
     refreshNetworks();
@@ -132,9 +143,22 @@ export default function App() {
   return (
     <main className="app">
       <header className="app__header">
-        <h1>PeerCove</h1>
+        <div className="app__brand">
+          <span className="app__logo" aria-hidden>
+            P
+          </span>
+          <h1>PeerCove</h1>
+        </div>
         <div className="app__actions">
           <ConnectionBadge connection={connection} />
+          <button
+            type="button"
+            className="button--icon"
+            title={t.header.theme(theme)}
+            onClick={() => setTheme(nextTheme(theme))}
+          >
+            {theme === "light" ? "☀" : theme === "dark" ? "☾" : "◐"}
+          </button>
           <button
             type="button"
             className="button--icon"
