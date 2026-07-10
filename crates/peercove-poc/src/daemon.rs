@@ -107,8 +107,13 @@ impl DaemonShared {
                 let (lines, dropped) = crate::logbuf::ring().since(after_seq);
                 Ok(IpcResponse::Logs { lines, dropped })
             }
-            IpcRequest::SendFile { config, peer, path } => {
-                let id = self.send_file(config, peer, path).await?;
+            IpcRequest::SendFile {
+                config,
+                peer,
+                path,
+                chat,
+            } => {
+                let id = self.send_file(config, peer, path, chat).await?;
                 Ok(IpcResponse::Transfer { id })
             }
             IpcRequest::ChatSend {
@@ -236,6 +241,7 @@ impl DaemonShared {
             text: text.clone(),
             sent_at,
             failed: false,
+            file: None,
         });
         let chat = Arc::clone(&active.chat);
         let seq = entry.seq;
@@ -453,52 +459,151 @@ impl DaemonShared {
 
     /// メンバーへのファイル送信を開始する(ADR-0015、M3-9)。送信自体は
     /// バックグラウンドタスクで走り、進捗は status 応答の transfers で追う。
+    /// チャット文脈付き(M3-13d)なら履歴にファイルのエントリを記録し、
+    /// network / group 宛は対象メンバーへの個別転送になる(履歴は 1 エントリ)。
     async fn send_file(
         &self,
         config: PathBuf,
-        peer: Ipv4Addr,
+        peer: Option<Ipv4Addr>,
         path: PathBuf,
+        chat_ctx: Option<peercove_core::msg::ChatContext>,
     ) -> anyhow::Result<String> {
+        use peercove_core::ipc::ChatFileInfo;
+        use peercove_core::msg::ChatScope;
+
         let active = self.active.lock().await;
         let active = active
             .get(&Self::key_for(&config))
             .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
-        if peer == active.address {
-            bail!("自分自身へは送れません");
-        }
-        // 台帳照合: 宛先はネットワークのメンバーで、オンラインであること
-        // (オフライン宛は V1 非対応 — ADR-0015)
-        let entry = {
-            let snapshot = active.snapshot.lock().unwrap();
-            snapshot
-                .as_ref()
-                .and_then(|s| s.ledger.as_ref())
-                .and_then(|ledger| ledger.iter().find(|e| e.ip == peer).cloned())
+        let ledger = Self::ledger_of(active);
+        let scope = chat_ctx
+            .as_ref()
+            .map(|c| c.scope)
+            .unwrap_or(ChatScope::Direct);
+        // 宛先の決定(チャットと同じ規則。オフライン宛は V1 非対応)
+        let targets: Vec<Ipv4Addr> = match scope {
+            ChatScope::Direct => {
+                let peer = peer.context("宛先(peer)が指定されていません")?;
+                if peer == active.address {
+                    bail!("自分自身へは送れません");
+                }
+                let entry = ledger
+                    .iter()
+                    .find(|e| e.ip == peer)
+                    .with_context(|| format!("{peer} はこのネットワークのメンバーにいません"))?;
+                if !entry.online {
+                    bail!(
+                        "{} はオフラインです(オフラインのメンバーへは送れません)",
+                        entry.name.as_deref().unwrap_or(&peer.to_string())
+                    );
+                }
+                vec![peer]
+            }
+            ChatScope::Network => ledger
+                .iter()
+                .filter(|e| e.ip != active.address && e.online)
+                .map(|e| e.ip)
+                .collect(),
+            ChatScope::Group => {
+                let group_id = chat_ctx
+                    .as_ref()
+                    .and_then(|c| c.group_id.as_deref())
+                    .context("宛先グループ(group_id)が指定されていません")?;
+                let group =
+                    active.groups.lock().unwrap().get(group_id).context(
+                        "このグループはありません(退出したか、まだ情報が届いていません)",
+                    )?;
+                if !group.members.contains(&active.address) {
+                    bail!("このグループのメンバーではありません");
+                }
+                ledger
+                    .iter()
+                    .filter(|e| e.ip != active.address && e.online && group.members.contains(&e.ip))
+                    .map(|e| e.ip)
+                    .collect()
+            }
         };
-        let entry =
-            entry.with_context(|| format!("{peer} はこのネットワークのメンバーにいません"))?;
-        if !entry.online {
-            bail!(
-                "{} はオフラインです(オフラインのメンバーへは送れません)",
-                entry.name.as_deref().unwrap_or(&peer.to_string())
-            );
-        }
         if !path.is_file() {
             bail!(
                 "{} が見つからないか、ファイルではありません",
                 path.display()
             );
         }
-        let id = crate::msg::new_transfer_id();
+        // 宛先ごとに 1 転送(TransferInfo の id は一意)。履歴には 1 エントリ
+        let ids: Vec<String> = targets
+            .iter()
+            .map(|_| crate::msg::new_transfer_id())
+            .collect();
+        let chat_entry_seq = match &chat_ctx {
+            Some(ctx) => {
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .context("ファイル名を取得できません")?
+                    .to_string();
+                let size = std::fs::metadata(&path)
+                    .with_context(|| format!("{} を読めません", path.display()))?
+                    .len();
+                let entry = active.chat.lock().unwrap().append(ChatMessageInfo {
+                    seq: 0, // append が振る
+                    id: crate::msg::new_transfer_id(),
+                    scope,
+                    group_id: ctx.group_id.clone(),
+                    from: active.address,
+                    to: match scope {
+                        ChatScope::Direct => peer,
+                        ChatScope::Network | ChatScope::Group => None,
+                    },
+                    text: String::new(),
+                    sent_at: crate::msg::now_unix_ms(),
+                    failed: false,
+                    file: Some(ChatFileInfo {
+                        name,
+                        size,
+                        transfers: ids.clone(),
+                    }),
+                });
+                Some(entry.seq)
+            }
+            None => None,
+        };
+        let first_id = ids
+            .first()
+            .cloned()
+            .unwrap_or_else(crate::msg::new_transfer_id);
         let transfers = Arc::clone(&active.transfers);
-        let task_id = id.clone();
+        let chat_log = Arc::clone(&active.chat);
         tokio::spawn(async move {
-            // ファイル名はログに出さない(秘匿ルール)。進捗一覧にはエラーが載る
-            if let Err(e) = crate::msg::send_file(peer, &path, transfers, task_id).await {
-                tracing::warn!("{peer} へのファイル送信に失敗しました: {e:#}");
+            let mut delivered = targets.is_empty(); // 宛先ゼロの全体/グループ宛は失敗扱いにしない
+            let sends: Vec<_> = targets
+                .into_iter()
+                .zip(ids)
+                .map(|(target, id)| {
+                    let path = path.clone();
+                    let transfers = Arc::clone(&transfers);
+                    let ctx = chat_ctx.clone();
+                    tokio::spawn(async move {
+                        // ファイル名はログに出さない(秘匿ルール)。進捗一覧にはエラーが載る
+                        match crate::msg::send_file(target, &path, transfers, id, ctx).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!("{target} へのファイル送信に失敗しました: {e:#}");
+                                false
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for send in sends {
+                delivered |= send.await.unwrap_or(false);
+            }
+            if !delivered {
+                if let Some(seq) = chat_entry_seq {
+                    chat_log.lock().unwrap().mark_failed(seq);
+                }
             }
         });
-        Ok(id)
+        Ok(first_id)
     }
 
     /// IPC で渡されたパスをキー用に正規化する。ファイルが消えている等で

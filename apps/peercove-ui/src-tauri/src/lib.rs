@@ -128,16 +128,32 @@ async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
 }
 
 /// メンバーへファイルを送る(デーモンが送信し、進捗は status の transfers)。
+/// `chat` を付けるとチャット内ファイル送信になり、履歴にも記録される
+/// (M3-13d。network / group 宛は peer 省略)。
 #[tauri::command]
-async fn send_file(config_path: String, peer: String, path: String) -> Result<String, String> {
+async fn send_file(
+    config_path: String,
+    peer: Option<String>,
+    path: String,
+    chat: Option<dto::ChatContextDto>,
+) -> Result<String, String> {
     let config = canonical(&config_path)?;
-    let peer: std::net::Ipv4Addr = peer
-        .parse()
-        .map_err(|_| format!("宛先 {peer} は IPv4 アドレスではありません"))?;
+    let peer = match peer {
+        Some(peer) => Some(
+            peer.parse::<std::net::Ipv4Addr>()
+                .map_err(|_| format!("宛先 {peer} は IPv4 アドレスではありません"))?,
+        ),
+        None => None,
+    };
+    let chat = match chat {
+        Some(dto) => Some(peercove_core::msg::ChatContext::try_from(dto)?),
+        None => None,
+    };
     match peercove_ipc::request_async(IpcRequest::SendFile {
         config,
         peer,
         path: PathBuf::from(path),
+        chat,
     })
     .await
     {

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::msg::{ChatScope, GroupInfo};
+use crate::msg::{ChatContext, ChatScope, GroupInfo};
 use crate::proto::LedgerEntry;
 
 /// Windows の名前付きパイプ名。
@@ -57,10 +57,16 @@ pub enum IpcRequest {
     /// 追加メソッドなので [`IPC_VERSION`] は上げない(旧デーモンは解析エラーを返す)。
     SendFile {
         config: PathBuf,
-        /// 宛先メンバーの仮想 IP。
-        peer: Ipv4Addr,
+        /// 宛先メンバーの仮想 IP(direct のとき必須。network / group 宛の
+        /// チャット内ファイル送信では省略 — M3-13d)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<Ipv4Addr>,
         /// 送るファイルの絶対パス。
         path: PathBuf,
+        /// チャット文脈(M3-13d)。付けると送受両側の履歴にファイルの
+        /// エントリが記録される。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<ChatContext>,
     },
     /// 稼働中トンネルのメンバーへチャットを送る(ADR-0016、M3-13)。
     /// 応答は [`IpcResponse::Chat`](送った 1 通だけを載せる)。
@@ -172,6 +178,21 @@ pub struct ChatMessageInfo {
     /// どの宛先にも届かなかった(揮発 — デーモン再起動で消える)。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub failed: bool,
+    /// チャット内ファイル送信のエントリ(M3-13d)。付いていれば `text` は空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<ChatFileInfo>,
+}
+
+/// チャット履歴に記録するファイル送信の情報(ADR-0016、M3-13d)。
+/// 実体は従来どおり受信ボックス(`name` は受信側では保存された実ファイル名)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatFileInfo {
+    pub name: String,
+    pub size: u64,
+    /// 対応する [`TransferInfo::id`](送信側は宛先ごとに 1 つ)。UI が
+    /// 進捗バーに使う。転送一覧から流れたら進捗なしで表示する。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfers: Vec<String>,
 }
 
 /// デーモンが保持する直近のログ 1 行(M2-G5)。
@@ -446,14 +467,35 @@ mod tests {
             id: 11,
             req: IpcRequest::SendFile {
                 config: PathBuf::from("host.toml"),
-                peer: "10.83.19.3".parse().unwrap(),
+                peer: Some("10.83.19.3".parse().unwrap()),
                 path: PathBuf::from("a.txt"),
+                chat: None,
             },
         })
         .unwrap();
         assert_eq!(
             json,
-            r#"{"id":11,"req":{"method":"send_file","config":"host.toml","peer":"10.83.19.3","path":"a.txt"}}"#
+            r#"{"id":11,"req":{"method":"send_file","config":"host.toml","peer":"10.83.19.3","path":"a.txt"}}"#,
+            "chat なしは M3-9 と同じワイヤ表現(旧デーモン互換)"
+        );
+
+        // チャット文脈付き(M3-13d)。group 宛は peer を省略する
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 19,
+            req: IpcRequest::SendFile {
+                config: PathBuf::from("host.toml"),
+                peer: None,
+                path: PathBuf::from("a.txt"),
+                chat: Some(ChatContext {
+                    scope: ChatScope::Group,
+                    group_id: Some("g1".to_string()),
+                }),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":19,"req":{"method":"send_file","config":"host.toml","path":"a.txt","chat":{"scope":"group","group_id":"g1"}}}"#
         );
 
         let json = serde_json::to_string(&IpcReply {
@@ -564,6 +606,7 @@ mod tests {
             text: "やあ".to_string(),
             sent_at: 1_700_000_000_000,
             failed: false,
+            file: None,
         };
         let json = serde_json::to_string(&IpcReply {
             id: 14,
@@ -598,6 +641,7 @@ mod tests {
             text: "x".to_string(),
             sent_at: 1,
             failed: true,
+            file: None,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(!json.contains("\"to\""), "network 宛は to を省略: {json}");
@@ -620,9 +664,36 @@ mod tests {
             text: "x".to_string(),
             sent_at: 1,
             failed: false,
+            file: None,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains(r#""group_id":"g1""#), "{json}");
+        assert!(!json.contains("file"), "ファイルなしは file を省略: {json}");
+        let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, message);
+
+        // チャット内ファイル送信のエントリ(M3-13d)
+        let message = ChatMessageInfo {
+            seq: 11,
+            id: "c4".to_string(),
+            scope: ChatScope::Direct,
+            group_id: None,
+            from: "10.83.19.1".parse().unwrap(),
+            to: Some("10.83.19.3".parse().unwrap()),
+            text: String::new(),
+            sent_at: 1,
+            failed: false,
+            file: Some(ChatFileInfo {
+                name: "写真.jpg".to_string(),
+                size: 1024,
+                transfers: vec!["t1".to_string()],
+            }),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(
+            json.contains(r#""file":{"name":"写真.jpg","size":1024,"transfers":["t1"]}"#),
+            "{json}"
+        );
         let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, message);
 

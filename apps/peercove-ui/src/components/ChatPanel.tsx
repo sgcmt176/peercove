@@ -1,5 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChatMessage, Group, Member, Tunnel, api, errorMessage } from "../ipc";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import {
+  ChatContext,
+  ChatMessage,
+  Group,
+  Member,
+  Transfer,
+  Tunnel,
+  api,
+  errorMessage,
+  formatBytes,
+} from "../ipc";
 import {
   ConversationKey,
   NETWORK_CONVERSATION,
@@ -28,10 +39,11 @@ interface ConversationItem {
 }
 
 /**
- * チャットタブ(M3-13b/c、ADR-0016)。LINE 風の 2 ペイン:
+ * チャットタブ(M3-13b/c/d、ADR-0016)。LINE 風の 2 ペイン:
  * 左 = 会話リスト(全体 + グループ + メンバー 1:1、未読バッジ、グループ作成)、
- * 右 = 吹き出しの会話。履歴は chat.ts のストア(App の 2 秒ポーリングが
- * 差分フェッチ済み)を読む。
+ * 右 = 吹き出しの会話(テキスト + ファイルバブル)。ファイルは 📎 か
+ * ドラッグ&ドロップで、いま開いている会話の宛先へ送る。
+ * 履歴は chat.ts のストア(App の 2 秒ポーリングが差分フェッチ済み)を読む。
  */
 export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
   const [conversation, setConversation] = useState<ConversationKey>(
@@ -40,10 +52,14 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   /** グループ作成ダイアログ(M3-13c)。 */
   const [creating, setCreating] = useState(false);
   /** グループ管理ダイアログの対象。 */
   const [managing, setManaging] = useState<Group | null>(null);
+  /** ドロップされたファイル(送信確認待ち — M3-13d)。 */
+  const [dropPaths, setDropPaths] = useState<string[] | null>(null);
+  const [dragOver, setDragOver] = useState(false);
   // 送信直後・既読直後にポーリングを待たず再描画するためのカウンタ
   const [, setBump] = useState(0);
   const rerender = () => setBump((n) => n + 1);
@@ -146,6 +162,47 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
     if (el && stickBottom.current) el.scrollTop = el.scrollHeight;
   }, [conversation, current.length]);
 
+  // ネイティブのファイルドロップ(M3-13d)。webview 全体のイベントだが、
+  // このリスナーはチャットタブが開いている間だけ生きている
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setDragOver(true);
+        } else if (event.payload.type === "drop") {
+          setDragOver(false);
+          if (event.payload.paths.length > 0) setDropPaths(event.payload.paths);
+        } else {
+          setDragOver(false);
+        }
+      })
+      .then((fn) => {
+        if (alive) {
+          unlisten = fn;
+        } else {
+          fn();
+        }
+      });
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, []);
+
+  /** いま開いている会話の宛先(ファイル送信のチャット文脈)。 */
+  const destination = (): { peer: string | null; chat: ChatContext } => {
+    const groupId = groupIdOf(conversation);
+    if (conversation === NETWORK_CONVERSATION) {
+      return { peer: null, chat: { scope: "network" } };
+    }
+    if (groupId !== null) {
+      return { peer: null, chat: { scope: "group", groupId } };
+    }
+    return { peer: conversation, chat: { scope: "direct" } };
+  };
+
   const send = async () => {
     const text = draft.trim();
     if (!text || sending || !canSend) return;
@@ -167,6 +224,47 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
       setError(errorMessage(e));
     } finally {
       setSending(false);
+    }
+  };
+
+  /** ファイルを送る(📎 / ドロップ共通)。バブルは次のポーリングで出る。 */
+  const sendFiles = async (paths: string[]) => {
+    if (!canSend || paths.length === 0) return;
+    setError(null);
+    try {
+      const { peer, chat } = destination();
+      for (const path of paths) {
+        await api.sendFile(tunnel.config, peer, path, chat);
+      }
+      stickBottom.current = true;
+      setNotice(t.chat.fileStarted(paths.length));
+      setTimeout(() => setNotice(null), 8000);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
+  const attach = async () => {
+    if (!canSend) return;
+    try {
+      const path = await api.pickFile();
+      if (path) await sendFiles([path]);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
+  /** 受信ファイルの保存(バブルの「保存」— 実体は受信ボックス)。 */
+  const saveFile = async (name: string) => {
+    setError(null);
+    try {
+      const saved = await api.saveInboxFile(tunnel.config, name);
+      if (saved) {
+        setNotice(t.inbox.savedTo(saved));
+        setTimeout(() => setNotice(null), 8000);
+      }
+    } catch (e) {
+      setError(errorMessage(e));
     }
   };
 
@@ -275,12 +373,29 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
               selfIp={selfIp}
               memberByIp={memberByIp}
               showNames={showNames}
+              transfers={tunnel.transfers}
+              onSaveFile={(name) => void saveFile(name)}
             />
+          )}
+          {dragOver && canSend && (
+            <div className="chat__drop" aria-hidden>
+              {t.chat.dropHint(selected?.name ?? conversation)}
+            </div>
           )}
         </div>
 
         {error && <p className="error-text small chat__error">{error}</p>}
+        {notice && <p className="notice small chat__error">{notice}</p>}
         <div className="chat__input">
+          <button
+            type="button"
+            className="button--icon chat__attach"
+            title={t.chat.attach}
+            disabled={!canSend}
+            onClick={() => void attach()}
+          >
+            📎
+          </button>
           <textarea
             rows={2}
             value={draft}
@@ -338,8 +453,50 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
           }}
         />
       )}
+      {dropPaths &&
+        (canSend ? (
+          <ConfirmModal
+            title={t.chat.dropTitle}
+            confirmLabel={t.chat.send}
+            onClose={() => setDropPaths(null)}
+            onConfirm={() => {
+              const paths = dropPaths;
+              setDropPaths(null);
+              void sendFiles(paths);
+            }}
+            message={
+              <>
+                <p>{t.chat.dropMessage(selected?.name ?? conversation)}</p>
+                <ul className="chat__drop-list">
+                  {dropPaths.map((path) => (
+                    <li key={path} className="mono ellipsis" title={path}>
+                      {baseName(path)}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            }
+          />
+        ) : (
+          <ConfirmModal
+            title={t.chat.dropTitle}
+            confirmLabel={t.common.close}
+            onClose={() => setDropPaths(null)}
+            onConfirm={() => setDropPaths(null)}
+            message={
+              groupIdOf(conversation) !== null
+                ? t.chat.leftGroup
+                : t.chat.offline
+            }
+          />
+        ))}
     </div>
   );
+}
+
+/** パスからファイル名だけを取り出す(表示用)。 */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
 }
 
 /**
@@ -435,14 +592,12 @@ function GroupDialog({
         </label>
 
         {group !== null && (
-          <>
-            <span className="muted small">
-              {t.chat.groupMembersHead}:{" "}
-              {group.members
-                .map((ip) => memberByIp.get(ip)?.name ?? ip)
-                .join("、")}
-            </span>
-          </>
+          <span className="muted small">
+            {t.chat.groupMembersHead}:{" "}
+            {group.members
+              .map((ip) => memberByIp.get(ip)?.name ?? ip)
+              .join("、")}
+          </span>
         )}
 
         <span className="field__label">
@@ -539,7 +694,10 @@ function lastMessageOf(
 
 function previewOf(message: ChatMessage, selfIp: string): string {
   const prefix = message.from === selfIp ? t.chat.previewSelf : "";
-  return `${prefix}${message.text.replace(/\s+/g, " ")}`;
+  const body = message.file
+    ? t.chat.filePreview(message.file.name)
+    : message.text.replace(/\s+/g, " ");
+  return `${prefix}${body}`;
 }
 
 function timeOf(unixMs: number): string {
@@ -554,11 +712,15 @@ function Bubbles({
   selfIp,
   memberByIp,
   showNames,
+  transfers,
+  onSaveFile,
 }: {
   messages: ChatMessage[];
   selfIp: string;
   memberByIp: Map<string, Member>;
   showNames: boolean;
+  transfers: Transfer[];
+  onSaveFile: (name: string) => void;
 }) {
   let lastDate = "";
   return (
@@ -596,7 +758,16 @@ function Bubbles({
                   </span>
                 )}
                 <span className="msg__row">
-                  <span className="msg__bubble">{message.text}</span>
+                  {message.file ? (
+                    <FileBubble
+                      message={message}
+                      own={own}
+                      transfers={transfers}
+                      onSave={onSaveFile}
+                    />
+                  ) : (
+                    <span className="msg__bubble">{message.text}</span>
+                  )}
                   <span className="msg__time muted">
                     {timeOf(message.sentAtMs)}
                     {message.failed && (
@@ -610,5 +781,63 @@ function Bubbles({
         );
       })}
     </>
+  );
+}
+
+/**
+ * ファイルバブル(M3-13d)。進捗は Tunnel.transfers と転送 id で突き合わせる
+ * (転送一覧から流れた古いエントリは進捗なしで表示)。受信済みのファイルは
+ * 「保存」で受信ボックスから任意の場所へ移せる。
+ */
+function FileBubble({
+  message,
+  own,
+  transfers,
+  onSave,
+}: {
+  message: ChatMessage;
+  own: boolean;
+  transfers: Transfer[];
+  onSave: (name: string) => void;
+}) {
+  const file = message.file!;
+  const related = transfers.filter((tr) => file.transfers.includes(tr.id));
+  const active = related.filter((tr) => !tr.done);
+  const failed =
+    message.failed ||
+    (related.length > 0 && related.every((tr) => tr.error !== null));
+  const totalSize = active.reduce((sum, tr) => sum + tr.size, 0);
+  const transferred = active.reduce((sum, tr) => sum + tr.transferred, 0);
+  const percent =
+    totalSize === 0
+      ? 100
+      : Math.min(100, Math.floor((transferred * 100) / totalSize));
+
+  return (
+    <span className="msg__bubble msg__bubble--file">
+      <span className="msg__file-name ellipsis" title={file.name}>
+        📎 {file.name}
+      </span>
+      <span className={own ? "msg__file-meta" : "msg__file-meta muted"}>
+        {formatBytes(file.size)}
+      </span>
+      {failed ? (
+        <span className="error-text small">{t.chat.fileFailed}</span>
+      ) : active.length > 0 ? (
+        <span className="progress" title={`${percent}%`}>
+          <span className="progress__bar" style={{ width: `${percent}%` }} />
+        </span>
+      ) : (
+        !own && (
+          <button
+            type="button"
+            className="msg__file-save"
+            onClick={() => onSave(file.name)}
+          >
+            {t.inbox.save}
+          </button>
+        )
+      )}
+    </span>
   );
 }

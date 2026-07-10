@@ -81,6 +81,23 @@ export interface ChatMessage {
   sentAtMs: number;
   /** どの宛先にも届かなかった（デーモン再起動で消える）。 */
   failed: boolean;
+  /** チャット内ファイル送信のエントリ（M3-13d）。付いていれば text は空。 */
+  file: ChatFile | null;
+}
+
+/** チャット内ファイル送信の情報（M3-13d）。実体は受信ボックス。 */
+export interface ChatFile {
+  /** ファイル名（受信側では保存された実ファイル名）。 */
+  name: string;
+  size: number;
+  /** 対応する転送 id（Tunnel.transfers と突き合わせて進捗を出す）。 */
+  transfers: string[];
+}
+
+/** ファイル送信のチャット文脈（M3-13d）。 */
+export interface ChatContext {
+  scope: "direct" | "network" | "group";
+  groupId?: string | null;
 }
 
 /** グループ（ADR-0016、M3-13c）。members に自分が居なければ「退出済み」。 */
@@ -267,10 +284,15 @@ export const api = {
   ) => invoke<Group>("group_update", { configPath, id, name, add }),
   groupLeave: (configPath: string, id: string) =>
     invoke<void>("group_leave", { configPath, id }),
-  // ファイル送信・受信ボックス（ADR-0015、M3-9b）
+  // ファイル送信・受信ボックス（ADR-0015、M3-9b）。chat 付きはチャット内
+  // ファイル送信（M3-13d。network / group 宛は peer = null）
   pickFile: () => invoke<string | null>("pick_file"),
-  sendFile: (configPath: string, peer: string, path: string) =>
-    invoke<string>("send_file", { configPath, peer, path }),
+  sendFile: (
+    configPath: string,
+    peer: string | null,
+    path: string,
+    chat?: ChatContext,
+  ) => invoke<string>("send_file", { configPath, peer, path, chat: chat ?? null }),
   listInbox: (configPath: string) =>
     invoke<InboxItem[]>("list_inbox", { configPath }),
   saveInboxFile: (configPath: string, name: string) =>

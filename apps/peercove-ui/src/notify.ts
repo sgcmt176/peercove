@@ -124,10 +124,14 @@ export async function notifyChatEvents(
         ? (tunnel.groups.find((g) => g.id === message.groupId)?.name ??
           t.chat.unknownGroup)
         : tunnel.network;
+    // ファイルは本文の代わりにファイル名(M3-13d)
+    const text = message.file
+      ? t.chat.filePreview(message.file.name)
+      : message.text;
     try {
       await invoke("notify", {
         title: t.notify.chatTitle(from, context),
-        body: t.notify.chatBody(message.text, message.scope === "network"),
+        body: t.notify.chatBody(text, message.scope === "network"),
       });
     } catch {
       // 通知の失敗で UI を止めない

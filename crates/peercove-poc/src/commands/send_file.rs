@@ -24,8 +24,9 @@ pub fn run(config: &Path, to: &str, file: &Path) -> anyhow::Result<()> {
 
     let response = daemon::request(IpcRequest::SendFile {
         config: config.clone(),
-        peer,
+        peer: Some(peer),
         path: file,
+        chat: None,
     })?;
     let IpcResponse::Transfer { id } = response else {
         bail!("デーモンから想定外の応答が返りました");

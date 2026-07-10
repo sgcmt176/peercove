@@ -176,6 +176,7 @@ mod tests {
             text: text.to_string(),
             sent_at: 1_700_000_000_000,
             failed: false,
+            file: None,
         }
     }
 

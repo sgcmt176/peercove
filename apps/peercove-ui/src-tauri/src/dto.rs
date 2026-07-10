@@ -127,6 +127,19 @@ pub struct ChatMessage {
     pub sent_at_ms: u64,
     /// どの宛先にも届かなかった(デーモン再起動で消える)。
     pub failed: bool,
+    /// チャット内ファイル送信のエントリ(M3-13d)。付いていれば text は空。
+    pub file: Option<ChatFile>,
+}
+
+/// チャット内ファイル送信の情報(M3-13d)。実体は受信ボックス。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatFile {
+    /// ファイル名(受信側では保存された実ファイル名)。
+    pub name: String,
+    pub size: u64,
+    /// 対応する転送 id(進捗表示用。転送一覧から流れたら進捗なし)。
+    pub transfers: Vec<String>,
 }
 
 impl From<&ChatMessageInfo> for ChatMessage {
@@ -145,7 +158,40 @@ impl From<&ChatMessageInfo> for ChatMessage {
             text: info.text.clone(),
             sent_at_ms: info.sent_at,
             failed: info.failed,
+            file: info.file.as_ref().map(|file| ChatFile {
+                name: file.name.clone(),
+                size: file.size,
+                transfers: file.transfers.clone(),
+            }),
         }
+    }
+}
+
+/// ファイル送信のチャット文脈(M3-13d)。frontend から camelCase で受け、
+/// core の [`peercove_core::msg::ChatContext`] へ変換する。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatContextDto {
+    /// "direct" | "network" | "group"
+    pub scope: String,
+    pub group_id: Option<String>,
+}
+
+impl TryFrom<ChatContextDto> for peercove_core::msg::ChatContext {
+    type Error = String;
+
+    fn try_from(dto: ChatContextDto) -> Result<Self, String> {
+        use peercove_core::msg::ChatScope;
+        let scope = match dto.scope.as_str() {
+            "direct" => ChatScope::Direct,
+            "network" => ChatScope::Network,
+            "group" => ChatScope::Group,
+            other => return Err(format!("不明な宛先種別です: {other}")),
+        };
+        Ok(Self {
+            scope,
+            group_id: dto.group_id,
+        })
     }
 }
 

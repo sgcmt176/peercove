@@ -285,6 +285,17 @@ export const ja = {
       `「${name}」から退出しますか？　これまでの履歴はこの端末に残ります。`,
     leftGroup: "このグループからは退出済みです（履歴のみ）",
     unknownGroup: "不明なグループ",
+    // チャット内ファイル送信 + ドラッグ&ドロップ(M3-13d)
+    attach: "ファイルを送る",
+    filePreview: (name: string) => `📎 ${name}`,
+    fileFailed: "転送失敗",
+    fileStarted: (count: number) =>
+      count === 1
+        ? "ファイルの送信を開始しました。"
+        : `${count} 件のファイルの送信を開始しました。`,
+    dropTitle: "ファイルを送信",
+    dropMessage: (dest: string) => `「${dest}」へ送信しますか？`,
+    dropHint: (dest: string) => `ドロップして「${dest}」へ送信`,
   },
 
   // ファイル送信・受信ボックス(M3-9b、ADR-0015)

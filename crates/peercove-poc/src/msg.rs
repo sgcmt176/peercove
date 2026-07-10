@@ -22,10 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use peercove_core::ipc::{ChatMessageInfo, TransferDirection, TransferInfo};
+use peercove_core::ipc::{ChatFileInfo, ChatMessageInfo, TransferDirection, TransferInfo};
 use peercove_core::msg::{
-    ChatScope, GroupInfo, MsgFrame, MAX_CHAT_TEXT_BYTES, MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES,
-    MSG_PORT, MSG_VERSION,
+    ChatContext, ChatScope, GroupInfo, MsgFrame, MAX_CHAT_TEXT_BYTES, MAX_GROUP_MEMBERS,
+    MAX_GROUP_NAME_BYTES, MSG_PORT, MSG_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -62,6 +62,14 @@ pub fn limit_bytes(mb: u64) -> u64 {
 /// (`networks/game.toml` → `networks/game.inbox/`。status ファイルと同じ規則)。
 pub fn inbox_dir(config_path: &Path) -> PathBuf {
     config_path.with_extension("inbox")
+}
+
+/// 現在時刻(UNIX ミリ秒)。時計が狂っていても 0 に落として続行する。
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 転送 ID。認証には使わない(身元は接続元 IP)ので、レジストリ内で
@@ -253,7 +261,12 @@ async fn handle_incoming(
     }
 
     match expect_frame(&mut reader, &mut line).await? {
-        MsgFrame::FileOffer { id, name, size } => {
+        MsgFrame::FileOffer {
+            id,
+            name,
+            size,
+            chat: chat_ctx,
+        } => {
             // 受信サイズ上限(0 は無制限)。受け取る側の設定として効く
             if limit > 0 && size > limit {
                 send_frame(
@@ -273,9 +286,12 @@ async fn handle_incoming(
                 &mut reader,
                 &mut write_half,
                 peer_ip,
+                own_ip,
                 &sender_name,
                 inbox,
                 transfers,
+                chat,
+                chat_ctx,
                 id,
                 &name,
                 size,
@@ -309,6 +325,7 @@ async fn handle_incoming(
                 text,
                 sent_at,
                 failed: false,
+                file: None,
             };
             chat.lock().unwrap().append(entry);
             send_frame(&mut write_half, &MsgFrame::ChatAck { id: id.clone() }).await?;
@@ -438,14 +455,18 @@ async fn connect_and_hello(
 
 /// ファイルを受信ボックスへ保存する。書きかけは `.part`、完了時に本名へ
 /// リネームし、隣に `.pcvmeta`(送信者などのメタ情報)を置く。
+/// チャット文脈付き(M3-13d)なら履歴にもファイルのエントリを記録する。
 #[allow(clippy::too_many_arguments)]
 async fn receive_file(
     reader: &mut LineReader,
     write_half: &mut tokio::net::tcp::OwnedWriteHalf,
     peer_ip: Ipv4Addr,
+    own_ip: Ipv4Addr,
     sender_name: &str,
     inbox: &Path,
     transfers: &TransferRegistry,
+    chat: &crate::chat::SharedChatLog,
+    chat_ctx: Option<ChatContext>,
     id: String,
     name: &str,
     size: u64,
@@ -488,6 +509,37 @@ async fn receive_file(
             error: None,
         },
     );
+    // チャット内ファイル送信(M3-13d): 受信開始時に履歴へ記録する
+    // (UI のファイルバブルは transfers の進捗を重ねて表示する)。
+    // name は実際に保存されるファイル名(同名回避の連番込み)
+    if let Some(ctx) = chat_ctx {
+        if ctx.scope != ChatScope::Group || ctx.group_id.is_some() {
+            let saved_name = final_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&safe_name)
+                .to_string();
+            chat.lock().unwrap().append(ChatMessageInfo {
+                seq: 0, // append が振る
+                id: new_transfer_id(),
+                scope: ctx.scope,
+                group_id: ctx.group_id,
+                from: peer_ip,
+                to: match ctx.scope {
+                    ChatScope::Direct => Some(own_ip),
+                    ChatScope::Network | ChatScope::Group => None,
+                },
+                text: String::new(),
+                sent_at: now_unix_ms(),
+                failed: false,
+                file: Some(ChatFileInfo {
+                    name: saved_name,
+                    size,
+                    transfers: vec![id.clone()],
+                }),
+            });
+        }
+    }
     let result = receive_body(
         reader,
         write_half,
@@ -584,11 +636,13 @@ async fn receive_body(
 
 /// 送信側: 相手の仮想 IP のメッセージングポートへ接続してファイルを送る。
 /// 進捗は `transfers` に反映される(UI / CLI は status 経由で追う)。
+/// `chat` はチャット内ファイル送信の文脈(M3-13d、任意)。
 pub async fn send_file(
     peer_ip: Ipv4Addr,
     path: &Path,
     transfers: TransferRegistry,
     id: String,
+    chat: Option<ChatContext>,
 ) -> anyhow::Result<()> {
     send_file_to(
         SocketAddr::from((peer_ip, MSG_PORT)),
@@ -596,6 +650,7 @@ pub async fn send_file(
         path,
         transfers,
         id,
+        chat,
     )
     .await
 }
@@ -607,6 +662,7 @@ async fn send_file_to(
     path: &Path,
     transfers: TransferRegistry,
     id: String,
+    chat: Option<ChatContext>,
 ) -> anyhow::Result<()> {
     let name = path
         .file_name()
@@ -634,7 +690,7 @@ async fn send_file_to(
             error: None,
         },
     );
-    let result = send_body(target, path, &transfers, &id, size).await;
+    let result = send_body(target, path, &transfers, &id, size, chat).await;
     match &result {
         Ok(()) => update(&transfers, &id, |t| t.done = true),
         Err(e) => mark_failed(&transfers, &id, e),
@@ -648,6 +704,7 @@ async fn send_body(
     transfers: &TransferRegistry,
     id: &str,
     size: u64,
+    chat: Option<ChatContext>,
 ) -> anyhow::Result<()> {
     let name = path
         .file_name()
@@ -680,6 +737,7 @@ async fn send_body(
             id: id.to_string(),
             name,
             size,
+            chat,
         },
     )
     .await?;
@@ -903,6 +961,7 @@ mod tests {
             &src,
             Arc::clone(&send_transfers),
             "t-1".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -930,6 +989,70 @@ mod tests {
             );
             assert_eq!(list[0].transferred, payload.len() as u64, "{label}");
         }
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_dir_all(&src_dir);
+    }
+
+    /// チャット文脈付きのファイル送信(M3-13d): 受信側の履歴に
+    /// kind = file のエントリ(保存された実ファイル名 + 転送 id)が残る。
+    #[tokio::test]
+    async fn chat_context_file_records_history() {
+        let inbox = temp_dir("chatfile");
+        let src_dir = temp_dir("chatfilesrc");
+        let src = src_dir.join("資料.bin");
+        std::fs::write(&src, b"hello").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chat = test_chat_log();
+        let server_chat = Arc::clone(&chat);
+        let recv_transfers: TransferRegistry = Default::default();
+        let server_transfers = Arc::clone(&recv_transfers);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                "10.9.9.9".parse().unwrap(), // 受信側(自分)の仮想 IP に見立てる
+                "alice".to_string(),
+                &server_inbox,
+                &server_transfers,
+                0,
+                &server_chat,
+                &test_groups(),
+            )
+            .await
+        });
+
+        send_file_to(
+            addr,
+            "127.0.0.1".parse().unwrap(),
+            &src,
+            Default::default(),
+            "t-5".to_string(),
+            Some(ChatContext {
+                scope: ChatScope::Direct,
+                group_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap().unwrap();
+
+        let entry = chat.lock().unwrap().fetch(0).1.pop().unwrap();
+        assert_eq!(entry.scope, ChatScope::Direct);
+        assert_eq!(entry.to, Some("10.9.9.9".parse().unwrap()));
+        assert!(entry.text.is_empty());
+        let file = entry.file.expect("ファイルのエントリ");
+        assert_eq!(file.name, "資料.bin");
+        assert_eq!(file.size, 5);
+        assert_eq!(file.transfers, vec!["t-5".to_string()]);
+        assert!(inbox.join("資料.bin").exists(), "実体は受信ボックス");
         let _ = std::fs::remove_dir_all(&inbox);
         let _ = std::fs::remove_dir_all(&src_dir);
     }
@@ -975,6 +1098,7 @@ mod tests {
             &src,
             Arc::clone(&send_transfers),
             "t-4".to_string(),
+            None,
         )
         .await
         .unwrap_err();
@@ -1029,6 +1153,7 @@ mod tests {
                 id: "t-2".to_string(),
                 name: "x.bin".to_string(),
                 size: 4,
+                chat: None,
             },
         ] {
             send_frame(&mut stream, &frame).await.unwrap();
@@ -1344,6 +1469,7 @@ mod tests {
                 id: "t-3".to_string(),
                 name: "..".to_string(),
                 size: 1,
+                chat: None,
             },
         )
         .await

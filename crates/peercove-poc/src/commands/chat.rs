@@ -134,12 +134,16 @@ fn format_message(message: &ChatMessageInfo, tunnel: &TunnelInfo) -> String {
             format!("[{name}] ")
         }
     };
+    // チャット内ファイル送信(M3-13d)は本文の代わりにファイル名を出す
+    let body = match &message.file {
+        Some(file) => format!("[ファイル] {}({} バイト)", file.name, file.size),
+        None => message.text.clone(),
+    };
     format!(
-        "{:02}:{:02}:{:02} {scope}{who}: {}{}",
+        "{:02}:{:02}:{:02} {scope}{who}: {body}{}",
         secs_of_day / 3600,
         (secs_of_day / 60) % 60,
         secs_of_day % 60,
-        message.text,
         if message.failed { "(送信失敗)" } else { "" }
     )
 }

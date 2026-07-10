@@ -40,6 +40,18 @@ pub enum ChatScope {
     Group,
 }
 
+/// ファイル送信のチャット文脈(ADR-0016、M3-13d)。`file_offer` に付けると
+/// 送受両側がチャット履歴にファイルのエントリを記録し、UI が会話内に
+/// ファイルバブルを出す。旧デーモン(M3-9a)は未知フィールドとして無視する
+/// (= チャット文脈なしの通常ファイル受信になるだけ)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatContext {
+    pub scope: ChatScope,
+    /// scope = group のときだけ付く。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+}
+
 /// グループ情報(ADR-0016、M3-13c)。**全量 + リビジョン**で伝搬し、受信側は
 /// revision が手元より新しければ丸ごと置換する(同値は updated_by の IP 比較で
 /// 決着 = 最新リビジョン勝ち)。
@@ -69,7 +81,14 @@ pub enum MsgFrame {
     /// 接続直後に双方の前提を揃える(送信側 → 受信側)。
     Hello { version: u32 },
     /// ファイル送信の申し出。`name` はファイル名のみ(パスは含めない)。
-    FileOffer { id: String, name: String, size: u64 },
+    /// `chat` はチャット内ファイル送信の文脈(M3-13d、任意)。
+    FileOffer {
+        id: String,
+        name: String,
+        size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<ChatContext>,
+    },
     /// 受信側: 受け入れる(この後に生バイト列が流れる)。
     FileAccept { id: String },
     /// 受信側: 受け取れない(不正なファイル名など)。
@@ -113,6 +132,16 @@ mod tests {
                 id: "t1".to_string(),
                 name: "写真.jpg".to_string(),
                 size: 1024,
+                chat: None,
+            },
+            MsgFrame::FileOffer {
+                id: "t2".to_string(),
+                name: "資料.pdf".to_string(),
+                size: 2048,
+                chat: Some(ChatContext {
+                    scope: ChatScope::Group,
+                    group_id: Some("g1".to_string()),
+                }),
             },
             MsgFrame::FileAccept {
                 id: "t1".to_string(),
@@ -183,11 +212,26 @@ mod tests {
             id: "a".to_string(),
             name: "b.txt".to_string(),
             size: 3,
+            chat: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json, r#"{"type":"file_offer","id":"a","name":"b.txt","size":3}"#,
+            "chat なしは M3-9a と同じワイヤ表現(旧デーモン互換)"
+        );
+        let json = serde_json::to_string(&MsgFrame::FileOffer {
+            id: "a".to_string(),
+            name: "b.txt".to_string(),
+            size: 3,
+            chat: Some(ChatContext {
+                scope: ChatScope::Direct,
+                group_id: None,
+            }),
         })
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"file_offer","id":"a","name":"b.txt","size":3}"#
+            r#"{"type":"file_offer","id":"a","name":"b.txt","size":3,"chat":{"scope":"direct"}}"#
         );
         let json = serde_json::to_string(&MsgFrame::Chat {
             id: "a".to_string(),
