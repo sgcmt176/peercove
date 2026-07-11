@@ -1384,3 +1384,66 @@ select {
 .prefs__hint {
   margin: 2px 0 10px 26px;
 }
+
+/* チャット本文の URL(M3-13e)。既定ブラウザで開く */
+.msg__link {
+  color: inherit;
+  text-decoration: underline;
+  word-break: break-all;
+}
+
+/* リンクプレビューのカード(M3-13e、ADR-0017 — LINE 風) */
+.msg__preview {
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--bg);
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.msg--own .msg__preview {
+  align-self: flex-end;
+}
+
+.msg__preview-img {
+  width: 100%;
+  max-height: 150px;
+  object-fit: cover;
+}
+
+.msg__preview-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.msg__preview-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.msg__preview-desc {
+  font-size: 0.78rem;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.msg__preview-host {
+  font-size: 0.72rem;
+  color: var(--muted);
+}

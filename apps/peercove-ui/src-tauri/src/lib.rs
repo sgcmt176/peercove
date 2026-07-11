@@ -13,6 +13,7 @@
 //! 残り、トレイから復帰・終了できる。
 
 mod dto;
+mod linkmeta;
 mod tray;
 
 use std::net::SocketAddrV4;
@@ -415,6 +416,175 @@ fn delete_inbox_file(config_path: String, name: String) -> Result<(), String> {
     Ok(())
 }
 
+// ---- チャットのリンク対応(M3-13e、ADR-0017) ----
+
+/// チャット本文の URL を既定ブラウザで開く。http/https だけを許す
+/// (チャット由来の文字列で他のスキームを起動させない)。
+#[tauri::command]
+fn open_link(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("http/https 以外の URL は開けません".to_string());
+    }
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| format!("URL を開けません: {e}"))
+}
+
+/// リンクプレビューの結果。`image` は og:image を data URI にしたもの
+/// (CSP で外部画像の直読みを許していないため、Rust 側で取得して埋め込む)。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkPreviewDto {
+    title: Option<String>,
+    description: Option<String>,
+    site_name: Option<String>,
+    image: Option<String>,
+}
+
+/// HTML はメタデータが取れれば十分なので先頭だけ読む。
+const PREVIEW_HTML_LIMIT: usize = 512 * 1024;
+/// プレビュー画像の上限。超えるものは画像なしで返す。
+const PREVIEW_IMAGE_LIMIT: usize = 2 * 1024 * 1024;
+
+/// 自動取得してよい URL か(ADR-0017)。チャットに URL を書くだけで相手の
+/// 端末が取得しに行くため、ループバック・プライベート等の IP リテラルと
+/// 内部向けドメインは拒否する(トンネル内サービスへの意図しないアクセス防止)。
+fn previewable(url: &reqwest::Url) -> Result<(), String> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("http/https 以外は取得しません".to_string());
+    }
+    let Some(host) = url.host_str() else {
+        return Err("ホスト名がありません".to_string());
+    };
+    let host = host.trim_matches(['[', ']']);
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        if ip.is_private()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            // CGNAT(100.64.0.0/10)。PeerCove の既定レンジもここ
+            || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+        {
+            return Err("プライベートな IP は取得しません".to_string());
+        }
+    } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Err("プライベートな IP は取得しません".to_string());
+        }
+    } else if host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".internal")
+        || host.to_ascii_lowercase().ends_with(".local")
+    {
+        return Err("内部向けの名前は取得しません".to_string());
+    }
+    Ok(())
+}
+
+/// 応答本体を上限付きで読む。戻りは (読めた分, 上限で打ち切ったか)。
+async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<(Vec<u8>, bool), String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("読み込みに失敗しました: {e}"))?
+    {
+        buf.extend_from_slice(&chunk);
+        if buf.len() > limit {
+            buf.truncate(limit);
+            return Ok((buf, true));
+        }
+    }
+    Ok((buf, false))
+}
+
+/// og:image を取得して data URI にする。画像でない・大きすぎる・失敗は None
+/// (プレビューは画像なしで出す)。
+async fn fetch_preview_image(client: &reqwest::Client, url: reqwest::Url) -> Option<String> {
+    let resp = client.get(url).send().await.ok()?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if !content_type.starts_with("image/") {
+        return None;
+    }
+    let (bytes, truncated) = read_capped(resp, PREVIEW_IMAGE_LIMIT).await.ok()?;
+    if truncated || bytes.is_empty() {
+        return None;
+    }
+    use base64::Engine as _;
+    Some(format!(
+        "data:{content_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+/// チャットの URL のページ情報(OGP)を取る(M3-13e、ADR-0017)。
+/// サーバーレスのため各端末が表示時に自分で取得する。アプリ設定で
+/// オフにできる(呼び出し自体を frontend が抑止する)。
+#[tauri::command]
+async fn link_preview(url: String) -> Result<LinkPreviewDto, String> {
+    let parsed = reqwest::Url::parse(&url).map_err(|_| "URL を解釈できません".to_string())?;
+    previewable(&parsed)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("PeerCove/0.1 (link preview)")
+        // リダイレクト先にも同じ制限をかける(内部アドレスへ誘導させない)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 5 {
+                return attempt.error("リダイレクトが多すぎます");
+            }
+            match previewable(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(_) => attempt.stop(),
+            }
+        }))
+        .build()
+        .map_err(|e| format!("HTTP クライアントを初期化できません: {e}"))?;
+
+    let resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| format!("取得できません: {e}"))?;
+    let final_url = resp.url().clone();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !content_type.starts_with("text/html") && !content_type.starts_with("application/xhtml") {
+        return Err("HTML のページではありません".to_string());
+    }
+    let (bytes, _) = read_capped(resp, PREVIEW_HTML_LIMIT).await?;
+    let meta = linkmeta::extract(&String::from_utf8_lossy(&bytes));
+
+    let mut image = None;
+    if let Some(src) = &meta.image {
+        if let Ok(img_url) = final_url.join(src) {
+            if previewable(&img_url).is_ok() {
+                image = fetch_preview_image(&client, img_url).await;
+            }
+        }
+    }
+    if meta.title.is_none() && meta.description.is_none() && image.is_none() {
+        return Err("プレビューできる情報がありません".to_string());
+    }
+    Ok(LinkPreviewDto {
+        title: meta.title,
+        description: meta.description,
+        site_name: meta.site_name,
+        image,
+    })
+}
+
 async fn send(request: IpcRequest) -> Result<(), String> {
     peercove_ipc::request_async(request)
         .await
@@ -674,6 +844,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             tray::setup(app.handle())?;
             // peercove:// スキームを OS に登録(M3-5)。インストーラも登録するが、
@@ -729,6 +900,8 @@ pub fn run() {
             save_inbox_file,
             delete_inbox_file,
             read_text_preview,
+            open_link,
+            link_preview,
             list_dns_records,
             add_dns_record,
             remove_dns_record,

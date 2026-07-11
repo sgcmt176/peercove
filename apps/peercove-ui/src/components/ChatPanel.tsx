@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   ChatContext,
   ChatMessage,
   Group,
+  LinkPreview,
   Member,
   TextPreview,
   Transfer,
@@ -14,6 +15,7 @@ import {
   errorMessage,
   formatBytes,
 } from "../ipc";
+import { loadPrefs } from "../prefs";
 import {
   ConversationKey,
   NETWORK_CONVERSATION,
@@ -755,6 +757,129 @@ function textSnippet(text: string): string {
   return head.length < text.length ? `${head}\n…` : head;
 }
 
+/** 本文を URL とそれ以外に分ける(M3-13e)。 */
+function splitLinks(text: string): Array<{ link: boolean; value: string }> {
+  const parts: Array<{ link: boolean; value: string }> = [];
+  const re = /https?:\/\/\S+/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    // 文末の句読点・閉じ括弧はリンクに含めない
+    const url = match[0].replace(/[.,!?;:。、」』）)\]>"']+$/u, "");
+    if (url.length === 0) continue;
+    if (match.index > last) {
+      parts.push({ link: false, value: text.slice(last, match.index) });
+    }
+    parts.push({ link: true, value: url });
+    last = match.index + url.length;
+  }
+  if (last < text.length) parts.push({ link: false, value: text.slice(last) });
+  return parts;
+}
+
+/** 本文中の最初の URL(リンクプレビューの対象)。 */
+function firstUrl(text: string): string | null {
+  return splitLinks(text).find((part) => part.link)?.value ?? null;
+}
+
+/** URL をクリックできるリンクにして本文を描画する(既定ブラウザで開く)。 */
+function linkify(text: string): ReactNode {
+  const parts = splitLinks(text);
+  if (!parts.some((part) => part.link)) return text;
+  return parts.map((part, index) =>
+    part.link ? (
+      <a
+        key={index}
+        className="msg__link"
+        href={part.value}
+        title={part.value}
+        onClick={(event) => {
+          event.preventDefault();
+          void api.openLink(part.value).catch(() => {});
+        }}
+      >
+        {part.value}
+      </a>
+    ) : (
+      <span key={index}>{part.value}</span>
+    ),
+  );
+}
+
+/** 表示用のホスト名。 */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+// リンクプレビューの結果は URL ごとに使い回す(null = 取れなかった)。
+// 同じ URL を含むメッセージが並んでも取得は 1 回で済む
+const previewCache = new Map<string, LinkPreview | null>();
+const previewPending = new Map<string, Promise<LinkPreview | null>>();
+
+/**
+ * リンクプレビューのカード(M3-13e、ADR-0017)。表示中の端末が自分で
+ * ページ情報(OGP)を取りに行く。取れなかったら何も出さない。
+ */
+function LinkPreviewCard({ url }: { url: string }) {
+  const [data, setData] = useState<LinkPreview | null | undefined>(() =>
+    previewCache.get(url),
+  );
+  useEffect(() => {
+    if (previewCache.has(url)) {
+      setData(previewCache.get(url));
+      return;
+    }
+    let alive = true;
+    let pending = previewPending.get(url);
+    if (!pending) {
+      pending = api.linkPreview(url).then(
+        (preview) => preview,
+        () => null,
+      );
+      previewPending.set(url, pending);
+    }
+    void pending.then((preview) => {
+      previewCache.set(url, preview);
+      previewPending.delete(url);
+      if (alive) setData(preview);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [url]);
+  if (!data) return null;
+  return (
+    <a
+      className="msg__preview"
+      href={url}
+      title={url}
+      onClick={(event) => {
+        event.preventDefault();
+        void api.openLink(url).catch(() => {});
+      }}
+    >
+      {data.image && (
+        <img className="msg__preview-img" src={data.image} alt="" />
+      )}
+      <span className="msg__preview-text">
+        {data.title && (
+          <span className="msg__preview-title">{data.title}</span>
+        )}
+        {data.description && (
+          <span className="msg__preview-desc">{data.description}</span>
+        )}
+        <span className="msg__preview-host">
+          {data.siteName ?? hostOf(url)}
+        </span>
+      </span>
+    </a>
+  );
+}
+
 function timeOf(unixMs: number): string {
   const at = new Date(unixMs);
   const pad = (value: number) => String(value).padStart(2, "0");
@@ -782,6 +907,8 @@ function Bubbles({
   onOpenText: (name: string, preview: TextPreview) => void;
 }) {
   let lastDate = "";
+  // リンクプレビューはアプリ設定でオフにできる(M3-13e)
+  const showLinkPreview = loadPrefs().linkPreview;
   return (
     <>
       {messages.map((message) => {
@@ -790,6 +917,10 @@ function Bubbles({
         lastDate = date;
         const own = message.from === selfIp;
         const sender = memberByIp.get(message.from) ?? null;
+        const previewUrl =
+          showLinkPreview && !message.system && !message.file
+            ? firstUrl(message.text)
+            : null;
         return (
           <div key={message.seq} className="chat__flow">
             {separator && <div className="chat__date">{date}</div>}
@@ -831,7 +962,9 @@ function Bubbles({
                         onOpenText={onOpenText}
                       />
                     ) : (
-                      <span className="msg__bubble">{message.text}</span>
+                      <span className="msg__bubble">
+                        {linkify(message.text)}
+                      </span>
                     )}
                     <span className="msg__time muted">
                       {timeOf(message.sentAtMs)}
@@ -840,6 +973,7 @@ function Bubbles({
                       )}
                     </span>
                   </span>
+                  {previewUrl && <LinkPreviewCard url={previewUrl} />}
                 </span>
               </div>
             )}

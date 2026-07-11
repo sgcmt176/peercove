@@ -30,6 +30,8 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"]
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-notification = "2"
+# チャットの URL を既定ブラウザで開く(M3-13e)
+tauri-plugin-opener = "2"
 # 招待ディープリンク(M3-5): peercove:// スキーム。single-instance は
 # 二重起動時の URL を既存インスタンスへ転送するため deep-link feature 付き
 tauri-plugin-deep-link = "2"
@@ -41,3 +43,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 fast_qr = { version = "0.13", features = ["svg"] }
+# チャットのリンクプレビュー(M3-13e、ADR-0017)。OGP メタデータの取得。
+# rustls にして OpenSSL への依存を避ける(Linux の実行時依存を増やさない)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# og:image を data URI にする(CSP で外部画像の直読みを許さないため)
+base64 = "0.22"

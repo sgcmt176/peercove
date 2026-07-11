@@ -105,6 +105,14 @@ export interface TextPreview {
   truncated: boolean;
 }
 
+/** リンクプレビュー（M3-13e、ADR-0017）。image は data URI。 */
+export interface LinkPreview {
+  title: string | null;
+  description: string | null;
+  siteName: string | null;
+  image: string | null;
+}
+
 /** ファイル送信のチャット文脈（M3-13d）。 */
 export interface ChatContext {
   scope: "direct" | "network" | "group";
@@ -313,6 +321,9 @@ export const api = {
   // テキストファイルのチャット内プレビュー（M3-13e）
   readTextPreview: (path: string) =>
     invoke<TextPreview>("read_text_preview", { path }),
+  // チャットの URL 対応（M3-13e、ADR-0017）
+  openLink: (url: string) => invoke<void>("open_link", { url }),
+  linkPreview: (url: string) => invoke<LinkPreview>("link_preview", { url }),
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),
