@@ -1337,6 +1337,21 @@ select {
   cursor: zoom-in;
 }
 
+/* テキストファイルのプレビュー(M3-13e。クリックで全文) */
+.msg__media--text {
+  width: 280px;
+  max-height: 130px;
+  overflow: hidden;
+  margin: 0;
+  padding: 8px;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+  cursor: zoom-in;
+  border: 1px solid var(--border);
+}
+
 /* 画像の拡大表示(クリックで開くモーダル) */
 .chat__viewer {
   display: flex;
@@ -1349,4 +1364,23 @@ select {
   max-height: 72vh;
   object-fit: contain;
   border-radius: 9px;
+}
+
+/* テキストの全文表示(M3-13e) */
+.chat__viewer-text pre {
+  max-height: 68vh;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--bg);
+  border-radius: 9px;
+  border: 1px solid var(--border);
+}
+
+/* アプリ設定(M3-13e)。チェックの説明文をチェック位置に揃える */
+.prefs__hint {
+  margin: 2px 0 10px 26px;
 }

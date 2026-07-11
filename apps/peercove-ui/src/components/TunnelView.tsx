@@ -6,6 +6,7 @@ import {
   Transfer,
   Tunnel,
   api,
+  baseName,
   errorMessage,
   formatBytes,
   formatHandshake,
@@ -14,7 +15,7 @@ import {
 } from "../ipc";
 import { rateSeries, rttSeries } from "../history";
 import { totalUnread } from "../chat";
-import { ConfirmModal } from "./Modal";
+import { ConfirmModal, Modal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { DnsDialog } from "./DnsDialog";
 import { SubnetDialog } from "./SubnetDialog";
@@ -51,6 +52,8 @@ export function TunnelView({
   const [removing, setRemoving] = useState<Member | null>(null);
   /** 広告サブネット編集の対象(M3-7b、ホストのみ)。 */
   const [editingSubnets, setEditingSubnets] = useState<Member | null>(null);
+  /** ファイル送信ダイアログ(M3-13e: 宛先をチェックボックスで選ぶ)。 */
+  const [sendingFile, setSendingFile] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -69,21 +72,6 @@ export function TunnelView({
       alive = false;
     };
   }, [tunnel]);
-
-  /** ファイル送信(M3-9b): ファイルを選んで、進捗の見える受信タブへ。 */
-  const sendFile = async (member: Member) => {
-    setError(null);
-    try {
-      const path = await api.pickFile();
-      if (!path) return;
-      await api.sendFile(tunnel.config, member.ip, path);
-      setTab("inbox");
-      setNotice(t.transfer.started(member.name ?? member.ip));
-      setTimeout(() => setNotice(null), 8000);
-    } catch (e) {
-      setError(errorMessage(e));
-    }
-  };
 
   const activeTransfers = tunnel.transfers.filter(
     (transfer) => !transfer.done,
@@ -222,6 +210,15 @@ export function TunnelView({
               <span className="tabs__badge">{inbox.length + activeTransfers}</span>
             )}
           </button>
+          {tab === "members" && tunnel.members.some((m) => !m.isSelf) && (
+            <button
+              type="button"
+              className="tabs__action"
+              onClick={() => setSendingFile(true)}
+            >
+              {t.transfer.sendButton}
+            </button>
+          )}
           {isHost && tab === "members" && (
             <button
               type="button"
@@ -249,7 +246,6 @@ export function TunnelView({
                     onRemove={() => setRemoving(member)}
                     onRename={(newName) => void rename(member, newName)}
                     onSubnets={() => setEditingSubnets(member)}
-                    onSendFile={() => void sendFile(member)}
                   />
                 ))}
               </ul>
@@ -322,7 +318,147 @@ export function TunnelView({
           message={t.tunnel.remove.message(removing.name ?? removing.ip)}
         />
       )}
+
+      {sendingFile && (
+        <SendFileDialog
+          tunnel={tunnel}
+          onClose={() => setSendingFile(false)}
+          onSent={(count) => {
+            setSendingFile(false);
+            setTab("inbox");
+            setNotice(t.transfer.startedMany(count));
+            setTimeout(() => setNotice(null), 8000);
+          }}
+        />
+      )}
     </>
+  );
+}
+
+/**
+ * ファイル送信ダイアログ(M3-13e)。ファイルを選び、宛先メンバーを
+ * チェックボックスで選んで送る(オフラインのメンバーは選べない — ADR-0015)。
+ * 進捗は受信タブの転送一覧に宛先ごとに出る。
+ */
+function SendFileDialog({
+  tunnel,
+  onClose,
+  onSent,
+}: {
+  tunnel: Tunnel;
+  onClose: () => void;
+  onSent: (count: number) => void;
+}) {
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [path, setPath] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const candidates = tunnel.members.filter((member) => !member.isSelf);
+
+  const toggle = (ip: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(ip)) {
+        next.delete(ip);
+      } else {
+        next.add(ip);
+      }
+      return next;
+    });
+  };
+
+  const pick = async () => {
+    setError(null);
+    try {
+      const picked = await api.pickFile();
+      if (picked) setPath(picked);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
+  const send = async () => {
+    if (!path || checked.size === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      for (const ip of checked) {
+        await api.sendFile(tunnel.config, ip, path);
+      }
+      onSent(checked.size);
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title={t.transfer.dialogTitle} onClose={onClose}>
+      <div className="modal__body">
+        <span className="field__label">{t.transfer.fileLabel}</span>
+        <div className="row">
+          <button type="button" className="button--ghost" onClick={() => void pick()}>
+            {t.transfer.pick}
+          </button>
+          {path ? (
+            <span className="mono ellipsis" title={path}>
+              {baseName(path)}
+            </span>
+          ) : (
+            <span className="muted small">{t.transfer.noFile}</span>
+          )}
+        </div>
+        <span className="field__label">{t.transfer.recipientsLabel}</span>
+        {candidates.length === 0 ? (
+          <p className="muted small">{t.transfer.noCandidates}</p>
+        ) : (
+          <ul className="chat__pick">
+            {candidates.map((member) => (
+              <li key={member.ip}>
+                <label className="chat__pick-row">
+                  <input
+                    type="checkbox"
+                    disabled={!member.online}
+                    checked={checked.has(member.ip)}
+                    onChange={() => toggle(member.ip)}
+                  />
+                  <Avatar
+                    publicKey={member.publicKey}
+                    name={member.name}
+                    online={member.online}
+                    onlineLabel={
+                      member.online
+                        ? t.tunnel.member.online
+                        : t.tunnel.member.offline
+                    }
+                  />
+                  <span className="ellipsis">{member.name ?? member.ip}</span>
+                  {!member.online && (
+                    <span className="muted small">
+                      {t.tunnel.member.offline}
+                    </span>
+                  )}
+                </label>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="muted small">{t.transfer.dialogNote}</p>
+        {error && <p className="error-text small">{error}</p>}
+      </div>
+      <div className="modal__actions">
+        <button type="button" className="button--ghost" onClick={onClose}>
+          {t.common.cancel}
+        </button>
+        <button
+          type="button"
+          onClick={() => void send()}
+          disabled={busy || !path || checked.size === 0}
+        >
+          {busy ? t.common.running : t.transfer.sendTo(checked.size)}
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -540,7 +676,6 @@ function MemberRow({
   onRemove,
   onRename,
   onSubnets,
-  onSendFile,
 }: {
   config: string;
   member: Member;
@@ -551,14 +686,10 @@ function MemberRow({
   onRename: (newName: string) => void;
   /** 広告サブネットの編集を開く(M3-7b、ホストのみ)。 */
   onSubnets: () => void;
-  /** このメンバーへファイルを送る(M3-9b)。 */
-  onSendFile: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(member.name ?? "");
   const rates = peer ? rateSeries(config, peer.publicKey) : [];
-  // 送れるのはオンラインの他人だけ(オフライン宛は V1 非対応 — ADR-0015)
-  const canSend = member.online && !member.isSelf;
 
   const commit = () => {
     const trimmed = draft.trim();
@@ -637,49 +768,35 @@ function MemberRow({
           </span>
         )}
       </span>
-      {(canManage || canSend) && !editing && (
+      {canManage && !editing && (
         <span className="member__actions">
-          {canSend && (
-            <button
-              type="button"
-              className="button--icon"
-              title={t.tunnel.member.sendFile}
-              onClick={onSendFile}
-            >
-              📤
-            </button>
-          )}
-          {canManage && (
-            <>
-              <button
-                type="button"
-                className="button--icon"
-                title={t.subnet.edit}
-                onClick={onSubnets}
-              >
-                🖧
-              </button>
-              <button
-                type="button"
-                className="button--icon"
-                title={t.tunnel.member.rename}
-                onClick={() => {
-                  setDraft(member.name ?? "");
-                  setEditing(true);
-                }}
-              >
-                ✎
-              </button>
-              <button
-                type="button"
-                className="button--icon button--icon-danger"
-                title={t.tunnel.member.remove}
-                onClick={onRemove}
-              >
-                ×
-              </button>
-            </>
-          )}
+          <button
+            type="button"
+            className="button--icon"
+            title={t.subnet.edit}
+            onClick={onSubnets}
+          >
+            🖧
+          </button>
+          <button
+            type="button"
+            className="button--icon"
+            title={t.tunnel.member.rename}
+            onClick={() => {
+              setDraft(member.name ?? "");
+              setEditing(true);
+            }}
+          >
+            ✎
+          </button>
+          <button
+            type="button"
+            className="button--icon button--icon-danger"
+            title={t.tunnel.member.remove}
+            onClick={onRemove}
+          >
+            ×
+          </button>
         </span>
       )}
     </li>

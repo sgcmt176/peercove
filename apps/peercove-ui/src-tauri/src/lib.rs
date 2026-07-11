@@ -371,6 +371,37 @@ async fn save_inbox_file(
     Ok(Some(dest))
 }
 
+/// チャットのテキストプレビュー(M3-13e)。先頭だけ読んで返す。
+/// NUL を含むファイルはテキストとみなさない(Err → UI は通常のファイル表示)。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextPreview {
+    text: String,
+    truncated: bool,
+}
+
+#[tauri::command]
+fn read_text_preview(path: String) -> Result<TextPreview, String> {
+    use std::io::Read as _;
+    const MAX_PREVIEW_BYTES: u64 = 256 * 1024;
+    let file = std::fs::File::open(&path).map_err(|e| format!("ファイルを開けません: {e}"))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("ファイルを読めません: {e}"))?
+        .len();
+    let mut buf = Vec::new();
+    file.take(MAX_PREVIEW_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("ファイルを読めません: {e}"))?;
+    if buf.contains(&0) {
+        return Err("テキストファイルではありません".to_string());
+    }
+    Ok(TextPreview {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        truncated: len > MAX_PREVIEW_BYTES,
+    })
+}
+
 /// 受信ボックスのファイルを削除する(メタ情報も対で)。
 #[tauri::command]
 fn delete_inbox_file(config_path: String, name: String) -> Result<(), String> {
@@ -697,6 +728,7 @@ pub fn run() {
             list_inbox,
             save_inbox_file,
             delete_inbox_file,
+            read_text_preview,
             list_dns_records,
             add_dns_record,
             remove_dns_record,

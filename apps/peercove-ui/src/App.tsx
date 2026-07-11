@@ -16,6 +16,7 @@ import { NetworksView } from "./components/NetworksView";
 import { TunnelView } from "./components/TunnelView";
 import { LogsDialog } from "./components/LogsDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { PrefsDialog } from "./components/PrefsDialog";
 
 /** デーモンの状態を取りに行く間隔。CLI の status(5 秒)より短くしておく。 */
 const POLL_INTERVAL_MS = 2000;
@@ -45,7 +46,7 @@ export default function App() {
   });
   /** 設定済みネットワークの一覧(M3-0c)。 */
   const [networks, setNetworks] = useState<NetworkInfo[]>([]);
-  const [dialog, setDialog] = useState<"logs" | null>(null);
+  const [dialog, setDialog] = useState<"logs" | "prefs" | null>(null);
   /** 設定ダイアログの対象(ネットワークごと — カード/詳細の「設定」から)。 */
   const [settingsFor, setSettingsFor] = useState<string | null>(null);
   /** 詳細表示中のネットワーク(configPath)。null なら一覧。 */
@@ -198,6 +199,14 @@ export default function App() {
           <button
             type="button"
             className="button--icon"
+            title={t.header.prefs}
+            onClick={() => setDialog("prefs")}
+          >
+            ⚙
+          </button>
+          <button
+            type="button"
+            className="button--icon"
             title={t.header.logs}
             disabled={connection.kind === "unreachable"}
             onClick={() => setDialog("logs")}
@@ -251,6 +260,7 @@ export default function App() {
       )}
 
       {dialog === "logs" && <LogsDialog onClose={() => setDialog(null)} />}
+      {dialog === "prefs" && <PrefsDialog onClose={() => setDialog(null)} />}
       {settingsFor && (
         <SettingsDialog
           configPath={settingsFor}

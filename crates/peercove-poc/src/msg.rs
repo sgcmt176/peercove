@@ -552,7 +552,9 @@ async fn receive_file(
     );
     // チャット内ファイル送信(M3-13d): 受信開始時に履歴へ記録する
     // (UI のファイルバブルは transfers の進捗を重ねて表示する)。
-    // name は実際に保存されるファイル名(同名回避の連番込み)
+    // name は実際に保存されるファイル名(同名回避の連番込み)。
+    // 失敗時のお知らせ(M3-13e)のため、載せたエントリを覚えておく
+    let mut chat_entry: Option<ChatMessageInfo> = None;
     if let Some(ctx) = chat_ctx {
         if ctx.scope != ChatScope::Group || ctx.group_id.is_some() {
             let saved_name = final_path
@@ -560,7 +562,7 @@ async fn receive_file(
                 .and_then(|s| s.to_str())
                 .unwrap_or(&safe_name)
                 .to_string();
-            chat.lock().unwrap().append(ChatMessageInfo {
+            chat_entry = Some(chat.lock().unwrap().append(ChatMessageInfo {
                 seq: 0, // append が振る
                 id: new_transfer_id(),
                 scope: ctx.scope,
@@ -582,7 +584,7 @@ async fn receive_file(
                     path: Some(final_path.clone()),
                 }),
                 system: false,
-            });
+            }));
         }
     }
     let result = receive_body(
@@ -602,6 +604,31 @@ async fn receive_file(
         Err(e) => {
             let _ = tokio::fs::remove_file(&part_path).await;
             mark_failed(transfers, &id, e);
+            // チャット内ファイルの受信失敗は会話にお知らせを出す(M3-13e)。
+            // バブルの失敗表示は転送一覧との突き合わせだが、一覧は直近分しか
+            // 残らないため、履歴に残るメッセージでも分かるようにする
+            if let Some(entry) = chat_entry {
+                let name = entry
+                    .file
+                    .as_ref()
+                    .map(|f| f.name.clone())
+                    .unwrap_or_default();
+                let mut log = chat.lock().unwrap();
+                log.mark_failed(entry.seq);
+                log.append(ChatMessageInfo {
+                    seq: 0, // append が振る
+                    id: new_transfer_id(),
+                    scope: entry.scope,
+                    group_id: entry.group_id,
+                    from: peer_ip,
+                    to: entry.to,
+                    text: format!("{sender_name}からのファイル「{name}」を受信できませんでした"),
+                    sent_at: now_unix_ms(),
+                    failed: false,
+                    file: None,
+                    system: true,
+                });
+            }
         }
     }
     result
@@ -1102,6 +1129,90 @@ mod tests {
         assert!(inbox.join("資料.bin").exists(), "実体は受信ボックス");
         let _ = std::fs::remove_dir_all(&inbox);
         let _ = std::fs::remove_dir_all(&src_dir);
+    }
+
+    /// チャット内ファイルの受信が途中で失敗すると、ファイルのエントリに
+    /// 失敗の印が付き、お知らせ(system)が履歴に残る(M3-13e)。
+    #[tokio::test]
+    async fn receive_failure_appends_system_notice() {
+        let inbox = temp_dir("chatfilefail");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chat = test_chat_log();
+        let server_chat = Arc::clone(&chat);
+        let recv_transfers: TransferRegistry = Default::default();
+        let server_transfers = Arc::clone(&recv_transfers);
+        let server_inbox = inbox.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                "10.9.9.9".parse().unwrap(),
+                "alice".to_string(),
+                &Default::default(),
+                &server_inbox,
+                &server_transfers,
+                0,
+                &server_chat,
+                &test_groups(),
+            )
+            .await
+        });
+
+        // 手で FileOffer を送り、本体の途中で切断する
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = line_reader(read_half);
+        let mut line = String::new();
+        send_frame(
+            &mut write_half,
+            &MsgFrame::Hello {
+                version: MSG_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        send_frame(
+            &mut write_half,
+            &MsgFrame::FileOffer {
+                id: "t-9".to_string(),
+                name: "資料.bin".to_string(),
+                size: 10,
+                chat: Some(ChatContext {
+                    scope: ChatScope::Direct,
+                    group_id: None,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        match expect_frame(&mut reader, &mut line).await.unwrap() {
+            MsgFrame::FileAccept { .. } => {}
+            other => panic!("FileAccept を期待しましたが {other:?}"),
+        }
+        write_half.write_all(b"abc").await.unwrap();
+        drop(write_half);
+        drop(reader);
+        assert!(server.await.unwrap().is_err(), "受信は失敗する");
+
+        let log = chat.lock().unwrap();
+        let (_, messages) = log.fetch(0);
+        assert_eq!(
+            messages.len(),
+            2,
+            "ファイルのエントリ + お知らせ: {messages:?}"
+        );
+        assert!(messages[0].file.is_some());
+        assert!(messages[0].failed, "ファイルのエントリに失敗の印");
+        assert!(messages[1].system);
+        assert!(messages[1].text.contains("受信できませんでした"));
+        assert!(messages[1].text.contains("資料.bin"));
+        let _ = std::fs::remove_dir_all(&inbox);
     }
 
     /// 受信サイズ上限(受け取る側の設定)を超える申し出は拒否され、

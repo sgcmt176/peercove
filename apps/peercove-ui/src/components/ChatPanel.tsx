@@ -6,9 +6,11 @@ import {
   ChatMessage,
   Group,
   Member,
+  TextPreview,
   Transfer,
   Tunnel,
   api,
+  baseName,
   errorMessage,
   formatBytes,
 } from "../ipc";
@@ -61,10 +63,12 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
   /** ドロップされたファイル(送信確認待ち — M3-13d)。 */
   const [dropPaths, setDropPaths] = useState<string[] | null>(null);
   const [dragOver, setDragOver] = useState(false);
-  /** 画像の拡大表示(クリックで開く — 検証 FB)。 */
-  const [viewer, setViewer] = useState<{ src: string; name: string } | null>(
-    null,
-  );
+  /** 拡大表示(クリックで開く)。画像(検証 FB)とテキスト(M3-13e)。 */
+  const [viewer, setViewer] = useState<
+    | { kind: "image"; src: string; name: string }
+    | { kind: "text"; name: string; preview: TextPreview }
+    | null
+  >(null);
   // 送信直後・既読直後にポーリングを待たず再描画するためのカウンタ
   const [, setBump] = useState(0);
   const rerender = () => setBump((n) => n + 1);
@@ -383,7 +387,10 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
               showNames={showNames}
               transfers={tunnel.transfers}
               onSaveFile={(name) => void saveFile(name)}
-              onEnlarge={(src, name) => setViewer({ src, name })}
+              onEnlarge={(src, name) => setViewer({ kind: "image", src, name })}
+              onOpenText={(name, preview) =>
+                setViewer({ kind: "text", name, preview })
+              }
             />
           )}
           {dragOver && canSend && (
@@ -464,9 +471,18 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
       )}
       {viewer && (
         <Modal title={viewer.name} onClose={() => setViewer(null)} wide>
-          <div className="chat__viewer">
-            <img src={viewer.src} alt={viewer.name} />
-          </div>
+          {viewer.kind === "image" ? (
+            <div className="chat__viewer">
+              <img src={viewer.src} alt={viewer.name} />
+            </div>
+          ) : (
+            <div className="chat__viewer-text">
+              {viewer.preview.truncated && (
+                <p className="muted small">{t.chat.textTruncated}</p>
+              )}
+              <pre>{viewer.preview.text}</pre>
+            </div>
+          )}
         </Modal>
       )}
       {dropPaths &&
@@ -508,11 +524,6 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
         ))}
     </div>
   );
-}
-
-/** パスからファイル名だけを取り出す(表示用)。 */
-function baseName(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
 }
 
 /**
@@ -718,15 +729,30 @@ function previewOf(message: ChatMessage, selfIp: string): string {
   return `${prefix}${body}`;
 }
 
+/** テキストとしてプレビューする拡張子(M3-13e)。 */
+const TEXT_EXTS = [
+  "txt", "md", "log", "csv", "tsv", "json", "xml", "yaml", "yml", "toml",
+  "ini", "conf", "sh", "ps1", "bat", "cmd", "py", "rs", "js", "ts", "jsx",
+  "tsx", "c", "h", "cpp", "java", "go", "sql", "html", "css",
+];
+
 /** 拡張子からインラインプレビューの種類を決める(M3-13d 検証 FB)。 */
-function mediaKind(name: string): "image" | "video" | "audio" | null {
+function mediaKind(name: string): "image" | "video" | "audio" | "text" | null {
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
   if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "svg"].includes(ext)) {
     return "image";
   }
   if (["mp4", "webm", "mov", "m4v"].includes(ext)) return "video";
   if (["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(ext)) return "audio";
+  if (TEXT_EXTS.includes(ext)) return "text";
   return null;
+}
+
+/** テキストプレビューのバブル内表示(先頭数行だけ)。 */
+function textSnippet(text: string): string {
+  const lines = text.split("\n");
+  const head = lines.slice(0, 6).join("\n").slice(0, 400);
+  return head.length < text.length ? `${head}\n…` : head;
 }
 
 function timeOf(unixMs: number): string {
@@ -744,6 +770,7 @@ function Bubbles({
   transfers,
   onSaveFile,
   onEnlarge,
+  onOpenText,
 }: {
   messages: ChatMessage[];
   selfIp: string;
@@ -752,6 +779,7 @@ function Bubbles({
   transfers: Transfer[];
   onSaveFile: (name: string) => void;
   onEnlarge: (src: string, name: string) => void;
+  onOpenText: (name: string, preview: TextPreview) => void;
 }) {
   let lastDate = "";
   return (
@@ -800,6 +828,7 @@ function Bubbles({
                         transfers={transfers}
                         onSave={onSaveFile}
                         onEnlarge={onEnlarge}
+                        onOpenText={onOpenText}
                       />
                     ) : (
                       <span className="msg__bubble">{message.text}</span>
@@ -833,16 +862,20 @@ function FileBubble({
   transfers,
   onSave,
   onEnlarge,
+  onOpenText,
 }: {
   message: ChatMessage;
   own: boolean;
   transfers: Transfer[];
   onSave: (name: string) => void;
   onEnlarge: (src: string, name: string) => void;
+  onOpenText: (name: string, preview: TextPreview) => void;
 }) {
   // プレビューの読み込みに失敗したら通常のファイル表示に戻す
   // (保存・削除でファイルが移動した後など)
   const [broken, setBroken] = useState(false);
+  /** テキストプレビューの中身(M3-13e。kind = text のとき読み込む)。 */
+  const [text, setText] = useState<TextPreview | null>(null);
   const file = message.file!;
   const related = transfers.filter((tr) => file.transfers.includes(tr.id));
   const active = related.filter((tr) => !tr.done);
@@ -861,9 +894,29 @@ function FileBubble({
   const kind = mediaKind(file.name);
   const ready = own || (active.length === 0 && !failed);
   const src =
-    !broken && kind !== null && ready && file.path
+    !broken && kind !== null && kind !== "text" && ready && file.path
       ? convertFileSrc(file.path)
       : null;
+
+  // テキストはファイルの先頭を読んで数行だけ出す(クリックで全文 — M3-13e)。
+  // 読めない(バイナリ・移動済みなど)ときは通常のファイル表示に戻す
+  const filePath = file.path;
+  const wantText = kind === "text" && ready && !broken && filePath !== null;
+  useEffect(() => {
+    if (!wantText || text !== null) return;
+    let alive = true;
+    api
+      .readTextPreview(filePath!)
+      .then((preview) => {
+        if (alive) setText(preview);
+      })
+      .catch(() => {
+        if (alive) setBroken(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [wantText, filePath, text]);
 
   return (
     <span className="msg__bubble msg__bubble--file">
@@ -889,6 +942,15 @@ function FileBubble({
       )}
       {src && kind === "audio" && (
         <audio src={src} controls onError={() => setBroken(true)} />
+      )}
+      {wantText && text && (
+        <pre
+          className="msg__media msg__media--text"
+          title={t.chat.textOpen}
+          onClick={() => onOpenText(file.name, text)}
+        >
+          {textSnippet(text.text)}
+        </pre>
       )}
       <span className="msg__file-name ellipsis" title={file.name}>
         📎 {file.name}

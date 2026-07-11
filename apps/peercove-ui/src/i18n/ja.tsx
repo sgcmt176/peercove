@@ -51,6 +51,7 @@ export const ja = {
     settings: "設定",
     settingsUnavailable:
       "設定ファイルがまだありません（ホストを始めるか参加してください）",
+    prefs: "アプリ設定",
     logs: "デーモンのログ",
     // 外観テーマの切替ボタン(M3-6)。ライト ⇄ ダークの 2 状態
     theme: (theme: "light" | "dark") =>
@@ -66,6 +67,18 @@ export const ja = {
       を参照）。
     </>
   ),
+
+  // アプリ全体の設定(M3-13e)。このマシンだけに効く(localStorage)
+  prefs: {
+    title: "アプリ設定",
+    notifications: "OS 通知を出す",
+    notificationsHint:
+      "メンバーの参加・切断、チャットの新着、ファイルの受信完了の通知です。オフにしても未読バッジや受信タブの表示は変わりません。",
+    linkPreview: "チャットの URL のプレビューを表示する",
+    linkPreviewHint:
+      "URL を含むメッセージを表示したとき、この端末がそのページへ情報（タイトルや画像）を取りに行きます。相手のサイトにあなたの IP アドレスが伝わるのが気になる場合はオフにしてください。",
+    note: "この設定はこのマシンにだけ保存されます（即時反映）。",
+  },
 
   daemonOutdated: {
     title: "デーモンの更新が必要です",
@@ -235,7 +248,6 @@ export const ja = {
       rateTitle: "このメンバーとの転送速度（受信+送信、直近約 90 秒の推移）",
       rename: "名前を変更",
       remove: "削除",
-      sendFile: "ファイルを送る",
       self: "自分",
       selfTitle: "このマシン自身です",
       // メンバー間の経路(M3-4、ADR-0013)
@@ -298,6 +310,9 @@ export const ja = {
     dropTitle: "ファイルを送信",
     dropMessage: (dest: string) => `「${dest}」へ送信しますか？`,
     dropHint: (dest: string) => `ドロップして「${dest}」へ送信`,
+    // テキストファイルのプレビュー(M3-13e)
+    textOpen: "クリックで全文を表示",
+    textTruncated: "ファイルが大きいため先頭のみ表示しています。",
   },
 
   // ファイル送信・受信ボックス(M3-9b、ADR-0015)
@@ -305,11 +320,24 @@ export const ja = {
     head: "転送",
     // 一覧の行頭に出す向き
     direction: (d: "send" | "recv") => (d === "send" ? "送信" : "受信"),
-    started: (name: string) =>
-      `${name} への送信を開始しました（進捗はこのタブに出ます）。`,
     done: "完了",
     failed: (reason: string) => `失敗: ${reason}`,
     progress: (transferred: string, size: string) => `${transferred} / ${size}`,
+    // ファイル送信ダイアログ(M3-13e: 宛先をチェックボックスで選ぶ)
+    sendButton: "📤 ファイル送信",
+    dialogTitle: "ファイル送信",
+    fileLabel: "送るファイル",
+    pick: "ファイルを選ぶ",
+    noFile: "（未選択）",
+    recipientsLabel: "送る相手（複数選べます）",
+    noCandidates: "送れるメンバーがいません。",
+    dialogNote:
+      "オフラインのメンバーには送れません。進捗は受信タブの転送一覧に宛先ごとに出ます。",
+    sendTo: (n: number) => (n === 0 ? "送信" : `${n} 人へ送信`),
+    startedMany: (n: number) =>
+      n === 1
+        ? "送信を開始しました（進捗はこのタブに出ます）。"
+        : `${n} 人への送信を開始しました（進捗はこのタブに出ます）。`,
   },
   inbox: {
     head: "受信ボックス",

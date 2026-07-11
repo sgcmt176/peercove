@@ -10,6 +10,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ChatMessage, Group, Member, Transfer } from "./ipc";
 import { conversationOf, isViewing } from "./chat";
+import { loadPrefs } from "./prefs";
 import { t } from "./i18n";
 
 export interface MemberEvent {
@@ -74,6 +75,8 @@ export async function notifyMemberEvents(
   events: MemberEvent[],
   network: string,
 ): Promise<void> {
+  // 通知はアプリ設定でまとめてオフにできる(M3-13e)。バッジは別(chat.ts)
+  if (!loadPrefs().notifications) return;
   for (const event of events) {
     try {
       await invoke("notify", describe(event, network));
@@ -112,6 +115,7 @@ export async function notifyChatEvents(
   tunnel: { config: string; address: string; network: string; groups: Group[] },
   members: Member[],
 ): Promise<void> {
+  if (!loadPrefs().notifications) return;
   for (const message of fresh) {
     if (message.from === tunnel.address) continue;
     if (message.system) continue; // グループ操作のお知らせは鳴らさない
@@ -146,6 +150,7 @@ export async function notifyFileEvents(
   members: Member[],
   network: string,
 ): Promise<void> {
+  if (!loadPrefs().notifications) return;
   for (const transfer of events) {
     const from =
       members.find((m) => m.ip === transfer.peer)?.name ?? transfer.peer;

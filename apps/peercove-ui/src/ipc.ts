@@ -98,6 +98,13 @@ export interface ChatFile {
   path: string | null;
 }
 
+/** テキストファイルのプレビュー（M3-13e）。先頭だけ読んだもの。 */
+export interface TextPreview {
+  text: string;
+  /** 上限（256 KiB）で打ち切った。 */
+  truncated: boolean;
+}
+
 /** ファイル送信のチャット文脈（M3-13d）。 */
 export interface ChatContext {
   scope: "direct" | "network" | "group";
@@ -303,6 +310,9 @@ export const api = {
     invoke<string | null>("save_inbox_file", { configPath, name }),
   deleteInboxFile: (configPath: string, name: string) =>
     invoke<void>("delete_inbox_file", { configPath, name }),
+  // テキストファイルのチャット内プレビュー（M3-13e）
+  readTextPreview: (path: string) =>
+    invoke<TextPreview>("read_text_preview", { path }),
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),
@@ -371,4 +381,9 @@ export function formatLogTime(unixMs: number): string {
 /** invoke のエラーは文字列で返る。 */
 export function errorMessage(error: unknown): string {
   return typeof error === "string" ? error : String(error);
+}
+
+/** パスからファイル名だけを取り出す(表示用)。 */
+export function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
 }
