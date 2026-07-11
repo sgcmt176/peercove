@@ -25,7 +25,8 @@ peercove-ops = { path = "../../../crates/peercove-ops" }
 
 # tray-icon: トレイ常駐(M2-G6)。Linux のビルドには libayatana-appindicator3-dev が要る
 # image-png: トレイアイコンを icons/32x32.png から読むため
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# protocol-asset: チャットのインラインプレビュー(画像・動画をローカルパスから表示)
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-notification = "2"

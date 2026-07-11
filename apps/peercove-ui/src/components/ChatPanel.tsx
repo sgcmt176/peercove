@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   ChatContext,
@@ -60,6 +61,10 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
   /** ドロップされたファイル(送信確認待ち — M3-13d)。 */
   const [dropPaths, setDropPaths] = useState<string[] | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  /** 画像の拡大表示(クリックで開く — 検証 FB)。 */
+  const [viewer, setViewer] = useState<{ src: string; name: string } | null>(
+    null,
+  );
   // 送信直後・既読直後にポーリングを待たず再描画するためのカウンタ
   const [, setBump] = useState(0);
   const rerender = () => setBump((n) => n + 1);
@@ -114,6 +119,7 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
       const group = groupId ? (groupById.get(groupId) ?? null) : null;
       items.push({
         key,
+        // グループ情報がまだ届いていない間は「同期中」の表示名にする
         name: groupId ? (group?.name ?? t.chat.unknownGroup) : key,
         online: false,
         member: null,
@@ -346,7 +352,9 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
               </button>
             </>
           ) : groupIdOf(conversation) !== null ? (
-            <span className="muted small">{t.chat.leftGroup}</span>
+            <span className="muted small">
+              {selected?.group ? t.chat.leftGroup : t.chat.groupPending}
+            </span>
           ) : selected?.member ? (
             <span className="muted small">
               {selected.online
@@ -375,6 +383,7 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
               showNames={showNames}
               transfers={tunnel.transfers}
               onSaveFile={(name) => void saveFile(name)}
+              onEnlarge={(src, name) => setViewer({ src, name })}
             />
           )}
           {dragOver && canSend && (
@@ -452,6 +461,13 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
             setConversation(NETWORK_CONVERSATION);
           }}
         />
+      )}
+      {viewer && (
+        <Modal title={viewer.name} onClose={() => setViewer(null)} wide>
+          <div className="chat__viewer">
+            <img src={viewer.src} alt={viewer.name} />
+          </div>
+        </Modal>
       )}
       {dropPaths &&
         (canSend ? (
@@ -693,11 +709,24 @@ function lastMessageOf(
 }
 
 function previewOf(message: ChatMessage, selfIp: string): string {
+  // グループ操作のお知らせは本文そのまま(「自分: 」を付けない)
+  if (message.system) return message.text;
   const prefix = message.from === selfIp ? t.chat.previewSelf : "";
   const body = message.file
     ? t.chat.filePreview(message.file.name)
     : message.text.replace(/\s+/g, " ");
   return `${prefix}${body}`;
+}
+
+/** 拡張子からインラインプレビューの種類を決める(M3-13d 検証 FB)。 */
+function mediaKind(name: string): "image" | "video" | "audio" | null {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "svg"].includes(ext)) {
+    return "image";
+  }
+  if (["mp4", "webm", "mov", "m4v"].includes(ext)) return "video";
+  if (["mp3", "wav", "ogg", "m4a", "flac", "aac"].includes(ext)) return "audio";
+  return null;
 }
 
 function timeOf(unixMs: number): string {
@@ -706,7 +735,7 @@ function timeOf(unixMs: number): string {
   return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
 }
 
-/** 吹き出しの列(日付が変わる箇所に区切りを挟む)。 */
+/** 吹き出しの列(日付が変わる箇所に区切り、グループ操作は中央の 1 行)。 */
 function Bubbles({
   messages,
   selfIp,
@@ -714,6 +743,7 @@ function Bubbles({
   showNames,
   transfers,
   onSaveFile,
+  onEnlarge,
 }: {
   messages: ChatMessage[];
   selfIp: string;
@@ -721,6 +751,7 @@ function Bubbles({
   showNames: boolean;
   transfers: Transfer[];
   onSaveFile: (name: string) => void;
+  onEnlarge: (src: string, name: string) => void;
 }) {
   let lastDate = "";
   return (
@@ -734,49 +765,55 @@ function Bubbles({
         return (
           <div key={message.seq} className="chat__flow">
             {separator && <div className="chat__date">{date}</div>}
-            <div className={own ? "msg msg--own" : "msg"}>
-              {!own && (
-                <span className="msg__avatar">
-                  {sender ? (
-                    <Avatar
-                      publicKey={sender.publicKey}
-                      name={sender.name}
-                      online={sender.online}
-                      onlineLabel=""
-                    />
-                  ) : (
-                    <span className="avatar" aria-hidden>
-                      ?
-                    </span>
-                  )}
-                </span>
-              )}
-              <span className="msg__body">
-                {!own && showNames && (
-                  <span className="msg__name muted small">
-                    {sender?.name ?? message.from}
-                  </span>
-                )}
-                <span className="msg__row">
-                  {message.file ? (
-                    <FileBubble
-                      message={message}
-                      own={own}
-                      transfers={transfers}
-                      onSave={onSaveFile}
-                    />
-                  ) : (
-                    <span className="msg__bubble">{message.text}</span>
-                  )}
-                  <span className="msg__time muted">
-                    {timeOf(message.sentAtMs)}
-                    {message.failed && (
-                      <span className="error-text"> {t.chat.failed}</span>
+            {message.system ? (
+              // グループ操作のお知らせ(作成・追加・退出・改名 — LINE 風)
+              <div className="chat__system">{message.text}</div>
+            ) : (
+              <div className={own ? "msg msg--own" : "msg"}>
+                {!own && (
+                  <span className="msg__avatar">
+                    {sender ? (
+                      <Avatar
+                        publicKey={sender.publicKey}
+                        name={sender.name}
+                        online={sender.online}
+                        onlineLabel=""
+                      />
+                    ) : (
+                      <span className="avatar" aria-hidden>
+                        ?
+                      </span>
                     )}
                   </span>
+                )}
+                <span className="msg__body">
+                  {!own && showNames && (
+                    <span className="msg__name muted small">
+                      {sender?.name ?? message.from}
+                    </span>
+                  )}
+                  <span className="msg__row">
+                    {message.file ? (
+                      <FileBubble
+                        message={message}
+                        own={own}
+                        transfers={transfers}
+                        onSave={onSaveFile}
+                        onEnlarge={onEnlarge}
+                      />
+                    ) : (
+                      <span className="msg__bubble">{message.text}</span>
+                    )}
+                    <span className="msg__time muted">
+                      {timeOf(message.sentAtMs)}
+                      {message.failed && (
+                        <span className="error-text"> {t.chat.failed}</span>
+                      )}
+                    </span>
+                  </span>
                 </span>
-              </span>
-            </div>
+              </div>
+            )}
           </div>
         );
       })}
@@ -786,20 +823,26 @@ function Bubbles({
 
 /**
  * ファイルバブル(M3-13d)。進捗は Tunnel.transfers と転送 id で突き合わせる
- * (転送一覧から流れた古いエントリは進捗なしで表示)。受信済みのファイルは
- * 「保存」で受信ボックスから任意の場所へ移せる。
+ * (転送一覧から流れた古いエントリは進捗なしで表示)。画像・動画・音声は
+ * その場でプレビューし、画像はクリックで拡大(2026-07-11 検証 FB)。
+ * 受信済みのファイルは「保存」で受信ボックスから任意の場所へ移せる。
  */
 function FileBubble({
   message,
   own,
   transfers,
   onSave,
+  onEnlarge,
 }: {
   message: ChatMessage;
   own: boolean;
   transfers: Transfer[];
   onSave: (name: string) => void;
+  onEnlarge: (src: string, name: string) => void;
 }) {
+  // プレビューの読み込みに失敗したら通常のファイル表示に戻す
+  // (保存・削除でファイルが移動した後など)
+  const [broken, setBroken] = useState(false);
   const file = message.file!;
   const related = transfers.filter((tr) => file.transfers.includes(tr.id));
   const active = related.filter((tr) => !tr.done);
@@ -813,8 +856,40 @@ function FileBubble({
       ? 100
       : Math.min(100, Math.floor((transferred * 100) / totalSize));
 
+  // プレビュー: 種類が分かり、場所が分かり、転送が終わっているとき
+  // (送信側は元ファイルが手元にあるので転送中でもよい)
+  const kind = mediaKind(file.name);
+  const ready = own || (active.length === 0 && !failed);
+  const src =
+    !broken && kind !== null && ready && file.path
+      ? convertFileSrc(file.path)
+      : null;
+
   return (
     <span className="msg__bubble msg__bubble--file">
+      {src && kind === "image" && (
+        <img
+          className="msg__media msg__media--image"
+          src={src}
+          alt={file.name}
+          loading="lazy"
+          onClick={() => onEnlarge(src, file.name)}
+          onError={() => setBroken(true)}
+        />
+      )}
+      {src && kind === "video" && (
+        // 再生できない形式(コーデック不足など)は通常表示に戻す
+        <video
+          className="msg__media"
+          src={src}
+          controls
+          preload="metadata"
+          onError={() => setBroken(true)}
+        />
+      )}
+      {src && kind === "audio" && (
+        <audio src={src} controls onError={() => setBroken(true)} />
+      )}
       <span className="msg__file-name ellipsis" title={file.name}>
         📎 {file.name}
       </span>

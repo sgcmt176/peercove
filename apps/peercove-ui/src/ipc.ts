@@ -83,6 +83,8 @@ export interface ChatMessage {
   failed: boolean;
   /** チャット内ファイル送信のエントリ（M3-13d）。付いていれば text は空。 */
   file: ChatFile | null;
+  /** グループ操作のお知らせ（中央の 1 行として表示。未読・通知の対象外）。 */
+  system: boolean;
 }
 
 /** チャット内ファイル送信の情報（M3-13d）。実体は受信ボックス。 */
@@ -92,6 +94,8 @@ export interface ChatFile {
   size: number;
   /** 対応する転送 id（Tunnel.transfers と突き合わせて進捗を出す）。 */
   transfers: string[];
+  /** この端末でのファイルの場所（インラインプレビュー用）。 */
+  path: string | null;
 }
 
 /** ファイル送信のチャット文脈（M3-13d）。 */

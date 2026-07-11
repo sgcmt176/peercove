@@ -242,6 +242,7 @@ impl DaemonShared {
             sent_at,
             failed: false,
             file: None,
+            system: false,
         });
         let chat = Arc::clone(&active.chat);
         let seq = entry.seq;
@@ -324,14 +325,17 @@ impl DaemonShared {
             revision: 1,
             updated_by: active.address,
         };
-        active.groups.lock().unwrap().apply(group.clone());
+        let applied = active.groups.lock().unwrap().apply(group.clone());
+        if let Some(update) = applied {
+            Self::append_group_system(active, &ledger, update.previous.as_ref(), &group);
+        }
         // グループ名はログに出さない(秘匿ルール)
         tracing::info!(
             "グループを作成しました(id={} members={})",
             group.id,
             group.members.len()
         );
-        Self::propagate_group(&group, &ledger, active.address);
+        Self::propagate_group(&group, &ledger, active.address, &active.groups);
         Ok(IpcResponse::Group { group })
     }
 
@@ -377,13 +381,16 @@ impl DaemonShared {
         }
         group.revision += 1;
         group.updated_by = active.address;
-        active.groups.lock().unwrap().apply(group.clone());
+        let applied = active.groups.lock().unwrap().apply(group.clone());
+        if let Some(update) = applied {
+            Self::append_group_system(active, &ledger, update.previous.as_ref(), &group);
+        }
         tracing::info!(
             "グループを更新しました(id={} rev={})",
             group.id,
             group.revision
         );
-        Self::propagate_group(&group, &ledger, active.address);
+        Self::propagate_group(&group, &ledger, active.address, &active.groups);
         Ok(IpcResponse::Group { group })
     }
 
@@ -406,9 +413,13 @@ impl DaemonShared {
         group.members.retain(|ip| *ip != active.address);
         group.revision += 1;
         group.updated_by = active.address;
-        active.groups.lock().unwrap().apply(group.clone());
+        let ledger = Self::ledger_of(active);
+        let applied = active.groups.lock().unwrap().apply(group.clone());
+        if let Some(update) = applied {
+            Self::append_group_system(active, &ledger, update.previous.as_ref(), &group);
+        }
         tracing::info!("グループから退出しました(id={})", group.id);
-        Self::propagate_group(&group, &Self::ledger_of(active), active.address);
+        Self::propagate_group(&group, &ledger, active.address, &active.groups);
         Ok(IpcResponse::Done)
     }
 
@@ -435,11 +446,13 @@ impl DaemonShared {
     }
 
     /// グループ全量をオンラインの対象メンバーへ配る(バックグラウンド)。
-    /// 失敗はオンライン復帰時の追いつき再送に任せる。
+    /// 成功は ack として記録し、失敗は supervise の送達同期
+    /// (30 秒間隔の再送)に任せる。
     fn propagate_group(
         group: &peercove_core::msg::GroupInfo,
         ledger: &[peercove_core::proto::LedgerEntry],
         self_ip: Ipv4Addr,
+        groups: &crate::groups::SharedGroups,
     ) {
         for entry in ledger {
             if entry.ip == self_ip || !entry.online || !group.members.contains(&entry.ip) {
@@ -447,12 +460,53 @@ impl DaemonShared {
             }
             let group = group.clone();
             let ip = entry.ip;
+            let groups = Arc::clone(groups);
             tokio::spawn(async move {
-                if let Err(e) = crate::msg::send_group_update(ip, &group).await {
-                    tracing::warn!(
-                        "{ip} へのグループ更新の送信に失敗しました(オンライン復帰時に再送): {e:#}"
-                    );
+                match crate::msg::send_group_update(ip, &group).await {
+                    Ok(()) => groups
+                        .lock()
+                        .unwrap()
+                        .mark_acked(&group.id, ip, group.revision),
+                    Err(e) => tracing::warn!(
+                        "{ip} へのグループ更新の送信に失敗しました(30 秒間隔で自動再送): {e:#}"
+                    ),
                 }
+            });
+        }
+    }
+
+    /// グループ操作(作成・追加・退出・改名)のお知らせを会話に出す
+    /// (LINE 風 — 2026-07-11 検証フィードバック)。
+    fn append_group_system(
+        active: &Active,
+        ledger: &[peercove_core::proto::LedgerEntry],
+        previous: Option<&peercove_core::msg::GroupInfo>,
+        group: &peercove_core::msg::GroupInfo,
+    ) {
+        let self_ip = active.address;
+        let name_of = |ip: Ipv4Addr| -> String {
+            if ip == self_ip {
+                return "自分".to_string();
+            }
+            ledger
+                .iter()
+                .find(|e| e.ip == ip)
+                .and_then(|e| e.name.clone())
+                .unwrap_or_else(|| ip.to_string())
+        };
+        for text in crate::groups::system_messages(previous, group, self_ip, &name_of) {
+            active.chat.lock().unwrap().append(ChatMessageInfo {
+                seq: 0, // append が振る
+                id: crate::msg::new_transfer_id(),
+                scope: peercove_core::msg::ChatScope::Group,
+                group_id: Some(group.id.clone()),
+                from: group.updated_by,
+                to: None,
+                text,
+                sent_at: crate::msg::now_unix_ms(),
+                failed: false,
+                file: None,
+                system: true,
             });
         }
     }
@@ -561,7 +615,10 @@ impl DaemonShared {
                         name,
                         size,
                         transfers: ids.clone(),
+                        // UI のインラインプレビュー用(送信側は元ファイル)
+                        path: Some(path.clone()),
                     }),
+                    system: false,
                 });
                 Some(entry.seq)
             }

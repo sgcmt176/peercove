@@ -129,6 +129,8 @@ pub struct ChatMessage {
     pub failed: bool,
     /// チャット内ファイル送信のエントリ(M3-13d)。付いていれば text は空。
     pub file: Option<ChatFile>,
+    /// グループ操作のお知らせ(中央の 1 行として表示する)。
+    pub system: bool,
 }
 
 /// チャット内ファイル送信の情報(M3-13d)。実体は受信ボックス。
@@ -140,6 +142,9 @@ pub struct ChatFile {
     pub size: u64,
     /// 対応する転送 id(進捗表示用。転送一覧から流れたら進捗なし)。
     pub transfers: Vec<String>,
+    /// この端末でのファイルの場所(インラインプレビュー用)。
+    /// 移動・削除済みなら読み込みに失敗してプレビューされないだけ。
+    pub path: Option<String>,
 }
 
 impl From<&ChatMessageInfo> for ChatMessage {
@@ -162,7 +167,10 @@ impl From<&ChatMessageInfo> for ChatMessage {
                 name: file.name.clone(),
                 size: file.size,
                 transfers: file.transfers.clone(),
+                // Windows の verbatim 接頭辞(\\?\)は asset URL で扱えないため剥がす
+                path: file.path.as_deref().map(display_path),
             }),
+            system: info.system,
         }
     }
 }

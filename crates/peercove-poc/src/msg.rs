@@ -201,12 +201,14 @@ pub async fn run_server(
                 let limit = *limit.lock().unwrap();
                 let chat = Arc::clone(&chat);
                 let groups = Arc::clone(&groups);
+                let peers = Arc::clone(&peers);
                 tokio::spawn(async move {
                     if let Err(e) = handle_incoming(
                         stream,
                         peer_ip,
                         bind_ip,
                         sender_name,
+                        &peers,
                         &inbox,
                         &transfers,
                         limit,
@@ -234,6 +236,7 @@ async fn handle_incoming(
     peer_ip: Ipv4Addr,
     own_ip: Ipv4Addr,
     sender_name: String,
+    peers: &SharedPeers,
     inbox: &Path,
     transfers: &TransferRegistry,
     limit: u64,
@@ -326,6 +329,7 @@ async fn handle_incoming(
                 sent_at,
                 failed: false,
                 file: None,
+                system: false,
             };
             chat.lock().unwrap().append(entry);
             send_frame(&mut write_half, &MsgFrame::ChatAck { id: id.clone() }).await?;
@@ -345,9 +349,46 @@ async fn handle_incoming(
             }
             let id = group.id.clone();
             let revision = group.revision;
-            let applied = groups.lock().unwrap().apply(group);
+            let applied = {
+                let mut store = groups.lock().unwrap();
+                // 送信者はこの revision を持っている → こちらから送り返さない
+                store.mark_acked(&id, peer_ip, revision);
+                store.apply(group.clone())
+            };
             send_frame(&mut write_half, &MsgFrame::GroupAck { id: id.clone() }).await?;
-            if applied {
+            if let Some(update) = applied {
+                // 作成・追加・退出・改名のお知らせを会話に出す(LINE 風)
+                let name_of = |ip: Ipv4Addr| -> String {
+                    if ip == own_ip {
+                        return "自分".to_string();
+                    }
+                    peers
+                        .lock()
+                        .unwrap()
+                        .get(&ip)
+                        .cloned()
+                        .unwrap_or_else(|| ip.to_string())
+                };
+                for text in crate::groups::system_messages(
+                    update.previous.as_ref(),
+                    &group,
+                    own_ip,
+                    &name_of,
+                ) {
+                    chat.lock().unwrap().append(ChatMessageInfo {
+                        seq: 0, // append が振る
+                        id: new_transfer_id(),
+                        scope: ChatScope::Group,
+                        group_id: Some(id.clone()),
+                        from: group.updated_by,
+                        to: None,
+                        text,
+                        sent_at: now_unix_ms(),
+                        failed: false,
+                        file: None,
+                        system: true,
+                    });
+                }
                 tracing::info!(
                     "{sender_name}({peer_ip})からグループ更新を受信しました(id={id} rev={revision})"
                 );
@@ -536,7 +577,11 @@ async fn receive_file(
                     name: saved_name,
                     size,
                     transfers: vec![id.clone()],
+                    // UI のインラインプレビュー用(受信完了までは UI 側が
+                    // 転送の進捗を見てプレビューしない)
+                    path: Some(final_path.clone()),
                 }),
+                system: false,
             });
         }
     }
@@ -945,6 +990,7 @@ mod tests {
                 ip,
                 ip,
                 "alice".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &server_transfers,
                 limit_bytes(100),
@@ -1020,6 +1066,7 @@ mod tests {
                 ip,
                 "10.9.9.9".parse().unwrap(), // 受信側(自分)の仮想 IP に見立てる
                 "alice".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &server_transfers,
                 0,
@@ -1082,6 +1129,7 @@ mod tests {
                 ip,
                 ip,
                 "alice".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &server_transfers,
                 limit_bytes(1), // 上限 1 MB
@@ -1135,6 +1183,7 @@ mod tests {
                 ip,
                 ip,
                 "mallory".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &server_transfers,
                 0,
@@ -1202,6 +1251,7 @@ mod tests {
                 ip,
                 "10.9.9.9".parse().unwrap(), // 受信側(自分)の仮想 IP に見立てる
                 "alice".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &Default::default(),
                 0,
@@ -1256,6 +1306,7 @@ mod tests {
                 ip,
                 ip,
                 "bob".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &Default::default(),
                 0,
@@ -1294,6 +1345,7 @@ mod tests {
                 ip,
                 ip,
                 "carol".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &Default::default(),
                 0,
@@ -1346,6 +1398,7 @@ mod tests {
                     ip,
                     ip,
                     "alice".to_string(),
+                    &Default::default(),
                     &server_inbox,
                     &Default::default(),
                     0,
@@ -1402,6 +1455,7 @@ mod tests {
                 ip,
                 ip,
                 "mallory".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &Default::default(),
                 0,
@@ -1443,6 +1497,7 @@ mod tests {
                 ip,
                 ip,
                 "eve".to_string(),
+                &Default::default(),
                 &server_inbox,
                 &server_transfers,
                 0,

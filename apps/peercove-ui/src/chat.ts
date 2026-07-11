@@ -144,6 +144,7 @@ export function unreadCounts(
   const counts = new Map<ConversationKey, number>();
   for (const message of chatMessages(tunnel.config)) {
     if (message.from === tunnel.address) continue;
+    if (message.system) continue; // お知らせは未読に数えない
     const conversation = conversationOf(message, tunnel.address);
     if (message.seq > (read[conversation] ?? 0)) {
       counts.set(conversation, (counts.get(conversation) ?? 0) + 1);

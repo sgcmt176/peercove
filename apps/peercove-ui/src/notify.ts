@@ -114,6 +114,7 @@ export async function notifyChatEvents(
 ): Promise<void> {
   for (const message of fresh) {
     if (message.from === tunnel.address) continue;
+    if (message.system) continue; // グループ操作のお知らせは鳴らさない
     const conversation = conversationOf(message, tunnel.address);
     if (isViewing(tunnel.config, conversation)) continue;
     const from =

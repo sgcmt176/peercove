@@ -318,8 +318,6 @@ pub async fn supervise(
             Arc::clone(&chat),
             Arc::clone(&groups),
         )));
-        // オンライン復帰の検知(グループの追いつき再送 — ADR-0016、M3-13c)
-        let mut prev_online: HashSet<std::net::Ipv4Addr> = HashSet::new();
         match role {
             Role::Host => {
                 tasks.push(tokio::spawn(control::run_host_server(
@@ -493,30 +491,36 @@ pub async fn supervise(
                             })
                             .collect();
                         *msg_peers.lock().unwrap() = map;
-                        // オフライン → オンライン遷移を検知したら、そのピアが属する
-                        // 既知グループを送り直す(追いつき — ADR-0016、M3-13c)。
-                        // 起動直後の最初の台帳では全オンラインメンバーへ送る
-                        // (自分が落ちていた間の変更を配り直すきっかけになる)
+                        // グループの送達同期(ADR-0016、M3-13c)。ack が取れる
+                        // まで 30 秒間隔で送り直す。「オンライン」判定には最終
+                        // ハンドシェイクの猶予(180 秒)があり、短時間の
+                        // オフライン→オンラインは遷移として見えないため、
+                        // 遷移検知でなく ack ベースにしている(検証 FB)
                         let online: HashSet<std::net::Ipv4Addr> = ledger
                             .iter()
                             .filter(|e| e.online && e.ip != spec.address.addr())
                             .map(|e| e.ip)
                             .collect();
-                        for ip in online.difference(&prev_online) {
-                            for group in groups.lock().unwrap().groups_with(*ip) {
-                                let ip = *ip;
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        crate::msg::send_group_update(ip, &group).await
-                                    {
-                                        tracing::debug!(
-                                            "{ip} へのグループ再送に失敗(次のオンライン復帰時に再試行): {e:#}"
-                                        );
-                                    }
-                                });
-                            }
+                        let pending = groups.lock().unwrap().pending_sync(
+                            spec.address.addr(),
+                            &online,
+                            Duration::from_secs(30),
+                        );
+                        for (ip, group) in pending {
+                            let groups = Arc::clone(&groups);
+                            tokio::spawn(async move {
+                                match crate::msg::send_group_update(ip, &group).await {
+                                    Ok(()) => groups.lock().unwrap().mark_acked(
+                                        &group.id,
+                                        ip,
+                                        group.revision,
+                                    ),
+                                    Err(e) => tracing::debug!(
+                                        "{ip} へのグループ同期に失敗(30 秒後に再試行): {e:#}"
+                                    ),
+                                }
+                            });
                         }
-                        prev_online = online;
                     }
                     if let Err(e) =
                         status::write_status_file(&status_path, &stats, ledger.as_deref())

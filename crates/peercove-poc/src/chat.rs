@@ -177,6 +177,7 @@ mod tests {
             sent_at: 1_700_000_000_000,
             failed: false,
             file: None,
+            system: false,
         }
     }
 

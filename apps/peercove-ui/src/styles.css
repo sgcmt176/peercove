@@ -1192,6 +1192,19 @@ select {
   font-size: 11px;
 }
 
+/* グループ操作のお知らせ(作成・追加・退出・改名 — 中央の 1 行) */
+.chat__system {
+  align-self: center;
+  margin: 4px 0;
+  padding: 2px 12px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+  max-width: 90%;
+}
+
 .msg {
   display: flex;
   align-items: flex-end;
@@ -1309,4 +1322,31 @@ select {
   align-self: flex-start;
   padding: 2px 12px;
   font-size: 12px;
+}
+
+/* インラインプレビュー(画像・動画 — 検証 FB) */
+.msg__media {
+  max-width: 280px;
+  max-height: 220px;
+  border-radius: 9px;
+  object-fit: contain;
+  background: var(--bg);
+}
+
+.msg__media--image {
+  cursor: zoom-in;
+}
+
+/* 画像の拡大表示(クリックで開くモーダル) */
+.chat__viewer {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0;
+}
+
+.chat__viewer img {
+  max-width: 76vw;
+  max-height: 72vh;
+  object-fit: contain;
+  border-radius: 9px;
 }

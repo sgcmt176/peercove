@@ -284,7 +284,9 @@ export const ja = {
     leaveConfirm: (name: string) =>
       `「${name}」から退出しますか？　これまでの履歴はこの端末に残ります。`,
     leftGroup: "このグループからは退出済みです（履歴のみ）",
-    unknownGroup: "不明なグループ",
+    unknownGroup: "グループ（同期中）",
+    groupPending:
+      "グループ情報の受信待ちです（メンバーがオンラインになると自動で届きます）",
     // チャット内ファイル送信 + ドラッグ&ドロップ(M3-13d)
     attach: "ファイルを送る",
     filePreview: (name: string) => `📎 ${name}`,

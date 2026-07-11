@@ -100,6 +100,16 @@ pub fn log(config: &Path, follow: bool) -> anyhow::Result<()> {
 /// `12:34:56 [全体] alice: こんにちは` の形式(時刻は UTC — daemon logs と同じ)。
 fn format_message(message: &ChatMessageInfo, tunnel: &TunnelInfo) -> String {
     let secs_of_day = (message.sent_at / 1000) % 86_400;
+    // グループ操作のお知らせは本文だけを出す
+    if message.system {
+        return format!(
+            "{:02}:{:02}:{:02} ― {}",
+            secs_of_day / 3600,
+            (secs_of_day / 60) % 60,
+            secs_of_day % 60,
+            message.text
+        );
+    }
     let who = if message.from == tunnel.address {
         "自分".to_string()
     } else {

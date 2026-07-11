@@ -181,6 +181,10 @@ pub struct ChatMessageInfo {
     /// チャット内ファイル送信のエントリ(M3-13d)。付いていれば `text` は空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<ChatFileInfo>,
+    /// グループ操作(作成・追加・退出・改名)のお知らせ(2026-07-11 検証 FB)。
+    /// `text` が本文で、UI は吹き出しでなく中央の 1 行として表示する。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
 }
 
 /// チャット履歴に記録するファイル送信の情報(ADR-0016、M3-13d)。
@@ -193,6 +197,11 @@ pub struct ChatFileInfo {
     /// 進捗バーに使う。転送一覧から流れたら進捗なしで表示する。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transfers: Vec<String>,
+    /// この端末でのファイルの場所(送信側 = 元ファイル / 受信側 = 受信
+    /// ボックス内)。UI が画像・動画などのインラインプレビューに使う
+    /// (2026-07-11 検証 FB)。移動・削除済みならプレビューされないだけ。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 /// デーモンが保持する直近のログ 1 行(M2-G5)。
@@ -607,6 +616,7 @@ mod tests {
             sent_at: 1_700_000_000_000,
             failed: false,
             file: None,
+            system: false,
         };
         let json = serde_json::to_string(&IpcReply {
             id: 14,
@@ -642,6 +652,7 @@ mod tests {
             sent_at: 1,
             failed: true,
             file: None,
+            system: false,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(!json.contains("\"to\""), "network 宛は to を省略: {json}");
@@ -665,6 +676,7 @@ mod tests {
             sent_at: 1,
             failed: false,
             file: None,
+            system: false,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains(r#""group_id":"g1""#), "{json}");
@@ -687,13 +699,36 @@ mod tests {
                 name: "写真.jpg".to_string(),
                 size: 1024,
                 transfers: vec!["t1".to_string()],
+                path: Some(PathBuf::from("C:/inbox/写真.jpg")),
             }),
+            system: false,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(
-            json.contains(r#""file":{"name":"写真.jpg","size":1024,"transfers":["t1"]}"#),
+            json.contains(
+                r#""file":{"name":"写真.jpg","size":1024,"transfers":["t1"],"path":"C:/inbox/写真.jpg"}"#
+            ),
             "{json}"
         );
+        let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, message);
+
+        // グループ操作のお知らせ(system)。通常のメッセージでは省略される
+        let message = ChatMessageInfo {
+            seq: 12,
+            id: "c5".to_string(),
+            scope: ChatScope::Group,
+            group_id: Some("g1".to_string()),
+            from: "10.83.19.1".parse().unwrap(),
+            to: None,
+            text: "グループ「開発」を作成しました".to_string(),
+            sent_at: 1,
+            failed: false,
+            file: None,
+            system: true,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains(r#""system":true"#), "{json}");
         let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, message);
 
