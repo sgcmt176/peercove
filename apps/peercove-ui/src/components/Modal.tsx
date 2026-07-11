@@ -14,6 +14,11 @@ export function Modal({
   wide?: boolean;
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  // バックドロップで閉じるのは「押下も離しもバックドロップ上」のときだけ。
+  // テキストをドラッグ選択してダイアログの外でマウスを離すと、click は
+  // 押下点と離し点の共通祖先(=バックドロップ)で発火するため、押下位置を
+  // 見ないと選択操作のたびにダイアログが閉じてしまう(検証フィードバック)。
+  const pressedOnBackdrop = useRef(false);
 
   // フォーカスは開いた瞬間だけ当てる。ここに onClose を依存に入れると、親（App）が
   // 2 秒ごとの状態ポーリングで再レンダーするたびに新しい onClose が渡り、この
@@ -31,7 +36,17 @@ export function Modal({
   }, [onClose]);
 
   return (
-    <div className="backdrop" onClick={onClose}>
+    <div
+      className="backdrop"
+      onMouseDown={(event) => {
+        pressedOnBackdrop.current = event.target === event.currentTarget;
+      }}
+      onClick={(event) => {
+        if (pressedOnBackdrop.current && event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
       <div
         className={wide ? "modal modal--wide" : "modal"}
         role="dialog"
