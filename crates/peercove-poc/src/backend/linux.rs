@@ -11,13 +11,15 @@ use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
 
-use super::{PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use super::{AclDeny, PeerSpec, PeerStats, TunnelSpec, WgBackend};
 
 pub struct LinuxBackend {
     if_name: String,
     api: WGApi<Kernel>,
     /// ルーター役(ADR-0014)として適用中の状態。down で対解除する。
     router: RouterState,
+    /// ACL(ADR-0018)で適用中の DROP ルールの (src, dst)。down で対解除する。
+    acl_rules: Vec<(String, String)>,
 }
 
 /// ルーター役の適用済み状態(サブネットごとの NAT ルールと、
@@ -94,6 +96,33 @@ fn forward_rule_args(op: &str, src: &str, dst: &str) -> Vec<String> {
     .collect()
 }
 
+/// ACL の DROP ルールの引数(ADR-0018)。トンネル IF に入りトンネル IF から
+/// 出る(= ホストがリレーする)トラフィックだけを対象にする。`-I`(先頭挿入)で
+/// 既存の ACCEPT 系ルールより先に評価させる。
+fn acl_rule_args(op: &str, wg_if: &str, src: &str, dst: &str) -> Vec<String> {
+    [
+        op,
+        "FORWARD",
+        "-i",
+        wg_if,
+        "-o",
+        wg_if,
+        "-s",
+        src,
+        "-d",
+        dst,
+        "-j",
+        "DROP",
+        "-m",
+        "comment",
+        "--comment",
+        "peercove-acl",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 fn iptables(args: &[String]) -> anyhow::Result<String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run("iptables", &args)
@@ -107,7 +136,17 @@ impl LinuxBackend {
             if_name: if_name.to_string(),
             api,
             router: RouterState::default(),
+            acl_rules: Vec::new(),
         })
+    }
+
+    /// 適用中の ACL ルールをすべて解除する(down・全解除の共通処理)。
+    fn clear_acl(&mut self) {
+        for (src, dst) in std::mem::take(&mut self.acl_rules) {
+            if let Err(e) = iptables(&acl_rule_args("-D", &self.if_name, &src, &dst)) {
+                tracing::warn!("ACL ルールの削除に失敗しました({src}→{dst}): {e:#}");
+            }
+        }
     }
 
     /// サブネットへの経路が向く LAN 側 IF を特定する(`ip route get`)。
@@ -329,6 +368,57 @@ impl WgBackend for LinuxBackend {
         }
     }
 
+    fn sync_acl(&mut self, denied: &[AclDeny]) -> anyhow::Result<()> {
+        // 望ましいルール集合: 各遮断組について「両側の /32 + 広告サブネット」の
+        // 全組合せ × 両方向
+        let mut desired: Vec<(String, String)> = Vec::new();
+        for deny in denied {
+            let side = |ip: std::net::Ipv4Addr, subnets: &[ipnet::Ipv4Net]| {
+                let mut nets = vec![format!("{ip}/32")];
+                nets.extend(subnets.iter().map(|s| s.to_string()));
+                nets
+            };
+            for a in side(deny.a, &deny.a_subnets) {
+                for b in side(deny.b, &deny.b_subnets) {
+                    desired.push((a.clone(), b.clone()));
+                    desired.push((b, a.clone()));
+                }
+            }
+        }
+        desired.sort_unstable();
+        desired.dedup();
+
+        // 解除されたルールを削除
+        let keep: std::collections::HashSet<_> = desired.iter().cloned().collect();
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.acl_rules)
+            .into_iter()
+            .partition(|rule| keep.contains(rule));
+        self.acl_rules = kept;
+        for (src, dst) in gone {
+            if let Err(e) = iptables(&acl_rule_args("-D", &self.if_name, &src, &dst)) {
+                tracing::warn!("ACL ルールの削除に失敗しました({src}→{dst}): {e:#}");
+            } else {
+                tracing::info!("ACL の遮断を解除しました({src} ⇔ {dst})");
+            }
+        }
+
+        // 新しいルールを適用(残骸との重複は -C で確認して避ける)
+        for (src, dst) in desired {
+            if self.acl_rules.contains(&(src.clone(), dst.clone())) {
+                continue;
+            }
+            if iptables(&acl_rule_args("-C", &self.if_name, &src, &dst)).is_err() {
+                iptables(&acl_rule_args("-I", &self.if_name, &src, &dst)).context(
+                    "ACL(DROP)ルールの設定に失敗しました。iptables が必要です \
+                     (sudo apt install iptables)",
+                )?;
+                tracing::info!("ACL で遮断しました({src} → {dst})");
+            }
+            self.acl_rules.push((src, dst));
+        }
+        Ok(())
+    }
+
     fn sync_subnet_router(
         &mut self,
         virtual_subnet: ipnet::Ipv4Net,
@@ -397,6 +487,7 @@ impl WgBackend for LinuxBackend {
     fn down(&mut self) -> anyhow::Result<()> {
         Self::ensure_root()?;
         self.clear_router();
+        self.clear_acl();
         match self.api.remove_interface() {
             Ok(()) => Ok(()),
             // 存在しない場合は成功扱い(クリーンアップの冪等性)

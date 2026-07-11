@@ -19,6 +19,7 @@ import { ConfirmModal, Modal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { DnsDialog } from "./DnsDialog";
 import { SubnetDialog } from "./SubnetDialog";
+import { AclDialog } from "./AclDialog";
 import { Avatar } from "./Avatar";
 import { ChatPanel } from "./ChatPanel";
 import { Sparkline } from "./Sparkline";
@@ -54,6 +55,8 @@ export function TunnelView({
   const [editingSubnets, setEditingSubnets] = useState<Member | null>(null);
   /** ファイル送信ダイアログ(M3-13e: 宛先をチェックボックスで選ぶ)。 */
   const [sendingFile, setSendingFile] = useState(false);
+  /** 通信制御ダイアログ(M3-10、ADR-0018。ホストのみ)。 */
+  const [showAcl, setShowAcl] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -219,6 +222,17 @@ export function TunnelView({
               {t.transfer.sendButton}
             </button>
           )}
+          {isHost &&
+            tab === "members" &&
+            tunnel.members.filter((m) => !m.isHost).length >= 2 && (
+              <button
+                type="button"
+                className="tabs__action"
+                onClick={() => setShowAcl(true)}
+              >
+                {t.acl.button}
+              </button>
+            )}
           {isHost && tab === "members" && (
             <button
               type="button"
@@ -292,6 +306,17 @@ export function TunnelView({
           isHost={isHost}
           onClose={() => {
             setShowDns(false);
+            onChanged();
+          }}
+        />
+      )}
+
+      {showAcl && (
+        <AclDialog
+          configPath={tunnel.config}
+          members={tunnel.members}
+          onClose={() => {
+            setShowAcl(false);
             onChanged();
           }}
         />
@@ -418,7 +443,7 @@ function SendFileDialog({
                 <label className="chat__pick-row">
                   <input
                     type="checkbox"
-                    disabled={!member.online}
+                    disabled={!member.online || member.blocked}
                     checked={checked.has(member.ip)}
                     onChange={() => toggle(member.ip)}
                   />
@@ -433,10 +458,19 @@ function SendFileDialog({
                     }
                   />
                   <span className="ellipsis">{member.name ?? member.ip}</span>
-                  {!member.online && (
-                    <span className="muted small">
-                      {t.tunnel.member.offline}
+                  {member.blocked ? (
+                    <span
+                      className="muted small"
+                      title={t.tunnel.member.blockedTitle}
+                    >
+                      🚫 {t.tunnel.member.blocked}
                     </span>
+                  ) : (
+                    !member.online && (
+                      <span className="muted small">
+                        {t.tunnel.member.offline}
+                      </span>
+                    )
                   )}
                 </label>
               </li>
@@ -736,6 +770,14 @@ function MemberRow({
               title={t.tunnel.member.route.title}
             >
               {t.tunnel.member.route[member.route]}
+            </span>
+          )}
+          {member.blocked && (
+            <span
+              className="tag tag--blocked"
+              title={t.tunnel.member.blockedTitle}
+            >
+              🚫 {t.tunnel.member.blocked}
             </span>
           )}
           {member.subnets.map((subnet) => (

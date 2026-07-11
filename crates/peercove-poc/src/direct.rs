@@ -251,7 +251,9 @@ impl DirectManager {
             .members
             .iter()
             .filter_map(|entry| {
-                if entry.is_host || !entry.online {
+                // blocked は ACL の遮断相手(ADR-0018)。ホストは endpoint も
+                // 落として配るが、こちらでも張らない(二重の守り)
+                if entry.is_host || !entry.online || entry.blocked {
                     return None;
                 }
                 let key = *entry.public_key.as_bytes();
@@ -342,6 +344,7 @@ mod tests {
             endpoint: endpoint.map(|e| e.parse().unwrap()),
             endpoint_age_secs: endpoint.map(|_| age),
             subnets: vec![],
+            blocked: false,
         }
     }
 
@@ -350,6 +353,7 @@ mod tests {
             distribution: Distribution {
                 members,
                 dns_records: vec![],
+                deny: vec![],
             },
             received_at: at,
         }
@@ -430,6 +434,44 @@ mod tests {
             backend.ops,
             vec![format!("add:{peer}"), format!("remove:{peer}")],
             "無効化で解除して中継へ戻る"
+        );
+    }
+
+    /// ACL で遮断された相手(blocked、ADR-0018)には直接ピアを張らず、
+    /// 既存の直接ピアも解除する。
+    #[test]
+    fn blocked_entries_are_not_tried_and_get_removed() {
+        let me = PrivateKey::generate().public_key();
+        let peer = PrivateKey::generate().public_key();
+        let mut m = manager(&me);
+        let mut backend = MockBackend::default();
+        let now = Instant::now();
+
+        let mut blocked = entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0);
+        blocked.blocked = true;
+        let dist = received(vec![blocked.clone()], now);
+        m.tick(now, true, Some(&dist), &[], &mut backend);
+        assert!(backend.ops.is_empty(), "blocked には張らない");
+
+        // 確立済みの相手が blocked になったら解除される
+        let open = received(
+            vec![entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0)],
+            now,
+        );
+        m.tick(now, true, Some(&open), &[], &mut backend);
+        assert_eq!(backend.ops, vec![format!("add:{peer}")]);
+        let dist = received(vec![blocked], now + Duration::from_secs(5));
+        m.tick(
+            now + Duration::from_secs(5),
+            true,
+            Some(&dist),
+            &[],
+            &mut backend,
+        );
+        assert_eq!(
+            backend.ops,
+            vec![format!("add:{peer}"), format!("remove:{peer}")],
+            "遮断されたら直接ピアを解除して中継(→ホストで遮断)へ戻す"
         );
     }
 

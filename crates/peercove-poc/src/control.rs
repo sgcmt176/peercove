@@ -36,11 +36,36 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 pub type Connections = Arc<Mutex<HashMap<Ipv4Addr, mpsc::UnboundedSender<ControlMessage>>>>;
 
 /// ホストが配布する内容一式(台帳 + カスタム DNS レコード — M3-1)。
-/// watch チャネルでまとめて流し、どちらかが変わったら再配布される。
+/// watch チャネルでまとめて流し、どれかが変わったら再配布される。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Distribution {
     pub members: Vec<LedgerEntry>,
     pub dns_records: Vec<DnsRecord>,
+    /// ACL の遮断組(ADR-0018、M3-10。仮想 IP の正規化済みペア)。
+    /// ワイヤには載せず、送信時にメンバーごとのフィルタ
+    /// ([`ledger_message_for`])の材料にする。
+    pub deny: Vec<(Ipv4Addr, Ipv4Addr)>,
+}
+
+/// 台帳スナップショットをメンバー向けにフィルタして Ledger メッセージにする
+/// (ADR-0018、M3-10)。`member_ip` と遮断関係にある相手のエントリは
+/// endpoint を落とし(直接通信をさせない)、`blocked` を立てる(UI 表示用)。
+fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMessage {
+    let deny = std::mem::take(&mut dist.deny);
+    for entry in &mut dist.members {
+        let blocked = deny
+            .iter()
+            .any(|&(a, b)| (a == member_ip && b == entry.ip) || (a == entry.ip && b == member_ip));
+        if blocked {
+            entry.endpoint = None;
+            entry.endpoint_age_secs = None;
+            entry.blocked = true;
+        }
+    }
+    ControlMessage::Ledger {
+        members: dist.members,
+        dns_records: dist.dns_records,
+    }
 }
 
 /// メンバーが受信した配布内容 + 受信時刻。エンドポイントの鮮度判定
@@ -248,6 +273,7 @@ async fn handle_member(
 
     let mut writer = tokio::spawn(host_writer(
         write_half,
+        member_ip,
         snapshot,
         ledger_rx,
         rx,
@@ -276,17 +302,14 @@ async fn handle_member(
 /// 書き側。分岐はすべてキャンセル安全なものだけにすること。
 async fn host_writer(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    member_ip: Ipv4Addr,
     initial: Distribution,
     mut ledger_rx: watch::Receiver<Distribution>,
     mut rx: mpsc::UnboundedReceiver<ControlMessage>,
     ping: SharedPing,
 ) -> anyhow::Result<()> {
-    let ledger_message = |dist: Distribution| ControlMessage::Ledger {
-        members: dist.members,
-        dns_records: dist.dns_records,
-    };
     write_half
-        .write_all(encode_line(&ledger_message(initial)).as_bytes())
+        .write_all(encode_line(&ledger_message_for(initial, member_ip)).as_bytes())
         .await?;
 
     let mut ping_tick = tokio::time::interval(PING_INTERVAL);
@@ -298,7 +321,7 @@ async fn host_writer(
                 }
                 let snapshot = ledger_rx.borrow_and_update().clone();
                 write_half
-                    .write_all(encode_line(&ledger_message(snapshot)).as_bytes())
+                    .write_all(encode_line(&ledger_message_for(snapshot, member_ip)).as_bytes())
                     .await?;
             }
             queued = rx.recv() => {
@@ -488,6 +511,7 @@ async fn member_reader(
                     distribution: Distribution {
                         members,
                         dns_records,
+                        deny: vec![], // deny はワイヤに載らない(blocked で受ける)
                     },
                     received_at: Instant::now(),
                 });
@@ -520,6 +544,7 @@ mod tests {
             endpoint: None,
             endpoint_age_secs: None,
             subnets: vec![],
+            blocked: false,
         }
     }
 
@@ -534,6 +559,7 @@ mod tests {
         let (ledger_tx, ledger_rx) = watch::channel(Distribution {
             members: vec![entry("alice", "100.100.42.2", true)],
             dns_records: vec![],
+            deny: vec![],
         });
         let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
         let host_rtt: RttMap = Default::default();
@@ -583,6 +609,7 @@ mod tests {
                     name: "nas".to_string(),
                     ip: "100.100.42.50".parse().unwrap(),
                 }],
+                deny: vec![],
             })
             .unwrap();
         wait_for(&latest, |l| members_len(l) == Some(2)).await;
@@ -613,6 +640,41 @@ mod tests {
             );
         }
         client.abort();
+    }
+
+    /// ACL(ADR-0018): 台帳はメンバーごとにフィルタされ、遮断相手の
+    /// エントリは endpoint が消え blocked が立つ。他のエントリは素通し。
+    #[test]
+    fn ledger_message_filters_blocked_entries_per_member() {
+        let member_ip: Ipv4Addr = "100.100.42.5".parse().unwrap();
+        let mut blocked_peer = entry("alice", "100.100.42.2", true);
+        blocked_peer.endpoint = Some("203.0.113.9:51820".parse().unwrap());
+        blocked_peer.endpoint_age_secs = Some(3);
+        let mut open_peer = entry("bob", "100.100.42.3", true);
+        open_peer.endpoint = Some("203.0.113.10:51820".parse().unwrap());
+        let dist = Distribution {
+            members: vec![blocked_peer, open_peer],
+            dns_records: vec![],
+            deny: vec![("100.100.42.2".parse().unwrap(), member_ip)],
+        };
+
+        let ControlMessage::Ledger { members, .. } = ledger_message_for(dist.clone(), member_ip)
+        else {
+            panic!("Ledger メッセージになる");
+        };
+        assert!(members[0].blocked, "遮断相手は blocked が立つ");
+        assert_eq!(members[0].endpoint, None, "endpoint は配布されない");
+        assert_eq!(members[0].endpoint_age_secs, None);
+        assert!(!members[1].blocked, "無関係の相手はそのまま");
+        assert!(members[1].endpoint.is_some());
+
+        // 別のメンバー(組に含まれない)にはフィルタがかからない
+        let other: Ipv4Addr = "100.100.42.9".parse().unwrap();
+        let ControlMessage::Ledger { members, .. } = ledger_message_for(dist, other) else {
+            panic!("Ledger メッセージになる");
+        };
+        assert!(!members[0].blocked);
+        assert!(members[0].endpoint.is_some());
     }
 
     /// Removed を送るとメンバー側セッションが終了し、台帳がクリアされる。

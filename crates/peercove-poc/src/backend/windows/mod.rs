@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use anyhow::{bail, Context};
 
 use self::device::{Device, TunIo};
-use super::{PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use super::{AclDeny, PeerSpec, PeerStats, TunnelSpec, WgBackend};
 
 /// wintun アダプタの「トンネル種別」表示名。
 const TUNNEL_TYPE: &str = "PeerCove";
@@ -253,6 +253,19 @@ impl WgBackend for WindowsBackend {
     fn remove_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
         self.netsh_route("delete", &subnet)
             .with_context(|| format!("経路 {subnet} の削除に失敗しました"))
+    }
+
+    fn sync_acl(&mut self, denied: &[AclDeny]) -> anyhow::Result<()> {
+        match &self.running {
+            Some(running) => {
+                // デバイス内リレーはピアの身元(仮想 IP)で判定するため、
+                // サブネットは渡さなくてよい(device.rs の virtual_ip 参照)
+                let pairs: Vec<_> = denied.iter().map(|d| (d.a, d.b)).collect();
+                running.device.set_acl(&pairs);
+                Ok(())
+            }
+            None => bail!("トンネルが起動していません"),
+        }
     }
 
     fn sync_subnet_router(

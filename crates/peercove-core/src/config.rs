@@ -27,6 +27,45 @@ pub struct Config {
     /// 台帳と一緒にメンバーへ配布される。
     #[serde(default, rename = "dns_record", skip_serializing_if = "Vec::is_empty")]
     pub dns_records: Vec<crate::dns::DnsRecord>,
+    /// アクセス制御(ADR-0018、M3-10)。ホスト設定のみ意味を持つ。
+    /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
+    /// 読めない(明示エラーになる)。
+    #[serde(default, skip_serializing_if = "AclConfig::is_empty")]
+    pub acl: AclConfig,
+}
+
+/// アクセス制御の設定(ADR-0018、M3-10)。既定はすべて許可で、
+/// `deny` に載せた仮想 IP の組(順不同)だけメンバー間通信を遮断する。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AclConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>,
+}
+
+impl AclConfig {
+    pub fn is_empty(&self) -> bool {
+        self.deny.is_empty()
+    }
+
+    /// 順不同の組を正規化(小さい IP を先)して返す。重複は除去。
+    pub fn normalized_deny(&self) -> Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+        let mut pairs: Vec<_> = self
+            .deny
+            .iter()
+            .map(|&(a, b)| if a <= b { (a, b) } else { (b, a) })
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
+
+    /// この組は遮断対象か(順不同)。
+    pub fn is_denied(&self, x: std::net::Ipv4Addr, y: std::net::Ipv4Addr) -> bool {
+        self.deny
+            .iter()
+            .any(|&(a, b)| (a == x && b == y) || (a == y && b == x))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +246,26 @@ impl Config {
                 ));
             }
         }
+        // ACL(ADR-0018): ホスト⇔メンバーの遮断はコントロールチャネルが
+        // 壊れるため拒否。存在しないメンバーの IP は許容(効果がないだけ)
+        for (a, b) in &self.acl.deny {
+            if a == b {
+                return invalid(format!("acl.deny の組 [{a}, {b}] が同じ IP です"));
+            }
+            for ip in [a, b] {
+                if *ip == self.interface.address.addr() {
+                    return invalid(format!(
+                        "acl.deny に自分(ホスト)の IP {ip} は指定できません\
+                        (ホストとの通信は遮断できません)"
+                    ));
+                }
+                if !virtual_subnet.contains(ip) {
+                    return invalid(format!(
+                        "acl.deny の IP {ip} が仮想サブネット {virtual_subnet} の外です"
+                    ));
+                }
+            }
+        }
         let mut seen_records = std::collections::HashSet::new();
         for record in &self.dns_records {
             if !crate::names::is_dns_label(&record.name) {
@@ -369,6 +428,54 @@ ip = "10.100.42.50"
         let mut dup = config.clone();
         dup.dns_records.push(dup.dns_records[0].clone());
         assert!(dup.validate().is_err());
+    }
+
+    #[test]
+    fn acl_parses_normalizes_and_validates() {
+        let config = parse(
+            r#"
+[interface]
+private_key_file = "host.key"
+address = "10.100.42.1/24"
+
+[acl]
+deny = [["10.100.42.3", "10.100.42.2"], ["10.100.42.2", "10.100.42.3"]]
+"#,
+        );
+        config.validate().unwrap();
+        // 正規化: 順不同 + 重複除去
+        let a: std::net::Ipv4Addr = "10.100.42.2".parse().unwrap();
+        let b: std::net::Ipv4Addr = "10.100.42.3".parse().unwrap();
+        assert_eq!(config.acl.normalized_deny(), vec![(a, b)]);
+        assert!(config.acl.is_denied(a, b));
+        assert!(config.acl.is_denied(b, a), "順不同で判定される");
+        assert!(!config.acl.is_denied(a, "10.100.42.9".parse().unwrap()));
+
+        // ホスト自身を含む組は拒否
+        let mut bad = config.clone();
+        bad.acl.deny = vec![("10.100.42.1".parse().unwrap(), a)];
+        assert!(bad.validate().is_err());
+        // サブネット外は拒否
+        let mut bad = config.clone();
+        bad.acl.deny = vec![("192.168.1.2".parse().unwrap(), a)];
+        assert!(bad.validate().is_err());
+        // 同一 IP の組は拒否
+        let mut bad = config.clone();
+        bad.acl.deny = vec![(a, a)];
+        assert!(bad.validate().is_err());
+        // 存在しないメンバーの IP は許容(効果がないだけ)
+        let mut ok = config.clone();
+        ok.acl.deny = vec![(a, "10.100.42.99".parse().unwrap())];
+        assert!(ok.validate().is_ok());
+    }
+
+    /// [acl] が無い旧設定はそのまま読め、空の ACL はシリアライズに現れない。
+    #[test]
+    fn acl_defaults_to_empty_and_stays_off_the_wire() {
+        let config = parse(MEMBER_TOML);
+        assert!(config.acl.is_empty());
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("acl"), "空なら書き出されない: {text}");
     }
 
     #[test]

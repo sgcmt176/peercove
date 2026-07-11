@@ -77,6 +77,11 @@ pub struct LedgerEntry {
     /// (追加フィールド — 旧バージョンとは互いに無視し合う)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subnets: Vec<ipnet::Ipv4Net>,
+    /// **受信者とこのメンバーの間**の通信がホストの ACL で遮断されているか
+    /// (ADR-0018、M3-10)。ホストが台帳をメンバーごとにフィルタして立てる
+    /// (このとき endpoint も落とす)。互換規則は endpoint と同じ。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked: bool,
 }
 
 #[cfg(test)]
@@ -94,6 +99,7 @@ mod tests {
             endpoint: Some("203.0.113.5:51820".parse().unwrap()),
             endpoint_age_secs: Some(3),
             subnets: vec![],
+            blocked: false,
         }
     }
 
@@ -170,6 +176,23 @@ mod tests {
         assert_eq!(json, r#"{"type":"ping","nonce":1}"#);
         let json = serde_json::to_string(&ControlMessage::Pong { nonce: 1 }).unwrap();
         assert_eq!(json, r#"{"type":"pong","nonce":1}"#);
+    }
+
+    /// blocked(ADR-0018、M3-10)の互換規則: false ならワイヤに現れず、
+    /// 旧バージョンからのエントリ(フィールドなし)は false として読める。
+    #[test]
+    fn ledger_entry_blocked_is_optional_on_the_wire() {
+        let e = entry();
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("blocked"), "false なら旧表現と一致: {json}");
+        let parsed: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.blocked);
+
+        let mut e = entry();
+        e.blocked = true;
+        let parsed: LedgerEntry =
+            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert!(parsed.blocked);
     }
 
     /// エンドポイント(ADR-0013、M3-2)の互換規則:

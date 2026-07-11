@@ -23,6 +23,8 @@ export interface Member {
   isSelf: boolean;
   /** このメンバーが広告する背後 LAN のサブネット（M3-7、ADR-0014）。 */
   subnets: string[];
+  /** 自分とこのメンバーの間がホストの ACL で遮断されている（M3-10、ADR-0018）。 */
+  blocked: boolean;
 }
 
 /** カスタム DNS レコード（M3-1c）。 */
@@ -282,6 +284,10 @@ export const api = {
     invoke<void>("rename_member", { configPath, publicKey, newName }),
   setMemberSubnets: (configPath: string, publicKey: string, subnets: string[]) =>
     invoke<void>("set_member_subnets", { configPath, publicKey, subnets }),
+  // ACL: メンバー間通信の遮断組（M3-10、ADR-0018。ホスト設定のみ）
+  listAcl: (configPath: string) => invoke<[string, string][]>("list_acl", { configPath }),
+  setAcl: (configPath: string, deny: [string, string][]) =>
+    invoke<void>("set_acl", { configPath, deny }),
   // チャット（ADR-0016、M3-13b/c）。peer 指定で 1:1、group 指定でグループ宛、
   // どちらも null でネットワーク全体宛
   chatSend: (

@@ -182,6 +182,7 @@ mod tests {
                 endpoint: None,
                 endpoint_age_secs: None,
                 subnets: vec![],
+                blocked: false,
             },
             LedgerEntry {
                 name: Some("alice".to_string()),
@@ -192,6 +193,7 @@ mod tests {
                 endpoint: None,
                 endpoint_age_secs: None,
                 subnets: vec![],
+                blocked: false,
             },
         ];
         let text = render(&[], Some(&ledger));

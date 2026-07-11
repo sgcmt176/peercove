@@ -688,6 +688,12 @@ select {
   border-color: var(--accent, #58a);
 }
 
+/* 通信不可バッジ(M3-10、ADR-0018)。遮断 = 注意色 */
+.tag--blocked {
+  color: var(--danger, #d33);
+  border-color: var(--danger, #d33);
+}
+
 .button--link-danger {
   color: var(--danger, #d33);
 }

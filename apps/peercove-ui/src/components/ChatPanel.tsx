@@ -142,11 +142,13 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
     (message) => conversationOf(message, selfIp) === conversation,
   );
   const selected = conversations.find((item) => item.key === conversation);
+  /** 相手がホストの ACL で遮断されている(M3-10)。送っても届かない。 */
+  const selectedBlocked = selected?.member?.blocked ?? false;
   const canSend =
     conversation === NETWORK_CONVERSATION ||
     (selected !== undefined &&
       !selected.left &&
-      (selected.group !== null || selected.online));
+      (selected.group !== null || (selected.online && !selectedBlocked)));
 
   // いま見ている会話を申告する(新着通知を鳴らさないため — notify.ts)
   useEffect(() => {
@@ -363,9 +365,11 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
             </span>
           ) : selected?.member ? (
             <span className="muted small">
-              {selected.online
-                ? t.tunnel.member.online
-                : t.tunnel.member.offline}
+              {selectedBlocked
+                ? `🚫 ${t.tunnel.member.blocked}`
+                : selected.online
+                  ? t.tunnel.member.online
+                  : t.tunnel.member.offline}
             </span>
           ) : (
             <span className="muted small">{t.chat.left}</span>
@@ -422,7 +426,9 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
                 ? t.chat.placeholder
                 : groupIdOf(conversation) !== null
                   ? t.chat.leftGroup
-                  : t.chat.offline
+                  : selectedBlocked
+                    ? t.chat.blocked
+                    : t.chat.offline
             }
             disabled={!canSend || sending}
             onChange={(event) => setDraft(event.target.value)}

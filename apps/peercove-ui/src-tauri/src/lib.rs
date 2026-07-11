@@ -763,6 +763,37 @@ fn set_member_subnets(
     .map_err(to_message)
 }
 
+/// ACL の遮断組(ADR-0018、M3-10)。正規化済みの仮想 IP 組を返す。
+#[tauri::command]
+fn list_acl(config_path: String) -> Result<Vec<[String; 2]>, String> {
+    let deny = peercove_ops::acl::list_deny(Path::new(&config_path)).map_err(to_message)?;
+    Ok(deny
+        .into_iter()
+        .map(|(a, b)| [a.to_string(), b.to_string()])
+        .collect())
+}
+
+/// ACL の遮断組を丸ごと差し替える(空で全許可)。ホスト設定(host.toml)に
+/// 対してのみ有効。実行中のデーモンは約 5 秒で追随する(リレー遮断 + 台帳配布)。
+#[tauri::command]
+fn set_acl(config_path: String, deny: Vec<[String; 2]>) -> Result<(), String> {
+    let parsed: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> = deny
+        .iter()
+        .map(|[a, b]| {
+            let a = a
+                .trim()
+                .parse()
+                .map_err(|_| format!("\"{a}\" は IP アドレスとして解釈できません"))?;
+            let b = b
+                .trim()
+                .parse()
+                .map_err(|_| format!("\"{b}\" は IP アドレスとして解釈できません"))?;
+            Ok::<_, String>((a, b))
+        })
+        .collect::<Result<_, _>>()?;
+    peercove_ops::acl::set_deny(Path::new(&config_path), &parsed).map_err(to_message)
+}
+
 // ---- カスタム DNS レコード(M3-1c、ADR-0011 §1b) ----
 
 /// カスタム DNS レコードの一覧(fqdn は表示用に組み立て済み)。
@@ -889,6 +920,8 @@ pub fn run() {
             remove_member,
             rename_member,
             set_member_subnets,
+            list_acl,
+            set_acl,
             pick_file,
             send_file,
             chat_send,

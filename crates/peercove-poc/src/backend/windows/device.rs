@@ -54,6 +54,14 @@ impl DevicePeer {
         *self.endpoint.read().unwrap()
     }
 
+    /// このピアの仮想 IP(AllowedIPs の先頭 = 慣例で `<仮想IP>/32`)。
+    /// ACL(ADR-0018)のリレー判定は、パケットの送信元 IP でなく
+    /// **どのピアから来てどのピアへ出るか**で行うため、これを身元に使う
+    /// (広告サブネット由来のトラフィックも自然に遮断される)。
+    fn virtual_ip(&self) -> Option<Ipv4Addr> {
+        self.allowed_ips.first().map(|net| net.addr())
+    }
+
     pub fn allows(&self, ip: Ipv4Addr) -> bool {
         self.allowed_ips.iter().any(|net| net.contains(&ip))
     }
@@ -90,7 +98,19 @@ pub struct Device {
     /// ピア間転送(ハブ&スポーク)。宛先が別ピアのパケットを OS を経由せず
     /// デバイス内で直接リレーする(ADR-0003)。ホストのみ true。
     relay: bool,
+    /// ACL の遮断組(ADR-0018)。仮想 IP の正規化済みペア(小さい方が先)。
+    /// リレー時に「来たピア × 出るピア」の組で判定して破棄する。
+    acl_denied: RwLock<std::collections::HashSet<(Ipv4Addr, Ipv4Addr)>>,
     shutdown: AtomicBool,
+}
+
+/// 順不同ペアの正規化(小さい IP を先に)。
+fn ordered(a: Ipv4Addr, b: Ipv4Addr) -> (Ipv4Addr, Ipv4Addr) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 impl Device {
@@ -119,8 +139,16 @@ impl Device {
             tun,
             peers: RwLock::new(PeerTable::default()),
             relay,
+            acl_denied: RwLock::new(std::collections::HashSet::new()),
             shutdown: AtomicBool::new(false),
         }))
+    }
+
+    /// ACL の遮断組を丸ごと差し替える(ADR-0018。冪等、空で全解除)。
+    pub fn set_acl(&self, denied: &[(Ipv4Addr, Ipv4Addr)]) {
+        let normalized: std::collections::HashSet<_> =
+            denied.iter().map(|&(a, b)| ordered(a, b)).collect();
+        *self.acl_denied.write().unwrap() = normalized;
     }
 
     pub fn add_peer(&self, spec: &PeerSpec) -> anyhow::Result<()> {
@@ -238,6 +266,13 @@ impl Device {
             if let Some(target) = self.find_peer_by_dst(dst) {
                 // 送信元ピア宛への折り返しはループになるため TUN 側へ落とす
                 if !Arc::ptr_eq(&target, from) {
+                    // ACL(ADR-0018): 遮断組のリレーは破棄(TUN にも渡さない)
+                    if let (Some(a), Some(b)) = (from.virtual_ip(), target.virtual_ip()) {
+                        if self.acl_denied.read().unwrap().contains(&ordered(a, b)) {
+                            tracing::trace!("ACL により {a} ⇔ {b} のリレーを破棄しました");
+                            return;
+                        }
+                    }
                     tracing::trace!("宛先 {dst} のピアへ直接リレーします");
                     let mut buf = [0u8; BUF_SIZE];
                     let mut tunn = target.tunn.lock().unwrap();
@@ -754,6 +789,81 @@ mod tests {
             host.tun.os_in_rx.try_recv().is_err(),
             "リレー対象パケットが host の TUN に漏れた"
         );
+
+        host.stop();
+        a.stop();
+        b.stop();
+    }
+
+    /// ACL(ADR-0018): 遮断組のリレーは破棄され、解除すれば再び通る。
+    /// ホスト宛の通信は影響を受けない。
+    #[test]
+    fn acl_blocks_relay_between_denied_members() {
+        let host_ip: Ipv4Addr = "100.100.42.1".parse().unwrap();
+        let a_ip: Ipv4Addr = "100.100.42.2".parse().unwrap();
+        let b_ip: Ipv4Addr = "100.100.42.3".parse().unwrap();
+        let host_key = PrivateKey::generate();
+        let a_key = PrivateKey::generate();
+        let b_key = PrivateKey::generate();
+
+        let host = TestNode::start_full(&host_key, None, true);
+        host.device
+            .add_peer(&peer_spec(
+                a_key.public_key(),
+                None,
+                &["100.100.42.2/32"],
+                None,
+            ))
+            .unwrap();
+        host.device
+            .add_peer(&peer_spec(
+                b_key.public_key(),
+                None,
+                &["100.100.42.3/32"],
+                None,
+            ))
+            .unwrap();
+        let member_peer = |endpoint| {
+            peer_spec(
+                host_key.public_key(),
+                Some(endpoint),
+                &["100.100.42.0/24"],
+                Some(25),
+            )
+        };
+        let a = TestNode::start(&a_key);
+        a.device.add_peer(&member_peer(host.endpoint())).unwrap();
+        let b = TestNode::start(&b_key);
+        b.device.add_peer(&member_peer(host.endpoint())).unwrap();
+
+        // まず疎通を確認(両セッションを確立させる)
+        let before = ipv4_packet(a_ip, b_ip, b"before acl");
+        expect_via_tunnel(&a, &b, before, "遮断前の A->B パケット");
+
+        // 遮断(逆順で渡しても正規化される)
+        host.device.set_acl(&[(b_ip, a_ip)]);
+        let blocked = ipv4_packet(a_ip, b_ip, b"blocked");
+        a.tun.os_out_tx.send(blocked).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            b.tun.os_in_rx.try_recv().is_err(),
+            "遮断中のパケットが B に届いた"
+        );
+        assert!(
+            host.tun.os_in_rx.try_recv().is_err(),
+            "遮断したパケットが host の TUN に漏れた"
+        );
+
+        // ホスト宛の通信は影響を受けない
+        let a2h = ipv4_packet(a_ip, host_ip, b"a to host");
+        let received = expect_via_tunnel(&a, &host, a2h.clone(), "遮断中の A->host パケット");
+        assert_eq!(received, a2h);
+
+        // 解除すれば再び通る
+        host.device.set_acl(&[]);
+        let after = ipv4_packet(a_ip, b_ip, b"after acl");
+        let received = expect_via_tunnel(&a, &b, after.clone(), "解除後の A->B パケット");
+        assert_eq!(received, after);
 
         host.stop();
         a.stop();

@@ -167,6 +167,8 @@ pub fn remove_peer(config_path: &Path, selector: &Selector) -> anyhow::Result<Re
         .unwrap_or_else(|| public_key.to_string());
     let psk_file = target.preshared_key_file.clone();
 
+    let removed_ip = target.allowed_ips.first().map(|net| net.addr());
+
     let mut doc = load_doc(config_path)?;
     let peers = peer_tables(&mut doc)?;
     let before = peers.len();
@@ -181,6 +183,18 @@ pub fn remove_peer(config_path: &Path, selector: &Selector) -> anyhow::Result<Re
         bail!(
             "host.toml から対象ピアを特定できませんでした(手編集で public_key が変わっている可能性)"
         );
+    }
+    // ACL(ADR-0018)に残った組も掃除する(残しても効果はないが紛らわしい)
+    if let Some(ip) = removed_ip {
+        if config.acl.deny.iter().any(|&(a, b)| a == ip || b == ip) {
+            let keep: Vec<_> = config
+                .acl
+                .normalized_deny()
+                .into_iter()
+                .filter(|&(a, b)| a != ip && b != ip)
+                .collect();
+            crate::acl::write_deny(&mut doc, &keep);
+        }
     }
     write_validated(config_path, &doc.to_string())?;
 

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use peercove_core::keys::PublicKey;
 
-use super::{PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use super::{AclDeny, PeerSpec, PeerStats, TunnelSpec, WgBackend};
 
 #[derive(Default)]
 pub(crate) struct MockBackend {
@@ -55,6 +55,11 @@ impl WgBackend for MockBackend {
     }
     fn remove_route(&mut self, subnet: ipnet::Ipv4Net) -> anyhow::Result<()> {
         self.record(format!("route-del:{subnet}"));
+        Ok(())
+    }
+    fn sync_acl(&mut self, denied: &[AclDeny]) -> anyhow::Result<()> {
+        let pairs: Vec<String> = denied.iter().map(|d| format!("{}-{}", d.a, d.b)).collect();
+        self.record(format!("acl:[{}]", pairs.join(",")));
         Ok(())
     }
     fn sync_subnet_router(

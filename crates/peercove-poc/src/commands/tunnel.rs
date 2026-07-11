@@ -8,7 +8,7 @@ use peercove_core::config::{Config, PeerConfig, DEFAULT_LISTEN_PORT};
 use peercove_core::keys::{read_preshared_key_file, read_private_key_file};
 use peercove_core::proto::LedgerEntry;
 
-use crate::backend::{create_backend, PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use crate::backend::{create_backend, AclDeny, PeerSpec, PeerStats, TunnelSpec, WgBackend};
 use crate::commands::status;
 use crate::control;
 
@@ -300,6 +300,9 @@ pub async fn supervise(
         let mut routes: std::collections::BTreeSet<ipnet::Ipv4Net> = Default::default();
         let mut member_extra: Vec<ipnet::Ipv4Net> = Vec::new();
         let mut router_error_logged = false;
+        // (host)適用済み ACL(ADR-0018)。変更があった周期だけ同期する
+        let mut applied_acl: Option<Vec<AclDeny>> = None;
+        let mut acl_error_logged = false;
         let mut tasks = Vec::new();
         // メッセージング基盤(ADR-0015、M3-9): 両ロールとも自分の仮想 IP で
         // 待受ける。接続元の照合に使うピア表と受信サイズ上限は毎周期更新する
@@ -389,6 +392,13 @@ pub async fn supervise(
                                 .flat_map(|p| p.subnets.iter().copied())
                                 .collect();
                             sync_routes(backend, &desired, &mut routes);
+                            // ACL(ADR-0018): リレー遮断の同期
+                            apply_acl(
+                                config,
+                                backend,
+                                &mut applied_acl,
+                                &mut acl_error_logged,
+                            );
                         }
                     }
                     let stats = match backend.stats() {
@@ -406,6 +416,7 @@ pub async fn supervise(
                             let dist = control::Distribution {
                                 members: build_ledger(config, &host_public_key, &stats),
                                 dns_records: config.dns_records.clone(),
+                                deny: config.acl.normalized_deny(),
                             };
                             ledger_tx.send_if_modified(|current| {
                                 if *current != dist {
@@ -572,6 +583,7 @@ fn build_ledger(
         endpoint: None,
         endpoint_age_secs: None,
         subnets: vec![],
+        blocked: false,
     }];
     for peer in &config.peers {
         let stats = by_key.get(peer.public_key.as_bytes());
@@ -602,9 +614,60 @@ fn build_ledger(
                 .and(handshake_age)
                 .map(|age| age.as_secs() / ENDPOINT_AGE_STEP_SECS * ENDPOINT_AGE_STEP_SECS),
             subnets: peer.subnets.clone(),
+            // 配布時にメンバーごとのフィルタで立てる(ADR-0018)。
+            // ホスト自身のスナップショットでは常に false
+            blocked: false,
         });
     }
     ledger
+}
+
+/// 設定の ACL(ADR-0018、M3-10)をバックエンドへ同期する。組ごとに両側の
+/// 広告サブネット(ADR-0014)も渡す(Linux の iptables ルールはパケットの
+/// src/dst で判定するため)。変更が無い周期は何もしない。
+fn apply_acl(
+    config: &Config,
+    backend: &mut dyn WgBackend,
+    applied: &mut Option<Vec<AclDeny>>,
+    error_logged: &mut bool,
+) {
+    let subnets_of = |ip: std::net::Ipv4Addr| -> Vec<ipnet::Ipv4Net> {
+        config
+            .peers
+            .iter()
+            .find(|p| p.allowed_ips.first().map(|net| net.addr()) == Some(ip))
+            .map(|p| p.subnets.clone())
+            .unwrap_or_default()
+    };
+    let denied: Vec<AclDeny> = config
+        .acl
+        .normalized_deny()
+        .into_iter()
+        .map(|(a, b)| AclDeny {
+            a,
+            a_subnets: subnets_of(a),
+            b,
+            b_subnets: subnets_of(b),
+        })
+        .collect();
+    if applied.as_ref() == Some(&denied) {
+        return;
+    }
+    match backend.sync_acl(&denied) {
+        Ok(()) => {
+            if !denied.is_empty() || applied.is_some() {
+                tracing::info!("ACL を適用しました(遮断 {} 組)", denied.len());
+            }
+            *applied = Some(denied);
+            *error_logged = false;
+        }
+        Err(e) => {
+            if !*error_logged {
+                tracing::warn!("ACL の適用に失敗しました(次の変更まで再試行しません): {e:#}");
+                *error_logged = true;
+            }
+        }
+    }
 }
 
 /// ピア設定の変更検知用フィンガープリント(M1-7)。

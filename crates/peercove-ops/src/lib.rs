@@ -6,6 +6,7 @@
 //!
 //! 関数は表示を持たず、結果を構造体で返す。整形は呼び出し側の責務。
 
+pub mod acl;
 pub mod dns;
 pub mod init;
 pub mod invite;

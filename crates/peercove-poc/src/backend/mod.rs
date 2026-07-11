@@ -11,7 +11,7 @@ pub(crate) mod mock;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::SystemTime;
 
 use ipnet::Ipv4Net;
@@ -38,6 +38,18 @@ pub struct PeerSpec {
     pub allowed_ips: Vec<Ipv4Net>,
     pub persistent_keepalive: Option<u16>,
     pub preshared_key: Option<PresharedKey>,
+}
+
+/// ACL の遮断組 1 件(ADR-0018、M3-10)。両側の仮想 IP と広告サブネット
+/// (ADR-0014)。サブネットも渡すのは、Linux の iptables ルールが
+/// パケットの src/dst で判定するため(Windows はピアの身元で判定するので
+/// 仮想 IP の組しか使わない)。
+#[derive(Clone, PartialEq, Eq)]
+pub struct AclDeny {
+    pub a: Ipv4Addr,
+    pub a_subnets: Vec<Ipv4Net>,
+    pub b: Ipv4Addr,
+    pub b_subnets: Vec<Ipv4Net>,
 }
 
 #[derive(Clone)]
@@ -74,6 +86,11 @@ pub trait WgBackend: Send {
 
     /// [`WgBackend::add_route`] の対。存在しない経路の削除は成功扱い(冪等)。
     fn remove_route(&mut self, subnet: Ipv4Net) -> anyhow::Result<()>;
+
+    /// メンバー間の遮断組(ADR-0018、M3-10)を同期する。冪等で、空なら全解除。
+    /// ホストのみ呼ぶ。Windows はデバイス内リレーの判定表、Linux は
+    /// iptables FORWARD の DROP ルールとして反映する。
+    fn sync_acl(&mut self, denied: &[AclDeny]) -> anyhow::Result<()>;
 
     /// ルーター役(自分の背後 LAN を広告している)としての転送設定を同期する。
     /// 冪等で、`subnets` が空なら全解除。`snat` は将来「LAN 側静的ルート前提」

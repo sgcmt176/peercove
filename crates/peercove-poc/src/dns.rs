@@ -250,6 +250,7 @@ mod tests {
             endpoint: None,
             endpoint_age_secs: None,
             subnets: vec![],
+            blocked: false,
         };
         let networks = vec![
             (

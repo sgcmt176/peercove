@@ -26,6 +26,9 @@ pub struct Member {
     pub is_self: bool,
     /// このメンバーが広告する背後 LAN のサブネット(ADR-0014、M3-7)。
     pub subnets: Vec<String>,
+    /// 自分とこのメンバーの間がホストの ACL で遮断されているか
+    /// (ADR-0018、M3-10)。UI はバッジ表示 + チャット/ファイル送信の抑止に使う。
+    pub blocked: bool,
 }
 
 impl Member {
@@ -45,6 +48,7 @@ impl Member {
             route,
             is_self,
             subnets: entry.subnets.iter().map(|s| s.to_string()).collect(),
+            blocked: entry.blocked,
         }
     }
 }
@@ -571,6 +575,7 @@ mod tests {
                 endpoint: None,
                 endpoint_age_secs: None,
                 subnets: vec![],
+                blocked: false,
             }],
             peers: vec![],
             removed: false,
@@ -634,6 +639,7 @@ mod tests {
             endpoint: None,
             endpoint_age_secs: None,
             subnets: vec![],
+            blocked: false,
         };
         let mut direct = std::collections::HashMap::new();
         direct.insert(
