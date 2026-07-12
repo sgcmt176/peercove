@@ -996,17 +996,25 @@ impl DaemonShared {
 
 /// 1 トンネル分の status 応答を組み立てる。
 fn tunnel_info(active: &Active) -> TunnelInfo {
-    let (peers, ledger, rtt_ms, removed, direct) = {
+    let (peers, ledger, dns_records, rtt_ms, removed, direct) = {
         let snapshot = active.snapshot.lock().unwrap();
         match snapshot.as_ref() {
             Some(snapshot) => (
                 snapshot.peers.clone(),
                 snapshot.ledger.clone(),
+                snapshot.dns_records.clone(),
                 snapshot.rtt_ms.clone(),
                 snapshot.removed,
                 snapshot.direct.clone(),
             ),
-            None => (Vec::new(), None, HashMap::new(), false, HashMap::new()),
+            None => (
+                Vec::new(),
+                None,
+                Vec::new(),
+                HashMap::new(),
+                false,
+                HashMap::new(),
+            ),
         }
     };
     let ledger = ledger.unwrap_or_default();
@@ -1042,6 +1050,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
             })
             .collect(),
         ledger,
+        dns_records,
         removed,
         direct,
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)

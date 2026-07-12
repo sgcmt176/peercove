@@ -324,6 +324,7 @@ export function TunnelView({
         <DnsDialog
           configPath={tunnel.config}
           members={tunnel.members}
+          distributed={tunnel.dnsRecords}
           isHost={isHost}
           onClose={() => {
             setShowDns(false);

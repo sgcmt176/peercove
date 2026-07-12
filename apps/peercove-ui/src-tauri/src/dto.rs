@@ -257,6 +257,10 @@ pub struct Tunnel {
     /// 既知のグループ(ADR-0016、M3-13c)。自分が抜けたグループも含む
     /// (UI が履歴の表示名に使い、会話リストからは隠す)。
     pub groups: Vec<Group>,
+    /// 解決済みカスタム DNS レコード(ADR-0022)。member はここから一覧表示
+    /// する(設定ファイルには無いため)。host の DNS 管理画面は編集情報つきの
+    /// `list_dns_records` を使う。
+    pub dns_records: Vec<DnsRecordDto>,
 }
 
 impl From<&TunnelInfo> for Tunnel {
@@ -305,6 +309,23 @@ impl From<&TunnelInfo> for Tunnel {
             transfers: info.transfers.iter().map(Transfer::from).collect(),
             chat_seq: info.chat_seq,
             groups: info.groups.iter().map(Group::from).collect(),
+            dns_records: info
+                .dns_records
+                .iter()
+                .map(|record| DnsRecordDto {
+                    name: record.name.clone(),
+                    ip: Some(record.ip.to_string()),
+                    fqdn: format!(
+                        "{}.{}.{}",
+                        record.name,
+                        info.network,
+                        peercove_core::dns::DNS_SUFFIX
+                    ),
+                    // 配布形式は解決済みの {name, ip} のみ(参照情報は持たない)
+                    member: None,
+                    under: None,
+                })
+                .collect(),
         }
     }
 }
@@ -613,6 +634,10 @@ mod tests {
             transfers: vec![],
             chat_seq: 0,
             groups: vec![],
+            dns_records: vec![peercove_core::dns::DnsRecord {
+                name: "web.alice".to_string(),
+                ip: "10.100.42.2".parse().unwrap(),
+            }],
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: peercove_core::ipc::IPC_VERSION,
@@ -636,6 +661,11 @@ mod tests {
             serde_json::Value::Null,
             "host ロールでは経路バッジなし(M3-4)"
         );
+        assert_eq!(
+            json["tunnel"]["dnsRecords"][0]["fqdn"], "web.alice.home.peercove.internal",
+            "配信されたレコードが status に載る(ADR-0022 検証 FB)"
+        );
+        assert_eq!(json["tunnel"]["dnsRecords"][0]["ip"], "10.100.42.2");
         assert_eq!(json["tunnels"].as_array().unwrap().len(), 1);
 
         let json = serde_json::to_value(Status::from(DaemonStatus {
@@ -699,6 +729,7 @@ mod tests {
             transfers: vec![],
             chat_seq: 0,
             groups: vec![],
+            dns_records: vec![],
         };
         let tunnel = Tunnel::from(&info);
         let routes: Vec<Option<&str>> = tunnel.members.iter().map(|m| m.route).collect();

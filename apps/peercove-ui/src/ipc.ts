@@ -157,6 +157,8 @@ export interface Tunnel {
   chatSeq: number;
   /** 既知のグループ（M3-13c）。自分が抜けたグループも含む。 */
   groups: Group[];
+  /** 解決済みカスタム DNS レコード（ADR-0022）。member はここから一覧表示する。 */
+  dnsRecords: DnsRecord[];
 }
 
 /** 同時参加は 1 ネットワークまで(M2 handoff Q4)。 */

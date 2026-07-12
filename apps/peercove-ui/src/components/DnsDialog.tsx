@@ -17,11 +17,14 @@ import { t } from "../i18n";
 export function DnsDialog({
   configPath,
   members,
+  distributed,
   isHost,
   onClose,
 }: {
   configPath: string;
   members: Member[];
+  /** status で配信された解決済みレコード(member の一覧表示用)。 */
+  distributed: DnsRecord[];
   isHost: boolean;
   onClose: () => void;
 }) {
@@ -36,16 +39,21 @@ export function DnsDialog({
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
 
+  // ホスト = 設定ファイルから(編集用の参照情報つき)。
+  // メンバー = 配信された status から(設定ファイルには載っていない)
   const reload = useCallback(() => {
+    if (!isHost) return;
     api
       .listDnsRecords(configPath)
       .then(setRecords)
       .catch((e) => setError(errorMessage(e)));
-  }, [configPath]);
+  }, [configPath, isHost]);
 
   useEffect(() => {
     reload();
   }, [reload]);
+
+  const shown = isHost ? records : distributed;
 
   /** メンバー参照("host" or 公開鍵)の表示名。 */
   const memberName = (ref: string): string => {
@@ -132,11 +140,11 @@ export function DnsDialog({
         )}
 
         <h3 className="subhead">{t.dns.customHead}</h3>
-        {records.length === 0 ? (
+        {shown.length === 0 ? (
           <p className="muted small">{t.dns.customEmpty}</p>
         ) : (
           <ul className="dns-list">
-            {records.map((record) => (
+            {shown.map((record) => (
               <li key={`${record.name}@${record.under ?? ""}`} className="dns-list__row">
                 <span className="mono ellipsis" title={record.fqdn}>
                   {record.fqdn}

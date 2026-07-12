@@ -278,6 +278,11 @@ pub struct TunnelInfo {
     /// 台帳スナップショット(host: 自前構築 / member: 受信したもの)。
     #[serde(default)]
     pub ledger: Vec<LedgerEntry>,
+    /// 解決済みカスタム DNS レコード(M3-1 / ADR-0022。host: 自分の設定を
+    /// 解決したもの / member: 台帳と一緒に受信したもの)。UI がメンバー側でも
+    /// レコード一覧を表示するために載せる。旧デーモンの応答には無い(空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_records: Vec<crate::dns::DnsRecord>,
     /// ピア統計の要約(公開鍵 base64 → (最終ハンドシェイク経過秒, rx, tx))。
     #[serde(default)]
     pub peers: Vec<PeerSummary>,
