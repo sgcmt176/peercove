@@ -303,6 +303,10 @@ impl WgBackend for LinuxBackend {
 
     fn add_peer(&mut self, peer: &PeerSpec) -> anyhow::Result<()> {
         Self::ensure_root()?;
+        // カーネル WG のピア設定は元々 upsert(既存ピアは属性更新、
+        // セッション維持)。roaming 学習済みエンドポイントを台帳の値で
+        // 上書きしないよう、更新の呼び出し(direct.rs の確立)は endpoint を
+        // 渡さない(ADR-0019)
         self.api
             .configure_peer(&to_peer(peer))
             .with_context(|| format!("ピア {} の追加に失敗しました", peer.public_key))

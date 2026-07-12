@@ -66,7 +66,10 @@ pub trait WgBackend: Send {
     /// TUN 作成・IP/MTU 設定・ピア登録・待受開始までを行う。
     fn up(&mut self, spec: &TunnelSpec) -> anyhow::Result<()>;
 
-    /// 実行中のトンネルへピアを追加する。
+    /// 実行中のトンネルへピアを追加する。**既に存在するピアに対しては
+    /// AllowedIPs の更新として働く**(upsert、ADR-0019。セッションと
+    /// roaming 学習済みエンドポイントは維持する。直接通信の二段階
+    /// AllowedIPs が使う)。鍵・PSK の変更は remove → add で行うこと。
     fn add_peer(&mut self, peer: &PeerSpec) -> anyhow::Result<()>;
 
     /// 実行中のトンネルからピアを削除する(M1-G3)。

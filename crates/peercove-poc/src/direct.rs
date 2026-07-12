@@ -7,6 +7,9 @@
 //!
 //! - 直接ピアは設定ファイルに書かない(台帳から毎回導出できるエフェメラルな
 //!   最適化)。追加/削除はこのモジュールだけが行い、ホストピアには触れない
+//! - **二段階 AllowedIPs(ADR-0019)**: 試行中は AllowedIPs 空のプローブとして
+//!   追加し(経路を奪わない = 中継が生き続ける)、ハンドシェイクを観測して
+//!   から `/32` を付与して直接経路へ切り替える
 //! - 失敗・陳腐化したらピアを削除するだけで、cryptokey routing の最長一致に
 //!   より自動的にホスト経由(/24)へ戻る。OS ルートは一切変更しない
 
@@ -24,33 +27,28 @@ use crate::control::ReceivedDistribution;
 /// 台帳のエンドポイント観測がこれより古いものは試行しない
 /// (ADR-0013 追加条件 1。「配布時の観測経過 + 受信からの経過」で判定)。
 const MAX_ENDPOINT_AGE: Duration = Duration::from_secs(300);
-/// 追加からこれ以内にハンドシェイクが完了しなければ失敗として除去する
-/// (→ 中継のまま)。WG のハンドシェイク再送は 5 秒間隔なので約 6 回分。
-const TRYING_TIMEOUT: Duration = Duration::from_secs(30);
+/// 追加からこれ以内にハンドシェイクが完了しなければ試行を打ち切る。
+/// 試行は AllowedIPs 空のプローブなので通信への影響はない(ADR-0019)。
+const TRYING_TIMEOUT: Duration = Duration::from_secs(45);
 /// 最終ハンドシェイクがこれを超えたら直接経路は死んだとみなす
 /// (WG のセッション有効期限 180 秒。tunnel.rs の ONLINE_THRESHOLD と同値)。
 const HANDSHAKE_STALE: Duration = Duration::from_secs(180);
-/// 失敗した相手への再試行までの基本待ち時間。失敗を重ねるごとに 2 倍
-/// (上限 [`RETRY_MAX`]、M3-4)。台帳のエンドポイントが変わったら待たずに
-/// 再試行し、バックオフもリセットする。
-const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
-/// 再試行間隔の上限(指数バックオフの頭打ち)。
-const RETRY_MAX: Duration = Duration::from_secs(3600);
-
-/// `failures` 回連続で失敗した後の待ち時間(5 分 → 10 分 → … → 上限 1 時間)。
-fn backoff(failures: u32) -> Duration {
-    RETRY_COOLDOWN
-        .saturating_mul(1u32 << failures.saturating_sub(1).min(4))
-        .min(RETRY_MAX)
-}
+/// 同じエンドポイントへの再試行間隔(固定、ADR-0019。指数バックオフは廃止)。
+/// パンチング(および相手側ステートフルファイアウォールのピンホール開け)には
+/// **両側の試行窓が重なる**ことが必要。試行窓 45 秒 × 周期 60 秒なら、両側の
+/// 位相がどうずれても重なりが 2×45−60 = 30 秒保証される。台帳のエンドポイントが
+/// 変わったら待たずに再試行する。
+const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// 直接ピアの keepalive 秒(NAT マッピング維持 + パンチの継続)。
 const DIRECT_KEEPALIVE: u16 = 25;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
-    /// 追加済みでハンドシェイク待ち。
-    Trying { since: Instant },
-    /// ハンドシェイク確認済み(直接通信中)。
+    /// プローブ追加済みでハンドシェイク待ち(AllowedIPs は空 = 経路は中継のまま)。
+    /// `quiet` は同じエンドポイントへの再試行(初回失敗後)で、ログは debug、
+    /// UI の経路表示にも出さない(ADR-0019)。
+    Trying { since: Instant, quiet: bool },
+    /// ハンドシェイク確認済みで `/32` を付与済み(直接通信中)。
     Direct,
 }
 
@@ -60,12 +58,10 @@ struct DirectState {
     phase: Phase,
 }
 
-/// 失敗の記録。同じエンドポイントへの再試行を [`backoff`] だけ抑える。
+/// 失敗の記録。同じエンドポイントへの再試行を [`RETRY_INTERVAL`] だけ抑える。
 struct Cooldown {
     endpoint: SocketAddr,
     at: Instant,
-    /// 連続失敗回数(バックオフの指数)。成功またはエンドポイント変化でリセット。
-    failures: u32,
 }
 
 /// 次の周期でやること(状態の参照と変更を分けるための中間表現)。
@@ -109,10 +105,9 @@ impl DirectManager {
         stats: &[PeerStats],
         backend: &mut dyn WgBackend,
     ) {
-        // 長く放置されたバックオフ記録を掃除する(メモリ衛生。上限バックオフの
-        // 2 倍以上経っていれば、忘れて 1 からやり直して問題ない)
+        // 台帳から消えた相手などの古い失敗記録を掃除する(メモリ衛生)
         self.cooldown
-            .retain(|_, cd| now.duration_since(cd.at) < RETRY_MAX.saturating_mul(2));
+            .retain(|_, cd| now.duration_since(cd.at) < RETRY_INTERVAL.saturating_mul(2));
 
         let desired = if enabled {
             self.desired(now, received)
@@ -139,7 +134,16 @@ impl DirectManager {
             .copied()
             .collect();
         for key in gone {
-            self.drop_peer(&key, backend, "台帳から外れたため直接ピアを解除します");
+            let quiet = matches!(
+                self.states.get(&key).map(|s| s.phase),
+                Some(Phase::Trying { quiet: true, .. })
+            );
+            self.drop_peer(
+                &key,
+                backend,
+                "台帳から外れたため直接ピアを解除します",
+                quiet,
+            );
         }
 
         for (key, (ip, endpoint)) in desired {
@@ -149,9 +153,11 @@ impl DirectManager {
                     let fresh = handshake_fresh.get(&key).copied().unwrap_or(false);
                     match state.phase {
                         Phase::Trying { .. } if fresh => Act::Establish,
-                        Phase::Trying { since } if now.duration_since(since) > TRYING_TIMEOUT => {
+                        Phase::Trying { since, .. }
+                            if now.duration_since(since) > TRYING_TIMEOUT =>
+                        {
                             Act::Fail(
-                                "直接接続がタイムアウトしました(中継で継続、後で再試行します)",
+                                "直接接続がタイムアウトしました(中継のまま、裏で再試行を続けます)",
                             )
                         }
                         Phase::Trying { .. } => Act::Keep,
@@ -160,11 +166,11 @@ impl DirectManager {
                     }
                 }
                 None => match self.cooldown.get(&key) {
-                    // 同じエンドポイントへの再試行はバックオフ中は控える。
+                    // 同じエンドポイントへの再試行は固定間隔(ADR-0019)。
                     // エンドポイントが変わったら即再試行(ADR-0013)
                     Some(cd)
                         if cd.endpoint == endpoint
-                            && now.duration_since(cd.at) < backoff(cd.failures) =>
+                            && now.duration_since(cd.at) < RETRY_INTERVAL =>
                     {
                         Act::Keep
                     }
@@ -173,16 +179,12 @@ impl DirectManager {
             };
             match act {
                 Act::Add => {
-                    // エンドポイントが変わっていたらバックオフをリセット
-                    // (同じままなら失敗回数を持ち越して待ちを伸ばす)
-                    if self
+                    // 同じエンドポイントへの再試行はログ・UI 表示を静かにする
+                    let quiet = self
                         .cooldown
-                        .get(&key)
-                        .is_some_and(|cd| cd.endpoint != endpoint)
-                    {
-                        self.cooldown.remove(&key);
-                    }
-                    self.try_add(key, ip, endpoint, now, backend);
+                        .remove(&key)
+                        .is_some_and(|cd| cd.endpoint == endpoint);
+                    self.try_add(key, ip, endpoint, now, quiet, backend);
                 }
                 Act::Rebind => {
                     self.cooldown.remove(&key);
@@ -190,30 +192,43 @@ impl DirectManager {
                         &key,
                         backend,
                         "エンドポイントが変わったため直接ピアを張り直します",
+                        false,
                     );
-                    self.try_add(key, ip, endpoint, now, backend);
+                    self.try_add(key, ip, endpoint, now, false, backend);
                 }
                 Act::Establish => {
-                    if let Some(state) = self.states.get_mut(&key) {
-                        state.phase = Phase::Direct;
-                        tracing::info!("直接通信を確立しました({ip} = {endpoint})");
+                    // ハンドシェイク確認 → `/32` を付与して経路を直接側へ
+                    // 切り替える(二段階 AllowedIPs、ADR-0019)。endpoint は
+                    // 渡さない(roaming 学習済みの実エンドポイントを維持)
+                    let spec = PeerSpec {
+                        public_key: PublicKey::from_bytes(key),
+                        endpoint: None,
+                        allowed_ips: vec![Ipv4Net::new(ip, 32).expect("/32 は常に有効")],
+                        persistent_keepalive: Some(DIRECT_KEEPALIVE),
+                        preshared_key: None,
+                    };
+                    match backend.add_peer(&spec) {
+                        Ok(()) => {
+                            if let Some(state) = self.states.get_mut(&key) {
+                                state.phase = Phase::Direct;
+                                tracing::info!("直接通信を確立しました({ip} = {endpoint})");
+                            }
+                            self.cooldown.remove(&key);
+                        }
+                        // 次の周期で再判定される(ハンドシェイクが新鮮なうちは
+                        // 再び Establish に来る)
+                        Err(e) => {
+                            tracing::warn!("直接経路への切り替えに失敗しました({ip}): {e:#}")
+                        }
                     }
-                    self.cooldown.remove(&key); // 成功したらバックオフをリセット
                 }
                 Act::Fail(why) => {
-                    let failures = match self.cooldown.get(&key) {
-                        Some(cd) if cd.endpoint == endpoint => cd.failures + 1,
-                        _ => 1,
-                    };
-                    self.cooldown.insert(
-                        key,
-                        Cooldown {
-                            endpoint,
-                            at: now,
-                            failures,
-                        },
+                    let quiet = matches!(
+                        self.states.get(&key).map(|s| s.phase),
+                        Some(Phase::Trying { quiet: true, .. })
                     );
-                    self.drop_peer(&key, backend, why);
+                    self.cooldown.insert(key, Cooldown { endpoint, at: now });
+                    self.drop_peer(&key, backend, why, quiet);
                 }
                 Act::Keep => {}
             }
@@ -221,16 +236,18 @@ impl DirectManager {
     }
 
     /// 現在の直接経路(相手の仮想 IP → 状態)。status / UI 表示用(M3-4)。
-    /// 載っていない相手はホスト経由(中継)。
+    /// 載っていない相手はホスト経由(中継)。静かな再試行(初回失敗後の
+    /// プローブ)は経路を奪っていないので「中継」として見せる(ADR-0019)。
     pub fn routes(&self) -> HashMap<Ipv4Addr, DirectStatus> {
         self.states
             .values()
-            .map(|state| {
+            .filter_map(|state| {
                 let status = match state.phase {
+                    Phase::Trying { quiet: true, .. } => return None,
                     Phase::Trying { .. } => DirectStatus::Trying,
                     Phase::Direct => DirectStatus::Direct,
                 };
-                (state.ip, status)
+                Some((state.ip, status))
             })
             .collect()
     }
@@ -279,25 +296,33 @@ impl DirectManager {
         ip: Ipv4Addr,
         endpoint: SocketAddr,
         now: Instant,
+        quiet: bool,
         backend: &mut dyn WgBackend,
     ) {
+        // プローブ: AllowedIPs は空で追加する(経路を奪わない = 試行中も
+        // 中継で通信が続く)。ハンドシェイクと keepalive だけが走り、
+        // 確立を観測してから `/32` を付与する(二段階、ADR-0019)
         let spec = PeerSpec {
             public_key: PublicKey::from_bytes(key),
             endpoint: Some(endpoint),
-            allowed_ips: vec![Ipv4Net::new(ip, 32).expect("/32 は常に有効")],
+            allowed_ips: vec![],
             persistent_keepalive: Some(DIRECT_KEEPALIVE),
             // 直接ピアに PSK は付けない(ADR-0013。WG の Noise で機密性は担保)
             preshared_key: None,
         };
         match backend.add_peer(&spec) {
             Ok(()) => {
-                tracing::info!("直接接続を試行します({ip} → {endpoint})");
+                if quiet {
+                    tracing::debug!("直接接続を再試行します({ip} → {endpoint})");
+                } else {
+                    tracing::info!("直接接続を試行します({ip} → {endpoint})");
+                }
                 self.states.insert(
                     key,
                     DirectState {
                         ip,
                         endpoint,
-                        phase: Phase::Trying { since: now },
+                        phase: Phase::Trying { since: now, quiet },
                     },
                 );
             }
@@ -307,10 +332,12 @@ impl DirectManager {
 
     /// 直接ピアを WG から外し、状態を忘れる。削除に失敗しても状態は消す
     /// (次の周期の add が失敗として観測される。残骸で固まるより良い)。
-    fn drop_peer(&mut self, key: &[u8; 32], backend: &mut dyn WgBackend, why: &str) {
+    /// `quiet` は静かな再試行の後片付け(ログは debug に落とす)。
+    fn drop_peer(&mut self, key: &[u8; 32], backend: &mut dyn WgBackend, why: &str, quiet: bool) {
         let public_key = PublicKey::from_bytes(*key);
         if let Some(state) = self.states.remove(key) {
             match backend.remove_peer(&public_key) {
+                Ok(()) if quiet => tracing::debug!("{why}({})", state.ip),
                 Ok(()) => tracing::info!("{why}({})", state.ip),
                 Err(e) => {
                     tracing::warn!("直接ピア {public_key} の削除に失敗しました: {e:#}")
@@ -523,10 +550,11 @@ mod tests {
         assert!(backend.ops.is_empty());
     }
 
-    /// タイムアウトで除去 → 同じエンドポイントへはクールダウン中再試行しない →
-    /// エンドポイントが変われば即再試行。
+    /// タイムアウトで除去 → 同じエンドポイントへは再試行間隔内は控える →
+    /// エンドポイントが変われば即再試行 → 間隔が明ければ再試行(固定間隔、
+    /// ADR-0019)。
     #[test]
-    fn trying_timeout_backs_off_until_endpoint_changes() {
+    fn trying_timeout_retries_on_fixed_interval() {
         let me = PrivateKey::generate().public_key();
         let peer = PrivateKey::generate().public_key();
         let mut m = manager(&me);
@@ -546,7 +574,7 @@ mod tests {
             vec![format!("add:{peer}"), format!("remove:{peer}")]
         );
 
-        // クールダウン中は同じエンドポイントを再試行しない
+        // 再試行間隔内は同じエンドポイントを再試行しない
         backend.ops.clear();
         m.tick(
             t1 + Duration::from_secs(5),
@@ -555,7 +583,7 @@ mod tests {
             &[],
             &mut backend,
         );
-        assert!(backend.ops.is_empty(), "クールダウン中");
+        assert!(backend.ops.is_empty(), "再試行間隔内");
 
         // エンドポイントが変わったら即再試行
         let rebound = received(
@@ -571,13 +599,13 @@ mod tests {
         );
         assert_eq!(backend.ops, vec![format!("add:{peer}")]);
 
-        // クールダウンが明ければ同じエンドポイントでも再試行する
+        // 間隔が明ければ同じエンドポイントでも再試行する
         let mut m = manager(&me);
         let mut backend = MockBackend::default();
         m.tick(t0, true, Some(&dist), &[], &mut backend);
-        m.tick(t1, true, Some(&dist), &[], &mut backend); // タイムアウト → cooldown
+        m.tick(t1, true, Some(&dist), &[], &mut backend); // タイムアウト
         backend.ops.clear();
-        let after = t1 + RETRY_COOLDOWN + Duration::from_secs(1);
+        let after = t1 + RETRY_INTERVAL + Duration::from_secs(1);
         // 受信も新しくないと鮮度ガードに引っかかるため台帳を再受信した体にする
         let refreshed = received(
             vec![entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0)],
@@ -587,7 +615,38 @@ mod tests {
         assert_eq!(backend.ops, vec![format!("add:{peer}")]);
     }
 
-    /// ハンドシェイクが観測できたら確立(除去しない)。その後途絶えたら
+    /// 何度失敗しても再試行間隔は一定のまま伸びない(指数バックオフの廃止、
+    /// ADR-0019。両側の試行窓の重なりを保証するため)。
+    #[test]
+    fn retry_interval_stays_fixed_after_repeated_failures() {
+        let me = PrivateKey::generate().public_key();
+        let peer = PrivateKey::generate().public_key();
+        let mut m = manager(&me);
+        let mut backend = MockBackend::default();
+        let dist_at = |at: Instant| {
+            received(
+                vec![entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0)],
+                at,
+            )
+        };
+
+        // 3 回連続で失敗させる
+        let mut t = Instant::now();
+        for round in 1..=3 {
+            m.tick(t, true, Some(&dist_at(t)), &[], &mut backend);
+            assert_eq!(
+                backend.ops.last(),
+                Some(&format!("add:{peer}")),
+                "{round} 回目も待ちが伸びずに再試行される"
+            );
+            t += TRYING_TIMEOUT + Duration::from_secs(1);
+            m.tick(t, true, Some(&dist_at(t)), &[], &mut backend); // タイムアウト
+            t += RETRY_INTERVAL + Duration::from_secs(1);
+        }
+    }
+
+    /// ハンドシェイクが観測できたら `/32` を付与して確立(二段階 AllowedIPs、
+    /// ADR-0019。タイムアウトを過ぎても除去されない)。その後途絶えたら
     /// 除去して中継へ戻る。
     #[test]
     fn establishes_then_falls_back_when_handshake_goes_stale() {
@@ -602,12 +661,17 @@ mod tests {
         );
 
         m.tick(t0, true, Some(&dist), &[], &mut backend);
-        // ハンドシェイク成功 → 確立(タイムアウトを過ぎても除去されない)
+        // ハンドシェイク成功 → /32 を付与(2 回目の add = upsert)して確立。
+        // タイムアウトを過ぎても除去されない
         let t1 = t0 + Duration::from_secs(10);
         m.tick(t1, true, Some(&dist), &fresh_stats(&peer), &mut backend);
         let t2 = t0 + TRYING_TIMEOUT + Duration::from_secs(10);
         m.tick(t2, true, Some(&dist), &fresh_stats(&peer), &mut backend);
-        assert_eq!(backend.ops, vec![format!("add:{peer}")], "確立後は維持");
+        assert_eq!(
+            backend.ops,
+            vec![format!("add:{peer}"), format!("add:{peer}")],
+            "プローブ追加 → 確立時の /32 付与、以後は維持"
+        );
 
         // ハンドシェイクが陳腐化 → 除去(中継へ)
         // 鮮度ガードを避けるため台帳は再受信した体にする
@@ -624,96 +688,16 @@ mod tests {
         );
         assert_eq!(
             backend.ops,
-            vec![format!("add:{peer}"), format!("remove:{peer}")]
-        );
-    }
-
-    /// 失敗を重ねるとバックオフが 2 倍ずつ伸びる(5 分 → 10 分 → … → 上限 1 時間)。
-    /// 確立に成功するとリセットされる。
-    #[test]
-    fn backoff_doubles_after_repeated_failures_and_resets_on_success() {
-        assert_eq!(backoff(1), Duration::from_secs(300));
-        assert_eq!(backoff(2), Duration::from_secs(600));
-        assert_eq!(backoff(3), Duration::from_secs(1200));
-        assert_eq!(backoff(10), RETRY_MAX, "上限で頭打ち");
-
-        let me = PrivateKey::generate().public_key();
-        let peer = PrivateKey::generate().public_key();
-        let mut m = manager(&me);
-        let mut backend = MockBackend::default();
-        let t0 = Instant::now();
-        let dist_at = |at: Instant| {
-            received(
-                vec![entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0)],
-                at,
-            )
-        };
-
-        // 1 回目の失敗
-        m.tick(t0, true, Some(&dist_at(t0)), &[], &mut backend);
-        let t1 = t0 + TRYING_TIMEOUT + Duration::from_secs(1);
-        m.tick(t1, true, Some(&dist_at(t1)), &[], &mut backend);
-        // 5 分後に再試行 → 2 回目の失敗
-        let t2 = t1 + backoff(1) + Duration::from_secs(1);
-        m.tick(t2, true, Some(&dist_at(t2)), &[], &mut backend);
-        let t3 = t2 + TRYING_TIMEOUT + Duration::from_secs(1);
-        m.tick(t3, true, Some(&dist_at(t3)), &[], &mut backend);
-        backend.ops.clear();
-
-        // 2 回目の失敗後は 5 分では再試行せず、10 分待つ
-        let after_5min = t3 + backoff(1) + Duration::from_secs(1);
-        m.tick(
-            after_5min,
-            true,
-            Some(&dist_at(after_5min)),
-            &[],
-            &mut backend,
-        );
-        assert!(backend.ops.is_empty(), "バックオフが 10 分に伸びている");
-        let after_10min = t3 + backoff(2) + Duration::from_secs(1);
-        m.tick(
-            after_10min,
-            true,
-            Some(&dist_at(after_10min)),
-            &[],
-            &mut backend,
-        );
-        assert_eq!(backend.ops, vec![format!("add:{peer}")]);
-
-        // 今回は確立に成功 → バックオフはリセットされ、次の失敗はまた 5 分から
-        m.tick(
-            after_10min + Duration::from_secs(5),
-            true,
-            Some(&dist_at(after_10min)),
-            &fresh_stats(&peer),
-            &mut backend,
-        );
-        assert_eq!(
-            m.routes().get(&"10.100.42.3".parse().unwrap()),
-            Some(&DirectStatus::Direct)
-        );
-        backend.ops.clear();
-        let t4 = after_10min + Duration::from_secs(10);
-        // 経路が途絶える(失敗 1 回目扱い)
-        let refreshed = dist_at(t4);
-        m.tick(
-            t4,
-            true,
-            Some(&refreshed),
-            &stale_stats(&peer),
-            &mut backend,
-        );
-        assert_eq!(backend.ops, vec![format!("remove:{peer}")]);
-        let t5 = t4 + backoff(1) + Duration::from_secs(1);
-        m.tick(t5, true, Some(&dist_at(t5)), &[], &mut backend);
-        assert_eq!(
-            backend.ops,
-            vec![format!("remove:{peer}"), format!("add:{peer}")],
-            "リセット後は 5 分で再試行する"
+            vec![
+                format!("add:{peer}"),
+                format!("add:{peer}"),
+                format!("remove:{peer}")
+            ]
         );
     }
 
     /// routes(): 確立中は Trying、確立後は Direct、解除後は消える。
+    /// 初回失敗後の静かな再試行は経路表示に出ない(中継扱い、ADR-0019)。
     #[test]
     fn routes_reflect_phase() {
         let me = PrivateKey::generate().public_key();
@@ -740,6 +724,35 @@ mod tests {
         assert_eq!(m.routes().get(&ip), Some(&DirectStatus::Direct));
         m.tick(t0 + Duration::from_secs(10), true, None, &[], &mut backend);
         assert!(m.routes().is_empty(), "台帳が無ければ解除される");
+
+        // 失敗 → 静かな再試行は「中継」として見せる(Trying を出さない)
+        let mut m = manager(&me);
+        let mut backend = MockBackend::default();
+        m.tick(t0, true, Some(&dist), &[], &mut backend);
+        let t1 = t0 + TRYING_TIMEOUT + Duration::from_secs(1);
+        m.tick(t1, true, Some(&dist), &[], &mut backend); // タイムアウト
+        let t2 = t1 + RETRY_INTERVAL + Duration::from_secs(1);
+        let refreshed = received(
+            vec![entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0)],
+            t2,
+        );
+        m.tick(t2, true, Some(&refreshed), &[], &mut backend); // 静かな再試行
+        assert_eq!(
+            backend.ops.last(),
+            Some(&format!("add:{peer}")),
+            "裏では再試行している"
+        );
+        assert!(m.routes().is_empty(), "静かな再試行は経路表示に出ない");
+
+        // 静かな再試行中でも確立すれば Direct になる
+        m.tick(
+            t2 + Duration::from_secs(5),
+            true,
+            Some(&refreshed),
+            &fresh_stats(&peer),
+            &mut backend,
+        );
+        assert_eq!(m.routes().get(&ip), Some(&DirectStatus::Direct));
     }
 
     /// 相手がオフラインになったら(クールダウンなしで)解除する。

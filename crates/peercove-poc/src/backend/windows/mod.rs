@@ -239,7 +239,7 @@ impl WgBackend for WindowsBackend {
                     last_handshake: since.map(|d| SystemTime::now() - d),
                     tx_bytes: tx as u64,
                     rx_bytes: rx as u64,
-                    allowed_ips: peer.allowed_ips.clone(),
+                    allowed_ips: peer.allowed_ips(),
                 }
             })
             .collect())

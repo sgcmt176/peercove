@@ -42,7 +42,9 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct DevicePeer {
     pub public_key: [u8; 32],
-    pub allowed_ips: Vec<Ipv4Net>,
+    /// 直接通信の二段階 AllowedIPs(ADR-0019: プローブは空 → 確立で /32)で
+    /// 実行中に書き換わるため RwLock。
+    allowed_ips: RwLock<Vec<Ipv4Net>>,
     /// `Tunn::new` に渡した 24bit ピアインデックス(削除時にテーブルから引く)。
     index: u32,
     tunn: Mutex<Tunn>,
@@ -54,21 +56,35 @@ impl DevicePeer {
         *self.endpoint.read().unwrap()
     }
 
+    pub fn allowed_ips(&self) -> Vec<Ipv4Net> {
+        self.allowed_ips.read().unwrap().clone()
+    }
+
     /// このピアの仮想 IP(AllowedIPs の先頭 = 慣例で `<仮想IP>/32`)。
     /// ACL(ADR-0018)のリレー判定は、パケットの送信元 IP でなく
     /// **どのピアから来てどのピアへ出るか**で行うため、これを身元に使う
     /// (広告サブネット由来のトラフィックも自然に遮断される)。
     fn virtual_ip(&self) -> Option<Ipv4Addr> {
-        self.allowed_ips.first().map(|net| net.addr())
+        self.allowed_ips
+            .read()
+            .unwrap()
+            .first()
+            .map(|net| net.addr())
     }
 
     pub fn allows(&self, ip: Ipv4Addr) -> bool {
-        self.allowed_ips.iter().any(|net| net.contains(&ip))
+        self.allowed_ips
+            .read()
+            .unwrap()
+            .iter()
+            .any(|net| net.contains(&ip))
     }
 
     /// `ip` を含む AllowedIPs のうち最長のプレフィックス長(含まなければ None)。
     fn longest_match(&self, ip: Ipv4Addr) -> Option<u8> {
         self.allowed_ips
+            .read()
+            .unwrap()
             .iter()
             .filter(|net| net.contains(&ip))
             .map(|net| net.prefix_len())
@@ -151,10 +167,14 @@ impl Device {
         *self.acl_denied.write().unwrap() = normalized;
     }
 
+    /// ピアを追加する。既存ピアなら AllowedIPs の更新として働く(upsert、
+    /// ADR-0019)。セッション(Tunn)と roaming 学習済みエンドポイントは
+    /// 維持する。鍵・PSK・keepalive の変更は remove → add で行うこと。
     pub fn add_peer(&self, spec: &PeerSpec) -> anyhow::Result<()> {
         let mut table = self.peers.write().unwrap();
-        if table.by_key.contains_key(spec.public_key.as_bytes()) {
-            anyhow::bail!("ピア {} は登録済みです", spec.public_key);
+        if let Some(existing) = table.by_key.get(spec.public_key.as_bytes()) {
+            *existing.allowed_ips.write().unwrap() = spec.allowed_ips.clone();
+            return Ok(());
         }
         let index = table.next_index;
         table.next_index += 1;
@@ -168,7 +188,7 @@ impl Device {
         );
         let peer = Arc::new(DevicePeer {
             public_key: *spec.public_key.as_bytes(),
-            allowed_ips: spec.allowed_ips.clone(),
+            allowed_ips: RwLock::new(spec.allowed_ips.clone()),
             index,
             tunn: Mutex::new(tunn),
             endpoint: RwLock::new(spec.endpoint),
@@ -196,7 +216,10 @@ impl Device {
         let mut table = self.peers.write().unwrap();
         if let Some(peer) = table.by_key.remove(public_key) {
             table.by_index.remove(&peer.index);
-            tracing::info!(
+            // 直接接続の再試行(ADR-0019: 60 秒周期)でも通るため debug。
+            // 意味のある削除(メンバー削除・経路の状態変化)は呼び出し側が
+            // 理由つきで INFO を出す
+            tracing::debug!(
                 "ピア {} を削除しました",
                 peercove_core::keys::PublicKey::from_bytes(*public_key)
             );
@@ -654,6 +677,39 @@ mod tests {
         device.remove_peer(direct_key.as_bytes());
         let fallback = device.find_peer_by_dst(dst).expect("/24 が引き継ぐ");
         assert_eq!(fallback.public_key, *host_key.as_bytes());
+        device.shutdown();
+    }
+
+    /// add_peer の upsert(ADR-0019): 既存ピアの AllowedIPs をその場で更新し、
+    /// ピアオブジェクト(= Tunn セッション)は作り直さない。直接通信の
+    /// 二段階 AllowedIPs(プローブは空 → 確立で /32)の土台。
+    #[test]
+    fn add_peer_upsert_updates_allowed_ips_in_place() {
+        let (tun, _handles) = mock_tun();
+        let device =
+            Device::new(*PrivateKey::generate().as_bytes(), None, false, tun).expect("device");
+        let key = PrivateKey::generate().public_key();
+        let dst: Ipv4Addr = "10.99.0.3".parse().unwrap();
+
+        // プローブ(AllowedIPs 空): どの宛先にも一致しない = 経路を奪わない
+        device.add_peer(&peer_spec(key, None, &[], None)).unwrap();
+        assert!(device.find_peer_by_dst(dst).is_none(), "プローブは経路なし");
+        let probe = &device.peers()[0];
+        assert!(probe.allowed_ips().is_empty());
+
+        // 確立: /32 を付与 → 経路がこのピアへ切り替わる。同じオブジェクトの
+        // まま(セッション維持)で、テーブルにも増えない
+        device
+            .add_peer(&peer_spec(key, None, &["10.99.0.3/32"], None))
+            .unwrap();
+        let peers = device.peers();
+        assert_eq!(peers.len(), 1, "upsert でピアは増えない");
+        assert!(
+            Arc::ptr_eq(probe, &peers[0]),
+            "既存の DevicePeer(セッション)を維持する"
+        );
+        let picked = device.find_peer_by_dst(dst).expect("/32 に一致する");
+        assert_eq!(picked.public_key, *key.as_bytes());
         device.shutdown();
     }
 

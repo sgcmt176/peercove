@@ -76,6 +76,42 @@ pub struct ReceivedDistribution {
     pub received_at: Instant,
 }
 
+/// 受信ログの INFO/debug 判定に使う「意味のある内容」の要約(ADR-0019)。
+/// エンドポイントとその観測経過(60 秒粒度)は鮮度更新のたびに変わり、
+/// 台帳は最大毎分数回再配布されるため、それ**だけ**の変化は debug に落とす。
+type LedgerDigest = (
+    Vec<(
+        Option<String>,                 // name
+        Ipv4Addr,                       // ip
+        peercove_core::keys::PublicKey, // 鍵の入れ替わりも「意味のある変化」
+        bool,                           // online
+        bool,                           // is_host
+        bool,                           // blocked(ACL、ADR-0018)
+        Vec<ipnet::Ipv4Net>,            // subnets(ADR-0014)
+    )>,
+    Vec<DnsRecord>,
+);
+
+fn ledger_digest(members: &[LedgerEntry], dns_records: &[DnsRecord]) -> LedgerDigest {
+    (
+        members
+            .iter()
+            .map(|m| {
+                (
+                    m.name.clone(),
+                    m.ip,
+                    m.public_key,
+                    m.online,
+                    m.is_host,
+                    m.blocked,
+                    m.subnets.clone(),
+                )
+            })
+            .collect(),
+        dns_records.to_vec(),
+    )
+}
+
 /// 相手の仮想 IP → 直近の RTT(ミリ秒、M2-G5)。切断時にエントリを消す。
 pub type RttMap = Arc<Mutex<HashMap<Ipv4Addr, f64>>>;
 
@@ -492,6 +528,7 @@ async fn member_reader(
     removed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
+    let mut last_digest: Option<LedgerDigest> = None;
     loop {
         if read_line(&mut reader, &mut line).await?.is_none() {
             anyhow::bail!("ホストが切断しました");
@@ -502,11 +539,19 @@ async fn member_reader(
                 members,
                 dns_records,
             }) => {
-                tracing::info!(
-                    "台帳を受信しました({} 名、DNS レコード {} 件)",
-                    members.len(),
-                    dns_records.len()
-                );
+                // 意味のある変化があったときだけ INFO(エンドポイント鮮度の
+                // 定期更新による再配布は debug に落とす — ADR-0019)
+                let digest = ledger_digest(&members, &dns_records);
+                if last_digest.as_ref() != Some(&digest) {
+                    tracing::info!(
+                        "台帳を受信しました({} 名、DNS レコード {} 件)",
+                        members.len(),
+                        dns_records.len()
+                    );
+                    last_digest = Some(digest);
+                } else {
+                    tracing::debug!("台帳を受信しました({} 名、内容の変化なし)", members.len());
+                }
                 *latest_ledger.lock().unwrap() = Some(ReceivedDistribution {
                     distribution: Distribution {
                         members,
@@ -546,6 +591,33 @@ mod tests {
             subnets: vec![],
             blocked: false,
         }
+    }
+
+    /// 受信ログの INFO/debug 判定(ADR-0019): エンドポイントとその観測経過
+    /// **だけ**の変化はダイジェスト一致(= debug)、メンバーの増減・オンライン・
+    /// 遮断・DNS の変化は不一致(= INFO)。
+    #[test]
+    fn ledger_digest_ignores_endpoint_freshness_only() {
+        let base = vec![entry("alice", "100.100.42.2", true)];
+        let mut fresher = base.clone();
+        fresher[0].endpoint = Some("203.0.113.9:51820".parse().unwrap());
+        fresher[0].endpoint_age_secs = Some(60);
+        assert_eq!(
+            ledger_digest(&base, &[]),
+            ledger_digest(&fresher, &[]),
+            "エンドポイント鮮度だけの変化は意味のある変化ではない"
+        );
+
+        let mut offline = base.clone();
+        offline[0].online = false;
+        assert_ne!(ledger_digest(&base, &[]), ledger_digest(&offline, &[]));
+
+        let mut blocked = base.clone();
+        blocked[0].blocked = true;
+        assert_ne!(ledger_digest(&base, &[]), ledger_digest(&blocked, &[]));
+
+        let more = vec![base[0].clone(), entry("bob", "100.100.42.3", true)];
+        assert_ne!(ledger_digest(&base, &[]), ledger_digest(&more, &[]));
     }
 
     /// host サーバー ↔ member クライアントを localhost で対向させ、
