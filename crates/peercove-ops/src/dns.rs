@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context};
 use peercove_core::config::{Config, MemberRef};
-use peercove_core::dns::DNS_SUFFIX;
+use peercove_core::dns::{is_service_scheme, service_url, DNS_SUFFIX};
 use peercove_core::names;
 
 use crate::peers::{load_doc, write_validated};
@@ -22,6 +22,15 @@ pub enum RecordTarget {
     Ip(Ipv4Addr),
     /// メンバー参照(配布時にその時点の仮想 IP へ解決)
     Member(MemberRef),
+}
+
+/// 追加するカスタム DNS レコード(ADR-0022 / ADR-0023)。
+pub struct NewRecord<'a> {
+    pub name: &'a str,
+    pub target: RecordTarget,
+    pub under: Option<MemberRef>,
+    pub scheme: Option<&'a str>,
+    pub port: Option<u16>,
 }
 
 /// 一覧表示用に解決済みの情報を添えたレコード。
@@ -38,6 +47,11 @@ pub struct RecordDetail {
     pub target: RecordTarget,
     /// member ターゲットを設定から解決した現在の仮想 IP(参照切れは None)
     pub resolved_ip: Option<Ipv4Addr>,
+    /// URL コピー用のサービス情報(ADR-0023)。
+    pub scheme: Option<String>,
+    pub port: Option<u16>,
+    /// scheme がある場合に組み立て済みの URL。既定ポートは省略する。
+    pub url: Option<String>,
 }
 
 /// メンバー参照の現在の DNS ラベルを設定から引く(表示・相対名の組み立て用。
@@ -87,13 +101,18 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
                 // validate が通っているので来ないが、保守的に IP 0.0.0.0 扱いにしない
                 (None, None) => (RecordTarget::Ip(Ipv4Addr::UNSPECIFIED), None),
             };
+            let fqdn = format!("{relative}.{network}.{DNS_SUFFIX}");
+            let url = service_url(&fqdn, record.scheme.as_deref(), record.port);
             RecordDetail {
                 name: record.name.clone(),
                 under: record.under,
-                fqdn: format!("{relative}.{network}.{DNS_SUFFIX}"),
+                fqdn,
                 relative,
                 target,
                 resolved_ip,
+                scheme: record.scheme.clone(),
+                port: record.port,
+                url,
             }
         })
         .collect())
@@ -104,24 +123,37 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
 /// 重複を拒否する(ADR-0021 §4 / ADR-0022 §4)。参照先の存在・LAN 機器
 /// (ip + under)の広告サブネット内チェックは `Config::validate` が行う。
 /// 解決済みの相対名(`web.alice` 等)を返す。
-pub fn add_record(
-    config_path: &Path,
-    name: &str,
-    target: RecordTarget,
-    under: Option<MemberRef>,
-) -> anyhow::Result<String> {
-    let Some(label) = names::dns_label(name) else {
-        bail!("\"{name}\" から有効なラベルを作れませんでした。半角英数字を含めてください");
+pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<String> {
+    let Some(label) = names::dns_label(record.name) else {
+        bail!(
+            "\"{}\" から有効なラベルを作れませんでした。半角英数字を含めてください",
+            record.name
+        );
     };
+    let scheme = record
+        .scheme
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    if let Some(scheme) = &scheme {
+        if !is_service_scheme(scheme) {
+            bail!(
+                "スキーム \"{scheme}\" が不正です(先頭は英字、以降は英数字と + . -、31 文字以内)"
+            );
+        }
+    }
+    if record.port == Some(0) {
+        bail!("ポートは 1〜65535 で指定してください");
+    }
     let config = Config::load(config_path)?;
     if config
         .dns_records
         .iter()
-        .any(|r| r.name == label && r.under == under)
+        .any(|r| r.name == label && r.under == record.under)
     {
         bail!("レコード \"{label}\" は既に存在します(削除してから追加し直してください)");
     }
-    if under.is_none() {
+    if record.under.is_none() {
         // 予約語・メンバー名との衝突は最上位のみ対象(ADR-0022 §4)
         if names::RESERVED_DNS_LABELS.contains(&label.as_str()) {
             bail!("「{label}」は予約されているためレコード名に使えません");
@@ -131,7 +163,7 @@ pub fn add_record(
             bail!("DNS 名「{label}」はメンバーが使用しています(別の名前にしてください)");
         }
     }
-    let relative = match &under {
+    let relative = match &record.under {
         None => label.clone(),
         Some(reference) => match label_of(&config, reference) {
             Some(parent) => format!("{label}.{parent}"),
@@ -146,7 +178,7 @@ pub fn add_record(
         .context("dns_record が配列テーブルではありません(手編集の可能性)")?;
     let mut table = toml_edit::Table::new();
     table.insert("name", toml_edit::value(label.as_str()));
-    match target {
+    match record.target {
         RecordTarget::Ip(ip) => {
             table.insert("ip", toml_edit::value(ip.to_string()));
         }
@@ -154,8 +186,14 @@ pub fn add_record(
             table.insert("member", toml_edit::value(member.to_config_string()));
         }
     }
-    if let Some(under) = under {
+    if let Some(under) = record.under {
         table.insert("under", toml_edit::value(under.to_config_string()));
+    }
+    if let Some(scheme) = scheme {
+        table.insert("scheme", toml_edit::value(scheme));
+    }
+    if let Some(port) = record.port {
+        table.insert("port", toml_edit::value(i64::from(port)));
     }
     records.push(table);
     write_validated(config_path, &doc.to_string())?;
@@ -206,15 +244,33 @@ mod tests {
         RecordTarget::Ip(target.parse().unwrap())
     }
 
+    fn add(
+        config: &Path,
+        name: &str,
+        target: RecordTarget,
+        under: Option<MemberRef>,
+    ) -> anyhow::Result<String> {
+        add_record(
+            config,
+            &NewRecord {
+                name,
+                target,
+                under,
+                scheme: None,
+                port: None,
+            },
+        )
+    }
+
     #[test]
     fn add_list_remove_roundtrip() {
         let config = setup("roundtrip");
         assert!(list_records(&config).unwrap().is_empty());
 
         // 表示名のままでも正規化される
-        let relative = add_record(&config, "My NAS", ip("10.68.1.50"), None).unwrap();
+        let relative = add(&config, "My NAS", ip("10.68.1.50"), None).unwrap();
         assert_eq!(relative, "my-nas");
-        add_record(&config, "printer", ip("10.68.1.51"), None).unwrap();
+        add(&config, "printer", ip("10.68.1.51"), None).unwrap();
 
         let records = list_records(&config).unwrap();
         assert_eq!(records.len(), 2);
@@ -224,7 +280,7 @@ mod tests {
         assert!(records[0].fqdn.starts_with("my-nas.home."));
 
         // 同じ (name, under) の重複追加は拒否
-        assert!(add_record(&config, "my-nas", ip("10.68.1.52"), None).is_err());
+        assert!(add(&config, "my-nas", ip("10.68.1.52"), None).is_err());
 
         remove_record(&config, "my-nas", None).unwrap();
         assert_eq!(list_records(&config).unwrap().len(), 1);
@@ -240,21 +296,91 @@ mod tests {
         // 手書きコメントが消えないこと(toml_edit の目的)
         let text = std::fs::read_to_string(&config).unwrap();
         std::fs::write(&config, format!("# 大事なコメント\n{text}")).unwrap();
-        add_record(&config, "nas", ip("10.68.1.50"), None).unwrap();
+        add(&config, "nas", ip("10.68.1.50"), None).unwrap();
         assert!(std::fs::read_to_string(&config)
             .unwrap()
             .contains("# 大事なコメント"));
 
-        assert!(add_record(&config, "たろう", ip("10.68.1.53"), None).is_err());
+        assert!(add(&config, "たろう", ip("10.68.1.53"), None).is_err());
+    }
+
+    #[test]
+    fn service_info_is_normalized_and_builds_urls() {
+        let config = setup("service-info");
+        add_record(
+            &config,
+            &NewRecord {
+                name: "gamehost",
+                target: ip("10.68.1.50"),
+                under: None,
+                scheme: Some("HTTP"),
+                port: Some(8080),
+            },
+        )
+        .unwrap();
+        add_record(
+            &config,
+            &NewRecord {
+                name: "secure",
+                target: ip("10.68.1.51"),
+                under: None,
+                scheme: Some("https"),
+                port: Some(443),
+            },
+        )
+        .unwrap();
+        add_record(
+            &config,
+            &NewRecord {
+                name: "port-only",
+                target: ip("10.68.1.52"),
+                under: None,
+                scheme: None,
+                port: Some(9000),
+            },
+        )
+        .unwrap();
+
+        let parsed = Config::load(&config).unwrap();
+        assert_eq!(parsed.dns_records[0].scheme.as_deref(), Some("http"));
+        let records = list_records(&config).unwrap();
+        assert_eq!(
+            records[0].url.as_deref(),
+            Some("http://gamehost.home.peercove.internal:8080/")
+        );
+        assert_eq!(
+            records[1].url.as_deref(),
+            Some("https://secure.home.peercove.internal/")
+        );
+        assert_eq!(records[2].url, None);
+        assert_eq!(records[2].port, Some(9000));
+
+        for (scheme, port) in [
+            (Some("1http"), None),
+            (Some("http_test"), None),
+            (None, Some(0)),
+        ] {
+            assert!(add_record(
+                &config,
+                &NewRecord {
+                    name: "bad-service",
+                    target: ip("10.68.1.99"),
+                    under: None,
+                    scheme,
+                    port,
+                },
+            )
+            .is_err());
+        }
     }
 
     /// 予約語とメンバー名(確定 DNS 名 / 従来導出)との重複を拒否する(ADR-0021)。
     #[test]
     fn add_rejects_reserved_and_member_labels() {
         let config = setup("reserved");
-        assert!(add_record(&config, "localhost", ip("10.68.1.50"), None).is_err());
+        assert!(add(&config, "localhost", ip("10.68.1.50"), None).is_err());
         assert!(
-            add_record(&config, "host", ip("10.68.1.50"), None).is_err(),
+            add(&config, "host", ip("10.68.1.50"), None).is_err(),
             "ホストの従来導出ラベルと衝突"
         );
 
@@ -268,7 +394,7 @@ mod tests {
         // init 環境ではエンドポイント検出に失敗する場合があるためスキップ可
         if result.is_ok() {
             assert!(
-                add_record(&config, "alice", ip("10.68.1.50"), None).is_err(),
+                add(&config, "alice", ip("10.68.1.50"), None).is_err(),
                 "メンバーの確定 DNS 名と衝突"
             );
         }
@@ -302,7 +428,7 @@ mod tests {
         .unwrap();
 
         // エイリアス(member ターゲット)。解決 IP は alice の仮想 IP
-        let relative = add_record(
+        let relative = add(
             &config,
             "gamehost",
             RecordTarget::Member(MemberRef::Key(alice)),
@@ -320,7 +446,7 @@ mod tests {
         );
 
         // ホスト配下のサブドメイン
-        let relative = add_record(
+        let relative = add(
             &config,
             "web",
             RecordTarget::Member(MemberRef::Host),
@@ -329,7 +455,7 @@ mod tests {
         .unwrap();
         assert_eq!(relative, "web.host");
         // 親が違えば同名可
-        let relative = add_record(
+        let relative = add(
             &config,
             "web",
             RecordTarget::Member(MemberRef::Key(alice)),
@@ -338,7 +464,7 @@ mod tests {
         .unwrap();
         assert_eq!(relative, "web.alice");
         // 同じ親なら重複拒否
-        assert!(add_record(
+        assert!(add(
             &config,
             "web",
             RecordTarget::Member(MemberRef::Host),
@@ -346,7 +472,7 @@ mod tests {
         )
         .is_err());
         // under 付きは予約語チェックの対象外
-        add_record(
+        add(
             &config,
             "dns",
             RecordTarget::Member(MemberRef::Key(alice)),
@@ -355,25 +481,25 @@ mod tests {
         .unwrap();
 
         // LAN 機器: 広告サブネット内は可、外・ホスト配下は不可
-        add_record(
+        add(
             &config,
             "printer",
             ip("192.168.10.50"),
             Some(MemberRef::Key(alice)),
         )
         .unwrap();
-        assert!(add_record(
+        assert!(add(
             &config,
             "cam",
             ip("192.168.99.50"),
             Some(MemberRef::Key(alice)),
         )
         .is_err());
-        assert!(add_record(&config, "cam", ip("192.168.10.51"), Some(MemberRef::Host)).is_err());
+        assert!(add(&config, "cam", ip("192.168.10.51"), Some(MemberRef::Host)).is_err());
 
         // 未登録メンバーへの参照は不可
         let stranger = peercove_core::keys::PrivateKey::generate().public_key();
-        assert!(add_record(
+        assert!(add(
             &config,
             "x",
             RecordTarget::Member(MemberRef::Key(stranger)),

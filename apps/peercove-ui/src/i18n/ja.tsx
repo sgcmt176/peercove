@@ -383,7 +383,7 @@ export const ja = {
     blockedTag: "遮断中",
   },
 
-  // DNS 管理画面(M3-1c、ADR-0022 でカスタムレコード拡張)
+  // DNS 管理画面(M3-1c、ADR-0022/0023 でカスタムレコード拡張)
   dns: {
     title: "DNS",
     button: "DNS",
@@ -413,12 +413,19 @@ export const ja = {
     parentUnder: (name: string) => `${name} の配下（name.メンバー名.…）`,
     parentHint:
       "メンバー配下 + IP 指定は、そのメンバーの広告サブネット内の機器（LAN 機器）だけ登録できます。",
+    schemeLabel: "スキーム（任意）",
+    schemePlaceholder: "http",
+    portLabel: "ポート（任意）",
+    portPlaceholder: "8080",
+    serviceHint:
+      "スキームを指定すると URL を組み立てて全メンバーに表示します。ポートだけ指定した場合は DNS名:ポートで表示します。",
     targetOf: (name: string) => `→ ${name}`,
     brokenRef: "参照先なし",
     add: "追加",
     adding: "追加中…",
     remove: "削除",
     copy: "コピー",
+    copyUrl: "URL をコピー",
     copied: "コピーしました",
   },
 

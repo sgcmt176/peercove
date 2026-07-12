@@ -875,6 +875,8 @@ fn add_dns_record(
     ip: Option<String>,
     member: Option<String>,
     under: Option<String>,
+    scheme: Option<String>,
+    port: Option<u16>,
 ) -> Result<(), String> {
     let target = match (ip.as_deref().filter(|s| !s.trim().is_empty()), &member) {
         (Some(ip), None) => peercove_ops::dns::RecordTarget::Ip(
@@ -890,9 +892,18 @@ fn add_dns_record(
         .filter(|s| !s.trim().is_empty())
         .map(parse_member_ref)
         .transpose()?;
-    peercove_ops::dns::add_record(Path::new(&config_path), name.trim(), target, under)
-        .map(|_| ())
-        .map_err(to_message)
+    peercove_ops::dns::add_record(
+        Path::new(&config_path),
+        &peercove_ops::dns::NewRecord {
+            name: name.trim(),
+            target,
+            under,
+            scheme: scheme.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            port,
+        },
+    )
+    .map(|_| ())
+    .map_err(to_message)
 }
 
 /// カスタム DNS レコードを (name, under) で削除する(ADR-0022)。

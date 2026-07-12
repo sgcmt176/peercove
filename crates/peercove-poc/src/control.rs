@@ -924,6 +924,8 @@ mod tests {
                 dns_records: vec![DnsRecord {
                     name: "nas".to_string(),
                     ip: "100.100.42.50".parse().unwrap(),
+                    scheme: Some("https".to_string()),
+                    port: Some(8443),
                 }],
                 deny: vec![],
             })
@@ -941,6 +943,8 @@ mod tests {
             assert!(!dist.members[1].online);
             assert_eq!(dist.dns_records.len(), 1, "DNS レコードも一緒に届く");
             assert_eq!(dist.dns_records[0].name, "nas");
+            assert_eq!(dist.dns_records[0].scheme.as_deref(), Some("https"));
+            assert_eq!(dist.dns_records[0].port, Some(8443));
         }
 
         // 接続レジストリに登録されている(削除通知の配送口)

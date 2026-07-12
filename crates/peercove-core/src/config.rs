@@ -68,13 +68,13 @@ impl AclConfig {
     }
 }
 
-/// カスタム DNS レコードの設定表現(ADR-0022、M3-14b)。
+/// カスタム DNS レコードの設定表現(ADR-0022 / ADR-0023、M3-14b/c)。
 ///
 /// ターゲットは `ip`(固定 IP、従来型)/ `member`(メンバー参照 = 配布時に
 /// その時点の仮想 IP へ解決)の排他でどちらか必須。`under` を指定すると
 /// 親メンバー配下のサブドメイン(`<name>.<親のDNSラベル>.<net>.…`)になる。
 /// `ip` + `under` は LAN 機器レコードで、ip は親の広告サブネット内のみ許可。
-/// 注意: `member` / `under` を書いた設定は旧バージョンでは読めない
+/// 注意: `member` / `under` / `scheme` / `port` を書いた設定は旧バージョンでは読めない
 /// (`deny_unknown_fields`。subnets / ACL / dns_name と同じ扱い)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +90,12 @@ pub struct DnsRecordConfig {
     /// 親メンバー(端末配下サブドメイン)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub under: Option<MemberRef>,
+    /// URL コピー用の URI スキーム(ADR-0023)。DNS 応答自体は A レコードのまま。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    /// URL コピー用のサービス待受ポート(ADR-0023)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// メンバー参照(ADR-0022)。ホスト自身は公開鍵が host.toml に無いため
@@ -441,6 +447,21 @@ impl Config {
                     ));
                 }
             }
+            if let Some(scheme) = &record.scheme {
+                if !crate::dns::is_service_scheme(scheme) {
+                    return invalid(format!(
+                        "dns_record \"{}\" の scheme \"{}\" が不正です\
+                        (先頭は小文字英字、以降は小文字英数字と + . -、31 文字以内)",
+                        record.name, scheme
+                    ));
+                }
+            }
+            if record.port == Some(0) {
+                return invalid(format!(
+                    "dns_record \"{}\" の port は 1〜65535 で指定してください",
+                    record.name
+                ));
+            }
         }
         Ok(())
     }
@@ -608,6 +629,8 @@ ip = "10.100.42.50"
         );
         assert_eq!(config.dns_records[0].member, None);
         assert_eq!(config.dns_records[0].under, None);
+        assert_eq!(config.dns_records[0].scheme, None);
+        assert_eq!(config.dns_records[0].port, None);
 
         // 不正ラベル・重複は弾く
         let mut bad = config.clone();
@@ -637,6 +660,8 @@ subnets = ["192.168.10.0/24"]
 [[dns_record]]
 name = "gamehost"
 member = "{peer_key}"
+scheme = "https"
+port = 8443
 
 [[dns_record]]
 name = "web"
@@ -651,6 +676,8 @@ under = "{peer_key}"
         ));
         config.validate().unwrap();
         assert_eq!(config.dns_records[0].member, Some(MemberRef::Key(peer_key)));
+        assert_eq!(config.dns_records[0].scheme.as_deref(), Some("https"));
+        assert_eq!(config.dns_records[0].port, Some(8443));
         assert_eq!(config.dns_records[1].under, Some(MemberRef::Host));
 
         // ip と member の両方 / どちらも無しは弾く
@@ -682,6 +709,8 @@ under = "{peer_key}"
             ip: None,
             member: Some(MemberRef::Key(peer_key)),
             under: Some(MemberRef::Key(peer_key)),
+            scheme: None,
+            port: None,
         });
         ok.validate().unwrap();
         let mut dup = ok.clone();
@@ -702,6 +731,20 @@ member = "not-a-key"
 "#
         )
         .is_err());
+
+        // scheme は正規化済みの URI スキーム、port は 1〜65535 のみ
+        let mut bad = config.clone();
+        bad.dns_records[0].scheme = Some("HTTP".to_string());
+        assert!(bad.validate().is_err());
+        let mut bad = config.clone();
+        bad.dns_records[0].scheme = Some("1http".to_string());
+        assert!(bad.validate().is_err());
+        let mut bad = config.clone();
+        bad.dns_records[0].scheme = Some("a".repeat(32));
+        assert!(bad.validate().is_err());
+        let mut bad = config.clone();
+        bad.dns_records[0].port = Some(0);
+        assert!(bad.validate().is_err());
     }
 
     #[test]

@@ -705,7 +705,7 @@ mod tests {
     /// 追随し、メンバー削除で参照レコードが掃除される。
     #[test]
     fn records_follow_rotation_and_removal() {
-        use crate::dns::{add_record, list_records, RecordTarget};
+        use crate::dns::{add_record, list_records, NewRecord, RecordTarget};
         use peercove_core::config::MemberRef;
 
         let config = setup("records-follow");
@@ -715,23 +715,35 @@ mod tests {
 
         add_record(
             &config,
-            "gamehost",
-            RecordTarget::Member(MemberRef::Key(alice)),
-            None,
+            &NewRecord {
+                name: "gamehost",
+                target: RecordTarget::Member(MemberRef::Key(alice)),
+                under: None,
+                scheme: Some("http"),
+                port: Some(8080),
+            },
         )
         .unwrap();
         add_record(
             &config,
-            "web",
-            RecordTarget::Member(MemberRef::Key(alice)),
-            Some(MemberRef::Key(alice)),
+            &NewRecord {
+                name: "web",
+                target: RecordTarget::Member(MemberRef::Key(alice)),
+                under: Some(MemberRef::Key(alice)),
+                scheme: None,
+                port: None,
+            },
         )
         .unwrap();
         add_record(
             &config,
-            "nas",
-            RecordTarget::Ip("10.100.42.50".parse().unwrap()),
-            None,
+            &NewRecord {
+                name: "nas",
+                target: RecordTarget::Ip("10.100.42.50".parse().unwrap()),
+                under: None,
+                scheme: None,
+                port: None,
+            },
         )
         .unwrap();
 

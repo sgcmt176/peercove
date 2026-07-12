@@ -156,6 +156,8 @@ mod tests {
                 dns_records: vec![crate::dns::DnsRecord {
                     name: "nas".to_string(),
                     ip: "100.100.42.50".parse().unwrap(),
+                    scheme: None,
+                    port: None,
                 }],
             },
             ControlMessage::Removed {
@@ -203,6 +205,16 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"ledger","members":[]}"#);
+
+        // サービス情報なしのレコードは M3-14c より前の JSON と完全に一致する。
+        let json = serde_json::to_string(&crate::dns::DnsRecord {
+            name: "nas".to_string(),
+            ip: "100.100.42.50".parse().unwrap(),
+            scheme: None,
+            port: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"name":"nas","ip":"100.100.42.50"}"#);
 
         // 旧ホストからの台帳(dns_records なし)も読める
         let old: ControlMessage =

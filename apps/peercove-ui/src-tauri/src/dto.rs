@@ -324,6 +324,18 @@ impl From<&TunnelInfo> for Tunnel {
                     // 配布形式は解決済みの {name, ip} のみ(参照情報は持たない)
                     member: None,
                     under: None,
+                    scheme: record.scheme.clone(),
+                    port: record.port,
+                    url: peercove_core::dns::service_url(
+                        &format!(
+                            "{}.{}.{}",
+                            record.name,
+                            info.network,
+                            peercove_core::dns::DNS_SUFFIX
+                        ),
+                        record.scheme.as_deref(),
+                        record.port,
+                    ),
                 })
                 .collect(),
         }
@@ -442,6 +454,9 @@ pub struct DnsRecordDto {
     pub member: Option<String>,
     /// 親メンバー(最上位レコードは None)
     pub under: Option<String>,
+    pub scheme: Option<String>,
+    pub port: Option<u16>,
+    pub url: Option<String>,
 }
 
 impl From<peercove_ops::dns::RecordDetail> for DnsRecordDto {
@@ -455,6 +470,9 @@ impl From<peercove_ops::dns::RecordDetail> for DnsRecordDto {
                 peercove_ops::dns::RecordTarget::Member(member) => Some(member.to_config_string()),
             },
             under: detail.under.map(|under| under.to_config_string()),
+            scheme: detail.scheme,
+            port: detail.port,
+            url: detail.url,
         }
     }
 }
@@ -637,6 +655,8 @@ mod tests {
             dns_records: vec![peercove_core::dns::DnsRecord {
                 name: "web.alice".to_string(),
                 ip: "10.100.42.2".parse().unwrap(),
+                scheme: Some("http".to_string()),
+                port: Some(8080),
             }],
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
@@ -666,6 +686,12 @@ mod tests {
             "配信されたレコードが status に載る(ADR-0022 検証 FB)"
         );
         assert_eq!(json["tunnel"]["dnsRecords"][0]["ip"], "10.100.42.2");
+        assert_eq!(json["tunnel"]["dnsRecords"][0]["scheme"], "http");
+        assert_eq!(json["tunnel"]["dnsRecords"][0]["port"], 8080);
+        assert_eq!(
+            json["tunnel"]["dnsRecords"][0]["url"], "http://web.alice.home.peercove.internal:8080/",
+            "メンバー側の配布経路でも URL が組み立てられる"
+        );
         assert_eq!(json["tunnels"].as_array().unwrap().len(), 1);
 
         let json = serde_json::to_value(Status::from(DaemonStatus {
@@ -826,6 +852,26 @@ mod tests {
         assert_eq!(update.host_endpoint, None);
         assert!(!update.direct);
         assert_eq!(update.max_recv_file_mb, 500);
+    }
+
+    #[test]
+    fn host_record_detail_keeps_service_url() {
+        let ip = "10.100.42.2".parse().unwrap();
+        let dto = DnsRecordDto::from(peercove_ops::dns::RecordDetail {
+            name: "gamehost".to_string(),
+            under: None,
+            relative: "gamehost".to_string(),
+            fqdn: "gamehost.home.peercove.internal".to_string(),
+            target: peercove_ops::dns::RecordTarget::Ip(ip),
+            resolved_ip: Some(ip),
+            scheme: Some("https".to_string()),
+            port: Some(443),
+            url: Some("https://gamehost.home.peercove.internal/".to_string()),
+        });
+        let json = serde_json::to_value(dto).unwrap();
+        assert_eq!(json["scheme"], "https");
+        assert_eq!(json["port"], 443);
+        assert_eq!(json["url"], "https://gamehost.home.peercove.internal/");
     }
 
     #[test]

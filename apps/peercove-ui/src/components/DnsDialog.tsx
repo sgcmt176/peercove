@@ -36,6 +36,8 @@ export function DnsDialog({
   const [ip, setIp] = useState("");
   // 配置: "" = 最上位 / それ以外 = 親メンバー("host" or 公開鍵)
   const [under, setUnder] = useState("");
+  const [scheme, setScheme] = useState("");
+  const [port, setPort] = useState("");
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -73,9 +75,13 @@ export function DnsDialog({
         name,
         target === "ip" ? { ip } : { member: target },
         under === "" ? undefined : under,
+        scheme.trim() === "" ? undefined : scheme.trim(),
+        port.trim() === "" ? undefined : Number(port),
       );
       setName("");
       setIp("");
+      setScheme("");
+      setPort("");
       reload();
     } catch (e) {
       setError(errorMessage(e));
@@ -104,13 +110,13 @@ export function DnsDialog({
     }
   };
 
-  const copyButton = (fqdn: string) => (
+  const copyButton = (value: string, label = t.dns.copy) => (
     <button
       type="button"
       className="button--link small"
-      onClick={() => void copy(fqdn)}
+      onClick={() => void copy(value)}
     >
-      {copied === fqdn ? t.dns.copied : t.dns.copy}
+      {copied === value ? t.dns.copied : label}
     </button>
   );
 
@@ -146,8 +152,19 @@ export function DnsDialog({
           <ul className="dns-list">
             {shown.map((record) => (
               <li key={`${record.name}@${record.under ?? ""}`} className="dns-list__row">
-                <span className="mono ellipsis" title={record.fqdn}>
-                  {record.fqdn}
+                <span className="dns-list__names">
+                  <span className="mono ellipsis" title={record.fqdn}>
+                    {record.fqdn}
+                  </span>
+                  {record.url !== null ? (
+                    <span className="mono small ellipsis" title={record.url}>
+                      {record.url}
+                    </span>
+                  ) : record.port !== null ? (
+                    <span className="mono small ellipsis">
+                      {record.fqdn}:{record.port}
+                    </span>
+                  ) : null}
                 </span>
                 {record.member !== null && (
                   <span className="muted small ellipsis">
@@ -156,6 +173,7 @@ export function DnsDialog({
                 )}
                 <span className="mono muted">{record.ip ?? t.dns.brokenRef}</span>
                 {copyButton(record.fqdn)}
+                {record.url !== null && copyButton(record.url, t.dns.copyUrl)}
                 {isHost && (
                   <button
                     type="button"
@@ -235,6 +253,31 @@ export function DnsDialog({
                   ))}
                 </select>
               </label>
+              <label className="field">
+                <span>{t.dns.schemeLabel}</span>
+                <input
+                  list="peercove-dns-schemes"
+                  value={scheme}
+                  placeholder={t.dns.schemePlaceholder}
+                  onChange={(event) => setScheme(event.target.value)}
+                />
+                <datalist id="peercove-dns-schemes">
+                  <option value="http" />
+                  <option value="https" />
+                </datalist>
+              </label>
+              <label className="field">
+                <span>{t.dns.portLabel}</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  step={1}
+                  value={port}
+                  placeholder={t.dns.portPlaceholder}
+                  onChange={(event) => setPort(event.target.value)}
+                />
+              </label>
               <button
                 type="button"
                 onClick={() => void add()}
@@ -244,6 +287,7 @@ export function DnsDialog({
               </button>
             </div>
             <p className="muted small">{t.dns.parentHint}</p>
+            <p className="muted small">{t.dns.serviceHint}</p>
           </>
         ) : (
           <p className="muted small">{t.dns.customNoteMember}</p>

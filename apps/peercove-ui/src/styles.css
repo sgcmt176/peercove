@@ -726,6 +726,18 @@ select {
   min-width: 0;
 }
 
+.dns-list__names {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dns-list__names > .ellipsis {
+  display: block;
+}
+
 /* ---- UI デザインパス(M3-6) ---- */
 
 /* ヘッダーのブランドマーク */

@@ -37,6 +37,11 @@ export interface DnsRecord {
   member: string | null;
   /** 親メンバー（"host" または公開鍵）。最上位レコードは null。 */
   under: string | null;
+  /** URL コピー用のサービス情報（M3-14c、ADR-0023）。 */
+  scheme: string | null;
+  port: number | null;
+  /** スキームがある場合にバックエンドで組み立て済みの URL。 */
+  url: string | null;
 }
 
 export interface Peer {
@@ -360,6 +365,8 @@ export const api = {
     name: string,
     target: { ip?: string; member?: string },
     under?: string,
+    scheme?: string,
+    port?: number,
   ) =>
     invoke<void>("add_dns_record", {
       configPath,
@@ -367,6 +374,8 @@ export const api = {
       ip: target.ip ?? null,
       member: target.member ?? null,
       under: under ?? null,
+      scheme: scheme ?? null,
+      port: port ?? null,
     }),
   removeDnsRecord: (configPath: string, name: string, under?: string | null) =>
     invoke<void>("remove_dns_record", { configPath, name, under: under ?? null }),

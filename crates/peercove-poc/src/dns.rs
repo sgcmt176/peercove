@@ -260,6 +260,8 @@ mod tests {
                 vec![DnsRecord {
                     name: "nas".to_string(),
                     ip: "10.1.0.50".parse().unwrap(),
+                    scheme: None,
+                    port: None,
                 }],
             ),
             (

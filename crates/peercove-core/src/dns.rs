@@ -21,12 +21,48 @@ pub const DNS_SUFFIX: &str = "peercove.internal";
 /// 応答 TTL。台帳の更新(5 秒周期)にすぐ追随できる短さにする。
 pub const DNS_TTL_SECS: u32 = 30;
 
+/// サービス情報に載せる URI スキームの最大長(ADR-0023)。
+pub const MAX_SERVICE_SCHEME_LEN: usize = 31;
+
+/// 文字列がサービス情報用の URI スキームとして正規形かどうか。
+/// 先頭は小文字英字、以降は小文字英数字または `+.-`、最大 31 文字。
+pub fn is_service_scheme(input: &str) -> bool {
+    if input.is_empty() || input.len() > MAX_SERVICE_SCHEME_LEN {
+        return false;
+    }
+    let mut bytes = input.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'+' | b'.' | b'-'))
+}
+
+/// サービス情報から UI 表示・コピー用 URL を組み立てる。
+/// scheme が無ければ URL にはせず、http:80 / https:443 は既定ポートとして省略する。
+pub fn service_url(fqdn: &str, scheme: Option<&str>, port: Option<u16>) -> Option<String> {
+    let scheme = scheme.filter(|value| is_service_scheme(value))?;
+    if port == Some(0) {
+        return None;
+    }
+    let show_port = match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => None,
+        (_, port) => port,
+    };
+    Some(match show_port {
+        Some(port) => format!("{scheme}://{fqdn}:{port}/"),
+        None => format!("{scheme}://{fqdn}/"),
+    })
+}
+
 /// カスタム A レコード(ADR-0011 §1b)。ホストが設定に持ち、台帳と一緒に配布する。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsRecord {
     /// ラベル(正規化済み。`nas` など)
     pub name: String,
     pub ip: Ipv4Addr,
+    /// UI の URL コピー用メタ情報。DNS 応答には使わない(ADR-0023)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// ゾーンの 1 エントリ。
@@ -174,7 +210,12 @@ pub fn resolve_records(
                 None => continue,
             },
         };
-        resolved.push(DnsRecord { name, ip });
+        resolved.push(DnsRecord {
+            name,
+            ip,
+            scheme: record.scheme.clone(),
+            port: record.port,
+        });
     }
     resolved
 }
@@ -311,6 +352,8 @@ mod tests {
                 ip: None,
                 member: Some(MemberRef::Key(alice_key)),
                 under: None,
+                scheme: Some("http".to_string()),
+                port: Some(8080),
             },
             DnsRecordConfig {
                 // 端末配下サブドメイン(要望 12): ホスト配下
@@ -318,6 +361,8 @@ mod tests {
                 ip: None,
                 member: Some(MemberRef::Host),
                 under: Some(MemberRef::Host),
+                scheme: None,
+                port: None,
             },
             DnsRecordConfig {
                 // LAN 機器(要望 14): alice 配下の固定 IP
@@ -325,6 +370,8 @@ mod tests {
                 ip: Some("192.168.10.50".parse().unwrap()),
                 member: None,
                 under: Some(MemberRef::Key(alice_key)),
+                scheme: None,
+                port: Some(9100),
             },
             DnsRecordConfig {
                 // 参照先が台帳に居ない(削除直後)→ 黙って外す
@@ -332,6 +379,8 @@ mod tests {
                 ip: None,
                 member: Some(MemberRef::Key(PrivateKey::generate().public_key())),
                 under: None,
+                scheme: None,
+                port: None,
             },
         ];
         let resolved = resolve_records(&records, &ledger);
@@ -347,6 +396,10 @@ mod tests {
                 ("printer.alice", "192.168.10.50".to_string()),
             ]
         );
+        assert_eq!(resolved[0].scheme.as_deref(), Some("http"));
+        assert_eq!(resolved[0].port, Some(8080));
+        assert_eq!(resolved[2].scheme, None);
+        assert_eq!(resolved[2].port, Some(9100));
 
         // IP が変わっても(再招待)同じ設定で追随する
         let mut moved = member(Some("山田"), "10.1.0.9", false);
@@ -365,10 +418,14 @@ mod tests {
             DnsRecord {
                 name: "web.alice".to_string(),
                 ip: "10.1.0.2".parse().unwrap(),
+                scheme: None,
+                port: None,
             },
             DnsRecord {
                 name: "Bad.alice".to_string(), // 大文字ラベル → 無視
                 ip: "10.1.0.3".parse().unwrap(),
+                scheme: None,
+                port: None,
             },
         ];
         let zone = zone_for("home", &ledger, &custom);
@@ -388,14 +445,20 @@ mod tests {
             DnsRecord {
                 name: "nas".to_string(), // メンバー名と衝突 → 自動生成が勝つ
                 ip: "10.1.0.99".parse().unwrap(),
+                scheme: None,
+                port: None,
             },
             DnsRecord {
                 name: "printer".to_string(),
                 ip: "10.1.0.50".parse().unwrap(),
+                scheme: None,
+                port: None,
             },
             DnsRecord {
                 name: "Bad Label".to_string(), // 不正 → 無視
                 ip: "10.1.0.51".parse().unwrap(),
+                scheme: None,
+                port: None,
             },
         ];
         let zone = zone_for("home", &ledger, &custom);
@@ -408,5 +471,34 @@ mod tests {
         );
         assert_eq!(zone[0].ip.to_string(), "10.1.0.2", "メンバー側の IP");
         assert!(zone[1].public_key.is_none(), "カスタム由来");
+    }
+
+    #[test]
+    fn service_scheme_and_url_rules() {
+        assert!(is_service_scheme("http"));
+        assert!(is_service_scheme("git+ssh"));
+        assert!(is_service_scheme("web.v2-test"));
+        assert!(!is_service_scheme("HTTP"));
+        assert!(!is_service_scheme("1http"));
+        assert!(!is_service_scheme("http_test"));
+        assert!(!is_service_scheme(""));
+        assert!(!is_service_scheme(&"a".repeat(32)));
+
+        let fqdn = "gamehost.home.peercove.internal";
+        assert_eq!(
+            service_url(fqdn, Some("http"), Some(8080)).as_deref(),
+            Some("http://gamehost.home.peercove.internal:8080/")
+        );
+        assert_eq!(
+            service_url(fqdn, Some("http"), Some(80)).as_deref(),
+            Some("http://gamehost.home.peercove.internal/")
+        );
+        assert_eq!(
+            service_url(fqdn, Some("https"), Some(443)).as_deref(),
+            Some("https://gamehost.home.peercove.internal/")
+        );
+        assert_eq!(service_url(fqdn, None, Some(8080)), None);
+        assert_eq!(service_url(fqdn, Some("HTTP"), None), None);
+        assert_eq!(service_url(fqdn, Some("http"), Some(0)), None);
     }
 }
