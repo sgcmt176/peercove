@@ -100,6 +100,25 @@ pub struct InterfaceConfig {
     /// 将来 UI の設定画面から切り替えられるようにするためのフラグ。
     #[serde(default = "default_direct")]
     pub direct: bool,
+    /// (member のみ)デバイス秘密鍵の出どころ(ADR-0020、M3-11)。
+    /// **省略時は "token"**(招待トークン経由 = 既存設定はすべて該当)とみなし、
+    /// デーモンが初回接続時に自動ローテーションを行う。完了時にデーモンが
+    /// "self" へ書き換える(join はこのフィールドを書かない — 旧デーモンとの
+    /// 互換維持。`deny_unknown_fields` のため、書かれた設定は旧バージョンでは
+    /// 読めない)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_source: Option<KeySource>,
+}
+
+/// デバイス秘密鍵の出どころ(ADR-0020)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeySource {
+    /// 招待トークンに同梱されていた鍵(ホストが生成 = 外部を経由した)。
+    Token,
+    /// この端末上で生成した鍵(ローテーション済み)。
+    #[serde(rename = "self")]
+    SelfGenerated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +361,25 @@ listen_port = 51820
         assert_eq!(config.interface.listen_port, Some(51820));
         assert!(config.peers.is_empty());
         config.validate().unwrap();
+    }
+
+    /// key_source(ADR-0020、M3-11): 省略時は None(= "token" 扱い)。
+    /// "token" / "self" が読める。デーモンだけが "self" を書く。
+    #[test]
+    fn key_source_parses_and_defaults_to_none() {
+        let config = parse(MEMBER_TOML);
+        assert_eq!(config.interface.key_source, None, "既存設定にはない");
+
+        let with = MEMBER_TOML.replace(
+            "private_key_file = \"member_a.key\"",
+            "private_key_file = \"member_a.key\"\nkey_source = \"self\"",
+        );
+        assert_eq!(
+            parse(&with).interface.key_source,
+            Some(KeySource::SelfGenerated)
+        );
+        let with = with.replace("key_source = \"self\"", "key_source = \"token\"");
+        assert_eq!(parse(&with).interface.key_source, Some(KeySource::Token));
     }
 
     #[test]

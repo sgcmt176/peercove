@@ -45,6 +45,17 @@ pub enum ControlMessage {
     Ping { nonce: u64 },
     /// 双方向: [`ControlMessage::Ping`] への応答。
     Pong { nonce: u64 },
+    /// member → host: デバイス鍵ローテーションの依頼(ADR-0020、M3-11)。
+    /// メンバーが端末上で生成した新しい鍵ペアの**公開鍵だけ**を届ける
+    /// (秘密鍵は端末から出さない)。送信元はトンネルの仮想 IP で特定済み。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
+    /// 失敗して黙って無視する(メンバーは応答が来ないまま現行鍵で動き続ける)。
+    RotateKey { new_public_key: PublicKey },
+    /// host → member: [`ControlMessage::RotateKey`] への応答。
+    /// `accepted` なら host.toml へ永続化済み(適用は次回再読込 ≤5 秒)。
+    /// 既に同じ鍵が登録済みの依頼も成功扱い(冪等)。
+    RotateKeyResult { accepted: bool, message: String },
 }
 
 /// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。
@@ -134,6 +145,13 @@ mod tests {
             },
             ControlMessage::Ping { nonce: 7 },
             ControlMessage::Pong { nonce: 7 },
+            ControlMessage::RotateKey {
+                new_public_key: PrivateKey::generate().public_key(),
+            },
+            ControlMessage::RotateKeyResult {
+                accepted: false,
+                message: "既に使われています".to_string(),
+            },
         ];
         for message in messages {
             let json = serde_json::to_string(&message).unwrap();
@@ -176,6 +194,27 @@ mod tests {
         assert_eq!(json, r#"{"type":"ping","nonce":1}"#);
         let json = serde_json::to_string(&ControlMessage::Pong { nonce: 1 }).unwrap();
         assert_eq!(json, r#"{"type":"pong","nonce":1}"#);
+
+        // 鍵ローテーション(ADR-0020、M3-11)。追加メッセージなので旧実装は
+        // 解析に失敗して無視する(それで壊れないことは実装側の規約)
+        let key = PrivateKey::generate().public_key();
+        let json = serde_json::to_string(&ControlMessage::RotateKey {
+            new_public_key: key,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"type":"rotate_key","new_public_key":"{key}"}}"#)
+        );
+        let json = serde_json::to_string(&ControlMessage::RotateKeyResult {
+            accepted: true,
+            message: "更新しました".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"rotate_key_result","accepted":true,"message":"更新しました"}"#
+        );
     }
 
     /// blocked(ADR-0018、M3-10)の互換規則: false ならワイヤに現れず、

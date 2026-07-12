@@ -66,6 +66,9 @@ struct Active {
     /// 既知のグループ(ADR-0016、M3-13c)。supervise 内の受信サーバーと
     /// Group 系リクエストが書き、status 応答(groups)が読む
     groups: crate::groups::SharedGroups,
+    /// (member)鍵ローテーションの手動要求(ADR-0020、M3-11)。IPC が立て、
+    /// supervise 内の状態機械が次の周期で拾う
+    rotate_request: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DaemonShared {
@@ -142,6 +145,23 @@ impl DaemonShared {
                 })?;
                 let (seq, messages) = active.chat.lock().unwrap().fetch(after_seq);
                 Ok(IpcResponse::Chat { seq, messages })
+            }
+            IpcRequest::RotateKey { config } => {
+                let active = self.active.lock().await;
+                let active = active.get(&Self::key_for(&config)).with_context(|| {
+                    format!("この設定のトンネルは動いていません({})", config.display())
+                })?;
+                if active.role != Role::Member {
+                    bail!(
+                        "鍵の更新はメンバーとして参加しているネットワークでのみ実行できます\
+                        (ホスト鍵の更新は未対応 — ADR-0020)"
+                    );
+                }
+                active
+                    .rotate_request
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!("鍵の更新要求を受け付けました(network={})", active.network);
+                Ok(IpcResponse::Done)
             }
         }
     }
@@ -714,6 +734,7 @@ impl DaemonShared {
         let (stop_tx, stop_rx) = watch::channel(false);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let transfers: crate::msg::TransferRegistry = Default::default();
+        let rotate_request: Arc<std::sync::atomic::AtomicBool> = Default::default();
         // チャット履歴・グループ情報の読み込み(数 MB 程度の同期 I/O。起動時のみ)
         let chat = crate::chat::ChatLog::load(&config);
         let groups = crate::groups::GroupStore::load(&config);
@@ -721,19 +742,63 @@ impl DaemonShared {
         let task_transfers = Arc::clone(&transfers);
         let task_chat = Arc::clone(&chat);
         let task_groups = Arc::clone(&groups);
+        let task_rotate = Arc::clone(&rotate_request);
         let task_config = config.clone();
+        // Linux のスプリット DNS は per-link 設定のため、鍵ローテーションの
+        // 入れ直し(インターフェース再作成)後に付け直す(ADR-0020)
+        let task_manage_dns = self.manage_os_dns;
+        let task_if_name = if_name.clone();
         let task = tokio::spawn(async move {
             let mut tunnel = tunnel;
-            let supervise_result = tunnel
-                .supervise_run(
-                    &task_config,
-                    stop_rx,
-                    Some(task_snapshot),
-                    task_transfers,
-                    task_chat,
-                    task_groups,
-                )
-                .await;
+            // 鍵ローテーション(ADR-0020)の入れ直しで supervisor を回し直す
+            let supervise_result = loop {
+                let result = tunnel
+                    .supervise_run(
+                        &task_config,
+                        stop_rx.clone(),
+                        Some(Arc::clone(&task_snapshot)),
+                        Arc::clone(&task_transfers),
+                        Arc::clone(&task_chat),
+                        Arc::clone(&task_groups),
+                        Arc::clone(&task_rotate),
+                    )
+                    .await;
+                match result {
+                    Ok(tunnel::SuperviseExit::Restart { use_pending }) => {
+                        let restart_config = task_config.clone();
+                        let (returned, restarted) = tokio::task::spawn_blocking(move || {
+                            let mut tunnel = tunnel;
+                            let result = tunnel.restart_in_place(&restart_config, use_pending);
+                            (tunnel, result)
+                        })
+                        .await
+                        .context("入れ直しタスクの実行に失敗しました")?;
+                        tunnel = returned;
+                        match restarted {
+                            Ok(()) => {
+                                // 入れ直し中に停止要求が来ていたら、次の supervisor へ
+                                // 入らない(clone した watch は既送の値を「見た」扱いに
+                                // するため、changed() では拾えない)
+                                if *stop_rx.borrow() {
+                                    break Ok(());
+                                }
+                                if task_manage_dns {
+                                    let link = task_if_name.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        crate::dnscfg::register_link(&link, address)
+                                    })
+                                    .await
+                                    .ok();
+                                }
+                            }
+                            Err(e) => {
+                                break Err(e).context("鍵ローテーション後の入れ直しに失敗しました")
+                            }
+                        }
+                    }
+                    other => break other.map(|_| ()),
+                }
+            };
             // クリーンアップ(ブロッキング)は必ず実行する
             let down_result =
                 tokio::task::spawn_blocking(move || tunnel::tear_down(tunnel, &task_config))
@@ -758,6 +823,7 @@ impl DaemonShared {
                 transfers,
                 chat,
                 groups,
+                rotate_request,
             },
         );
         drop(active);

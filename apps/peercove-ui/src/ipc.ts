@@ -266,6 +266,7 @@ export const api = {
     invoke<void>("start_member", { configPath }),
   stopTunnel: (configPath: string) =>
     invoke<void>("stop_tunnel", { configPath }),
+  rotateKey: (configPath: string) => invoke<void>("rotate_key", { configPath }),
   listNetworks: () => invoke<NetworkInfo[]>("list_networks"),
   deleteNetwork: (slug: string) => invoke<void>("delete_network", { slug }),
   initHost: (name: string, force: boolean) =>

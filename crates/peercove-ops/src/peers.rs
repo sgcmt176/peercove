@@ -286,6 +286,58 @@ pub fn set_subnets(
     Ok(display)
 }
 
+/// 鍵ローテーション(ADR-0020、M3-11)の適用結果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum RotateOutcome {
+    /// host.toml の public_key を書き換えた(表示名を返す)。
+    Applied { display: String },
+    /// 既に同じ鍵が登録されていた(冪等 — 再送された依頼)。
+    Unchanged,
+}
+
+/// メンバーのデバイス公開鍵を差し替える(ADR-0020、M3-11)。
+/// ホストデーモンがコントロールチャネルの `rotate_key` を受けて呼ぶ。
+/// name / IP / subnets / PSK / ACL は変更しない(PSK は静的鍵と独立)。
+pub fn rotate_peer_key(
+    config_path: &Path,
+    member_ip: Ipv4Addr,
+    new_key: &PublicKey,
+    host_public_key: &PublicKey,
+) -> anyhow::Result<RotateOutcome> {
+    let config = Config::load(config_path)?;
+    let target = find_peer(&config, &Selector::Ip(member_ip))?;
+    if target.public_key == *new_key {
+        return Ok(RotateOutcome::Unchanged);
+    }
+    if *new_key == *host_public_key {
+        bail!("新しい公開鍵がホストの公開鍵と同じです");
+    }
+    if config.peers.iter().any(|p| p.public_key == *new_key) {
+        bail!("新しい公開鍵は別のメンバーが使用中です");
+    }
+    let target_key = target.public_key.to_base64();
+    let display = target.name.clone().unwrap_or_else(|| member_ip.to_string());
+
+    let mut doc = load_doc(config_path)?;
+    let mut updated = false;
+    for table in peer_tables(&mut doc)?.iter_mut() {
+        let matches = table
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            == Some(target_key.as_str());
+        if matches {
+            table["public_key"] = toml_edit::value(new_key.to_base64());
+            updated = true;
+        }
+    }
+    if !updated {
+        bail!("host.toml から対象ピアを特定できませんでした");
+    }
+    write_validated(config_path, &doc.to_string())?;
+    Ok(RotateOutcome::Applied { display })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +457,67 @@ mod tests {
                 "{bad_ip} は拒否される"
             );
         }
+    }
+
+    /// 鍵ローテーション(ADR-0020): 対象の public_key だけが変わり、name /
+    /// allowed_ips / コメントは保持される。同じ鍵の再送は Unchanged(冪等)。
+    #[test]
+    fn rotate_peer_key_swaps_only_the_target_key() {
+        let config = setup("rotate");
+        let alice = add(&config, "alice", "10.100.42.2");
+        let bob = add(&config, "bob", "10.100.42.3");
+        let host_key = PrivateKey::generate().public_key();
+
+        let new_key = PrivateKey::generate().public_key();
+        let outcome =
+            rotate_peer_key(&config, "10.100.42.2".parse().unwrap(), &new_key, &host_key).unwrap();
+        assert_eq!(
+            outcome,
+            RotateOutcome::Applied {
+                display: "alice".to_string()
+            }
+        );
+
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.starts_with("# ホスト設定のコメント"), "コメント保持");
+        let parsed = Config::load(&config).unwrap();
+        assert_eq!(parsed.peers[0].public_key, new_key);
+        assert_eq!(parsed.peers[0].name.as_deref(), Some("alice"));
+        assert_eq!(
+            parsed.peers[0].allowed_ips[0].addr().to_string(),
+            "10.100.42.2"
+        );
+        assert_eq!(parsed.peers[1].public_key, bob, "他のピアは触らない");
+
+        // 同じ依頼の再送は成功扱い(冪等)
+        let outcome =
+            rotate_peer_key(&config, "10.100.42.2".parse().unwrap(), &new_key, &host_key).unwrap();
+        assert_eq!(outcome, RotateOutcome::Unchanged);
+
+        // 旧鍵はもう登録されていない
+        assert!(!parsed.peers.iter().any(|p| p.public_key == alice));
+    }
+
+    #[test]
+    fn rotate_peer_key_rejects_collisions_and_unknown_ip() {
+        let config = setup("rotate-reject");
+        add(&config, "alice", "10.100.42.2");
+        let bob = add(&config, "bob", "10.100.42.3");
+        let host_key = PrivateKey::generate().public_key();
+        let ip: Ipv4Addr = "10.100.42.2".parse().unwrap();
+
+        // 別メンバーの鍵・ホストの鍵とは衝突させない
+        assert!(rotate_peer_key(&config, ip, &bob, &host_key).is_err());
+        assert!(rotate_peer_key(&config, ip, &host_key, &host_key).is_err());
+        // 登録のない IP からの依頼は拒否
+        let new_key = PrivateKey::generate().public_key();
+        assert!(rotate_peer_key(
+            &config,
+            "10.100.42.99".parse().unwrap(),
+            &new_key,
+            &host_key
+        )
+        .is_err());
     }
 
     #[test]

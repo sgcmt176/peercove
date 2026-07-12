@@ -109,6 +109,11 @@ pub enum IpcRequest {
     },
     /// 自分がグループから抜ける(履歴とグループ情報はローカルに残る)。
     GroupLeave { config: PathBuf, id: String },
+    /// (member のみ)デバイス鍵のローテーションを要求する(ADR-0020、M3-11)。
+    /// 応答は Done(受理のみ)。実際の更新はコントロールチャネル経由で
+    /// 非同期に行われ、完了時に数秒の再接続が発生する。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    RotateKey { config: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

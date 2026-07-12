@@ -115,6 +115,132 @@ fn ledger_digest(members: &[LedgerEntry], dns_records: &[DnsRecord]) -> LedgerDi
 /// 相手の仮想 IP → 直近の RTT(ミリ秒、M2-G5)。切断時にエントリを消す。
 pub type RttMap = Arc<Mutex<HashMap<Ipv4Addr, f64>>>;
 
+/// メンバー側コントロールチャネルと supervisor の橋渡し(ADR-0020、M3-11)。
+/// supervisor が鍵ローテーションの依頼を接続中の送信キューへ差し込み、
+/// 読みタスクが受け取った応答をここへ置く(supervisor が周期処理で回収)。
+#[derive(Default)]
+pub struct MemberLink {
+    inner: Mutex<MemberLinkState>,
+}
+
+#[derive(Default)]
+struct MemberLinkState {
+    /// セッション世代。接続のたびに増える(「このセッションで依頼済みか」の判定用)。
+    session: u64,
+    outbox: Option<Outbox>,
+    rotate_result: Option<(bool, String)>,
+}
+
+impl MemberLink {
+    /// 接続中ならセッション世代を返す。
+    pub fn session(&self) -> Option<u64> {
+        let state = self.inner.lock().unwrap();
+        state.outbox.is_some().then_some(state.session)
+    }
+
+    /// 接続中なら送信キューへ積む(切断済みなら false)。
+    pub fn send(&self, message: ControlMessage) -> bool {
+        let state = self.inner.lock().unwrap();
+        match &state.outbox {
+            Some(outbox) => outbox.send(message).is_ok(),
+            None => false,
+        }
+    }
+
+    /// 届いた rotate_key_result を取り出す(1 回限り)。
+    pub fn take_rotate_result(&self) -> Option<(bool, String)> {
+        self.inner.lock().unwrap().rotate_result.take()
+    }
+
+    fn attach(&self, outbox: Outbox) {
+        let mut state = self.inner.lock().unwrap();
+        state.session += 1;
+        state.outbox = Some(outbox);
+        state.rotate_result = None;
+    }
+
+    fn detach(&self) {
+        self.inner.lock().unwrap().outbox = None;
+    }
+
+    fn put_rotate_result(&self, accepted: bool, message: String) {
+        self.inner.lock().unwrap().rotate_result = Some((accepted, message));
+    }
+}
+
+#[cfg(test)]
+impl MemberLink {
+    /// テスト用: 接続済み状態を作り、送信キューの受け口を返す(rotate.rs)。
+    pub(crate) fn attach_for_test(&self) -> mpsc::UnboundedReceiver<ControlMessage> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.attach(tx);
+        rx
+    }
+
+    /// テスト用: ホストからの応答が届いた状態を作る(rotate.rs)。
+    pub(crate) fn put_rotate_result_for_test(&self, accepted: bool, message: String) {
+        self.put_rotate_result(accepted, message);
+    }
+}
+
+/// ホスト側の鍵ローテーション処理(ADR-0020、M3-11)。
+/// `rotate_key` を受けたら host.toml の public_key を差し替えて応答する。
+/// 適用(WG ピアの入れ替え)は supervisor の次回再読込(≤5 秒)が行うため、
+/// 応答は旧鍵のセッションが生きているうちに届く。
+pub struct HostRotation {
+    config_path: std::path::PathBuf,
+    host_public_key: peercove_core::keys::PublicKey,
+    /// host.toml の読み書きを直列化する(複数メンバーの同時依頼)。
+    lock: tokio::sync::Mutex<()>,
+}
+
+impl HostRotation {
+    pub fn new(
+        config_path: std::path::PathBuf,
+        host_public_key: peercove_core::keys::PublicKey,
+    ) -> Self {
+        Self {
+            config_path,
+            host_public_key,
+            lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// 依頼を適用し、(accepted, メッセージ) を返す。
+    async fn apply(
+        &self,
+        member_ip: Ipv4Addr,
+        new_key: peercove_core::keys::PublicKey,
+    ) -> (bool, String) {
+        use peercove_ops::peers::RotateOutcome;
+        let _guard = self.lock.lock().await;
+        let path = self.config_path.clone();
+        let host_key = self.host_public_key;
+        let outcome = tokio::task::spawn_blocking(move || {
+            peercove_ops::peers::rotate_peer_key(&path, member_ip, &new_key, &host_key)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(RotateOutcome::Applied { display: name })) => {
+                tracing::info!("メンバー {member_ip}({name})の公開鍵を更新しました: {new_key}");
+                (
+                    true,
+                    "更新を受け付けました(数秒で新しい鍵に切り替わります)".to_string(),
+                )
+            }
+            Ok(Ok(RotateOutcome::Unchanged)) => (true, "既に更新済みです".to_string()),
+            Ok(Err(e)) => {
+                tracing::warn!("メンバー {member_ip} の鍵更新を拒否しました: {e:#}");
+                (false, format!("{e:#}"))
+            }
+            Err(e) => {
+                tracing::warn!("鍵更新の適用タスクが失敗しました: {e}");
+                (false, "ホスト側の内部エラーです".to_string())
+            }
+        }
+    }
+}
+
 fn encode_line(message: &ControlMessage) -> String {
     let mut line = serde_json::to_string(message).expect("ControlMessage は常に直列化可能");
     line.push('\n');
@@ -214,6 +340,7 @@ pub async fn run_host_server(
     ledger_rx: watch::Receiver<Distribution>,
     connections: Connections,
     rtt: RttMap,
+    rotation: Arc<HostRotation>,
 ) {
     // トンネル作成直後は Windows が仮想 IP を数秒間「準備中」として扱うため、
     // bind が 10049 等で失敗する。準備が整うまで 1 秒間隔でリトライする
@@ -240,9 +367,11 @@ pub async fn run_host_server(
                 let ledger_rx = ledger_rx.clone();
                 let connections = Arc::clone(&connections);
                 let rtt = Arc::clone(&rtt);
+                let rotation = Arc::clone(&rotation);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_member(stream, member_ip, ledger_rx, &connections, &rtt).await
+                        handle_member(stream, member_ip, ledger_rx, &connections, &rtt, rotation)
+                            .await
                     {
                         tracing::debug!("メンバー {member_ip} との制御接続が終了: {e:#}");
                     }
@@ -269,6 +398,7 @@ async fn handle_member(
     mut ledger_rx: watch::Receiver<Distribution>,
     connections: &Connections,
     rtt: &RttMap,
+    rotation: Arc<HostRotation>,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = line_reader(read_half);
@@ -322,6 +452,7 @@ async fn handle_member(
         ping,
         Arc::clone(rtt),
         line,
+        rotation,
     ));
 
     // どちらかが終わったら接続を畳む。
@@ -389,18 +520,22 @@ async fn host_reader(
     ping: SharedPing,
     rtt: RttMap,
     mut line: String,
+    rotation: Arc<HostRotation>,
 ) -> anyhow::Result<()> {
     loop {
         if read_line(&mut reader, &mut line).await?.is_none() {
             return Ok(()); // メンバー側が切断
         }
         match serde_json::from_str::<ControlMessage>(&line) {
-            Ok(message) => {
-                // Hello 以降にメンバーから届くのは ping/pong だけ(将来拡張用に無視)
-                if !handle_ping_pong(&message, member_ip, &out, &ping, &rtt) {
-                    tracing::debug!("メンバー {member_ip} から: {}", line.trim_end());
-                }
+            Ok(message) if handle_ping_pong(&message, member_ip, &out, &ping, &rtt) => {}
+            Ok(ControlMessage::RotateKey { new_public_key }) => {
+                // 鍵ローテーション(ADR-0020)。apply は host.toml への永続化のみで、
+                // WG ピアの入れ替えは supervisor の次回再読込(≤5 秒)が行う。
+                // 応答が先に返るので、旧鍵のセッションが生きているうちに届く
+                let (accepted, message) = rotation.apply(member_ip, new_public_key).await;
+                let _ = out.send(ControlMessage::RotateKeyResult { accepted, message });
             }
+            Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
         }
     }
@@ -418,6 +553,7 @@ pub async fn run_member_client(
     latest_ledger: Arc<Mutex<Option<ReceivedDistribution>>>,
     rtt: RttMap,
     removed: Arc<AtomicBool>,
+    link: Arc<MemberLink>,
 ) {
     let target = SocketAddr::from((host_ip, CONTROL_PORT));
     let mut logged_wait = false;
@@ -433,8 +569,11 @@ pub async fn run_member_client(
                     host_ip,
                     &rtt,
                     &removed,
+                    &link,
                 );
-                if let Err(e) = session.await {
+                let result = session.await;
+                link.detach();
+                if let Err(e) = result {
                     tracing::debug!("制御接続が終了しました(再接続します): {e:#}");
                 }
                 rtt.lock().unwrap().remove(&host_ip);
@@ -463,6 +602,7 @@ async fn member_session(
     host_ip: Ipv4Addr,
     rtt: &RttMap,
     removed: &Arc<AtomicBool>,
+    link: &Arc<MemberLink>,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
@@ -471,6 +611,8 @@ async fn member_session(
         name: display_name.clone(),
     })
     .expect("受信側はこの後 spawn する");
+    // supervisor が鍵ローテーション依頼を差し込めるようにする(ADR-0020)
+    link.attach(tx.clone());
 
     let ping: SharedPing = Default::default();
     let mut writer = tokio::spawn(member_writer(write_half, rx, Arc::clone(&ping)));
@@ -482,6 +624,7 @@ async fn member_session(
         Arc::clone(rtt),
         Arc::clone(latest_ledger),
         Arc::clone(removed),
+        Arc::clone(link),
     ));
 
     // biased: 削除通知(Removed)を検知する読み側が「意味のある終了」なので先に見る。
@@ -518,6 +661,7 @@ async fn member_writer(
 }
 
 /// 読み側。`select!` を使わない素直なループ(read_line のキャンセル安全性のため)。
+#[allow(clippy::too_many_arguments)]
 async fn member_reader(
     mut reader: LineReader,
     host_ip: Ipv4Addr,
@@ -526,6 +670,7 @@ async fn member_reader(
     rtt: RttMap,
     latest_ledger: Arc<Mutex<Option<ReceivedDistribution>>>,
     removed: Arc<AtomicBool>,
+    link: Arc<MemberLink>,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
     let mut last_digest: Option<LedgerDigest> = None;
@@ -568,6 +713,11 @@ async fn member_reader(
                 removed.store(true, Ordering::Relaxed);
                 anyhow::bail!("削除通知を受信");
             }
+            Ok(ControlMessage::RotateKeyResult { accepted, message }) => {
+                // 鍵ローテーションの応答(ADR-0020)。ファイル操作と再起動は
+                // supervisor が周期処理で行う(ここでは受け渡しのみ)
+                link.put_rotate_result(accepted, message);
+            }
             Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
         }
@@ -591,6 +741,14 @@ mod tests {
             subnets: vec![],
             blocked: false,
         }
+    }
+
+    /// 鍵ローテーションを使わないテスト用のダミー文脈(host.toml は実在しない)。
+    fn test_rotation() -> Arc<HostRotation> {
+        Arc::new(HostRotation::new(
+            std::env::temp_dir().join("peercove-control-no-host.toml"),
+            PrivateKey::generate().public_key(),
+        ))
     }
 
     /// 受信ログの INFO/debug 判定(ADR-0019): エンドポイントとその観測経過
@@ -644,7 +802,15 @@ mod tests {
                 IpAddr::V4(ip) => ip,
                 _ => unreachable!(),
             };
-            let _ = handle_member(stream, ip, ledger_rx, &server_connections, &server_rtt).await;
+            let _ = handle_member(
+                stream,
+                ip,
+                ledger_rx,
+                &server_connections,
+                &server_rtt,
+                test_rotation(),
+            )
+            .await;
         });
 
         let latest: Arc<Mutex<Option<ReceivedDistribution>>> = Arc::new(Mutex::new(None));
@@ -661,6 +827,7 @@ mod tests {
                 host_ip,
                 &client_rtt,
                 &Arc::new(AtomicBool::new(false)),
+                &Arc::new(MemberLink::default()),
             )
             .await;
         });
@@ -765,7 +932,15 @@ mod tests {
                 IpAddr::V4(ip) => ip,
                 _ => unreachable!(),
             };
-            handle_member(stream, ip, ledger_rx, &server_connections, &server_rtt).await
+            handle_member(
+                stream,
+                ip,
+                ledger_rx,
+                &server_connections,
+                &server_rtt,
+                test_rotation(),
+            )
+            .await
         });
 
         let latest: Arc<Mutex<Option<ReceivedDistribution>>> = Arc::new(Mutex::new(None));
@@ -783,6 +958,7 @@ mod tests {
                 host_ip,
                 &client_rtt,
                 &removed_flag,
+                &Arc::new(MemberLink::default()),
             )
             .await
         });
@@ -885,6 +1061,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("途中で切断"), "{error}");
+    }
+
+    /// 鍵ローテーションの往復(ADR-0020): メンバーが rotate_key を送ると
+    /// ホストは host.toml の public_key を差し替えて accepted を返し、
+    /// メンバー側は MemberLink 経由で応答を回収できる。
+    #[tokio::test]
+    async fn rotate_key_roundtrip_updates_host_config() {
+        // ループバック接続では member_ip = 127.0.0.1 になるため、
+        // その IP のピアを持つ host.toml を用意する
+        let dir = std::env::temp_dir().join("peercove-control-rotate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let old_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\nlisten_port = 51820\n\n[[peer]]\nname = \"alice\"\npublic_key = \"{old_key}\"\nallowed_ips = [\"127.0.0.1/32\"]\n"
+            ),
+        )
+        .unwrap();
+        let host_public_key = PrivateKey::generate().public_key();
+        let rotation = Arc::new(HostRotation::new(config_path.clone(), host_public_key));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_ledger_tx, ledger_rx) = watch::channel(Distribution::default());
+        let connections: Connections = Default::default();
+        let server_connections = Arc::clone(&connections);
+        let server_rtt: RttMap = Default::default();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            let _ = handle_member(
+                stream,
+                ip,
+                ledger_rx,
+                &server_connections,
+                &server_rtt,
+                rotation,
+            )
+            .await;
+        });
+
+        let link = Arc::new(MemberLink::default());
+        let client_link = Arc::clone(&link);
+        let client = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let host_ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+            let _ = member_session(
+                stream,
+                &Some("alice".to_string()),
+                &Arc::new(Mutex::new(None)),
+                host_ip,
+                &Default::default(),
+                &Arc::new(AtomicBool::new(false)),
+                &client_link,
+            )
+            .await;
+        });
+
+        // 接続(attach)を待って依頼を送る
+        wait_until(|| link.session()).await;
+        let new_key = PrivateKey::generate().public_key();
+        assert!(link.send(ControlMessage::RotateKey {
+            new_public_key: new_key,
+        }));
+
+        let (accepted, message) = wait_until(|| link.take_rotate_result()).await;
+        assert!(accepted, "{message}");
+        let updated = peercove_core::config::Config::load(&config_path).unwrap();
+        assert_eq!(updated.peers[0].public_key, new_key);
+        assert_eq!(updated.peers[0].name.as_deref(), Some("alice"));
+
+        // 同じ依頼の再送も成功扱い(冪等)。衝突する鍵は拒否される
+        assert!(link.send(ControlMessage::RotateKey {
+            new_public_key: new_key,
+        }));
+        let (accepted, _) = wait_until(|| link.take_rotate_result()).await;
+        assert!(accepted, "再送は冪等に成功する");
+        assert!(link.send(ControlMessage::RotateKey {
+            new_public_key: host_public_key,
+        }));
+        let (accepted, message) = wait_until(|| link.take_rotate_result()).await;
+        assert!(!accepted, "ホスト鍵との衝突は拒否: {message}");
+
+        client.abort();
+        server.abort();
     }
 
     /// 未知の nonce の Pong では RTT を記録しない(遅れて届いた応答の混入防止)。

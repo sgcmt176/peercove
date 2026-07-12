@@ -9,6 +9,7 @@ mod dnscfg;
 mod groups;
 mod logbuf;
 mod msg;
+mod rotate;
 mod service;
 mod upnp;
 

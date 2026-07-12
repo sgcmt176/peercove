@@ -29,6 +29,16 @@ pub enum Role {
     Member,
 }
 
+/// supervise の終了理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperviseExit {
+    /// 停止要求(Ctrl+C / IPC の stop)。
+    Stopped,
+    /// (member)鍵ローテーションのためトンネルを入れ直す(ADR-0020)。
+    /// `use_pending` は更新待ちの鍵(`<key>.new`)で起動するか。
+    Restart { use_pending: bool },
+}
+
 /// 起動済みトンネル一式(バックエンド + UPnP リース)。
 /// [`bring_up`] で作り、[`tear_down`] で必ず対で破棄する。
 pub struct ActiveTunnel {
@@ -145,6 +155,7 @@ pub fn bring_up(
 
 impl ActiveTunnel {
     /// 停止シグナルまで supervisor を回す(daemon 用の入り口)。
+    #[allow(clippy::too_many_arguments)]
     pub async fn supervise_run(
         &mut self,
         config_path: &Path,
@@ -153,7 +164,8 @@ impl ActiveTunnel {
         transfers: crate::msg::TransferRegistry,
         chat: crate::chat::SharedChatLog,
         groups: crate::groups::SharedGroups,
-    ) -> anyhow::Result<()> {
+        rotate_request: Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<SuperviseExit> {
         supervise(
             config_path,
             self.role,
@@ -164,8 +176,36 @@ impl ActiveTunnel {
             transfers,
             chat,
             groups,
+            rotate_request,
         )
         .await
+    }
+
+    /// 鍵ローテーション後の入れ直し(ADR-0020)。同じインターフェース名で
+    /// down → up し直す(メンバー専用。UPnP リースはメンバーには無い)。
+    /// `use_pending` なら設定の鍵の代わりに更新待ちの鍵(`<key>.new`)で起動する。
+    pub fn restart_in_place(
+        &mut self,
+        config_path: &Path,
+        use_pending: bool,
+    ) -> anyhow::Result<()> {
+        let config = Config::load(config_path)?;
+        let mut spec = build_spec(&config, self.role)?;
+        if use_pending {
+            spec.private_key = crate::rotate::load_pending(&config.interface.private_key_file)
+                .context("更新待ちの鍵(.new)が読めません")?;
+        }
+        self.backend.down()?;
+        let mut backend = crate::backend::create_backend(&self.if_name)?;
+        backend.up(&spec)?;
+        self.backend = backend;
+        self.spec = spec;
+        tracing::info!(
+            "トンネル {} を入れ直しました(鍵ローテーション、peers={})",
+            self.if_name,
+            self.spec.peers.len()
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -211,27 +251,39 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
         .enable_all()
         .build()
         .context("非同期ランタイムの初期化に失敗しました")?;
-    let supervise_result = runtime.block_on(async {
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let ctrl_c = tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            let _ = stop_tx.send(true);
+    // 鍵ローテーション(ADR-0020)の入れ直しで supervisor を回し直す
+    let supervise_result = loop {
+        let result = runtime.block_on(async {
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let ctrl_c = tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = stop_tx.send(true);
+            });
+            let result = supervise(
+                config_path,
+                role,
+                tunnel.backend.as_mut(),
+                &tunnel.spec,
+                stop_rx,
+                None,
+                Default::default(),
+                crate::chat::ChatLog::load(config_path),
+                crate::groups::GroupStore::load(config_path),
+                Default::default(),
+            )
+            .await;
+            ctrl_c.abort();
+            result
         });
-        let result = supervise(
-            config_path,
-            role,
-            tunnel.backend.as_mut(),
-            &tunnel.spec,
-            stop_rx,
-            None,
-            Default::default(),
-            crate::chat::ChatLog::load(config_path),
-            crate::groups::GroupStore::load(config_path),
-        )
-        .await;
-        ctrl_c.abort();
-        result
-    });
+        match result {
+            Ok(SuperviseExit::Restart { use_pending }) => {
+                if let Err(e) = tunnel.restart_in_place(config_path, use_pending) {
+                    break Err(e).context("鍵ローテーション後の入れ直しに失敗しました");
+                }
+            }
+            other => break other.map(|_| ()),
+        }
+    };
     println!("終了処理中…");
     tear_down(tunnel, config_path)?;
     println!("クリーンアップが完了しました");
@@ -271,7 +323,8 @@ pub async fn supervise(
     transfers: crate::msg::TransferRegistry,
     chat: crate::chat::SharedChatLog,
     groups: crate::groups::SharedGroups,
-) -> anyhow::Result<()> {
+    rotate_request: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<SuperviseExit> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
     let mut known: HashMap<[u8; 32], PeerFingerprint> = spec
@@ -321,6 +374,9 @@ pub async fn supervise(
             Arc::clone(&chat),
             Arc::clone(&groups),
         )));
+        // (member)鍵ローテーションの状態機械と、制御接続への差し込み口(ADR-0020)
+        let member_link: Arc<control::MemberLink> = Default::default();
+        let mut rotation: Option<crate::rotate::Rotation> = None;
         match role {
             Role::Host => {
                 tasks.push(tokio::spawn(control::run_host_server(
@@ -328,6 +384,10 @@ pub async fn supervise(
                     ledger_rx,
                     Arc::clone(&connections),
                     Arc::clone(&rtt),
+                    Arc::new(control::HostRotation::new(
+                        config_path.to_path_buf(),
+                        host_public_key,
+                    )),
                 )));
             }
             Role::Member => {
@@ -346,12 +406,20 @@ pub async fn supervise(
                             Arc::clone(&member_ledger),
                             Arc::clone(&rtt),
                             Arc::clone(&removed),
+                            Arc::clone(&member_link),
                         )));
                     }
                     _ => tracing::warn!(
                         "コントロールチャネルの接続先が決められないため台帳同期を行いません"
                     ),
                 }
+                rotation = Some(crate::rotate::Rotation::new(
+                    config_path.to_path_buf(),
+                    config.interface.private_key_file.clone(),
+                    &spec.private_key,
+                    Arc::clone(&rotate_request),
+                    std::time::Instant::now(),
+                ));
             }
         }
 
@@ -359,7 +427,7 @@ pub async fn supervise(
         let result = loop {
             tokio::select! {
                 _ = stop.changed() => {
-                    break Ok(());
+                    break Ok(SuperviseExit::Stopped);
                 }
                 _ = tick.tick() => {
                     let config = match Config::load(config_path) {
@@ -491,6 +559,20 @@ pub async fn supervise(
                             received.map(|r| r.distribution)
                         }
                     };
+                    // (member)鍵ローテーション(ADR-0020)。鍵の切り替えが
+                    // 必要になったら supervisor を抜けて入れ直してもらう
+                    if let (Some(rotation), Some(config)) = (rotation.as_mut(), config.as_ref()) {
+                        if let Some(action) = rotation.tick(
+                            std::time::Instant::now(),
+                            config,
+                            &stats,
+                            &member_link,
+                        ) {
+                            break Ok(SuperviseExit::Restart {
+                                use_pending: action.use_pending,
+                            });
+                        }
+                    }
                     let ledger = distribution.as_ref().map(|dist| dist.members.clone());
                     // メッセージングのピア表(自分以外の 仮想 IP → 表示名)を台帳から更新
                     if let Some(ledger) = &ledger {
@@ -700,6 +782,9 @@ impl PeerFingerprint {
 /// - 設定に増えたピア: バックエンドへ追加
 /// - 設定が変わったピア(endpoint / allowed_ips / keepalive / PSK): 削除→再追加で反映
 ///   (再ハンドシェイクが走るため数秒の断がある)
+/// - 鍵ローテーション(ADR-0020): 消えた鍵の IP を設定内の別の鍵が引き継いで
+///   いる場合は「削除」でなく「鍵の入れ替え」。削除通知(Removed)を送らず、
+///   同じ /32 のピアを並存させないよう**旧鍵を先に**外す
 /// - 設定から消えたピア: まず削除通知を送り(1 周期目)、次の周期で実削除する
 ///   (通知はトンネル経由なので、先にピアを消すと届かないため)
 fn sync_peers(
@@ -709,6 +794,36 @@ fn sync_peers(
     pending_removal: &mut HashSet<[u8; 32]>,
     connections: &control::Connections,
 ) {
+    let config_keys: HashSet<[u8; 32]> = config
+        .peers
+        .iter()
+        .map(|p| *p.public_key.as_bytes())
+        .collect();
+
+    // 鍵ローテーション: 旧鍵の除去(追加より先)
+    let rotated: Vec<([u8; 32], std::net::Ipv4Addr)> = known
+        .iter()
+        .filter(|(key, fingerprint)| {
+            !config_keys.contains(*key)
+                && config
+                    .peers
+                    .iter()
+                    .any(|p| p.allowed_ips.first().map(|net| net.addr()) == Some(fingerprint.ip))
+        })
+        .map(|(key, fingerprint)| (*key, fingerprint.ip))
+        .collect();
+    for (key, ip) in rotated {
+        let public_key = peercove_core::keys::PublicKey::from_bytes(key);
+        match backend.remove_peer(&public_key) {
+            Ok(()) => {
+                known.remove(&key);
+                pending_removal.remove(&key);
+                tracing::info!("ピア {ip} の鍵が更新されたため、旧鍵 {public_key} を外しました");
+            }
+            Err(e) => tracing::warn!("旧鍵 {public_key} の除去に失敗しました: {e:#}"),
+        }
+    }
+
     // 追加・変更
     for peer in &config.peers {
         let key = *peer.public_key.as_bytes();
@@ -751,11 +866,6 @@ fn sync_peers(
     }
 
     // 削除(2 段階)
-    let config_keys: HashSet<[u8; 32]> = config
-        .peers
-        .iter()
-        .map(|p| *p.public_key.as_bytes())
-        .collect();
     let removed: Vec<([u8; 32], std::net::Ipv4Addr)> = known
         .iter()
         .filter(|(key, _)| !config_keys.contains(*key))
@@ -1028,6 +1138,61 @@ mod tests {
         assert!(!bob.online);
         assert_eq!(bob.endpoint, None, "古い観測は配布しない");
         assert_eq!(bob.endpoint_age_secs, None);
+    }
+
+    /// 鍵ローテーション(ADR-0020): 同じ IP を設定内の別の鍵が引き継いだら、
+    /// 「削除」でなく「入れ替え」。削除通知(Removed)は送らず、同じ /32 の
+    /// ピアを並存させないよう旧鍵の除去が新鍵の追加より先に行われる。
+    #[test]
+    fn sync_peers_rotates_key_without_removal_notice() {
+        let old_key = PrivateKey::generate().public_key();
+        let new_key = PrivateKey::generate().public_key();
+        let peer_toml = |key: &peercove_core::keys::PublicKey| {
+            format!(
+                "[[peer]]\nname = \"alice\"\npublic_key = \"{key}\"\nallowed_ips = [\"10.100.42.2/32\"]\n"
+            )
+        };
+        let mut backend = MockBackend::default();
+        let mut known = HashMap::new();
+        let mut pending = HashSet::new();
+        let connections: control::Connections = Default::default();
+        // alice の制御接続を模擬(誤って削除通知が送られたら検出できるように)
+        let (tx, mut member_inbox) = tokio::sync::mpsc::unbounded_channel();
+        connections
+            .lock()
+            .unwrap()
+            .insert("10.100.42.2".parse().unwrap(), tx);
+
+        let config = host_config(&peer_toml(&old_key));
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &connections,
+        );
+        backend.ops.clear();
+
+        let config = host_config(&peer_toml(&new_key));
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &connections,
+        );
+        assert_eq!(
+            backend.ops,
+            vec![format!("remove:{old_key}"), format!("add:{new_key}")],
+            "旧鍵の除去が先(同じ /32 の並存を避ける)"
+        );
+        assert!(pending.is_empty(), "2 段階削除には入らない");
+        assert!(known.contains_key(new_key.as_bytes()));
+        assert!(!known.contains_key(old_key.as_bytes()));
+        assert!(
+            member_inbox.try_recv().is_err(),
+            "削除通知は送られない(メンバーが「削除された」と誤認しない)"
+        );
     }
 
     #[test]

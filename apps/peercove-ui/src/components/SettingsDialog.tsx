@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Settings, api, errorMessage } from "../ipc";
-import { Modal } from "./Modal";
+import { ConfirmModal, Modal } from "./Modal";
 import { t } from "../i18n";
 
 /**
@@ -73,6 +73,24 @@ function SettingsForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // デバイス鍵ローテーション(ADR-0020、M3-11)
+  const [confirmRotate, setConfirmRotate] = useState(false);
+  const [rotateBusy, setRotateBusy] = useState(false);
+
+  const rotate = async () => {
+    setRotateBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.rotateKey(configPath);
+      setNotice(t.settings.rotateKeyRequested);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setRotateBusy(false);
+      setConfirmRotate(false);
+    }
+  };
 
   const save = async () => {
     setBusy(true);
@@ -214,6 +232,24 @@ function SettingsForm({
           </label>
         )}
 
+        {settings.isMember && (
+          <div className="field">
+            <span>
+              {t.settings.rotateKeyLabel}
+              <small className="muted"> — {t.settings.rotateKeyHint}</small>
+            </span>
+            <div>
+              <button
+                type="button"
+                className="button--ghost"
+                onClick={() => setConfirmRotate(true)}
+              >
+                {t.settings.rotateKeyButton}
+              </button>
+            </div>
+          </div>
+        )}
+
         <p className="muted small">{t.settings.restartHint(settings.isMember)}</p>
 
         {error && <p className="error-text">{error}</p>}
@@ -227,6 +263,16 @@ function SettingsForm({
           {busy ? t.common.saving : t.common.save}
         </button>
       </div>
+      {confirmRotate && (
+        <ConfirmModal
+          title={t.settings.rotateKeyButton}
+          message={<p>{t.settings.rotateKeyConfirm}</p>}
+          confirmLabel={t.settings.rotateKeyButton}
+          busy={rotateBusy}
+          onConfirm={() => void rotate()}
+          onClose={() => setConfirmRotate(false)}
+        />
+      )}
     </>
   );
 }

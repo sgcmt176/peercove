@@ -78,6 +78,15 @@ async fn stop_tunnel(config_path: String) -> Result<(), String> {
     .await
 }
 
+/// (member)デバイス鍵のローテーションを要求する(ADR-0020、M3-11)。
+/// 応答は受理のみ。実際の更新はコントロールチャネル経由で非同期に行われ、
+/// 完了時に数秒の再接続が発生する(結果はログに出る)。
+#[tauri::command]
+async fn rotate_key(config_path: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::RotateKey { config }).await
+}
+
 // ---- 通知(M2-G6) ----
 
 /// OS 通知を出す(メンバーの参加・切断)。
@@ -911,6 +920,7 @@ pub fn run() {
             start_host,
             start_member,
             stop_tunnel,
+            rotate_key,
             notify,
             list_networks,
             delete_network,
