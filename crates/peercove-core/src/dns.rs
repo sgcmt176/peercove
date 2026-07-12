@@ -62,7 +62,35 @@ pub fn zone_for(network: &str, ledger: &[LedgerEntry], custom: &[DnsRecord]) -> 
     // 決定性のため仮想 IP 順に処理する(台帳の並び順に依存しない)
     let mut members: Vec<&LedgerEntry> = ledger.iter().collect();
     members.sort_by_key(|entry| entry.ip);
+    let labels = assign_labels(&members, &mut taken);
 
+    for (member, label) in members.iter().zip(labels) {
+        entries.push(ZoneEntry {
+            fqdn: format!("{label}.{network}.{DNS_SUFFIX}"),
+            ip: member.ip,
+            public_key: Some(member.public_key),
+        });
+    }
+
+    for record in custom {
+        // ドット付きはサブドメインレコード(ADR-0022)。ラベル単位で正規形なら
+        // 受け入れる。単一ラベルはメンバー名との衝突で自動生成が勝つ
+        if !names::is_dns_name(&record.name) || taken.contains(&record.name) {
+            continue; // 自動生成が勝つ / 不正ラベルは無視(doc コメント参照)
+        }
+        taken.insert(record.name.clone());
+        entries.push(ZoneEntry {
+            fqdn: format!("{}.{network}.{DNS_SUFFIX}", record.name),
+            ip: record.ip,
+            public_key: None,
+        });
+    }
+    entries
+}
+
+/// 仮想 IP 順に並んだメンバーへ DNS ラベルを割り当てる(zone_for の
+/// ラベル決定規則そのもの。`resolve_records` と共有する)。
+fn assign_labels(members: &[&LedgerEntry], taken: &mut HashSet<String>) -> Vec<String> {
     // 第 1 パス: 確定済みの DNS 名を先に確保(ADR-0021。不正なラベルは
     // 従来導出へフォールバック — 配布側の検証をすり抜けても解決を壊さない)
     let mut labels: Vec<Option<String>> = members
@@ -72,7 +100,7 @@ pub fn zone_for(network: &str, ledger: &[LedgerEntry], custom: &[DnsRecord]) -> 
                 .dns_name
                 .as_deref()
                 .filter(|n| names::is_dns_label(n))?;
-            let label = uniquify(fixed, member.ip.octets()[3], &taken);
+            let label = uniquify(fixed, member.ip.octets()[3], taken);
             taken.insert(label.clone());
             Some(label)
         })
@@ -95,32 +123,60 @@ pub fn zone_for(network: &str, ledger: &[LedgerEntry], custom: &[DnsRecord]) -> 
                     format!("member-{oct}")
                 }
             });
-        let derived = uniquify(&base, oct, &taken);
+        let derived = uniquify(&base, oct, taken);
         taken.insert(derived.clone());
         *label = Some(derived);
     }
+    labels
+        .into_iter()
+        .map(|label| label.expect("両パスでどのメンバーにもラベルが付く"))
+        .collect()
+}
 
-    for (member, label) in members.iter().zip(labels) {
-        let label = label.expect("両パスでどのメンバーにもラベルが付く");
-        entries.push(ZoneEntry {
-            fqdn: format!("{label}.{network}.{DNS_SUFFIX}"),
-            ip: member.ip,
-            public_key: Some(member.public_key),
-        });
-    }
+/// カスタムレコード設定(ADR-0022)を配布用の `{name, ip}` へ解決する。
+/// ホストが台帳構築のたびに呼ぶ(5 秒周期)ため、メンバー参照はその時点の
+/// 仮想 IP・DNS ラベルへ追随する。参照先が台帳に見つからないレコード
+/// (削除直後など)は黙って外す — 解決全体を壊さない。
+pub fn resolve_records(
+    records: &[crate::config::DnsRecordConfig],
+    ledger: &[LedgerEntry],
+) -> Vec<DnsRecord> {
+    use crate::config::MemberRef;
 
-    for record in custom {
-        if !names::is_dns_label(&record.name) || taken.contains(&record.name) {
-            continue; // 自動生成が勝つ / 不正ラベルは無視(doc コメント参照)
-        }
-        taken.insert(record.name.clone());
-        entries.push(ZoneEntry {
-            fqdn: format!("{}.{network}.{DNS_SUFFIX}", record.name),
-            ip: record.ip,
-            public_key: None,
-        });
+    let mut taken = HashSet::new();
+    let mut members: Vec<&LedgerEntry> = ledger.iter().collect();
+    members.sort_by_key(|entry| entry.ip);
+    let labels = assign_labels(&members, &mut taken);
+    let lookup = |reference: &MemberRef| {
+        members
+            .iter()
+            .zip(labels.iter())
+            .find(|(member, _)| match reference {
+                MemberRef::Host => member.is_host,
+                MemberRef::Key(key) => member.public_key == *key,
+            })
+    };
+
+    let mut resolved = Vec::with_capacity(records.len());
+    for record in records {
+        let ip = match (record.ip, &record.member) {
+            (Some(ip), _) => ip,
+            (None, Some(member)) => match lookup(member) {
+                Some((entry, _)) => entry.ip,
+                None => continue,
+            },
+            (None, None) => continue,
+        };
+        let name = match &record.under {
+            None => record.name.clone(),
+            Some(under) => match lookup(under) {
+                Some((_, label)) => format!("{}.{label}", record.name),
+                None => continue,
+            },
+        };
+        resolved.push(DnsRecord { name, ip });
     }
-    entries
+    resolved
 }
 
 /// `base` が取られていたら `-<oct>`、それも駄目なら `-<oct>-2`, … で一意化。
@@ -234,6 +290,95 @@ mod tests {
         bad.dns_name = Some("Bad Label".to_string());
         let zone = zone_for("net", &[bad], &[]);
         assert_eq!(fqdns(&zone), vec!["bob.net.peercove.internal"]);
+    }
+
+    /// レコード解決(ADR-0022): member 参照はその時点の IP、under は
+    /// その時点のラベルへ追随する。参照先が居なければ黙って外す。
+    #[test]
+    fn resolve_records_follows_member_ip_and_label() {
+        use crate::config::{DnsRecordConfig, MemberRef};
+
+        let host = member(None, "10.1.0.1", true);
+        let mut alice = member(Some("山田"), "10.1.0.5", false);
+        alice.dns_name = Some("alice".to_string());
+        let alice_key = alice.public_key;
+        let ledger = vec![host, alice];
+
+        let records = vec![
+            DnsRecordConfig {
+                // エイリアス(要望 10/11): メンバー参照 → IP 追随
+                name: "gamehost".to_string(),
+                ip: None,
+                member: Some(MemberRef::Key(alice_key)),
+                under: None,
+            },
+            DnsRecordConfig {
+                // 端末配下サブドメイン(要望 12): ホスト配下
+                name: "web".to_string(),
+                ip: None,
+                member: Some(MemberRef::Host),
+                under: Some(MemberRef::Host),
+            },
+            DnsRecordConfig {
+                // LAN 機器(要望 14): alice 配下の固定 IP
+                name: "printer".to_string(),
+                ip: Some("192.168.10.50".parse().unwrap()),
+                member: None,
+                under: Some(MemberRef::Key(alice_key)),
+            },
+            DnsRecordConfig {
+                // 参照先が台帳に居ない(削除直後)→ 黙って外す
+                name: "ghost".to_string(),
+                ip: None,
+                member: Some(MemberRef::Key(PrivateKey::generate().public_key())),
+                under: None,
+            },
+        ];
+        let resolved = resolve_records(&records, &ledger);
+        let names: Vec<(&str, String)> = resolved
+            .iter()
+            .map(|r| (r.name.as_str(), r.ip.to_string()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("gamehost", "10.1.0.5".to_string()),
+                ("web.host", "10.1.0.1".to_string()),
+                ("printer.alice", "192.168.10.50".to_string()),
+            ]
+        );
+
+        // IP が変わっても(再招待)同じ設定で追随する
+        let mut moved = member(Some("山田"), "10.1.0.9", false);
+        moved.dns_name = Some("alice".to_string());
+        moved.public_key = alice_key;
+        let resolved = resolve_records(&records[..1], &[moved]);
+        assert_eq!(resolved[0].ip.to_string(), "10.1.0.9");
+    }
+
+    /// ドット付きの相対名(サブドメインレコード)はゾーンに入る。
+    /// ラベル単位で不正なものは従来どおり無視する。
+    #[test]
+    fn zone_accepts_dotted_custom_records() {
+        let ledger = vec![member(Some("alice"), "10.1.0.2", false)];
+        let custom = vec![
+            DnsRecord {
+                name: "web.alice".to_string(),
+                ip: "10.1.0.2".parse().unwrap(),
+            },
+            DnsRecord {
+                name: "Bad.alice".to_string(), // 大文字ラベル → 無視
+                ip: "10.1.0.3".parse().unwrap(),
+            },
+        ];
+        let zone = zone_for("home", &ledger, &custom);
+        assert_eq!(
+            fqdns(&zone),
+            vec![
+                "alice.home.peercove.internal",
+                "web.alice.home.peercove.internal",
+            ]
+        );
     }
 
     #[test]

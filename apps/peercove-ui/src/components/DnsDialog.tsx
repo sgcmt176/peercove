@@ -5,12 +5,14 @@ import { Modal } from "./Modal";
 import { t } from "../i18n";
 
 /**
- * DNS 管理画面(M3-1c、ADR-0011 §1b)。
+ * DNS 管理画面(M3-1c、ADR-0011 §1b、ADR-0022)。
  *
  * - 自動レコード: 台帳から導出されたメンバーの DNS 名(閲覧のみ。改名は
  *   メンバー一覧の ✎ から)
- * - カスタムレコード: ホストのみ追加・削除できる。設定に書かれ、5 秒の
- *   再読込 → 台帳と一緒に全メンバーへ配布される
+ * - カスタムレコード: ホストのみ追加・削除できる。ターゲットは IP 直指定か
+ *   メンバー参照(IP 自動追随 = 別名・サービス名)、配置は最上位かメンバー
+ *   配下(端末配下サブドメイン・LAN 機器)。設定に書かれ、5 秒の再読込 →
+ *   解決 → 台帳と一緒に全メンバーへ配布される
  */
 export function DnsDialog({
   configPath,
@@ -26,7 +28,11 @@ export function DnsDialog({
   const [records, setRecords] = useState<DnsRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
+  // ターゲット: "ip" = IP 直指定 / それ以外 = メンバー参照("host" or 公開鍵)
+  const [target, setTarget] = useState("ip");
   const [ip, setIp] = useState("");
+  // 配置: "" = 最上位 / それ以外 = 親メンバー("host" or 公開鍵)
+  const [under, setUnder] = useState("");
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -41,11 +47,25 @@ export function DnsDialog({
     reload();
   }, [reload]);
 
+  /** メンバー参照("host" or 公開鍵)の表示名。 */
+  const memberName = (ref: string): string => {
+    const member = members.find((m) =>
+      ref === "host" ? m.isHost : m.publicKey === ref,
+    );
+    if (!member) return t.dns.brokenRef;
+    return member.name ?? member.dnsName?.split(".")[0] ?? member.ip;
+  };
+
   const add = async () => {
     setBusy(true);
     setError(null);
     try {
-      await api.addDnsRecord(configPath, name, ip);
+      await api.addDnsRecord(
+        configPath,
+        name,
+        target === "ip" ? { ip } : { member: target },
+        under === "" ? undefined : under,
+      );
       setName("");
       setIp("");
       reload();
@@ -59,7 +79,7 @@ export function DnsDialog({
   const remove = async (record: DnsRecord) => {
     setError(null);
     try {
-      await api.removeDnsRecord(configPath, record.name);
+      await api.removeDnsRecord(configPath, record.name, record.under);
       reload();
     } catch (e) {
       setError(errorMessage(e));
@@ -85,6 +105,9 @@ export function DnsDialog({
       {copied === fqdn ? t.dns.copied : t.dns.copy}
     </button>
   );
+
+  const canAdd =
+    name.trim() !== "" && (target !== "ip" || ip.trim() !== "");
 
   return (
     <Modal title={t.dns.title} onClose={onClose} wide>
@@ -114,11 +137,16 @@ export function DnsDialog({
         ) : (
           <ul className="dns-list">
             {records.map((record) => (
-              <li key={record.name} className="dns-list__row">
+              <li key={`${record.name}@${record.under ?? ""}`} className="dns-list__row">
                 <span className="mono ellipsis" title={record.fqdn}>
                   {record.fqdn}
                 </span>
-                <span className="mono muted">{record.ip}</span>
+                {record.member !== null && (
+                  <span className="muted small ellipsis">
+                    {t.dns.targetOf(memberName(record.member))}
+                  </span>
+                )}
+                <span className="mono muted">{record.ip ?? t.dns.brokenRef}</span>
                 {copyButton(record.fqdn)}
                 {isHost && (
                   <button
@@ -147,22 +175,67 @@ export function DnsDialog({
                 />
               </label>
               <label className="field">
-                <span>{t.dns.ipLabel}</span>
-                <input
-                  value={ip}
-                  placeholder={t.dns.ipPlaceholder}
-                  className="mono"
-                  onChange={(event) => setIp(event.target.value)}
-                />
+                <span>{t.dns.targetLabel}</span>
+                <select
+                  value={target}
+                  onChange={(event) => setTarget(event.target.value)}
+                >
+                  <option value="ip">{t.dns.targetIp}</option>
+                  {members.map((member) => (
+                    <option
+                      key={member.publicKey}
+                      value={member.isHost ? "host" : member.publicKey}
+                    >
+                      {t.dns.targetMember(
+                        member.name ??
+                          member.dnsName?.split(".")[0] ??
+                          member.ip,
+                      )}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {target === "ip" && (
+                <label className="field">
+                  <span>{t.dns.ipLabel}</span>
+                  <input
+                    value={ip}
+                    placeholder={t.dns.ipPlaceholder}
+                    className="mono"
+                    onChange={(event) => setIp(event.target.value)}
+                  />
+                </label>
+              )}
+              <label className="field">
+                <span>{t.dns.parentLabel}</span>
+                <select
+                  value={under}
+                  onChange={(event) => setUnder(event.target.value)}
+                >
+                  <option value="">{t.dns.parentTop}</option>
+                  {members.map((member) => (
+                    <option
+                      key={member.publicKey}
+                      value={member.isHost ? "host" : member.publicKey}
+                    >
+                      {t.dns.parentUnder(
+                        member.name ??
+                          member.dnsName?.split(".")[0] ??
+                          member.ip,
+                      )}
+                    </option>
+                  ))}
+                </select>
               </label>
               <button
                 type="button"
                 onClick={() => void add()}
-                disabled={busy || name.trim() === "" || ip.trim() === ""}
+                disabled={busy || !canAdd}
               >
                 {busy ? t.dns.adding : t.dns.add}
               </button>
             </div>
+            <p className="muted small">{t.dns.parentHint}</p>
           </>
         ) : (
           <p className="muted small">{t.dns.customNoteMember}</p>

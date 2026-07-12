@@ -27,11 +27,16 @@ export interface Member {
   blocked: boolean;
 }
 
-/** カスタム DNS レコード（M3-1c）。 */
+/** カスタム DNS レコード（M3-1c、ADR-0022 で拡張）。 */
 export interface DnsRecord {
   name: string;
-  ip: string;
+  /** 解決済みの現在の IP（メンバー参照が切れている場合のみ null）。 */
+  ip: string | null;
   fqdn: string;
+  /** ターゲットのメンバー参照（"host" または公開鍵）。固定 IP レコードは null。 */
+  member: string | null;
+  /** 親メンバー（"host" または公開鍵）。最上位レコードは null。 */
+  under: string | null;
 }
 
 export interface Peer {
@@ -346,10 +351,23 @@ export const api = {
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),
-  addDnsRecord: (configPath: string, name: string, ip: string) =>
-    invoke<void>("add_dns_record", { configPath, name, ip }),
-  removeDnsRecord: (configPath: string, name: string) =>
-    invoke<void>("remove_dns_record", { configPath, name }),
+  // ターゲットは ip（固定）か member（メンバー参照 = IP 自動追随）のどちらか。
+  // under で親メンバー配下のサブドメインになる（ADR-0022）
+  addDnsRecord: (
+    configPath: string,
+    name: string,
+    target: { ip?: string; member?: string },
+    under?: string,
+  ) =>
+    invoke<void>("add_dns_record", {
+      configPath,
+      name,
+      ip: target.ip ?? null,
+      member: target.member ?? null,
+      under: under ?? null,
+    }),
+  removeDnsRecord: (configPath: string, name: string, under?: string | null) =>
+    invoke<void>("remove_dns_record", { configPath, name, under: under ?? null }),
   readSettings: (configPath: string) =>
     invoke<Settings>("read_settings", { configPath }),
   saveSettings: (configPath: string, update: SettingsUpdate) =>

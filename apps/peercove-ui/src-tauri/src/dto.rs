@@ -407,13 +407,35 @@ impl From<&peercove_ops::networks::NetworkEntry> for NetworkDto {
     }
 }
 
-/// カスタム DNS レコード(M3-1c)。fqdn は表示用に組み立て済み。
+/// カスタム DNS レコード(M3-1c、ADR-0022 で拡張)。fqdn は表示用に
+/// 組み立て済み。member / under は "host" または公開鍵(フロントが
+/// メンバー一覧と突き合わせて表示名にする)。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsRecordDto {
     pub name: String,
-    pub ip: String,
+    /// 解決済みの現在の IP(メンバー参照が切れている場合のみ None)
+    pub ip: Option<String>,
     pub fqdn: String,
+    /// ターゲットのメンバー参照(固定 IP レコードは None)
+    pub member: Option<String>,
+    /// 親メンバー(最上位レコードは None)
+    pub under: Option<String>,
+}
+
+impl From<peercove_ops::dns::RecordDetail> for DnsRecordDto {
+    fn from(detail: peercove_ops::dns::RecordDetail) -> Self {
+        Self {
+            name: detail.name,
+            ip: detail.resolved_ip.map(|ip| ip.to_string()),
+            fqdn: detail.fqdn,
+            member: match detail.target {
+                peercove_ops::dns::RecordTarget::Ip(_) => None,
+                peercove_ops::dns::RecordTarget::Member(member) => Some(member.to_config_string()),
+            },
+            under: detail.under.map(|under| under.to_config_string()),
+        }
+    }
 }
 
 /// ホスト初期化の結果。

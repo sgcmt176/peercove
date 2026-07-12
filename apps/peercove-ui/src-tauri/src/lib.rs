@@ -844,46 +844,70 @@ fn set_acl(config_path: String, deny: Vec<[String; 2]>) -> Result<(), String> {
     peercove_ops::acl::set_deny(Path::new(&config_path), &parsed).map_err(to_message)
 }
 
-// ---- カスタム DNS レコード(M3-1c、ADR-0011 §1b) ----
+// ---- カスタム DNS レコード(M3-1c、ADR-0011 §1b、ADR-0022) ----
+
+/// メンバー参照("host" または公開鍵 base64)を解析する。
+fn parse_member_ref(input: &str) -> Result<peercove_core::config::MemberRef, String> {
+    input
+        .trim()
+        .parse()
+        .map_err(|_| "メンバーの指定が不正です".to_string())
+}
 
 /// カスタム DNS レコードの一覧(fqdn は表示用に組み立て済み)。
 #[tauri::command]
 fn list_dns_records(config_path: String) -> Result<Vec<DnsRecordDto>, String> {
-    let config =
-        peercove_core::config::Config::load(Path::new(&config_path)).map_err(|e| e.to_string())?;
-    let network = config.network_name().to_string();
-    Ok(config
-        .dns_records
-        .iter()
-        .map(|record| DnsRecordDto {
-            name: record.name.clone(),
-            ip: record.ip.to_string(),
-            fqdn: format!(
-                "{}.{network}.{}",
-                record.name,
-                peercove_core::dns::DNS_SUFFIX
-            ),
-        })
+    Ok(peercove_ops::dns::list_records(Path::new(&config_path))
+        .map_err(to_message)?
+        .into_iter()
+        .map(DnsRecordDto::from)
         .collect())
 }
 
-/// カスタム DNS レコードを追加する(ホストの設定のみ)。実行中のホストは
-/// 5 秒の再読込で拾い、台帳と一緒に全メンバーへ配布される。
+/// カスタム DNS レコードを追加する(ホストの設定のみ、ADR-0022)。
+/// ターゲットは ip(固定 IP)/ member(メンバー参照 = IP 自動追随)の
+/// どちらか。under で親メンバー配下のサブドメインになる。実行中のホストは
+/// 5 秒の再読込で拾い、解決してから台帳と一緒に全メンバーへ配布される。
 #[tauri::command]
-fn add_dns_record(config_path: String, name: String, ip: String) -> Result<(), String> {
-    let ip: std::net::Ipv4Addr = ip
-        .trim()
-        .parse()
-        .map_err(|_| format!("\"{ip}\" は IPv4 アドレスとして解釈できません"))?;
-    peercove_ops::dns::add_record(Path::new(&config_path), name.trim(), ip)
+fn add_dns_record(
+    config_path: String,
+    name: String,
+    ip: Option<String>,
+    member: Option<String>,
+    under: Option<String>,
+) -> Result<(), String> {
+    let target = match (ip.as_deref().filter(|s| !s.trim().is_empty()), &member) {
+        (Some(ip), None) => peercove_ops::dns::RecordTarget::Ip(
+            ip.trim()
+                .parse()
+                .map_err(|_| format!("\"{ip}\" は IPv4 アドレスとして解釈できません"))?,
+        ),
+        (None, Some(member)) => peercove_ops::dns::RecordTarget::Member(parse_member_ref(member)?),
+        _ => return Err("ターゲットには IP かメンバーのどちらかを指定してください".to_string()),
+    };
+    let under = under
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(parse_member_ref)
+        .transpose()?;
+    peercove_ops::dns::add_record(Path::new(&config_path), name.trim(), target, under)
         .map(|_| ())
         .map_err(to_message)
 }
 
-/// カスタム DNS レコードを削除する。
+/// カスタム DNS レコードを (name, under) で削除する(ADR-0022)。
 #[tauri::command]
-fn remove_dns_record(config_path: String, name: String) -> Result<(), String> {
-    peercove_ops::dns::remove_record(Path::new(&config_path), &name).map_err(to_message)
+fn remove_dns_record(
+    config_path: String,
+    name: String,
+    under: Option<String>,
+) -> Result<(), String> {
+    let under = under
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(parse_member_ref)
+        .transpose()?;
+    peercove_ops::dns::remove_record(Path::new(&config_path), &name, under).map_err(to_message)
 }
 
 /// 設定ファイルの現在値を読む(M2-G5)。

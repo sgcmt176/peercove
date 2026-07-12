@@ -383,14 +383,14 @@ export const ja = {
     blockedTag: "遮断中",
   },
 
-  // DNS 管理画面(M3-1c)
+  // DNS 管理画面(M3-1c、ADR-0022 でカスタムレコード拡張)
   dns: {
     title: "DNS",
     button: "DNS",
     intro: (
       <>
-        メンバーは <code>名前.ネットワーク名.peercove.internal</code>{" "}
-        で呼べます。名前はメンバー一覧の表示名から自動で決まります。
+        メンバーは <code>DNS名.ネットワーク名.peercove.internal</code>{" "}
+        で呼べます。DNS 名はメンバー一覧の ✎ から変更できます。
       </>
     ),
     autoHead: "自動レコード（メンバー）",
@@ -398,12 +398,23 @@ export const ja = {
     customHead: "カスタムレコード",
     customEmpty: "カスタムレコードはありません。",
     customNote:
-      "ホストだけが追加・削除できます。追加すると約 10 秒で全メンバーに配布されます。",
+      "ホストだけが追加・削除できます。追加すると約 10 秒で全メンバーに配布されます。" +
+      "ターゲットをメンバーにすると、そのメンバーの IP に自動で追随します（別名・サービス名）。",
     customNoteMember: "カスタムレコードはホストが管理します（ここでは閲覧のみ）。",
     nameLabel: "名前（ラベル）",
     namePlaceholder: "nas",
+    targetLabel: "ターゲット",
+    targetIp: "IP アドレス指定",
+    targetMember: (name: string) => `メンバー: ${name}`,
     ipLabel: "IPv4 アドレス",
     ipPlaceholder: "10.68.1.50",
+    parentLabel: "配置",
+    parentTop: "最上位（name.ネットワーク名.…）",
+    parentUnder: (name: string) => `${name} の配下（name.メンバー名.…）`,
+    parentHint:
+      "メンバー配下 + IP 指定は、そのメンバーの広告サブネット内の機器（LAN 機器）だけ登録できます。",
+    targetOf: (name: string) => `→ ${name}`,
+    brokenRef: "参照先なし",
     add: "追加",
     adding: "追加中…",
     remove: "削除",

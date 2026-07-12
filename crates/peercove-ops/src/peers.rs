@@ -201,6 +201,22 @@ pub fn remove_peer(config_path: &Path, selector: &Selector) -> anyhow::Result<Re
             crate::acl::write_deny(&mut doc, &keep);
         }
     }
+    // 削除メンバーを参照するカスタムレコードも掃除する(ADR-0022 §5。
+    // 残すと Config::validate の参照先チェックで設定全体が壊れる)
+    if let Some(records) = doc
+        .get_mut("dns_record")
+        .and_then(|item| item.as_array_of_tables_mut())
+    {
+        records.retain(|table| {
+            !["member", "under"].iter().any(|field| {
+                table.get(field).and_then(|v| v.as_str()).map(str::trim)
+                    == Some(target_key.as_str())
+            })
+        });
+        if records.is_empty() {
+            doc.remove("dns_record");
+        }
+    }
     write_validated(config_path, &doc.to_string())?;
 
     let removed_psk_file = psk_file.and_then(|path| match std::fs::remove_file(&path) {
@@ -339,6 +355,21 @@ pub fn rotate_peer_key(
     if !updated {
         bail!("host.toml から対象ピアを特定できませんでした");
     }
+    // カスタムレコードのメンバー参照(ADR-0022)も同じ書き込みで追随させる
+    if let Some(records) = doc
+        .get_mut("dns_record")
+        .and_then(|item| item.as_array_of_tables_mut())
+    {
+        for table in records.iter_mut() {
+            for field in ["member", "under"] {
+                if table.get(field).and_then(|v| v.as_str()).map(str::trim)
+                    == Some(target_key.as_str())
+                {
+                    table[field] = toml_edit::value(new_key.to_base64());
+                }
+            }
+        }
+    }
     write_validated(config_path, &doc.to_string())?;
     Ok(RotateOutcome::Applied { display })
 }
@@ -351,45 +382,58 @@ pub enum DnsExclude<'a> {
     Peer(&'a PublicKey),
 }
 
+/// ホスト自身の現在の DNS ラベル(確定 dns_name → 表示名の正規化 → `host`)。
+/// zone_for の従来導出と同じ規則(表示・重複検証用)。
+pub fn host_dns_label(config: &Config) -> String {
+    use peercove_core::names;
+    config.interface.dns_name.clone().unwrap_or_else(|| {
+        config
+            .interface
+            .display_name
+            .as_deref()
+            .and_then(names::dns_label)
+            .unwrap_or_else(|| names::HOST_DNS_LABEL.to_string())
+    })
+}
+
+/// ピアの現在の DNS ラベル(確定 dns_name → 表示名の正規化 → `member-<oct>`)。
+pub fn peer_dns_label(peer: &PeerConfig) -> String {
+    use peercove_core::names;
+    peer.dns_name
+        .clone()
+        .or_else(|| peer.name.as_deref().and_then(names::dns_label))
+        .unwrap_or_else(|| {
+            let oct = peer
+                .allowed_ips
+                .first()
+                .map(|net| net.addr().octets()[3])
+                .unwrap_or(0);
+            format!("member-{oct}")
+        })
+}
+
 /// ネットワーク内で使用中の DNS ラベル一覧(ADR-0021 の重複検証用)。
 ///
 /// 確定済みの `dns_name` に加え、**未確定エントリの従来導出ラベル**
 /// (表示名の正規化 → 空なら host / member-<第4オクテット>)と
-/// カスタムレコード名も含める。従来導出で現に解決できている名前を、
+/// カスタムレコード名(最上位のみ — under 付きは親配下なので衝突しない、
+/// ADR-0022)も含める。従来導出で現に解決できている名前を、
 /// 明示設定が奪えないようにするため。
 pub fn taken_dns_labels(config: &Config, exclude: DnsExclude) -> std::collections::HashSet<String> {
-    use peercove_core::names;
     let mut taken = std::collections::HashSet::new();
     if !matches!(exclude, DnsExclude::Host) {
-        taken.insert(config.interface.dns_name.clone().unwrap_or_else(|| {
-            config
-                .interface
-                .display_name
-                .as_deref()
-                .and_then(names::dns_label)
-                .unwrap_or_else(|| names::HOST_DNS_LABEL.to_string())
-        }));
+        taken.insert(host_dns_label(config));
     }
     for peer in &config.peers {
         if matches!(exclude, DnsExclude::Peer(key) if *key == peer.public_key) {
             continue;
         }
-        let label = peer
-            .dns_name
-            .clone()
-            .or_else(|| peer.name.as_deref().and_then(names::dns_label))
-            .unwrap_or_else(|| {
-                let oct = peer
-                    .allowed_ips
-                    .first()
-                    .map(|net| net.addr().octets()[3])
-                    .unwrap_or(0);
-                format!("member-{oct}")
-            });
-        taken.insert(label);
+        taken.insert(peer_dns_label(peer));
     }
     for record in &config.dns_records {
-        taken.insert(record.name.clone());
+        if record.under.is_none() {
+            taken.insert(record.name.clone());
+        }
     }
     taken
 }
@@ -655,6 +699,54 @@ mod tests {
             &host_key
         )
         .is_err());
+    }
+
+    /// カスタムレコードのメンバー参照(ADR-0022): 鍵ローテーションで参照が
+    /// 追随し、メンバー削除で参照レコードが掃除される。
+    #[test]
+    fn records_follow_rotation_and_removal() {
+        use crate::dns::{add_record, list_records, RecordTarget};
+        use peercove_core::config::MemberRef;
+
+        let config = setup("records-follow");
+        let alice = add(&config, "alice", "10.100.42.2");
+        add(&config, "bob", "10.100.42.3");
+        let host_key = PrivateKey::generate().public_key();
+
+        add_record(
+            &config,
+            "gamehost",
+            RecordTarget::Member(MemberRef::Key(alice)),
+            None,
+        )
+        .unwrap();
+        add_record(
+            &config,
+            "web",
+            RecordTarget::Member(MemberRef::Key(alice)),
+            Some(MemberRef::Key(alice)),
+        )
+        .unwrap();
+        add_record(
+            &config,
+            "nas",
+            RecordTarget::Ip("10.100.42.50".parse().unwrap()),
+            None,
+        )
+        .unwrap();
+
+        // 鍵ローテーション: member / under の両参照が新しい鍵へ差し替わる
+        let new_key = PrivateKey::generate().public_key();
+        rotate_peer_key(&config, "10.100.42.2".parse().unwrap(), &new_key, &host_key).unwrap();
+        let parsed = Config::load(&config).unwrap();
+        assert_eq!(parsed.dns_records[0].member, Some(MemberRef::Key(new_key)));
+        assert_eq!(parsed.dns_records[1].under, Some(MemberRef::Key(new_key)));
+
+        // メンバー削除: 参照レコードだけ消え、固定 IP レコードは残る
+        remove_peer(&config, &Selector::Name("alice")).unwrap();
+        let records = list_records(&config).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "nas");
     }
 
     /// DNS 名の設定(ADR-0021): 正規化して書き込み、表示名は触らない。

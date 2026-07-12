@@ -482,14 +482,20 @@ pub async fn supervise(
                         }
                     };
                     // 台帳 + DNS レコード: host は設定+統計から構築して配布、
-                    // member は受信済みを表示(M3-1 で dns_records が加わった)
+                    // member は受信済みを表示(M3-1 で dns_records が加わった)。
+                    // レコードのメンバー参照(ADR-0022)はここで毎周期
+                    // その時点の仮想 IP・DNS ラベルへ解決する(IP 追随)
                     let mut direct_routes = HashMap::new();
                     let distribution = match role {
                         Role::Host => config.as_ref().map(|config| {
+                            let members = build_ledger(config, &host_public_key, &stats);
                             let dist = control::Distribution {
-                                members: build_ledger(config, &host_public_key, &stats),
-                                dns_records: config.dns_records.clone(),
+                                dns_records: peercove_core::dns::resolve_records(
+                                    &config.dns_records,
+                                    &members,
+                                ),
                                 deny: config.acl.normalized_deny(),
+                                members,
                             };
                             ledger_tx.send_if_modified(|current| {
                                 if *current != dist {

@@ -23,10 +23,10 @@ pub struct Config {
     pub interface: InterfaceConfig,
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
-    /// カスタム DNS レコード(ADR-0011 §1b)。ホスト設定のみ意味を持ち、
-    /// 台帳と一緒にメンバーへ配布される。
+    /// カスタム DNS レコード(ADR-0011 §1b、ADR-0022 で拡張)。ホスト設定のみ
+    /// 意味を持ち、ホストが配布時に IP へ解決してから台帳と一緒に配る。
     #[serde(default, rename = "dns_record", skip_serializing_if = "Vec::is_empty")]
-    pub dns_records: Vec<crate::dns::DnsRecord>,
+    pub dns_records: Vec<DnsRecordConfig>,
     /// アクセス制御(ADR-0018、M3-10)。ホスト設定のみ意味を持つ。
     /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
     /// 読めない(明示エラーになる)。
@@ -65,6 +65,88 @@ impl AclConfig {
         self.deny
             .iter()
             .any(|&(a, b)| (a == x && b == y) || (a == y && b == x))
+    }
+}
+
+/// カスタム DNS レコードの設定表現(ADR-0022、M3-14b)。
+///
+/// ターゲットは `ip`(固定 IP、従来型)/ `member`(メンバー参照 = 配布時に
+/// その時点の仮想 IP へ解決)の排他でどちらか必須。`under` を指定すると
+/// 親メンバー配下のサブドメイン(`<name>.<親のDNSラベル>.<net>.…`)になる。
+/// `ip` + `under` は LAN 機器レコードで、ip は親の広告サブネット内のみ許可。
+/// 注意: `member` / `under` を書いた設定は旧バージョンでは読めない
+/// (`deny_unknown_fields`。subnets / ACL / dns_name と同じ扱い)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsRecordConfig {
+    /// 正規化済みラベル(単一。ドットは持たない — 階層は `under` で表す)
+    pub name: String,
+    /// ターゲット A: 固定 IP
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<std::net::Ipv4Addr>,
+    /// ターゲット B: メンバー参照(IP 自動追随)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<MemberRef>,
+    /// 親メンバー(端末配下サブドメイン)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub under: Option<MemberRef>,
+}
+
+/// メンバー参照(ADR-0022)。ホスト自身は公開鍵が host.toml に無いため
+/// 番兵文字列 `"host"`、メンバーは公開鍵 base64 で表す。
+/// 鍵ローテーション(ADR-0020)時は ops::peers::rotate_peer_key が
+/// `[[dns_record]]` 内の参照も併せて書き換える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemberRef {
+    Host,
+    Key(PublicKey),
+}
+
+impl MemberRef {
+    /// 設定・IPC で使う文字列表現(`"host"` または公開鍵 base64)。
+    pub fn to_config_string(&self) -> String {
+        match self {
+            MemberRef::Host => "host".to_string(),
+            MemberRef::Key(key) => key.to_base64(),
+        }
+    }
+}
+
+impl std::str::FromStr for MemberRef {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        if s == "host" {
+            return Ok(MemberRef::Host);
+        }
+        PublicKey::from_base64(s).map(MemberRef::Key)
+    }
+}
+
+impl std::fmt::Display for MemberRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_config_string())
+    }
+}
+
+impl Serialize for MemberRef {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_config_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for MemberRef {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(|_| {
+            serde::de::Error::custom(
+                "メンバー参照は \"host\" または公開鍵(base64)で指定してください",
+            )
+        })
     }
 }
 
@@ -299,6 +381,13 @@ impl Config {
                 }
             }
         }
+        // カスタムレコード(ADR-0022): (name, under) で一意。ターゲットは
+        // ip / member の排他必須。参照先メンバーの存在と LAN 機器
+        // (ip + under)の広告サブネット内チェックもここで行う
+        let member_exists = |member: &MemberRef| match member {
+            MemberRef::Host => true,
+            MemberRef::Key(key) => self.peers.iter().any(|p| p.public_key == *key),
+        };
         let mut seen_records = std::collections::HashSet::new();
         for record in &self.dns_records {
             if !crate::names::is_dns_label(&record.name) {
@@ -307,8 +396,50 @@ impl Config {
                     record.name
                 ));
             }
-            if !seen_records.insert(record.name.as_str()) {
+            if !seen_records.insert((record.name.as_str(), record.under)) {
                 return invalid(format!("dns_record \"{}\" が重複しています", record.name));
+            }
+            match (&record.ip, &record.member) {
+                (Some(_), Some(_)) => {
+                    return invalid(format!(
+                        "dns_record \"{}\" に ip と member の両方は指定できません",
+                        record.name
+                    ));
+                }
+                (None, None) => {
+                    return invalid(format!(
+                        "dns_record \"{}\" に ip か member のどちらかを指定してください",
+                        record.name
+                    ));
+                }
+                _ => {}
+            }
+            for reference in [&record.member, &record.under].into_iter().flatten() {
+                if !member_exists(reference) {
+                    return invalid(format!(
+                        "dns_record \"{}\" の参照先メンバーが登録されていません",
+                        record.name
+                    ));
+                }
+            }
+            // LAN 機器レコード(要望 14): ip は親メンバーの広告サブネット内のみ
+            if let (Some(ip), Some(under)) = (&record.ip, &record.under) {
+                let subnets: Vec<Ipv4Net> = match under {
+                    MemberRef::Host => vec![], // ホストは広告サブネットを持たない
+                    MemberRef::Key(key) => self
+                        .peers
+                        .iter()
+                        .find(|p| p.public_key == *key)
+                        .map(|p| p.subnets.clone())
+                        .unwrap_or_default(),
+                };
+                if !subnets.iter().any(|subnet| subnet.contains(ip)) {
+                    return invalid(format!(
+                        "dns_record \"{}\" の IP {ip} が親メンバーの広告サブネットの範囲外です\
+                        (LAN 機器は広告サブネット内の IP のみ登録できます)",
+                        record.name
+                    ));
+                }
             }
         }
         Ok(())
@@ -471,7 +602,12 @@ ip = "10.100.42.50"
         config.validate().unwrap();
         assert_eq!(config.dns_records.len(), 1);
         assert_eq!(config.dns_records[0].name, "nas");
-        assert_eq!(config.dns_records[0].ip.to_string(), "10.100.42.50");
+        assert_eq!(
+            config.dns_records[0].ip.unwrap().to_string(),
+            "10.100.42.50"
+        );
+        assert_eq!(config.dns_records[0].member, None);
+        assert_eq!(config.dns_records[0].under, None);
 
         // 不正ラベル・重複は弾く
         let mut bad = config.clone();
@@ -480,6 +616,92 @@ ip = "10.100.42.50"
         let mut dup = config.clone();
         dup.dns_records.push(dup.dns_records[0].clone());
         assert!(dup.validate().is_err());
+    }
+
+    /// 拡張レコード(ADR-0022): member / under の解析、排他必須、参照先の
+    /// 存在確認、LAN 機器(ip + under)の広告サブネット内チェック。
+    #[test]
+    fn dns_records_member_targets_validate() {
+        let peer_key = crate::keys::PrivateKey::generate().public_key();
+        let config = parse(&format!(
+            r#"
+[interface]
+private_key_file = "host.key"
+address = "10.100.42.1/24"
+
+[[peer]]
+public_key = "{peer_key}"
+allowed_ips = ["10.100.42.2/32"]
+subnets = ["192.168.10.0/24"]
+
+[[dns_record]]
+name = "gamehost"
+member = "{peer_key}"
+
+[[dns_record]]
+name = "web"
+member = "host"
+under = "host"
+
+[[dns_record]]
+name = "printer"
+ip = "192.168.10.50"
+under = "{peer_key}"
+"#
+        ));
+        config.validate().unwrap();
+        assert_eq!(config.dns_records[0].member, Some(MemberRef::Key(peer_key)));
+        assert_eq!(config.dns_records[1].under, Some(MemberRef::Host));
+
+        // ip と member の両方 / どちらも無しは弾く
+        let mut bad = config.clone();
+        bad.dns_records[0].ip = Some("10.100.42.9".parse().unwrap());
+        assert!(bad.validate().is_err());
+        let mut bad = config.clone();
+        bad.dns_records[0].member = None;
+        assert!(bad.validate().is_err());
+
+        // 未登録メンバーへの参照は弾く
+        let stranger = crate::keys::PrivateKey::generate().public_key();
+        let mut bad = config.clone();
+        bad.dns_records[0].member = Some(MemberRef::Key(stranger));
+        assert!(bad.validate().is_err());
+
+        // LAN 機器: 広告サブネット外の IP、ホスト配下の ip レコードは弾く
+        let mut bad = config.clone();
+        bad.dns_records[2].ip = Some("192.168.99.50".parse().unwrap());
+        assert!(bad.validate().is_err());
+        let mut bad = config.clone();
+        bad.dns_records[2].under = Some(MemberRef::Host);
+        assert!(bad.validate().is_err());
+
+        // 親が違えば同名可、同じ親なら重複
+        let mut ok = config.clone();
+        ok.dns_records.push(DnsRecordConfig {
+            name: "web".to_string(),
+            ip: None,
+            member: Some(MemberRef::Key(peer_key)),
+            under: Some(MemberRef::Key(peer_key)),
+        });
+        ok.validate().unwrap();
+        let mut dup = ok.clone();
+        dup.dns_records
+            .push(dup.dns_records.last().unwrap().clone());
+        assert!(dup.validate().is_err());
+
+        // 不正なメンバー参照文字列は解析段階で弾く
+        assert!(toml::from_str::<Config>(
+            r#"
+[interface]
+private_key_file = "host.key"
+address = "10.100.42.1/24"
+
+[[dns_record]]
+name = "x"
+member = "not-a-key"
+"#
+        )
+        .is_err());
     }
 
     #[test]

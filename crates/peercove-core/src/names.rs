@@ -47,6 +47,12 @@ pub fn is_dns_label(input: &str) -> bool {
     dns_label(input).as_deref() == Some(input)
 }
 
+/// ドット区切りの相対名(`web.alice` 等、ADR-0022)として正規形かどうか。
+/// 各ラベルが [`is_dns_label`] を満たせばよい(単一ラベルも真)。
+pub fn is_dns_name(input: &str) -> bool {
+    !input.is_empty() && input.split('.').all(is_dns_label)
+}
+
 /// DNS 名に使えない予約語(ADR-0021 §4)。将来の内部用途と
 /// 紛らわしい名前を先取りで塞ぐ。
 pub const RESERVED_DNS_LABELS: &[&str] = &[
@@ -151,6 +157,18 @@ mod tests {
             normalize_dns_name("dns", true),
             Err(DnsNameError::Reserved("dns".into()))
         );
+    }
+
+    #[test]
+    fn is_dns_name_accepts_dotted_relative_names() {
+        assert!(is_dns_name("web"));
+        assert!(is_dns_name("web.alice"));
+        assert!(is_dns_name("nas.member-2"));
+        assert!(!is_dns_name("Web.alice"));
+        assert!(!is_dns_name("web..alice"));
+        assert!(!is_dns_name(".alice"));
+        assert!(!is_dns_name("web.alice."));
+        assert!(!is_dns_name(""));
     }
 
     #[test]
