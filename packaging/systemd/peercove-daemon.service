@@ -11,7 +11,7 @@
 
 [Unit]
 Description=PeerCove daemon (P2P tunnel management)
-Documentation=https://github.com/peercove
+Documentation=https://github.com/sgcmt176/peercove
 After=network-online.target
 Wants=network-online.target
 
