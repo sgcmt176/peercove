@@ -114,6 +114,13 @@ pub enum IpcRequest {
     /// 非同期に行われ、完了時に数秒の再接続が発生する。
     /// 追加メソッドなので [`IPC_VERSION`] は上げない。
     RotateKey { config: PathBuf },
+    /// (member のみ)自分の DNS 名の変更を要求する(ADR-0021、M3-14a)。
+    /// デーモンがコントロールチャネルでホストへ届け、検証・適用の結果を
+    /// 待って返す(成功 = Done / 拒否・タイムアウト = Err に理由)。
+    /// ホスト自身・ホストから見た各メンバーの変更は設定ファイル操作
+    /// (peercove-ops)で行い、IPC には乗せない(ADR-0007)。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    SetDnsName { config: PathBuf, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -364,6 +371,10 @@ mod tests {
             },
             IpcRequest::Shutdown,
             IpcRequest::Logs { after_seq: 42 },
+            IpcRequest::SetDnsName {
+                config: PathBuf::from("member.toml"),
+                name: "yamada-dev".to_string(),
+            },
         ];
         for (i, req) in requests.into_iter().enumerate() {
             let envelope = IpcEnvelope { id: i as u64, req };

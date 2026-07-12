@@ -47,6 +47,48 @@ pub fn is_dns_label(input: &str) -> bool {
     dns_label(input).as_deref() == Some(input)
 }
 
+/// DNS 名に使えない予約語(ADR-0021 §4)。将来の内部用途と
+/// 紛らわしい名前を先取りで塞ぐ。
+pub const RESERVED_DNS_LABELS: &[&str] = &[
+    "localhost",
+    "local",
+    "internal",
+    "arpa",
+    "peercove",
+    "dns",
+    "gateway",
+    "relay",
+];
+
+/// ホスト専用のラベル(`host.<ネットワーク>.peercove.internal`)。
+/// メンバーの DNS 名としては予約語扱いで拒否する。
+pub const HOST_DNS_LABEL: &str = "host";
+
+/// DNS 名の検証エラー(ADR-0021 §4)。
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DnsNameError {
+    #[error(
+        "DNS 名には英数字(a-z、0-9)を 1 文字以上含めてください(使える文字は英数字とハイフンのみ)"
+    )]
+    Empty,
+    #[error("「{0}」は予約されているため DNS 名に使えません")]
+    Reserved(String),
+}
+
+/// 入力を DNS 名として正規化・検証する(ADR-0021 §4)。
+///
+/// 正規化は [`dns_label`] と同じ(小文字化・空白/記号はハイフンへ)。
+/// `for_host` はホスト自身の名前かどうか([`HOST_DNS_LABEL`] はホスト専用)。
+/// **重複チェックは含まない**(ホスト設定全体との突合は呼び出し側 =
+/// peercove-ops が行う)。
+pub fn normalize_dns_name(input: &str, for_host: bool) -> Result<String, DnsNameError> {
+    let label = dns_label(input).ok_or(DnsNameError::Empty)?;
+    if RESERVED_DNS_LABELS.contains(&label.as_str()) || (!for_host && label == HOST_DNS_LABEL) {
+        return Err(DnsNameError::Reserved(label));
+    }
+    Ok(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +121,36 @@ mod tests {
         let tricky = format!("{}-{}", "a".repeat(62), "b".repeat(10));
         let label = dns_label(&tricky).unwrap();
         assert!(!label.ends_with('-'));
+    }
+
+    #[test]
+    fn normalize_dns_name_validates() {
+        // 正規化(小文字化・空白→ハイフン)して返す
+        assert_eq!(
+            normalize_dns_name("Yamada Dev", false),
+            Ok("yamada-dev".into())
+        );
+        // 英数字が残らない入力はエラー
+        assert_eq!(
+            normalize_dns_name("開発機", false),
+            Err(DnsNameError::Empty)
+        );
+        // 予約語は拒否(正規化後で判定)
+        assert_eq!(
+            normalize_dns_name("LocalHost", false),
+            Err(DnsNameError::Reserved("localhost".into()))
+        );
+        // host はホスト専用
+        assert_eq!(
+            normalize_dns_name("host", false),
+            Err(DnsNameError::Reserved("host".into()))
+        );
+        assert_eq!(normalize_dns_name("host", true), Ok("host".into()));
+        // ホストでも一般予約語は不可
+        assert_eq!(
+            normalize_dns_name("dns", true),
+            Err(DnsNameError::Reserved("dns".into()))
+        );
     }
 
     #[test]

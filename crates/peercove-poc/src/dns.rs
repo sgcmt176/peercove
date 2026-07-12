@@ -243,6 +243,7 @@ mod tests {
         use peercove_core::keys::PrivateKey;
         let entry = |name: &str, ip: &str| LedgerEntry {
             name: Some(name.to_string()),
+            dns_name: None,
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             online: true,

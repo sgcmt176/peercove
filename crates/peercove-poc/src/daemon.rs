@@ -69,6 +69,9 @@ struct Active {
     /// (member)鍵ローテーションの手動要求(ADR-0020、M3-11)。IPC が立て、
     /// supervise 内の状態機械が次の周期で拾う
     rotate_request: Arc<std::sync::atomic::AtomicBool>,
+    /// (member)制御接続への差し込み口(ADR-0021)。IPC の SetDnsName が
+    /// ここからホストへ依頼を送り、応答を待つ
+    member_link: Arc<crate::control::MemberLink>,
 }
 
 impl DaemonShared {
@@ -162,6 +165,37 @@ impl DaemonShared {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!("鍵の更新要求を受け付けました(network={})", active.network);
                 Ok(IpcResponse::Done)
+            }
+            IpcRequest::SetDnsName { config, name } => {
+                // (member)DNS 名の変更依頼(ADR-0021)。ホストへ送って
+                // 検証・適用の結果を待つ。ロックは送信前に手放す
+                let (link, network) = {
+                    let active = self.active.lock().await;
+                    let active = active.get(&Self::key_for(&config)).with_context(|| {
+                        format!("この設定のトンネルは動いていません({})", config.display())
+                    })?;
+                    if active.role != Role::Member {
+                        bail!(
+                            "この操作はメンバーとして参加しているネットワーク用です\
+                            (ホストの DNS 名は設定画面から変更できます)"
+                        );
+                    }
+                    (Arc::clone(&active.member_link), active.network.clone())
+                };
+                let reply = link
+                    .request_dns_name(name)
+                    .context("ホストに接続していません(接続が確立してからやり直してください)")?;
+                match tokio::time::timeout(std::time::Duration::from_secs(10), reply).await {
+                    Ok(Ok((true, message))) => {
+                        tracing::info!("DNS 名を変更しました(network={network}): {message}");
+                        Ok(IpcResponse::Done)
+                    }
+                    Ok(Ok((false, message))) => bail!("{message}"),
+                    Ok(Err(_)) => bail!("ホストとの接続が切れました。やり直してください"),
+                    Err(_) => bail!(
+                        "ホストから応答がありません(ホストのバージョンが古い可能性があります)"
+                    ),
+                }
             }
         }
     }
@@ -735,6 +769,9 @@ impl DaemonShared {
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let transfers: crate::msg::TransferRegistry = Default::default();
         let rotate_request: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        // (member)制御接続への差し込み口(ADR-0020/0021)。supervisor の
+        // 入れ直しをまたいで共有し、IPC の SetDnsName がここから送る
+        let member_link: Arc<crate::control::MemberLink> = Default::default();
         // チャット履歴・グループ情報の読み込み(数 MB 程度の同期 I/O。起動時のみ)
         let chat = crate::chat::ChatLog::load(&config);
         let groups = crate::groups::GroupStore::load(&config);
@@ -743,6 +780,7 @@ impl DaemonShared {
         let task_chat = Arc::clone(&chat);
         let task_groups = Arc::clone(&groups);
         let task_rotate = Arc::clone(&rotate_request);
+        let task_link = Arc::clone(&member_link);
         let task_config = config.clone();
         // Linux のスプリット DNS は per-link 設定のため、鍵ローテーションの
         // 入れ直し(インターフェース再作成)後に付け直す(ADR-0020)
@@ -761,6 +799,7 @@ impl DaemonShared {
                         Arc::clone(&task_chat),
                         Arc::clone(&task_groups),
                         Arc::clone(&task_rotate),
+                        Arc::clone(&task_link),
                     )
                     .await;
                 match result {
@@ -824,6 +863,7 @@ impl DaemonShared {
                 chat,
                 groups,
                 rotate_request,
+                member_link,
             },
         );
         drop(active);

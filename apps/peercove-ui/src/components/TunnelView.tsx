@@ -121,6 +121,25 @@ export function TunnelView({
     }
   };
 
+  // DNS 名の変更(ADR-0021、M3-14a)。ホストは全員分を直接、
+  // メンバーは自分の分だけデーモン経由(ホストが検証)で変更する
+  const renameDns = async (member: Member, label: string) => {
+    setError(null);
+    try {
+      if (isHost) {
+        if (member.isHost) await api.setHostDnsName(tunnel.config, label);
+        else await api.setMemberDnsName(tunnel.config, member.publicKey, label);
+      } else {
+        await api.setMyDnsName(tunnel.config, label);
+      }
+      setNotice(t.tunnel.member.dnsRenamed);
+      setTimeout(() => setNotice(null), 8000);
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
   return (
     <>
       {tunnel.removed && (
@@ -257,8 +276,10 @@ export function TunnelView({
                     member={member}
                     peer={peerByKey.get(member.publicKey) ?? null}
                     canManage={isHost && !member.isHost}
+                    canEditDns={isHost || member.isSelf}
                     onRemove={() => setRemoving(member)}
                     onRename={(newName) => void rename(member, newName)}
+                    onRenameDns={(label) => void renameDns(member, label)}
                     onSubnets={() => setEditingSubnets(member)}
                   />
                 ))}
@@ -707,8 +728,10 @@ function MemberRow({
   member,
   peer,
   canManage,
+  canEditDns,
   onRemove,
   onRename,
+  onRenameDns,
   onSubnets,
 }: {
   config: string;
@@ -716,19 +739,33 @@ function MemberRow({
   /** この行のメンバーと張っている WG ピア(統計)。無ければ null。 */
   peer: Peer | null;
   canManage: boolean;
+  /** DNS 名を変更できるか(ADR-0021。ホスト = 全員 / メンバー = 自分のみ)。 */
+  canEditDns: boolean;
   onRemove: () => void;
   onRename: (newName: string) => void;
+  /** DNS 名(先頭ラベルのみ)の変更(ADR-0021、M3-14a)。 */
+  onRenameDns: (label: string) => void;
   /** 広告サブネットの編集を開く(M3-7b、ホストのみ)。 */
   onSubnets: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(member.name ?? "");
+  const [editingDns, setEditingDns] = useState(false);
+  const [dnsDraft, setDnsDraft] = useState("");
   const rates = peer ? rateSeries(config, peer.publicKey) : [];
+  /** DNS 名の先頭ラベル(fqdn の 1 つ目。編集対象はここだけ)。 */
+  const dnsLabel = member.dnsName?.split(".")[0] ?? "";
 
   const commit = () => {
     const trimmed = draft.trim();
     setEditing(false);
     if (trimmed && trimmed !== member.name) onRename(trimmed);
+  };
+
+  const commitDns = () => {
+    const trimmed = dnsDraft.trim();
+    setEditingDns(false);
+    if (trimmed && trimmed !== dnsLabel) onRenameDns(trimmed);
   };
 
   return (
@@ -788,10 +825,37 @@ function MemberRow({
         </span>
         <span className="member__meta">
           <span className="mono">{member.ip}</span>
-          {member.dnsName && (
-            <span className="mono ellipsis" title={member.dnsName}>
-              {member.dnsName}
-            </span>
+          {editingDns ? (
+            <input
+              className="member__edit mono"
+              value={dnsDraft}
+              autoFocus
+              onChange={(event) => setDnsDraft(event.target.value)}
+              onBlur={commitDns}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") commitDns();
+                if (event.key === "Escape") setEditingDns(false);
+              }}
+            />
+          ) : (
+            member.dnsName && (
+              <span className="mono ellipsis" title={member.dnsName}>
+                {member.dnsName}
+                {canEditDns && (
+                  <button
+                    type="button"
+                    className="button--icon button--icon-inline"
+                    title={t.tunnel.member.editDns}
+                    onClick={() => {
+                      setDnsDraft(dnsLabel);
+                      setEditingDns(true);
+                    }}
+                  >
+                    ✎
+                  </button>
+                )}
+              </span>
+            )
           )}
         </span>
       </span>

@@ -56,6 +56,16 @@ pub enum ControlMessage {
     /// `accepted` なら host.toml へ永続化済み(適用は次回再読込 ≤5 秒)。
     /// 既に同じ鍵が登録済みの依頼も成功扱い(冪等)。
     RotateKeyResult { accepted: bool, message: String },
+    /// member → host: 自分の DNS 名の変更依頼(ADR-0021、M3-14a)。
+    /// ホストが検証(正規化・予約語・重複)して host.toml へ永続化し、
+    /// 台帳の再配布で全員に伝わる。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
+    /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
+    SetDnsName { name: String },
+    /// host → member: [`ControlMessage::SetDnsName`] への応答。
+    /// 拒否時は `message` に理由(重複・予約語など)が入る。
+    SetDnsNameResult { accepted: bool, message: String },
 }
 
 /// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。
@@ -63,6 +73,13 @@ pub enum ControlMessage {
 pub struct LedgerEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 確定済みの DNS 名(ADR-0021、M3-14a)。host.toml が正本。
+    /// あればゾーン導出はこれをそのままラベルに使う。無ければ(旧ホスト・
+    /// アップグレード前に登録されたピア)従来どおり `name` から導出する。
+    /// 互換規則は endpoint と同じ(追加フィールド — 旧バージョンとは
+    /// 互いに無視し合う)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
     pub ip: Ipv4Addr,
     pub public_key: PublicKey,
     /// 最終ハンドシェイクが十分新しい(ホストから見て到達可能)か。
@@ -103,6 +120,7 @@ mod tests {
     fn entry() -> LedgerEntry {
         LedgerEntry {
             name: Some("alice".to_string()),
+            dns_name: None,
             ip: "100.100.42.2".parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             online: true,
@@ -151,6 +169,13 @@ mod tests {
             ControlMessage::RotateKeyResult {
                 accepted: false,
                 message: "既に使われています".to_string(),
+            },
+            ControlMessage::SetDnsName {
+                name: "yamada-dev".to_string(),
+            },
+            ControlMessage::SetDnsNameResult {
+                accepted: true,
+                message: "更新しました".to_string(),
             },
         ];
         for message in messages {
@@ -215,6 +240,39 @@ mod tests {
             json,
             r#"{"type":"rotate_key_result","accepted":true,"message":"更新しました"}"#
         );
+    }
+
+    /// DNS 名の変更依頼(ADR-0021、M3-14a)のワイヤ表現と、
+    /// `LedgerEntry.dns_name` の互換規則(None ならワイヤに現れない)。
+    #[test]
+    fn set_dns_name_wire_format() {
+        let json = serde_json::to_string(&ControlMessage::SetDnsName {
+            name: "yamada-dev".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"set_dns_name","name":"yamada-dev"}"#);
+        let json = serde_json::to_string(&ControlMessage::SetDnsNameResult {
+            accepted: false,
+            message: "既に使われています".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"set_dns_name_result","accepted":false,"message":"既に使われています"}"#
+        );
+
+        // dns_name が None ならワイヤに現れず、旧バージョンの台帳も読める
+        let e = entry();
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("dns_name"), "{json}");
+        let parsed: LedgerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.dns_name, None);
+
+        let mut e = entry();
+        e.dns_name = Some("alice-pc".to_string());
+        let parsed: LedgerEntry =
+            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(parsed.dns_name.as_deref(), Some("alice-pc"));
     }
 
     /// blocked(ADR-0018、M3-10)の互換規則: false ならワイヤに現れず、

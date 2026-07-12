@@ -17,6 +17,7 @@ pub fn run(config_path: &Path, pubkey: &str, ip: Ipv4Addr) -> anyhow::Result<()>
             public_key,
             ip,
             name: None,
+            dns_name: None,
             preshared_key_file: None,
         },
     )?;

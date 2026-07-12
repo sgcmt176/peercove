@@ -87,6 +87,19 @@ async fn rotate_key(config_path: String) -> Result<(), String> {
     send(IpcRequest::RotateKey { config }).await
 }
 
+/// (member)自分の DNS 名の変更を要求する(ADR-0021、M3-14a)。
+/// デーモンがコントロールチャネルでホストへ届け、検証・適用の結果を待つ。
+/// 拒否(重複・予約語)やタイムアウトはエラー文字列で返る。
+#[tauri::command]
+async fn set_my_dns_name(config_path: String, dns_name: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::SetDnsName {
+        config,
+        name: dns_name,
+    })
+    .await
+}
+
 // ---- 通知(M2-G6) ----
 
 /// OS 通知を出す(メンバーの参加・切断)。
@@ -747,6 +760,34 @@ fn rename_member(config_path: String, public_key: String, new_name: String) -> R
     .map_err(to_message)
 }
 
+/// メンバーの DNS 名を変更する(ADR-0021、M3-14a)。ホスト設定(host.toml)に
+/// 対してのみ有効。正規化後のラベルを返す(約 5 秒で全メンバーへ配布される)。
+#[tauri::command]
+fn set_member_dns_name(
+    config_path: String,
+    public_key: String,
+    dns_name: String,
+) -> Result<String, String> {
+    use peercove_ops::peers::DnsNameOutcome;
+    let outcome = peercove_ops::peers::set_peer_dns_name(
+        Path::new(&config_path),
+        &Selector::PublicKey(&public_key),
+        dns_name.trim(),
+    )
+    .map_err(to_message)?;
+    Ok(match outcome {
+        DnsNameOutcome::Applied { label, .. } | DnsNameOutcome::Unchanged { label } => label,
+    })
+}
+
+/// ホスト自身の DNS 名を変更する(ADR-0021、M3-14a)。ホスト設定のみ有効。
+/// 正規化後のラベルを返す。
+#[tauri::command]
+fn set_host_dns_name(config_path: String, dns_name: String) -> Result<String, String> {
+    peercove_ops::peers::set_host_dns_name(Path::new(&config_path), dns_name.trim())
+        .map_err(to_message)
+}
+
 /// メンバーの広告サブネット(ADR-0014、M3-7)を設定する。空配列で解除。
 /// ホスト設定(host.toml)に対してのみ有効。約 10 秒で全メンバーへ配布される。
 #[tauri::command]
@@ -929,6 +970,9 @@ pub fn run() {
             join_network,
             remove_member,
             rename_member,
+            set_member_dns_name,
+            set_my_dns_name,
+            set_host_dns_name,
             set_member_subnets,
             list_acl,
             set_acl,

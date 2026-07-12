@@ -18,6 +18,8 @@ pub struct NewPeer<'a> {
     pub ip: Ipv4Addr,
     /// 台帳用の表示名(invite 経由のとき)
     pub name: Option<&'a str>,
+    /// 確定済みの DNS 名(ADR-0021、M3-14a)。invite が IP 割当と同時に決める。
+    pub dns_name: Option<&'a str>,
     /// 設定ファイルからの相対パス(invite --psk のとき)
     pub preshared_key_file: Option<&'a str>,
 }
@@ -74,6 +76,9 @@ pub fn append_peer(config_path: &Path, peer: &NewPeer) -> anyhow::Result<()> {
     let mut block = String::from("\n[[peer]]\n");
     if let Some(name) = peer.name {
         block.push_str(&format!("name = {}\n", toml_string(name)));
+    }
+    if let Some(dns_name) = peer.dns_name {
+        block.push_str(&format!("dns_name = {}\n", toml_string(dns_name)));
     }
     block.push_str(&format!("public_key = \"{public_key}\"\n"));
     block.push_str(&format!("allowed_ips = [\"{ip}/32\"]\n"));
@@ -338,6 +343,135 @@ pub fn rotate_peer_key(
     Ok(RotateOutcome::Applied { display })
 }
 
+/// DNS 名の重複検証(ADR-0021 §4)で除外する対象(自分自身の現名は衝突にしない)。
+#[derive(Clone, Copy)]
+pub enum DnsExclude<'a> {
+    None,
+    Host,
+    Peer(&'a PublicKey),
+}
+
+/// ネットワーク内で使用中の DNS ラベル一覧(ADR-0021 の重複検証用)。
+///
+/// 確定済みの `dns_name` に加え、**未確定エントリの従来導出ラベル**
+/// (表示名の正規化 → 空なら host / member-<第4オクテット>)と
+/// カスタムレコード名も含める。従来導出で現に解決できている名前を、
+/// 明示設定が奪えないようにするため。
+pub fn taken_dns_labels(config: &Config, exclude: DnsExclude) -> std::collections::HashSet<String> {
+    use peercove_core::names;
+    let mut taken = std::collections::HashSet::new();
+    if !matches!(exclude, DnsExclude::Host) {
+        taken.insert(config.interface.dns_name.clone().unwrap_or_else(|| {
+            config
+                .interface
+                .display_name
+                .as_deref()
+                .and_then(names::dns_label)
+                .unwrap_or_else(|| names::HOST_DNS_LABEL.to_string())
+        }));
+    }
+    for peer in &config.peers {
+        if matches!(exclude, DnsExclude::Peer(key) if *key == peer.public_key) {
+            continue;
+        }
+        let label = peer
+            .dns_name
+            .clone()
+            .or_else(|| peer.name.as_deref().and_then(names::dns_label))
+            .unwrap_or_else(|| {
+                let oct = peer
+                    .allowed_ips
+                    .first()
+                    .map(|net| net.addr().octets()[3])
+                    .unwrap_or(0);
+                format!("member-{oct}")
+            });
+        taken.insert(label);
+    }
+    for record in &config.dns_records {
+        taken.insert(record.name.clone());
+    }
+    taken
+}
+
+/// DNS 名変更(ADR-0021、M3-14a)の適用結果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum DnsNameOutcome {
+    /// host.toml の dns_name を書き換えた。
+    Applied { display: String, label: String },
+    /// 既に同じ名前だった(冪等 — 再送された依頼)。
+    Unchanged { label: String },
+}
+
+/// メンバーの DNS 名を設定する(ADR-0021、M3-14a)。
+/// 入力は正規化(小文字化・空白/記号 → ハイフン)してから予約語・重複を検証する。
+pub fn set_peer_dns_name(
+    config_path: &Path,
+    selector: &Selector,
+    input: &str,
+) -> anyhow::Result<DnsNameOutcome> {
+    let label = peercove_core::names::normalize_dns_name(input, false)?;
+    let config = Config::load(config_path)?;
+    let target = find_peer(&config, selector)?;
+    let display = target.name.clone().unwrap_or_else(|| label.clone());
+    if target.dns_name.as_deref() == Some(label.as_str()) {
+        return Ok(DnsNameOutcome::Unchanged { label });
+    }
+    if taken_dns_labels(&config, DnsExclude::Peer(&target.public_key)).contains(&label) {
+        bail!("DNS 名「{label}」はこのネットワークで既に使用されています");
+    }
+    let target_key = target.public_key.to_base64();
+
+    let mut doc = load_doc(config_path)?;
+    let mut updated = false;
+    for table in peer_tables(&mut doc)?.iter_mut() {
+        let matches = table
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            == Some(target_key.as_str());
+        if matches {
+            table["dns_name"] = toml_edit::value(&label);
+            updated = true;
+        }
+    }
+    if !updated {
+        bail!("host.toml から対象ピアを特定できませんでした");
+    }
+    write_validated(config_path, &doc.to_string())?;
+    Ok(DnsNameOutcome::Applied { display, label })
+}
+
+/// コントロールチャネル経由(本人の仮想 IP で特定)の入り口(ADR-0021)。
+/// ホストデーモンが `set_dns_name` を受けて呼ぶ。
+pub fn set_peer_dns_name_by_ip(
+    config_path: &Path,
+    member_ip: Ipv4Addr,
+    input: &str,
+) -> anyhow::Result<DnsNameOutcome> {
+    set_peer_dns_name(config_path, &Selector::Ip(member_ip), input)
+}
+
+/// ホスト自身の DNS 名を設定する(ADR-0021)。戻り値は確定したラベル。
+pub fn set_host_dns_name(config_path: &Path, input: &str) -> anyhow::Result<String> {
+    let label = peercove_core::names::normalize_dns_name(input, true)?;
+    let config = Config::load(config_path)?;
+    if config.interface.dns_name.as_deref() == Some(label.as_str()) {
+        return Ok(label);
+    }
+    if taken_dns_labels(&config, DnsExclude::Host).contains(&label) {
+        bail!("DNS 名「{label}」はこのネットワークで既に使用されています");
+    }
+    let mut doc = load_doc(config_path)?;
+    let interface = doc
+        .get_mut("interface")
+        .and_then(|item| item.as_table_mut())
+        .context("[interface] が見つかりません")?;
+    interface.insert("dns_name", toml_edit::value(&label));
+    write_validated(config_path, &doc.to_string())?;
+    Ok(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +500,7 @@ mod tests {
                 public_key: key,
                 ip: ip.parse().unwrap(),
                 name: Some(name),
+                dns_name: None,
                 preshared_key_file: None,
             },
         )
@@ -440,6 +575,7 @@ mod tests {
             public_key: key,
             ip: "10.100.42.9".parse().unwrap(),
             name: None,
+            dns_name: None,
             preshared_key_file: None,
         };
         assert!(append_peer(&config, &dup).is_err(), "公開鍵の重複");
@@ -450,6 +586,7 @@ mod tests {
                 public_key: other,
                 ip: bad_ip.parse().unwrap(),
                 name: None,
+                dns_name: None,
                 preshared_key_file: None,
             };
             assert!(
@@ -518,6 +655,83 @@ mod tests {
             &host_key
         )
         .is_err());
+    }
+
+    /// DNS 名の設定(ADR-0021): 正規化して書き込み、表示名は触らない。
+    /// 冪等・重複・予約語・従来導出ラベルとの衝突も検証する。
+    #[test]
+    fn set_peer_dns_name_validates_and_persists() {
+        let config = setup("dns-name");
+        let alice = add(&config, "alice", "10.100.42.2");
+        add(&config, "テレビ", "10.100.42.3"); // 従来導出では member-3
+
+        // 正規化(大文字・空白)して書き込まれる。表示名は変わらない
+        let outcome = set_peer_dns_name(
+            &config,
+            &Selector::PublicKey(&alice.to_base64()),
+            "Alice PC",
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            DnsNameOutcome::Applied {
+                display: "alice".to_string(),
+                label: "alice-pc".to_string()
+            }
+        );
+        let parsed = Config::load(&config).unwrap();
+        assert_eq!(parsed.peers[0].dns_name.as_deref(), Some("alice-pc"));
+        assert_eq!(parsed.peers[0].name.as_deref(), Some("alice"));
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.starts_with("# ホスト設定のコメント"), "コメント保持");
+
+        // 同じ名前の再設定は Unchanged(冪等)
+        let outcome = set_peer_dns_name(
+            &config,
+            &Selector::Ip("10.100.42.2".parse().unwrap()),
+            "alice-pc",
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            DnsNameOutcome::Unchanged {
+                label: "alice-pc".to_string()
+            }
+        );
+
+        // 他メンバーの確定名・従来導出ラベル・予約語・ホスト名は拒否
+        let bob_selector = Selector::Name("テレビ");
+        assert!(set_peer_dns_name(&config, &bob_selector, "alice-pc").is_err());
+        assert!(set_peer_dns_name(&config, &bob_selector, "host").is_err());
+        assert!(set_peer_dns_name(&config, &bob_selector, "localhost").is_err());
+        assert!(
+            set_peer_dns_name(&config, &bob_selector, "開発機").is_err(),
+            "英数字なし"
+        );
+        // 従来導出中の自分のラベル(member-3)は自分でなら取れる
+        assert!(set_peer_dns_name(&config, &bob_selector, "member-3").is_ok());
+    }
+
+    /// ホスト自身の DNS 名(ADR-0021): host は許可、メンバーの名前とは衝突不可。
+    #[test]
+    fn set_host_dns_name_validates_and_persists() {
+        let config = setup("host-dns");
+        add(&config, "alice", "10.100.42.2");
+        set_peer_dns_name(&config, &Selector::Name("alice"), "game-pc").unwrap();
+
+        assert_eq!(set_host_dns_name(&config, "host").unwrap(), "host");
+        assert_eq!(
+            set_host_dns_name(&config, "Game Room").unwrap(),
+            "game-room"
+        );
+        let parsed = Config::load(&config).unwrap();
+        assert_eq!(parsed.interface.dns_name.as_deref(), Some("game-room"));
+
+        assert!(
+            set_host_dns_name(&config, "game-pc").is_err(),
+            "メンバーと重複"
+        );
+        assert!(set_host_dns_name(&config, "localhost").is_err(), "予約語");
     }
 
     #[test]

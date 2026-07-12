@@ -457,6 +457,8 @@ pub struct JoinResult {
 pub struct Settings {
     pub interface_name: String,
     pub display_name: Option<String>,
+    /// (host のみ)自分の DNS 名(ADR-0021、M3-14a)。
+    pub dns_name: Option<String>,
     pub address: String,
     pub listen_port: Option<u16>,
     pub mtu: u16,
@@ -477,6 +479,7 @@ impl From<peercove_ops::settings::Settings> for Settings {
         Self {
             interface_name: settings.interface_name,
             display_name: settings.display_name,
+            dns_name: settings.dns_name,
             address: settings.address,
             listen_port: settings.listen_port,
             mtu: settings.mtu,
@@ -495,6 +498,9 @@ impl From<peercove_ops::settings::Settings> for Settings {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsUpdate {
     pub display_name: Option<String>,
+    /// (host のみ)自分の DNS 名(ADR-0021)。None / 空文字で従来導出に戻す。
+    #[serde(default)]
+    pub dns_name: Option<String>,
     pub listen_port: Option<u16>,
     pub mtu: u16,
     pub host_endpoint: Option<String>,
@@ -506,6 +512,7 @@ impl From<SettingsUpdate> for peercove_ops::settings::Update {
     fn from(update: SettingsUpdate) -> Self {
         Self {
             display_name: update.display_name,
+            dns_name: update.dns_name,
             listen_port: update.listen_port,
             mtu: update.mtu,
             host_endpoint: update.host_endpoint,
@@ -568,6 +575,7 @@ mod tests {
             address: "10.100.42.1".parse().unwrap(),
             ledger: vec![LedgerEntry {
                 name: Some("alice".to_string()),
+                dns_name: None,
                 ip: "10.100.42.2".parse().unwrap(),
                 public_key: PrivateKey::generate().public_key(),
                 online: true,
@@ -632,6 +640,7 @@ mod tests {
     fn member_routes_are_derived_from_direct_map() {
         let entry = |name: &str, ip: &str, is_host: bool| LedgerEntry {
             name: Some(name.to_string()),
+            dns_name: None,
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             online: true,
@@ -731,6 +740,7 @@ mod tests {
         let json = serde_json::to_value(Settings::from(peercove_ops::settings::Settings {
             interface_name: "peercove0".to_string(),
             display_name: Some("alice".to_string()),
+            dns_name: None,
             address: "10.119.96.2/24".to_string(),
             listen_port: None,
             mtu: 1420,

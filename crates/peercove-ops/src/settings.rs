@@ -30,6 +30,11 @@ pub struct Settings {
     pub interface_name: String,
     /// 台帳に載る自分の表示名。
     pub display_name: Option<String>,
+    /// (host のみ)自分の DNS 名(ADR-0021、M3-14a)。未設定なら従来どおり
+    /// 表示名から導出(実質 `host`)。メンバーの DNS 名は host.toml が正本の
+    /// ためここには出ない(変更はデーモン IPC の set_dns_name 経由)。
+    /// 反映は次の supervisor 周期(約 5 秒)— 再起動不要。
+    pub dns_name: Option<String>,
     /// 自分の仮想 IP とサブネット(表示のみ。変更は init/join のやり直し)。
     pub address: String,
     /// UDP 待受ポート。メンバーでは未指定(OS 任せ)が普通。
@@ -61,6 +66,9 @@ impl Settings {
 pub struct Update {
     /// `None` または空文字で削除。
     pub display_name: Option<String>,
+    /// (host のみ)自分の DNS 名(ADR-0021)。`None` または空文字で削除
+    /// (従来導出に戻る)。メンバー設定では無視する。
+    pub dns_name: Option<String>,
     /// `None` で削除(ホストでは既定の 51820、メンバーでは OS 任せになる)。
     pub listen_port: Option<u16>,
     pub mtu: u16,
@@ -84,6 +92,7 @@ pub fn read(config_path: &Path) -> anyhow::Result<Settings> {
     Ok(Settings {
         interface_name: config.interface.name.clone(),
         display_name: config.interface.display_name.clone(),
+        dns_name: config.interface.dns_name.clone(),
         address: config.interface.address.to_string(),
         listen_port: config.interface.listen_port,
         mtu: config.interface.mtu,
@@ -128,6 +137,24 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         .transpose()?;
 
     let current = read(config_path)?;
+    // (host のみ)DNS 名(ADR-0021)。正規化 → 予約語・重複を検証してから書く
+    let dns_name = update
+        .dns_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|_| !current.is_member)
+        .map(|input| -> anyhow::Result<String> {
+            let label = peercove_core::names::normalize_dns_name(input, true)?;
+            let config = Config::load(config_path)?;
+            if crate::peers::taken_dns_labels(&config, crate::peers::DnsExclude::Host)
+                .contains(&label)
+            {
+                bail!("DNS 名「{label}」はこのネットワークで既に使用されています");
+            }
+            Ok(label)
+        })
+        .transpose()?;
     let mut doc = load_doc(config_path)?;
     let interface = doc
         .get_mut("interface")
@@ -138,6 +165,12 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         Some(name) => interface.insert("display_name", toml_edit::value(name)),
         None => interface.remove("display_name"),
     };
+    if !current.is_member {
+        match &dns_name {
+            Some(label) => interface.insert("dns_name", toml_edit::value(label)),
+            None => interface.remove("dns_name"),
+        };
+    }
     match update.listen_port {
         Some(port) => interface.insert("listen_port", toml_edit::value(i64::from(port))),
         None => interface.remove("listen_port"),
@@ -237,6 +270,7 @@ allowed_ips = ["10.119.96.2/32"]
             &path,
             &Update {
                 display_name: Some("  alice2 ".to_string()),
+                dns_name: None,
                 listen_port: Some(51900),
                 mtu: 1380,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
@@ -268,6 +302,7 @@ allowed_ips = ["10.119.96.2/32"]
             &path,
             &Update {
                 display_name: Some("alice2".to_string()),
+                dns_name: None,
                 listen_port: Some(51900),
                 mtu: 1380,
                 host_endpoint: None,
@@ -287,6 +322,66 @@ allowed_ips = ["10.119.96.2/32"]
         );
     }
 
+    /// ホスト自身の DNS 名(ADR-0021): 正規化して書き込み、空で削除。
+    /// メンバー設定では無視される。
+    #[test]
+    fn update_host_dns_name() {
+        let path = write("host-dns", HOST);
+        let base = Update {
+            display_name: None,
+            dns_name: None,
+            listen_port: None,
+            mtu: 1420,
+            host_endpoint: None,
+            direct: true,
+            max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
+        };
+        update(
+            &path,
+            &Update {
+                dns_name: Some("Game Room".to_string()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(read(&path).unwrap().dns_name.as_deref(), Some("game-room"));
+
+        // 予約語・メンバー名との重複は拒否(bob は従来導出ラベル)
+        assert!(update(
+            &path,
+            &Update {
+                dns_name: Some("localhost".to_string()),
+                ..base.clone()
+            }
+        )
+        .is_err());
+        assert!(update(
+            &path,
+            &Update {
+                dns_name: Some("bob".to_string()),
+                ..base.clone()
+            }
+        )
+        .is_err());
+
+        // 空で削除(従来導出に戻る)
+        update(&path, &base).unwrap();
+        assert_eq!(read(&path).unwrap().dns_name, None);
+
+        // メンバー設定では無視される(書き込まれない)
+        let member = write("member-dns", MEMBER);
+        update(
+            &member,
+            &Update {
+                dns_name: Some("my-pc".to_string()),
+                mtu: 1420,
+                ..base
+            },
+        )
+        .unwrap();
+        assert_eq!(read(&member).unwrap().dns_name, None);
+    }
+
     /// ホスト設定では endpoint を渡されても `[[peer]]`(= メンバー登録)を触らない。
     #[test]
     fn update_host_never_touches_peer_endpoint() {
@@ -295,6 +390,7 @@ allowed_ips = ["10.119.96.2/32"]
             &path,
             &Update {
                 display_name: None,
+                dns_name: None,
                 listen_port: None,
                 mtu: 1400,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
@@ -314,6 +410,7 @@ allowed_ips = ["10.119.96.2/32"]
         let path = write("reject", MEMBER);
         let base = Update {
             display_name: None,
+            dns_name: None,
             listen_port: None,
             mtu: 1420,
             host_endpoint: None,
@@ -357,6 +454,7 @@ allowed_ips = ["10.119.96.2/32"]
         let current = read(&write("restart", MEMBER)).unwrap();
         let same = Update {
             display_name: current.display_name.clone(),
+            dns_name: current.dns_name.clone(),
             listen_port: current.listen_port,
             mtu: current.mtu,
             host_endpoint: current.host_endpoint.clone(),

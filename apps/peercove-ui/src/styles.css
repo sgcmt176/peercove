@@ -389,6 +389,13 @@ button:disabled {
   color: #c0392b;
 }
 
+/* DNS 名の行内編集ボタン(M3-14a)。メタ行の文字サイズに合わせて小さく */
+.button--icon-inline {
+  font-size: 12px;
+  padding: 0 4px;
+  vertical-align: baseline;
+}
+
 .field {
   display: flex;
   flex-direction: column;

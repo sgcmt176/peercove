@@ -82,6 +82,7 @@ pub struct ReceivedDistribution {
 type LedgerDigest = (
     Vec<(
         Option<String>,                 // name
+        Option<String>,                 // dns_name(ADR-0021)
         Ipv4Addr,                       // ip
         peercove_core::keys::PublicKey, // 鍵の入れ替わりも「意味のある変化」
         bool,                           // online
@@ -99,6 +100,7 @@ fn ledger_digest(members: &[LedgerEntry], dns_records: &[DnsRecord]) -> LedgerDi
             .map(|m| {
                 (
                     m.name.clone(),
+                    m.dns_name.clone(),
                     m.ip,
                     m.public_key,
                     m.online,
@@ -129,6 +131,10 @@ struct MemberLinkState {
     session: u64,
     outbox: Option<Outbox>,
     rotate_result: Option<(bool, String)>,
+    /// DNS 名変更(ADR-0021)の応答待ち。IPC ハンドラが受け口を握り、
+    /// 読みタスクが応答を流し込む。切断(attach)で捨てられると受け口側は
+    /// Err になる(= 接続が切れた)。
+    dns_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
 }
 
 impl MemberLink {
@@ -152,19 +158,45 @@ impl MemberLink {
         self.inner.lock().unwrap().rotate_result.take()
     }
 
+    /// 自分の DNS 名の変更をホストへ依頼し、応答の受け口を返す(ADR-0021)。
+    /// 切断中なら `None`。先行する依頼の応答待ちがあれば破棄される
+    /// (受け口側は Err = 打ち切り扱い)。
+    pub fn request_dns_name(
+        &self,
+        name: String,
+    ) -> Option<tokio::sync::oneshot::Receiver<(bool, String)>> {
+        let mut state = self.inner.lock().unwrap();
+        let outbox = state.outbox.as_ref()?;
+        if outbox.send(ControlMessage::SetDnsName { name }).is_err() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.dns_reply = Some(tx);
+        Some(rx)
+    }
+
     fn attach(&self, outbox: Outbox) {
         let mut state = self.inner.lock().unwrap();
         state.session += 1;
         state.outbox = Some(outbox);
         state.rotate_result = None;
+        state.dns_reply = None; // 応答待ちの受け口は Err(切断)になる
     }
 
     fn detach(&self) {
-        self.inner.lock().unwrap().outbox = None;
+        let mut state = self.inner.lock().unwrap();
+        state.outbox = None;
+        state.dns_reply = None;
     }
 
     fn put_rotate_result(&self, accepted: bool, message: String) {
         self.inner.lock().unwrap().rotate_result = Some((accepted, message));
+    }
+
+    fn put_dns_result(&self, accepted: bool, message: String) {
+        if let Some(reply) = self.inner.lock().unwrap().dns_reply.take() {
+            let _ = reply.send((accepted, message));
+        }
     }
 }
 
@@ -183,18 +215,18 @@ impl MemberLink {
     }
 }
 
-/// ホスト側の鍵ローテーション処理(ADR-0020、M3-11)。
-/// `rotate_key` を受けたら host.toml の public_key を差し替えて応答する。
-/// 適用(WG ピアの入れ替え)は supervisor の次回再読込(≤5 秒)が行うため、
-/// 応答は旧鍵のセッションが生きているうちに届く。
-pub struct HostRotation {
+/// メンバー発の設定変更依頼をホスト側で host.toml へ適用する
+/// (鍵ローテーション = ADR-0020 / DNS 名変更 = ADR-0021)。
+/// 適用の反映(WG ピアの入れ替え・台帳の再配布)は supervisor の
+/// 次回再読込(≤5 秒)が行うため、応答は現行セッションが生きているうちに届く。
+pub struct HostRequests {
     config_path: std::path::PathBuf,
     host_public_key: peercove_core::keys::PublicKey,
     /// host.toml の読み書きを直列化する(複数メンバーの同時依頼)。
     lock: tokio::sync::Mutex<()>,
 }
 
-impl HostRotation {
+impl HostRequests {
     pub fn new(
         config_path: std::path::PathBuf,
         host_public_key: peercove_core::keys::PublicKey,
@@ -206,8 +238,8 @@ impl HostRotation {
         }
     }
 
-    /// 依頼を適用し、(accepted, メッセージ) を返す。
-    async fn apply(
+    /// 鍵ローテーション依頼を適用し、(accepted, メッセージ) を返す。
+    async fn apply_rotate_key(
         &self,
         member_ip: Ipv4Addr,
         new_key: peercove_core::keys::PublicKey,
@@ -235,6 +267,39 @@ impl HostRotation {
             }
             Err(e) => {
                 tracing::warn!("鍵更新の適用タスクが失敗しました: {e}");
+                (false, "ホスト側の内部エラーです".to_string())
+            }
+        }
+    }
+
+    /// DNS 名の変更依頼(ADR-0021)を適用し、(accepted, メッセージ) を返す。
+    async fn apply_dns_name(&self, member_ip: Ipv4Addr, name: String) -> (bool, String) {
+        use peercove_ops::peers::DnsNameOutcome;
+        let _guard = self.lock.lock().await;
+        let path = self.config_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            peercove_ops::peers::set_peer_dns_name_by_ip(&path, member_ip, &name)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(DnsNameOutcome::Applied { display, label })) => {
+                // tracing マクロは {display} を同名関数に解決してしまうため束縛し直す
+                let name = display;
+                tracing::info!("メンバー {member_ip}({name})の DNS 名を {label} に変更しました");
+                (
+                    true,
+                    format!("DNS 名を {label} に変更しました(数秒で全員に反映されます)"),
+                )
+            }
+            Ok(Ok(DnsNameOutcome::Unchanged { label })) => {
+                (true, format!("DNS 名は既に {label} です"))
+            }
+            Ok(Err(e)) => {
+                tracing::info!("メンバー {member_ip} の DNS 名変更を受け付けませんでした: {e:#}");
+                (false, format!("{e:#}"))
+            }
+            Err(e) => {
+                tracing::warn!("DNS 名変更の適用タスクが失敗しました: {e}");
                 (false, "ホスト側の内部エラーです".to_string())
             }
         }
@@ -340,7 +405,7 @@ pub async fn run_host_server(
     ledger_rx: watch::Receiver<Distribution>,
     connections: Connections,
     rtt: RttMap,
-    rotation: Arc<HostRotation>,
+    requests: Arc<HostRequests>,
 ) {
     // トンネル作成直後は Windows が仮想 IP を数秒間「準備中」として扱うため、
     // bind が 10049 等で失敗する。準備が整うまで 1 秒間隔でリトライする
@@ -367,10 +432,10 @@ pub async fn run_host_server(
                 let ledger_rx = ledger_rx.clone();
                 let connections = Arc::clone(&connections);
                 let rtt = Arc::clone(&rtt);
-                let rotation = Arc::clone(&rotation);
+                let requests = Arc::clone(&requests);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_member(stream, member_ip, ledger_rx, &connections, &rtt, rotation)
+                        handle_member(stream, member_ip, ledger_rx, &connections, &rtt, requests)
                             .await
                     {
                         tracing::debug!("メンバー {member_ip} との制御接続が終了: {e:#}");
@@ -398,7 +463,7 @@ async fn handle_member(
     mut ledger_rx: watch::Receiver<Distribution>,
     connections: &Connections,
     rtt: &RttMap,
-    rotation: Arc<HostRotation>,
+    requests: Arc<HostRequests>,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = line_reader(read_half);
@@ -452,7 +517,7 @@ async fn handle_member(
         ping,
         Arc::clone(rtt),
         line,
-        rotation,
+        requests,
     ));
 
     // どちらかが終わったら接続を畳む。
@@ -520,7 +585,7 @@ async fn host_reader(
     ping: SharedPing,
     rtt: RttMap,
     mut line: String,
-    rotation: Arc<HostRotation>,
+    requests: Arc<HostRequests>,
 ) -> anyhow::Result<()> {
     loop {
         if read_line(&mut reader, &mut line).await?.is_none() {
@@ -532,8 +597,15 @@ async fn host_reader(
                 // 鍵ローテーション(ADR-0020)。apply は host.toml への永続化のみで、
                 // WG ピアの入れ替えは supervisor の次回再読込(≤5 秒)が行う。
                 // 応答が先に返るので、旧鍵のセッションが生きているうちに届く
-                let (accepted, message) = rotation.apply(member_ip, new_public_key).await;
+                let (accepted, message) =
+                    requests.apply_rotate_key(member_ip, new_public_key).await;
                 let _ = out.send(ControlMessage::RotateKeyResult { accepted, message });
+            }
+            Ok(ControlMessage::SetDnsName { name }) => {
+                // DNS 名の変更依頼(ADR-0021)。永続化のみで、台帳への反映は
+                // supervisor の次回再読込(≤5 秒)が行う
+                let (accepted, message) = requests.apply_dns_name(member_ip, name).await;
+                let _ = out.send(ControlMessage::SetDnsNameResult { accepted, message });
             }
             Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
@@ -718,6 +790,10 @@ async fn member_reader(
                 // supervisor が周期処理で行う(ここでは受け渡しのみ)
                 link.put_rotate_result(accepted, message);
             }
+            Ok(ControlMessage::SetDnsNameResult { accepted, message }) => {
+                // DNS 名変更の応答(ADR-0021)。IPC ハンドラが待つ受け口へ渡す
+                link.put_dns_result(accepted, message);
+            }
             Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
         }
@@ -732,6 +808,7 @@ mod tests {
     fn entry(name: &str, ip: &str, online: bool) -> LedgerEntry {
         LedgerEntry {
             name: Some(name.to_string()),
+            dns_name: None,
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             online,
@@ -744,8 +821,8 @@ mod tests {
     }
 
     /// 鍵ローテーションを使わないテスト用のダミー文脈(host.toml は実在しない)。
-    fn test_rotation() -> Arc<HostRotation> {
-        Arc::new(HostRotation::new(
+    fn test_requests() -> Arc<HostRequests> {
+        Arc::new(HostRequests::new(
             std::env::temp_dir().join("peercove-control-no-host.toml"),
             PrivateKey::generate().public_key(),
         ))
@@ -808,7 +885,7 @@ mod tests {
                 ledger_rx,
                 &server_connections,
                 &server_rtt,
-                test_rotation(),
+                test_requests(),
             )
             .await;
         });
@@ -938,7 +1015,7 @@ mod tests {
                 ledger_rx,
                 &server_connections,
                 &server_rtt,
-                test_rotation(),
+                test_requests(),
             )
             .await
         });
@@ -1083,7 +1160,7 @@ mod tests {
         )
         .unwrap();
         let host_public_key = PrivateKey::generate().public_key();
-        let rotation = Arc::new(HostRotation::new(config_path.clone(), host_public_key));
+        let requests = Arc::new(HostRequests::new(config_path.clone(), host_public_key));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1103,7 +1180,7 @@ mod tests {
                 ledger_rx,
                 &server_connections,
                 &server_rtt,
-                rotation,
+                requests,
             )
             .await;
         });

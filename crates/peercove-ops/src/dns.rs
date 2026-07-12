@@ -20,14 +20,21 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<DnsRecord>> {
 }
 
 /// カスタムレコードを追加する。`name` は表示名のままでよく、ここで正規化する。
-/// 正規化後のラベルを返す。
+/// 予約語とメンバー名(確定 DNS 名・従来導出ラベル)との重複は拒否する
+/// (ADR-0021 §4)。正規化後のラベルを返す。
 pub fn add_record(config_path: &Path, name: &str, ip: Ipv4Addr) -> anyhow::Result<String> {
     let Some(label) = names::dns_label(name) else {
         bail!("\"{name}\" から有効なラベルを作れませんでした。半角英数字を含めてください");
     };
+    if names::RESERVED_DNS_LABELS.contains(&label.as_str()) {
+        bail!("「{label}」は予約されているためレコード名に使えません");
+    }
     let config = Config::load(config_path)?;
     if config.dns_records.iter().any(|r| r.name == label) {
         bail!("レコード \"{label}\" は既に存在します(削除してから追加し直してください)");
+    }
+    if crate::peers::taken_dns_labels(&config, crate::peers::DnsExclude::None).contains(&label) {
+        bail!("DNS 名「{label}」はメンバーが使用しています(別の名前にしてください)");
     }
 
     let mut doc = load_doc(config_path)?;
@@ -111,5 +118,31 @@ mod tests {
             .contains("# 大事なコメント"));
 
         assert!(add_record(&config, "たろう", "10.68.1.53".parse().unwrap()).is_err());
+    }
+
+    /// 予約語とメンバー名(確定 DNS 名 / 従来導出)との重複を拒否する(ADR-0021)。
+    #[test]
+    fn add_rejects_reserved_and_member_labels() {
+        let config = setup("reserved");
+        assert!(add_record(&config, "localhost", "10.68.1.50".parse().unwrap()).is_err());
+        assert!(
+            add_record(&config, "host", "10.68.1.50".parse().unwrap()).is_err(),
+            "ホストの従来導出ラベルと衝突"
+        );
+
+        let result = crate::invite::invite(&crate::invite::InviteOptions {
+            config_path: &config,
+            name: Some("alice"),
+            ip: None,
+            extra_endpoints: &[],
+            psk: false,
+        });
+        // init 環境ではエンドポイント検出に失敗する場合があるためスキップ可
+        if result.is_ok() {
+            assert!(
+                add_record(&config, "alice", "10.68.1.50".parse().unwrap()).is_err(),
+                "メンバーの確定 DNS 名と衝突"
+            );
+        }
     }
 }

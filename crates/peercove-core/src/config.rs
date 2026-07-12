@@ -79,8 +79,15 @@ pub struct InterfaceConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
     /// 台帳・コントロールチャネルで使う自分の表示名(join で設定される)。
+    /// ADR-0021 以降は表示専用(DNS 名は `dns_name` / `[[peer]].dns_name` が別に持つ)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// (host のみ)ホスト自身の DNS 名(ADR-0021、M3-14a)。正規化済みラベル。
+    /// 省略時は従来どおり表示名から導出される(実質 `host`)。
+    /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
+    /// 読めない(明示エラーになる)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
     pub private_key_file: PathBuf,
     /// 仮想 IP とサブネット(例: `100.100.42.2/24`)。
     pub address: Ipv4Net,
@@ -124,9 +131,16 @@ pub enum KeySource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
-    /// 台帳用の表示名(invite で発行したメンバーに付く)。
+    /// 台帳用の表示名(invite で発行したメンバーに付く)。日本語・空白可。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// このピアの DNS 名(ADR-0021、M3-14a)。正規化済みラベル。invite が
+    /// IP 割当と同時に確定し、以後 IP と独立に維持される(台帳経由で配布)。
+    /// 省略時(アップグレード前に登録されたピア)は従来どおり表示名から
+    /// 導出される。注意: `deny_unknown_fields` のため、これを書いた設定は
+    /// 旧バージョンでは読めない(明示エラーになる)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
     /// このピア(ホスト)の仮想 IP。メンバー側でコントロールチャネルの
     /// 接続先として使う(join が設定する)。
     #[serde(skip_serializing_if = "Option::is_none")]

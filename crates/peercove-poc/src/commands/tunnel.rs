@@ -165,6 +165,7 @@ impl ActiveTunnel {
         chat: crate::chat::SharedChatLog,
         groups: crate::groups::SharedGroups,
         rotate_request: Arc<std::sync::atomic::AtomicBool>,
+        member_link: Arc<control::MemberLink>,
     ) -> anyhow::Result<SuperviseExit> {
         supervise(
             config_path,
@@ -177,6 +178,7 @@ impl ActiveTunnel {
             chat,
             groups,
             rotate_request,
+            member_link,
         )
         .await
     }
@@ -270,6 +272,7 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
                 crate::chat::ChatLog::load(config_path),
                 crate::groups::GroupStore::load(config_path),
                 Default::default(),
+                Default::default(),
             )
             .await;
             ctrl_c.abort();
@@ -324,6 +327,7 @@ pub async fn supervise(
     chat: crate::chat::SharedChatLog,
     groups: crate::groups::SharedGroups,
     rotate_request: Arc<std::sync::atomic::AtomicBool>,
+    member_link: Arc<control::MemberLink>,
 ) -> anyhow::Result<SuperviseExit> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
@@ -374,8 +378,9 @@ pub async fn supervise(
             Arc::clone(&chat),
             Arc::clone(&groups),
         )));
-        // (member)鍵ローテーションの状態機械と、制御接続への差し込み口(ADR-0020)
-        let member_link: Arc<control::MemberLink> = Default::default();
+        // (member)鍵ローテーションの状態機械(ADR-0020)。制御接続への
+        // 差し込み口(member_link)は呼び出し側と共有(IPC の DNS 名変更 —
+        // ADR-0021 — がここを通ってホストへ届く)
         let mut rotation: Option<crate::rotate::Rotation> = None;
         match role {
             Role::Host => {
@@ -384,7 +389,7 @@ pub async fn supervise(
                     ledger_rx,
                     Arc::clone(&connections),
                     Arc::clone(&rtt),
-                    Arc::new(control::HostRotation::new(
+                    Arc::new(control::HostRequests::new(
                         config_path.to_path_buf(),
                         host_public_key,
                     )),
@@ -657,6 +662,7 @@ fn build_ledger(
             .display_name
             .clone()
             .or_else(|| Some("host".to_string())),
+        dns_name: config.interface.dns_name.clone(),
         ip: config.interface.address.addr(),
         public_key: *host_public_key,
         online: true,
@@ -683,6 +689,7 @@ fn build_ledger(
         };
         ledger.push(LedgerEntry {
             name: peer.name.clone(),
+            dns_name: peer.dns_name.clone(),
             ip: peer
                 .allowed_ips
                 .first()

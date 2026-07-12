@@ -364,6 +364,7 @@ mod tests {
     fn entry(key: &PublicKey, ip: &str, endpoint: Option<&str>, age: u64) -> LedgerEntry {
         LedgerEntry {
             name: None,
+            dns_name: None,
             ip: ip.parse().unwrap(),
             public_key: *key,
             online: true,

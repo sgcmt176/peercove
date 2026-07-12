@@ -208,6 +208,8 @@ export interface JoinResult {
 export interface Settings {
   interfaceName: string;
   displayName: string | null;
+  /** (host のみ)自分の DNS 名（ADR-0021、M3-14a）。未設定なら実質 host。 */
+  dnsName: string | null;
   address: string;
   listenPort: number | null;
   mtu: number;
@@ -224,6 +226,8 @@ export interface Settings {
 
 export interface SettingsUpdate {
   displayName: string | null;
+  /** (host のみ)自分の DNS 名（ADR-0021）。null / 空で既定（host）に戻す。 */
+  dnsName: string | null;
   listenPort: number | null;
   mtu: number;
   hostEndpoint: string | null;
@@ -283,6 +287,14 @@ export const api = {
     invoke<string>("remove_member", { configPath, publicKey }),
   renameMember: (configPath: string, publicKey: string, newName: string) =>
     invoke<void>("rename_member", { configPath, publicKey, newName }),
+  // DNS 名（ADR-0021、M3-14a）。ホストは任意メンバーを直接、メンバー本人は
+  // デーモン経由（接続中のみ・ホストが検証）で変更する
+  setMemberDnsName: (configPath: string, publicKey: string, dnsName: string) =>
+    invoke<string>("set_member_dns_name", { configPath, publicKey, dnsName }),
+  setMyDnsName: (configPath: string, dnsName: string) =>
+    invoke<void>("set_my_dns_name", { configPath, dnsName }),
+  setHostDnsName: (configPath: string, dnsName: string) =>
+    invoke<string>("set_host_dns_name", { configPath, dnsName }),
   setMemberSubnets: (configPath: string, publicKey: string, subnets: string[]) =>
     invoke<void>("set_member_subnets", { configPath, publicKey, subnets }),
   // ACL: メンバー間通信の遮断組（M3-10、ADR-0018。ホスト設定のみ）

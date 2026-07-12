@@ -61,6 +61,8 @@ function SettingsForm({
   onClose: () => void;
 }) {
   const [displayName, setDisplayName] = useState(settings.displayName ?? "");
+  // (host のみ)自分の DNS 名(ADR-0021、M3-14a)。空なら既定(host)
+  const [dnsName, setDnsName] = useState(settings.dnsName ?? "");
   const [listenPort, setListenPort] = useState(
     settings.listenPort === null ? "" : String(settings.listenPort),
   );
@@ -109,6 +111,8 @@ function SettingsForm({
       }
       const result = await api.saveSettings(configPath, {
         displayName: displayName.trim() === "" ? null : displayName.trim(),
+        dnsName:
+          settings.isMember || dnsName.trim() === "" ? null : dnsName.trim(),
         listenPort: portValue,
         mtu: mtuValue,
         hostEndpoint:
@@ -157,6 +161,21 @@ function SettingsForm({
             onChange={(event) => setDisplayName(event.target.value)}
           />
         </label>
+
+        {!settings.isMember && (
+          <label className="field">
+            <span>
+              {t.settings.dnsNameLabel}
+              <small className="muted">{t.settings.dnsNameHint}</small>
+            </span>
+            <input
+              type="text"
+              value={dnsName}
+              placeholder="host"
+              onChange={(event) => setDnsName(event.target.value)}
+            />
+          </label>
+        )}
 
         <label className="field">
           <span>

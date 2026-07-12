@@ -78,6 +78,7 @@ mod tests {
                 public_key: PrivateKey::generate().public_key(),
                 ip: ip.parse().unwrap(),
                 name: Some(name),
+                dns_name: None,
                 preshared_key_file: None,
             },
         )

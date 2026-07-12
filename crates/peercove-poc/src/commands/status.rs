@@ -175,6 +175,7 @@ mod tests {
         let ledger = vec![
             LedgerEntry {
                 name: Some("host".to_string()),
+                dns_name: None,
                 ip: "100.100.42.1".parse().unwrap(),
                 public_key: PublicKey::from_bytes([3; 32]),
                 online: true,
@@ -186,6 +187,7 @@ mod tests {
             },
             LedgerEntry {
                 name: Some("alice".to_string()),
+                dns_name: None,
                 ip: "100.100.42.2".parse().unwrap(),
                 public_key: PublicKey::from_bytes([4; 32]),
                 online: false,

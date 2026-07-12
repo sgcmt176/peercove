@@ -16,7 +16,7 @@ use peercove_core::keys::PresharedKey;
 use peercove_core::keys::PrivateKey;
 use peercove_core::token::{InviteToken, MAX_NAME_LEN};
 
-use crate::peers::{append_peer, used_ips, NewPeer};
+use crate::peers::{append_peer, taken_dns_labels, used_ips, DnsExclude, NewPeer};
 
 pub struct InviteOptions<'a> {
     pub config_path: &'a Path,
@@ -79,6 +79,29 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
         bail!("エンドポイントを決定できませんでした。ホストへの到達先を指定してください");
     }
 
+    // DNS 名を IP 割当と同時に確定する(ADR-0021、M3-14a)。以後この名前は
+    // IP と独立に維持される。既定は表示名の正規化ラベル(空・予約語なら
+    // member-<第4オクテット>)、重複は -<oct>、-<oct>-2、… で一意化
+    let dns_name = {
+        let taken = taken_dns_labels(&config, DnsExclude::None);
+        let oct = ip.octets()[3];
+        let base = peercove_core::names::normalize_dns_name(&name, false)
+            .unwrap_or_else(|_| format!("member-{oct}"));
+        if !taken.contains(&base) {
+            base
+        } else {
+            let with_oct = format!("{base}-{oct}");
+            if !taken.contains(&with_oct) {
+                with_oct
+            } else {
+                (2..)
+                    .map(|i| format!("{with_oct}-{i}"))
+                    .find(|candidate| !taken.contains(candidate))
+                    .expect("いつかは空きがある")
+            }
+        }
+    };
+
     let member_private_key = PrivateKey::generate();
     let member_public_key = member_private_key.public_key();
     let preshared_key = options.psk.then(PresharedKey::generate);
@@ -99,6 +122,7 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
             public_key: member_public_key,
             ip,
             name: Some(&name),
+            dns_name: Some(&dns_name),
             preshared_key_file: preshared_key.as_ref().map(|_| psk_file_name.as_str()),
         },
     )?;
@@ -179,6 +203,11 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].name.as_deref(), Some(result.name.as_str()));
+        assert_eq!(
+            config.peers[0].dns_name.as_deref(),
+            Some(result.name.as_str()),
+            "DNS 名が invite 時に確定・永続化される(ADR-0021)"
+        );
 
         let token = InviteToken::parse(&result.token).unwrap();
         assert_eq!(
@@ -211,6 +240,36 @@ mod tests {
         let host_psk = peercove_core::keys::read_preshared_key_file(psk_path).unwrap();
         let token = InviteToken::parse(&result.token).unwrap();
         assert_eq!(host_psk.as_bytes(), token.preshared_key.unwrap().as_bytes());
+    }
+
+    /// DNS 名の初期割当(ADR-0021): 日本語名は member-<oct>、
+    /// 表示名由来のラベルが衝突したら -<oct> で一意化される。
+    #[test]
+    fn invite_assigns_default_dns_name() {
+        let config_path = setup("dns-default");
+        let mut opts = options(&config_path);
+        opts.name = Some("たろう");
+        let taro = invite(&opts).unwrap();
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config.peers[0].dns_name.as_deref(),
+            Some(format!("member-{}", taro.ip.octets()[3]).as_str()),
+            "日本語名はフォールバック"
+        );
+
+        // 正規化すると同じ "alice pc" → 2 人目は -<oct> で一意化
+        let mut opts = options(&config_path);
+        opts.name = Some("Alice PC");
+        invite(&opts).unwrap();
+        let mut opts = options(&config_path);
+        opts.name = Some("alice-pc");
+        let second = invite(&opts).unwrap();
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.peers[1].dns_name.as_deref(), Some("alice-pc"));
+        assert_eq!(
+            config.peers[2].dns_name.as_deref(),
+            Some(format!("alice-pc-{}", second.ip.octets()[3]).as_str())
+        );
     }
 
     #[test]

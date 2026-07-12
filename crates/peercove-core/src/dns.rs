@@ -40,14 +40,18 @@ pub struct ZoneEntry {
     pub public_key: Option<PublicKey>,
 }
 
-/// 1 ネットワーク分のゾーンを導出する(ADR-0011 §2)。
+/// 1 ネットワーク分のゾーンを導出する(ADR-0011 §2、ADR-0021)。
 ///
 /// ラベルの決定規則(全ノードで同一の結果になるよう、仮想 IP 順に確定する):
-/// 1. 表示名を [`names::dns_label`] で正規化。空になる名前(日本語など)は
-///    ホスト = `host`、メンバー = `member-<IP 第 4 オクテット>`
-/// 2. 正規化後の衝突は仮想 IP が小さい方が勝ち、負けた方は `<ラベル>-<第4オクテット>`
+/// 1. **確定済みの DNS 名(`dns_name`、ADR-0021)を持つメンバーを先に確保する**
+///    (固定した名前が従来導出の名前に奪われないため)。ホストが重複検証済み
+///    だが、防御的な一意化は維持する
+/// 2. `dns_name` の無いメンバーは従来導出: 表示名を [`names::dns_label`] で
+///    正規化。空になる名前(日本語など)はホスト = `host`、
+///    メンバー = `member-<IP 第 4 オクテット>`
+/// 3. 正規化後の衝突は仮想 IP が小さい方が勝ち、負けた方は `<ラベル>-<第4オクテット>`
 ///    (それも取られていたら `-2`, `-3`, …)で一意化
-/// 3. カスタムレコードは自動生成の後に足す。**自動生成側が勝つ**
+/// 4. カスタムレコードは自動生成の後に足す。**自動生成側が勝つ**
 ///    (改名でぶつかったとき、メンバー名の解決が奪われないため)。
 ///    不正なラベル・重複したカスタムは黙って飛ばす(配布側の検証をすり抜けた
 ///    場合でも解決全体を壊さない)
@@ -59,7 +63,26 @@ pub fn zone_for(network: &str, ledger: &[LedgerEntry], custom: &[DnsRecord]) -> 
     let mut members: Vec<&LedgerEntry> = ledger.iter().collect();
     members.sort_by_key(|entry| entry.ip);
 
-    for member in members {
+    // 第 1 パス: 確定済みの DNS 名を先に確保(ADR-0021。不正なラベルは
+    // 従来導出へフォールバック — 配布側の検証をすり抜けても解決を壊さない)
+    let mut labels: Vec<Option<String>> = members
+        .iter()
+        .map(|member| {
+            let fixed = member
+                .dns_name
+                .as_deref()
+                .filter(|n| names::is_dns_label(n))?;
+            let label = uniquify(fixed, member.ip.octets()[3], &taken);
+            taken.insert(label.clone());
+            Some(label)
+        })
+        .collect();
+
+    // 第 2 パス: 残りは従来導出(表示名 → フォールバック → 一意化)
+    for (member, label) in members.iter().zip(labels.iter_mut()) {
+        if label.is_some() {
+            continue;
+        }
         let oct = member.ip.octets()[3];
         let base = member
             .name
@@ -72,8 +95,13 @@ pub fn zone_for(network: &str, ledger: &[LedgerEntry], custom: &[DnsRecord]) -> 
                     format!("member-{oct}")
                 }
             });
-        let label = uniquify(&base, oct, &taken);
-        taken.insert(label.clone());
+        let derived = uniquify(&base, oct, &taken);
+        taken.insert(derived.clone());
+        *label = Some(derived);
+    }
+
+    for (member, label) in members.iter().zip(labels) {
+        let label = label.expect("両パスでどのメンバーにもラベルが付く");
         entries.push(ZoneEntry {
             fqdn: format!("{label}.{network}.{DNS_SUFFIX}"),
             ip: member.ip,
@@ -118,6 +146,7 @@ mod tests {
     fn member(name: Option<&str>, ip: &str, is_host: bool) -> LedgerEntry {
         LedgerEntry {
             name: name.map(String::from),
+            dns_name: None,
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             online: true,
@@ -173,6 +202,38 @@ mod tests {
         let reversed: Vec<LedgerEntry> = ledger.into_iter().rev().collect();
         let zone2 = zone_for("net", &reversed, &[]);
         assert_eq!(fqdns(&zone2), fqdns(&zone));
+    }
+
+    /// 確定済みの DNS 名(ADR-0021)は表示名の導出より優先され、
+    /// 従来導出の同名メンバー(IP が小さくても)に奪われない。
+    #[test]
+    fn fixed_dns_name_wins_over_derived() {
+        let mut fixed = member(Some("山田"), "10.1.0.5", false);
+        fixed.dns_name = Some("alice".to_string());
+        let ledger = vec![
+            member(Some("alice"), "10.1.0.2", false), // 従来導出で "alice" になるはずだった
+            fixed,
+        ];
+        let zone = zone_for("net", &ledger, &[]);
+        assert_eq!(
+            fqdns(&zone),
+            vec![
+                "alice-2.net.peercove.internal", // 従来導出側が一意化で譲る
+                "alice.net.peercove.internal",   // 確定名が勝つ
+            ]
+        );
+
+        // 表示名を変えても確定名は変わらない(表示名と DNS 名の独立)
+        let mut renamed = member(Some("べつの名前"), "10.1.0.5", false);
+        renamed.dns_name = Some("alice".to_string());
+        let zone = zone_for("net", &[renamed], &[]);
+        assert_eq!(fqdns(&zone), vec!["alice.net.peercove.internal"]);
+
+        // 不正な dns_name(正規化されていない)は従来導出へフォールバック
+        let mut bad = member(Some("Bob"), "10.1.0.7", false);
+        bad.dns_name = Some("Bad Label".to_string());
+        let zone = zone_for("net", &[bad], &[]);
+        assert_eq!(fqdns(&zone), vec!["bob.net.peercove.internal"]);
     }
 
     #[test]
