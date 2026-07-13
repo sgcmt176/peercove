@@ -60,6 +60,22 @@ export const ja = {
         : "外観: ダーク（クリックでライト）",
   },
 
+  // 左サイドバー(M3-15。外枠の刷新)
+  sidebar: {
+    networks: "ネットワーク",
+    chat: "チャット",
+    inbox: "受信",
+    settings: "設定",
+    connected: "接続中",
+    disconnected: "未接続",
+    theme: (theme: "light" | "dark") =>
+      theme === "light"
+        ? "外観: ライト（クリックでダーク）"
+        : "外観: ダーク（クリックでライト）",
+    logs: "デーモンのログ",
+    version: (v: string) => `v${v}`,
+  },
+
   footer: (
     <>
       wintun.dll © WireGuard LLC — Prebuilt Binaries License の下で無改変同梱
@@ -199,8 +215,36 @@ export const ja = {
       "このネットワークからあなたは削除されました。通信はすでに遮断されています。「切断」してから、必要なら新しい招待トークンで参加し直してください。",
     disconnectConfirm: "切断する",
     disconnect: "切断",
+    back: "一覧へ戻る",
+    connected: "接続中",
     configFileLabel: "設定ファイル",
     membersHead: (n: number) => `メンバー（${n}）`,
+    // 詳細ヘッダー直下の統計カード(M3-15)
+    overview: {
+      virtualIp: "仮想IP",
+      online: "オンライン",
+      onlineCount: (n: number) => `${n}人`,
+      rate: "転送速度",
+    },
+    // メンバー表の見出し(M3-15)
+    table: {
+      role: "ロール",
+      dnsName: "DNS 名",
+      virtualIp: "仮想IP",
+      rate: "転送速度",
+      rtt: "遅延",
+      actions: "アクション",
+      copyIp: "仮想IP をコピー",
+      chat: "チャットを開く",
+    },
+    // DNS サービスカード(M3-15、ADR-0023 の URL を活用)
+    service: {
+      head: "DNS サービス",
+      hint: "スキームを設定したカスタム DNS レコードは、ここからワンクリックで開けます（全メンバーに表示されます）。",
+      copyUrl: "URLをコピー",
+      copied: "コピーしました",
+      openTitle: "既定のブラウザで開く",
+    },
     // ネットワーク詳細のタブ(M3-6)
     tabs: {
       chat: "チャット",

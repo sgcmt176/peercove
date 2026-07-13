@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
+  DnsRecord,
   InboxItem,
   Member,
   Peer,
@@ -28,24 +30,28 @@ import { t } from "../i18n";
 /**
  * ネットワーク詳細(トンネル稼働中)。ホストのときだけ招待・削除・名前変更ができる。
  *
- * 中身はタブ構成(M3-6)。「メンバー」「統計」に加えて、チャット(M3-13)や
- * ファイル送信(M3-9)は将来ここへタブを足して収める。
+ * 中身はタブ構成(M3-6)。タブの状態は App が持ち(M3-15)、サイドバーの
+ * 「チャット」「受信」からも切り替えられる。ヘッダー直下に統計カード、
+ * メンバーは表、最下部に DNS サービスカード(ADR-0023 の URL を活用)。
  */
 export function TunnelView({
   tunnel,
+  tab,
+  onTab,
+  onBack,
   onChanged,
   onSettings,
 }: {
   tunnel: Tunnel;
+  tab: "members" | "chat" | "stats" | "inbox";
+  onTab: (tab: "members" | "chat" | "stats" | "inbox") => void;
+  onBack: () => void;
   onChanged: () => void;
   onSettings: () => void;
 }) {
   const isHost = tunnel.role === "hosting";
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
   const peerByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer]));
-  const [tab, setTab] = useState<"members" | "chat" | "stats" | "inbox">(
-    "members",
-  );
   /** 受信ボックスの中身(M3-9b)。status のポーリングに合わせて読み直す。 */
   const [inbox, setInbox] = useState<InboxItem[]>([]);
   const [inviting, setInviting] = useState(false);
@@ -81,6 +87,14 @@ export function TunnelView({
   ).length;
   /** チャットの未読合計(M3-13b)。ストアは App のポーリングが同期済み。 */
   const chatUnread = totalUnread(tunnel);
+  const onlineCount = tunnel.members.filter((member) => member.online).length;
+  // 全ピアの直近速度の合計(ヘッダーの「転送速度」カード — M3-15)
+  const totalRate = tunnel.peers.reduce(
+    (sum, peer) => sum + (rateSeries(tunnel.config, peer.publicKey).at(-1) ?? 0),
+    0,
+  );
+  // URL を組み立て済みのカスタムレコード(DNS サービスカード。ホスト・メンバー共通)
+  const services = tunnel.dnsRecords.filter((record) => record.url !== null);
 
   const stop = async () => {
     setBusy(true);
@@ -157,60 +171,89 @@ export function TunnelView({
         </section>
       )}
 
-      <section className="card">
-        <div className="card__head">
-          <h2>
-            {tunnel.network}
-            <span className="tag">
-              {isHost ? t.networks.roleHost : t.networks.roleMember}
+      <div className="detail__head">
+        <button
+          type="button"
+          className="button--icon detail__back"
+          title={t.tunnel.back}
+          onClick={onBack}
+        >
+          ←
+        </button>
+        <h2 className="detail__title" title={tunnel.config}>
+          {tunnel.network}
+        </h2>
+        <span className="badge badge--on">{t.tunnel.connected}</span>
+        <span className="tag">
+          {isHost ? t.networks.roleHost : t.networks.roleMember}
+        </span>
+        <div className="detail__actions">
+          <button
+            type="button"
+            className="button--ghost"
+            onClick={() => setShowDns(true)}
+          >
+            🌐 {t.dns.button}
+          </button>
+          <button type="button" className="button--ghost" onClick={onSettings}>
+            ⚙ {t.networks.settings}
+          </button>
+          <button
+            type="button"
+            className="button--ghost button--ghost-danger"
+            onClick={() => void stop()}
+            disabled={busy}
+          >
+            ⏻ {t.tunnel.disconnect}
+          </button>
+        </div>
+      </div>
+
+      <div className="stat-cards">
+        <div className="stat-card">
+          <span className="stat-card__icon">IP</span>
+          <div className="stat-card__body">
+            <span className="stat-card__label">{t.tunnel.overview.virtualIp}</span>
+            <span className="stat-card__value mono">
+              {tunnel.address}
+              <CopyIcon value={tunnel.address} title={t.tunnel.table.copyIp} />
             </span>
-          </h2>
-          <div className="row">
-            <button
-              type="button"
-              className="button--ghost"
-              onClick={() => setShowDns(true)}
-            >
-              {t.dns.button}
-            </button>
-            <button type="button" className="button--ghost" onClick={onSettings}>
-              {t.networks.settings}
-            </button>
-            <button
-              type="button"
-              className="button--ghost"
-              onClick={() => void stop()}
-              disabled={busy}
-            >
-              {t.tunnel.disconnect}
-            </button>
           </div>
         </div>
-        <dl className="facts">
-          <dt>{t.common.virtualIp}</dt>
-          <dd className="mono">{tunnel.address}</dd>
-          <dt>{t.tunnel.configFileLabel}</dt>
-          <dd className="mono ellipsis" title={tunnel.config}>
-            {tunnel.config}
-          </dd>
-        </dl>
-        {error && <p className="error-text">{error}</p>}
-        {notice && <p className="notice">{notice}</p>}
-      </section>
+        <div className="stat-card">
+          <span className="stat-card__icon">👥</span>
+          <div className="stat-card__body">
+            <span className="stat-card__label">{t.tunnel.overview.online}</span>
+            <span className="stat-card__value">
+              {t.tunnel.overview.onlineCount(onlineCount)}
+            </span>
+          </div>
+        </div>
+        <div className="stat-card">
+          <span className="stat-card__icon">📈</span>
+          <div className="stat-card__body">
+            <span className="stat-card__label">{t.tunnel.overview.rate}</span>
+            <span className="stat-card__value">{formatRate(totalRate)}</span>
+          </div>
+        </div>
+      </div>
+
+      {error && <p className="error-text">{error}</p>}
+      {notice && <p className="notice">{notice}</p>}
 
       <section className="card">
         <div className="tabs">
           <button
             type="button"
             className={tab === "members" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => setTab("members")}
+            onClick={() => onTab("members")}
           >
             {t.tunnel.membersHead(tunnel.members.length)}
           </button>
           <button
             type="button"
             className={tab === "chat" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => setTab("chat")}
+            onClick={() => onTab("chat")}
           >
             {t.tunnel.tabs.chat}
             {chatUnread > 0 && <span className="tabs__badge">{chatUnread}</span>}
@@ -218,14 +261,14 @@ export function TunnelView({
           <button
             type="button"
             className={tab === "stats" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => setTab("stats")}
+            onClick={() => onTab("stats")}
           >
             {t.tunnel.tabs.stats}
           </button>
           <button
             type="button"
             className={tab === "inbox" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => setTab("inbox")}
+            onClick={() => onTab("inbox")}
           >
             {t.tunnel.tabs.inbox}
             {inbox.length + activeTransfers > 0 && (
@@ -255,7 +298,7 @@ export function TunnelView({
           {isHost && tab === "members" && (
             <button
               type="button"
-              className="tabs__action"
+              className="tabs__action tabs__action--primary"
               onClick={() => setInviting(true)}
             >
               {t.tunnel.invite}
@@ -268,22 +311,39 @@ export function TunnelView({
             <p className="muted">{t.tunnel.ledgerPending}</p>
           ) : (
             <>
-              <ul className="members">
-                {tunnel.members.map((member) => (
-                  <MemberRow
-                    key={member.publicKey}
-                    config={tunnel.config}
-                    member={member}
-                    peer={peerByKey.get(member.publicKey) ?? null}
-                    canManage={isHost && !member.isHost}
-                    canEditDns={isHost || member.isSelf}
-                    onRemove={() => setRemoving(member)}
-                    onRename={(newName) => void rename(member, newName)}
-                    onRenameDns={(label) => void renameDns(member, label)}
-                    onSubnets={() => setEditingSubnets(member)}
-                  />
-                ))}
-              </ul>
+              <div className="table-scroll">
+                <table className="member-table">
+                  <thead>
+                    <tr>
+                      <th>{t.tunnel.membersHead(tunnel.members.length)}</th>
+                      <th>{t.tunnel.table.role}</th>
+                      <th>{t.tunnel.table.virtualIp}</th>
+                      <th>{t.tunnel.table.rate}</th>
+                      <th>{t.tunnel.table.rtt}</th>
+                      <th className="member-table__actions-head">
+                        {t.tunnel.table.actions}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tunnel.members.map((member) => (
+                      <MemberRow
+                        key={member.publicKey}
+                        config={tunnel.config}
+                        member={member}
+                        peer={peerByKey.get(member.publicKey) ?? null}
+                        canManage={isHost && !member.isHost}
+                        canEditDns={isHost || member.isSelf}
+                        onChat={() => onTab("chat")}
+                        onRemove={() => setRemoving(member)}
+                        onRename={(newName) => void rename(member, newName)}
+                        onRenameDns={(label) => void renameDns(member, label)}
+                        onSubnets={() => setEditingSubnets(member)}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
               {/* 直接通信の説明(M3-4)。経路バッジが出るメンバー視点でのみ表示 */}
               {!isHost && tunnel.members.some((member) => member.route) && (
                 <p className="muted small">{t.tunnel.directNote}</p>
@@ -309,6 +369,10 @@ export function TunnelView({
           <PeersTable config={tunnel.config} peers={tunnel.peers} />
         )}
       </section>
+
+      {tab === "members" && services.length > 0 && (
+        <ServiceCard services={services} />
+      )}
 
       {inviting && (
         <InviteDialog
@@ -372,7 +436,7 @@ export function TunnelView({
           onClose={() => setSendingFile(false)}
           onSent={(count) => {
             setSendingFile(false);
-            setTab("inbox");
+            onTab("inbox");
             setNotice(t.transfer.startedMany(count));
             setTimeout(() => setNotice(null), 8000);
           }}
@@ -730,6 +794,7 @@ function MemberRow({
   peer,
   canManage,
   canEditDns,
+  onChat,
   onRemove,
   onRename,
   onRenameDns,
@@ -742,6 +807,8 @@ function MemberRow({
   canManage: boolean;
   /** DNS 名を変更できるか(ADR-0021。ホスト = 全員 / メンバー = 自分のみ)。 */
   canEditDns: boolean;
+  /** チャットタブを開く(自分以外の行の 💬)。 */
+  onChat: () => void;
   onRemove: () => void;
   onRename: (newName: string) => void;
   /** DNS 名(先頭ラベルのみ)の変更(ADR-0021、M3-14a)。 */
@@ -770,142 +837,261 @@ function MemberRow({
   };
 
   return (
-    <li className="member">
-      <Avatar
-        publicKey={member.publicKey}
-        name={member.name}
-        online={member.online}
-        onlineLabel={member.online ? t.tunnel.member.online : t.tunnel.member.offline}
-      />
-      <span className="member__id">
-        <span className="member__title">
-          {editing ? (
-            <input
-              className="member__edit"
-              value={draft}
-              autoFocus
-              onChange={(event) => setDraft(event.target.value)}
-              onBlur={commit}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") commit();
-                if (event.key === "Escape") setEditing(false);
-              }}
-            />
-          ) : (
-            <span className="member__name">
-              {member.name ?? t.tunnel.member.noName}
-            </span>
-          )}
-          {member.isSelf && (
-            <span className="tag tag--self" title={t.tunnel.member.selfTitle}>
-              {t.tunnel.member.self}
-            </span>
-          )}
-          {member.isHost && <span className="tag">host</span>}
-          {member.route && (
-            <span
-              className={`tag tag--route-${member.route}`}
-              title={t.tunnel.member.route.title}
-            >
-              {t.tunnel.member.route[member.route]}
-            </span>
-          )}
-          {member.blocked && (
-            <span
-              className="tag tag--blocked"
-              title={t.tunnel.member.blockedTitle}
-            >
-              🚫 {t.tunnel.member.blocked}
-            </span>
-          )}
-          {member.subnets.map((subnet) => (
-            <span key={subnet} className="tag mono" title={t.subnet.badgeTitle}>
-              {subnet}
-            </span>
-          ))}
-        </span>
-        <span className="member__meta">
-          <span className="mono">{member.ip}</span>
-          {editingDns ? (
-            <input
-              className="member__edit mono"
-              value={dnsDraft}
-              autoFocus
-              onChange={(event) => setDnsDraft(event.target.value)}
-              onBlur={commitDns}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") commitDns();
-                if (event.key === "Escape") setEditingDns(false);
-              }}
-            />
-          ) : (
-            member.dnsName && (
-              <span className="mono ellipsis" title={member.dnsName}>
-                {member.dnsName}
-                {canEditDns && (
-                  <button
-                    type="button"
-                    className="button--icon button--icon-inline"
-                    title={t.tunnel.member.editDns}
-                    onClick={() => {
-                      setDnsDraft(dnsLabel);
-                      setEditingDns(true);
-                    }}
-                  >
-                    ✎
-                  </button>
-                )}
+    <tr className="member-table__row">
+      <td className="member-cell">
+        <Avatar
+          publicKey={member.publicKey}
+          name={member.name}
+          online={member.online}
+          onlineLabel={
+            member.online ? t.tunnel.member.online : t.tunnel.member.offline
+          }
+        />
+        <span className="member-cell__text">
+          <span className="member__title">
+            {editing ? (
+              <input
+                className="member__edit"
+                value={draft}
+                autoFocus
+                onChange={(event) => setDraft(event.target.value)}
+                onBlur={commit}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") commit();
+                  if (event.key === "Escape") setEditing(false);
+                }}
+              />
+            ) : (
+              <span className="member__name">
+                {member.name ?? t.tunnel.member.noName}
               </span>
-            )
-          )}
+            )}
+            {member.isSelf && (
+              <span className="tag tag--self" title={t.tunnel.member.selfTitle}>
+                {t.tunnel.member.self}
+              </span>
+            )}
+            {member.route && (
+              <span
+                className={`tag tag--route-${member.route}`}
+                title={t.tunnel.member.route.title}
+              >
+                {t.tunnel.member.route[member.route]}
+              </span>
+            )}
+            {member.blocked && (
+              <span
+                className="tag tag--blocked"
+                title={t.tunnel.member.blockedTitle}
+              >
+                🚫 {t.tunnel.member.blocked}
+              </span>
+            )}
+            {member.subnets.map((subnet) => (
+              <span key={subnet} className="tag mono" title={t.subnet.badgeTitle}>
+                {subnet}
+              </span>
+            ))}
+          </span>
+          <span className="member__meta">
+            {editingDns ? (
+              <input
+                className="member__edit mono"
+                value={dnsDraft}
+                autoFocus
+                onChange={(event) => setDnsDraft(event.target.value)}
+                onBlur={commitDns}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") commitDns();
+                  if (event.key === "Escape") setEditingDns(false);
+                }}
+              />
+            ) : (
+              member.dnsName && (
+                <span className="mono ellipsis" title={member.dnsName}>
+                  {member.dnsName}
+                </span>
+              )
+            )}
+            {member.dnsName && <CopyIcon value={member.dnsName} title={t.dns.copy} />}
+            {canEditDns && !editingDns && (
+              <button
+                type="button"
+                className="button--icon button--icon-inline"
+                title={t.tunnel.member.editDns}
+                onClick={() => {
+                  setDnsDraft(dnsLabel);
+                  setEditingDns(true);
+                }}
+              >
+                ✎
+              </button>
+            )}
+          </span>
         </span>
-      </span>
-      <span className="member__stats">
-        {peer && (
-          <>
+      </td>
+      <td>
+        <span className={member.isHost ? "tag tag--self" : "tag"}>
+          {member.isHost ? t.networks.roleHost : t.networks.roleMember}
+        </span>
+      </td>
+      <td className="member-table__ip">
+        <span className="mono">{member.ip}</span>
+        <CopyIcon value={member.ip} title={t.tunnel.table.copyIp} />
+      </td>
+      <td>
+        {peer ? (
+          <span className="cell-trend">
             <Sparkline values={rates} title={t.tunnel.member.rateTitle} />
             <span className="stat" title={t.tunnel.member.rateTitle}>
               {formatRate(rates.at(-1) ?? null)}
             </span>
-          </>
+          </span>
+        ) : (
+          <span className="muted">—</span>
         )}
-        {peer?.rttMs != null && (
+      </td>
+      <td>
+        {peer?.rttMs != null ? (
           <span className="tag" title={t.tunnel.member.rttTitle}>
             {formatRtt(peer.rttMs)}
           </span>
+        ) : (
+          <span className="muted">—</span>
         )}
-      </span>
-      {canManage && !editing && (
-        <span className="member__actions">
+      </td>
+      <td className="member-table__actions">
+        {!member.isSelf && (
           <button
             type="button"
             className="button--icon"
-            title={t.subnet.edit}
-            onClick={onSubnets}
+            title={t.tunnel.table.chat}
+            onClick={onChat}
           >
-            🖧
+            💬
           </button>
-          <button
-            type="button"
-            className="button--icon"
-            title={t.tunnel.member.rename}
-            onClick={() => {
-              setDraft(member.name ?? "");
-              setEditing(true);
-            }}
-          >
-            ✎
-          </button>
-          <button
-            type="button"
-            className="button--icon button--icon-danger"
-            title={t.tunnel.member.remove}
-            onClick={onRemove}
-          >
-            ×
-          </button>
+        )}
+        {canManage && !editing && (
+          <>
+            <button
+              type="button"
+              className="button--icon"
+              title={t.subnet.edit}
+              onClick={onSubnets}
+            >
+              🖧
+            </button>
+            <button
+              type="button"
+              className="button--icon"
+              title={t.tunnel.member.rename}
+              onClick={() => {
+                setDraft(member.name ?? "");
+                setEditing(true);
+              }}
+            >
+              ✎
+            </button>
+            <button
+              type="button"
+              className="button--icon button--icon-danger"
+              title={t.tunnel.member.remove}
+              onClick={onRemove}
+            >
+              ×
+            </button>
+          </>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * DNS サービスカード(M3-15、ADR-0023)。スキームを設定したカスタムレコードを
+ * URL 付きで並べ、クリックで既定ブラウザ起動・ボタンで URL コピー。表示名は
+ * レコード名から自動(ホスト・メンバー共通で status の配信レコードを使う)。
+ */
+function ServiceCard({ services }: { services: DnsRecord[] }) {
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const copy = async (url: string) => {
+    try {
+      await writeText(url);
+      setCopied(url);
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      // コピー失敗は致命的でないので握りつぶす
+    }
+  };
+
+  return (
+    <section className="card">
+      <div className="service__head">
+        <h3 className="service__title">{t.tunnel.service.head}</h3>
+        <span className="service__info" title={t.tunnel.service.hint} aria-hidden>
+          ⓘ
         </span>
-      )}
-    </li>
+      </div>
+      <ul className="service-list">
+        {services.map((record) => (
+          <li key={`${record.name}@${record.under ?? ""}`} className="service">
+            <span className="service__icon" aria-hidden>
+              🔗
+            </span>
+            <div className="service__text">
+              <span className="service__name">{record.name}</span>
+              {record.url && (
+                <button
+                  type="button"
+                  className="service__url mono"
+                  title={t.tunnel.service.openTitle}
+                  onClick={() => void api.openLink(record.url as string)}
+                >
+                  {record.url}
+                </button>
+              )}
+            </div>
+            {record.url && (
+              <button
+                type="button"
+                className="button--ghost small"
+                onClick={() => void copy(record.url as string)}
+              >
+                {copied === record.url
+                  ? t.tunnel.service.copied
+                  : t.tunnel.service.copyUrl}
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** クリップボードへコピーする小さなアイコンボタン(コピー後 1.5 秒だけ ✓)。 */
+function CopyIcon({ value, title }: { value: string; title: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // コピー失敗は致命的でないので握りつぶす
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      className="button--icon button--icon-inline"
+      title={title}
+      onClick={() => void copy()}
+    >
+      {copied ? "✓" : "📋"}
+    </button>
   );
 }

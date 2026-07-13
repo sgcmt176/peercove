@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { getVersion } from "@tauri-apps/api/app";
 import { Connection, Member, NetworkInfo, Transfer, api, errorMessage } from "./ipc";
 import { t } from "./i18n";
 import {
@@ -51,6 +52,15 @@ export default function App() {
   const [settingsFor, setSettingsFor] = useState<string | null>(null);
   /** 詳細表示中のネットワーク(configPath)。null なら一覧。 */
   const [openConfig, setOpenConfig] = useState<string | null>(null);
+  /**
+   * ネットワーク詳細のタブ(M3-15 で App に持ち上げた)。サイドバーの
+   * 「チャット」「受信」からタブを切り替えられるように状態をここへ集約する。
+   */
+  const [detailTab, setDetailTab] = useState<
+    "members" | "chat" | "stats" | "inbox"
+  >("members");
+  /** アプリのバージョン(サイドバー下部に出す)。取得できなければ空。 */
+  const [version, setVersion] = useState("");
   /**
    * ディープリンクで受けた招待トークン(M3-5)。オブジェクトで包むのは、
    * 同じリンクを 2 回クリックしても再度フォームを開くため(参照が変わる)。
@@ -166,6 +176,13 @@ export default function App() {
     applyTheme(theme);
   }, [theme]);
 
+  // アプリのバージョン(サイドバー下部の表示用)。1 回だけ取れば十分
+  useEffect(() => {
+    void getVersion()
+      .then(setVersion)
+      .catch(() => {});
+  }, []);
+
   const changed = () => {
     void refresh();
     refreshNetworks();
@@ -177,87 +194,140 @@ export default function App() {
       ? null
       : (tunnels.find((tun) => tun.config === openConfig) ?? null);
 
+  // ネットワークを開くときはメンバータブから始める(M3-15)
+  const openNetwork = (configPath: string) => {
+    setOpenConfig(configPath);
+    setDetailTab("members");
+  };
+
+  // サイドバーの「チャット」「受信」→ 開いている詳細のタブを切り替える。
+  // どれも開いていないときは、稼働中が 1 つならそれを開く。複数/0 なら一覧へ
+  const goToTab = (tab: "chat" | "inbox") => {
+    if (openTunnel) {
+      setDetailTab(tab);
+    } else if (tunnels.length === 1) {
+      setOpenConfig(tunnels[0].config);
+      setDetailTab(tab);
+    } else {
+      setOpenConfig(null);
+    }
+  };
+
+  // サイドバーで強調する項目。チャット/受信タブを見ているときはそれを、
+  // それ以外(一覧・メンバー・統計)は「ネットワーク」を強調する
+  const activeNav =
+    openTunnel && detailTab === "chat"
+      ? "chat"
+      : openTunnel && detailTab === "inbox"
+        ? "inbox"
+        : "networks";
+
   return (
-    <main className="app">
-      <header className="app__header">
-        <div className="app__brand">
+    <div className="app">
+      <nav className="sidebar">
+        <div className="sidebar__brand">
           <span className="app__logo" aria-hidden>
             P
           </span>
-          <h1>PeerCove</h1>
+          <span className="sidebar__brand-name">PeerCove</span>
         </div>
-        <div className="app__actions">
-          <ConnectionBadge connection={connection} />
-          <button
-            type="button"
-            className="button--icon"
-            title={t.header.theme(theme)}
-            onClick={() => setTheme(nextTheme(theme))}
-          >
-            {theme === "light" ? "☀" : "☾"}
-          </button>
-          <button
-            type="button"
-            className="button--icon"
-            title={t.header.prefs}
-            onClick={() => setDialog("prefs")}
-          >
-            ⚙
-          </button>
-          <button
-            type="button"
-            className="button--icon"
-            title={t.header.logs}
-            disabled={connection.kind === "unreachable"}
-            onClick={() => setDialog("logs")}
-          >
-            ☰
-          </button>
-        </div>
-      </header>
-
-      {connection.kind === "ok" && connection.status.daemonOutdated && (
-        <section className="card card--error">
-          <h2>{t.daemonOutdated.title}</h2>
-          <p>{t.daemonOutdated.body}</p>
-          <p className="muted small mono">{t.daemonOutdated.windows}</p>
-          <p className="muted small mono">{t.daemonOutdated.linux}</p>
-        </section>
-      )}
-
-      {connection.kind === "unreachable" ? (
-        <DaemonUnreachable
-          message={connection.message}
-          onRetry={() => void refresh()}
-        />
-      ) : connection.kind === "connecting" ? (
-        <p className="muted">{t.state.connectingDaemon}</p>
-      ) : openTunnel !== null ? (
-        <>
-          <button
-            type="button"
-            className="button--link"
+        <ul className="sidebar__nav">
+          <SidebarItem
+            icon="🖧"
+            label={t.sidebar.networks}
+            active={activeNav === "networks"}
             onClick={() => setOpenConfig(null)}
-          >
-            {t.networks.back}
-          </button>
+          />
+          <SidebarItem
+            icon="💬"
+            label={t.sidebar.chat}
+            active={activeNav === "chat"}
+            disabled={connection.kind !== "ok" || tunnels.length === 0}
+            onClick={() => goToTab("chat")}
+          />
+          <SidebarItem
+            icon="📥"
+            label={t.sidebar.inbox}
+            active={activeNav === "inbox"}
+            disabled={connection.kind !== "ok" || tunnels.length === 0}
+            onClick={() => goToTab("inbox")}
+          />
+          <SidebarItem
+            icon="⚙"
+            label={t.sidebar.settings}
+            active={false}
+            onClick={() => setDialog("prefs")}
+          />
+        </ul>
+        <div className="sidebar__foot">
+          <ConnectionStatus connection={connection} />
+          <div className="sidebar__foot-row">
+            {version && (
+              <span className="sidebar__version muted small">
+                {t.sidebar.version(version)}
+              </span>
+            )}
+            <span className="sidebar__foot-actions">
+              <button
+                type="button"
+                className="button--icon"
+                title={t.sidebar.theme(theme)}
+                onClick={() => setTheme(nextTheme(theme))}
+              >
+                {theme === "light" ? "☀" : "☾"}
+              </button>
+              <button
+                type="button"
+                className="button--icon"
+                title={t.sidebar.logs}
+                disabled={connection.kind === "unreachable"}
+                onClick={() => setDialog("logs")}
+              >
+                ☰
+              </button>
+            </span>
+          </div>
+        </div>
+      </nav>
+
+      <main className="app__main">
+        {connection.kind === "ok" && connection.status.daemonOutdated && (
+          <section className="card card--error">
+            <h2>{t.daemonOutdated.title}</h2>
+            <p>{t.daemonOutdated.body}</p>
+            <p className="muted small mono">{t.daemonOutdated.windows}</p>
+            <p className="muted small mono">{t.daemonOutdated.linux}</p>
+          </section>
+        )}
+
+        {connection.kind === "unreachable" ? (
+          <DaemonUnreachable
+            message={connection.message}
+            onRetry={() => void refresh()}
+          />
+        ) : connection.kind === "connecting" ? (
+          <p className="muted">{t.state.connectingDaemon}</p>
+        ) : openTunnel !== null ? (
           <TunnelView
             tunnel={openTunnel}
+            tab={detailTab}
+            onTab={setDetailTab}
+            onBack={() => setOpenConfig(null)}
             onChanged={changed}
             onSettings={() => setSettingsFor(openTunnel.config)}
           />
-        </>
-      ) : (
-        <NetworksView
-          networks={networks}
-          tunnels={tunnels}
-          onChanged={changed}
-          onOpen={(configPath) => setOpenConfig(configPath)}
-          onSettings={(configPath) => setSettingsFor(configPath)}
-          pendingJoin={pendingJoin}
-          onPendingJoinHandled={() => setPendingJoin(null)}
-        />
-      )}
+        ) : (
+          <NetworksView
+            networks={networks}
+            tunnels={tunnels}
+            onChanged={changed}
+            onOpen={openNetwork}
+            onSettings={(configPath) => setSettingsFor(configPath)}
+            pendingJoin={pendingJoin}
+            onPendingJoinHandled={() => setPendingJoin(null)}
+          />
+        )}
+      </main>
 
       {dialog === "logs" && <LogsDialog onClose={() => setDialog(null)} />}
       {dialog === "prefs" && <PrefsDialog onClose={() => setDialog(null)} />}
@@ -270,20 +340,53 @@ export default function App() {
           }}
         />
       )}
-
-      <footer className="app__footer muted small">{t.footer}</footer>
-    </main>
+    </div>
   );
 }
 
-function ConnectionBadge({ connection }: { connection: Connection }) {
-  if (connection.kind !== "ok") {
-    return <span className="badge badge--off">{t.state.daemonDisconnected}</span>;
-  }
-  const count = connection.status.tunnels.length;
+/** サイドバーのナビ項目(アイコン + ラベル。狭い幅ではアイコンだけになる)。 */
+function SidebarItem({
+  icon,
+  label,
+  active,
+  disabled,
+  onClick,
+}: {
+  icon: string;
+  label: string;
+  active: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
   return (
-    <span className={count === 0 ? "badge" : "badge badge--on"}>
-      {count === 0 ? t.state.idle : t.state.runningCount(count)}
+    <li>
+      <button
+        type="button"
+        className={
+          active ? "sidebar__item sidebar__item--active" : "sidebar__item"
+        }
+        disabled={disabled}
+        onClick={onClick}
+        title={label}
+      >
+        <span className="sidebar__icon" aria-hidden>
+          {icon}
+        </span>
+        <span className="sidebar__label">{label}</span>
+      </button>
+    </li>
+  );
+}
+
+/** サイドバー下部のデーモン接続状態(ドット + 文字)。 */
+function ConnectionStatus({ connection }: { connection: Connection }) {
+  const ok = connection.kind === "ok";
+  return (
+    <span className="sidebar__status">
+      <span className={ok ? "dot dot--online" : "dot"} aria-hidden />
+      <span className="muted small">
+        {ok ? t.sidebar.connected : t.sidebar.disconnected}
+      </span>
     </span>
   );
 }

@@ -39,6 +39,7 @@ export function PrefsDialog({ onClose }: { onClose: () => void }) {
         </label>
         <p className="muted small prefs__hint">{t.prefs.linkPreviewHint}</p>
         <p className="muted small">{t.prefs.note}</p>
+        <p className="muted small prefs__license">{t.footer}</p>
       </div>
     </Modal>
   );
