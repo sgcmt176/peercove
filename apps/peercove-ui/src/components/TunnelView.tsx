@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
-  DnsRecord,
   InboxItem,
   Member,
   Peer,
@@ -84,8 +83,6 @@ export function TunnelView({
     (sum, peer) => sum + (rateSeries(tunnel.config, peer.publicKey).at(-1) ?? 0),
     0,
   );
-  // URL を組み立て済みのカスタムレコード(DNS サービスカード。ホスト・メンバー共通)
-  const services = tunnel.dnsRecords.filter((record) => record.url !== null);
 
   const remove = async (member: Member) => {
     setBusy(true);
@@ -248,8 +245,6 @@ export function TunnelView({
               </>
             )}
           </section>
-
-          {services.length > 0 && <ServiceCard services={services} />}
         </>
       ) : view === "chat" ? (
         <ChatPanel tunnel={tunnel} initialConversation={chatTarget} />
@@ -883,69 +878,6 @@ function MemberRow({
         )}
       </td>
     </tr>
-  );
-}
-
-/**
- * DNS サービスカード(M3-15、ADR-0023)。スキームを設定したカスタムレコードを
- * URL 付きで並べ、クリックで既定ブラウザ起動・ボタンで URL コピー。表示名は
- * レコード名から自動(ホスト・メンバー共通で status の配信レコードを使う)。
- */
-function ServiceCard({ services }: { services: DnsRecord[] }) {
-  const [copied, setCopied] = useState<string | null>(null);
-
-  const copy = async (url: string) => {
-    try {
-      await writeText(url);
-      setCopied(url);
-      setTimeout(() => setCopied(null), 1500);
-    } catch {
-      // コピー失敗は致命的でないので握りつぶす
-    }
-  };
-
-  return (
-    <section className="card">
-      <div className="service__head">
-        <h3 className="service__title">{t.tunnel.service.head}</h3>
-        <span className="service__info" title={t.tunnel.service.hint} aria-hidden>
-          ⓘ
-        </span>
-      </div>
-      <ul className="service-list">
-        {services.map((record) => (
-          <li key={`${record.name}@${record.under ?? ""}`} className="service">
-            <span className="service__icon" aria-hidden>
-              🔗
-            </span>
-            <div className="service__text">
-              <span className="service__name">{record.name}</span>
-              {record.url && (
-                <button
-                  type="button"
-                  className="service__url mono"
-                  title={t.tunnel.service.openTitle}
-                  onClick={() => void api.openLink(record.url as string)}
-                >
-                  {record.url}
-                </button>
-              )}
-            </div>
-            {record.url && (
-              <button
-                type="button"
-                className="button--ghost small"
-                onClick={() => void copy(record.url as string)}
-              >
-                {copied === record.url
-                  ? t.tunnel.service.copied
-                  : t.tunnel.service.copyUrl}
-              </button>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
   );
 }
 

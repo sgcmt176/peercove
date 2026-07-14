@@ -1935,6 +1935,12 @@ select {
 
 .service__name {
   font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* DNS 一覧のカードで、解決先(IP / CNAME 先)を名前・URL の下に薄く出す */
+.service__target {
+  overflow-wrap: anywhere;
 }
 
 .service__url {

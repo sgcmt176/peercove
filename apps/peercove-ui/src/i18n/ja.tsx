@@ -482,6 +482,7 @@ export const ja = {
     serviceHint:
       "スキームを指定すると URL を組み立てて全メンバーに表示します。ポートだけ指定した場合は DNS名:ポートで表示します。",
     targetOf: (name: string) => `→ ${name}`,
+    openTitle: "既定のブラウザで開く",
     brokenRef: "参照先なし",
     add: "追加",
     adding: "追加中…",

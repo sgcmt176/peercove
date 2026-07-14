@@ -81,15 +81,6 @@ export function DnsView({
 
   const shown = isHost ? records : distributed;
 
-  /** メンバー参照("host" or 公開鍵)の表示名。 */
-  const memberName = (ref: string): string => {
-    const member = members.find((m) =>
-      ref === "host" ? m.isHost : m.publicKey === ref,
-    );
-    if (!member) return t.dns.brokenRef;
-    return member.name ?? member.dnsName?.split(".")[0] ?? member.ip;
-  };
-
   const machineBase = baseKind !== "free";
   const machineRef = machineBase ? baseKind : undefined;
   // 表示・登録に使う base ラベル(マシンなら現在ラベル、自由入力なら入力値)
@@ -212,33 +203,32 @@ export function DnsView({
         {shown.length === 0 ? (
           <p className="muted small">{t.dns.customEmpty}</p>
         ) : (
-          <ul className="dns-list">
+          <ul className="service-list">
             {shown.map((record) => (
-              <li key={`${record.name}@${record.under ?? ""}`} className="dns-list__row">
-                <span className="dns-list__names">
-                  <span className="mono ellipsis" title={record.fqdn}>
-                    {record.fqdn}
-                  </span>
+              <li key={`${record.name}@${record.under ?? ""}`} className="service">
+                <span className="service__icon" aria-hidden>
+                  🔗
+                </span>
+                <div className="service__text">
+                  <span className="service__name mono">{record.fqdn}</span>
                   {record.url !== null ? (
-                    <span className="mono small ellipsis" title={record.url}>
+                    <button
+                      type="button"
+                      className="service__url mono"
+                      title={t.dns.openTitle}
+                      onClick={() => void api.openLink(record.url as string)}
+                    >
                       {record.url}
-                    </span>
+                    </button>
                   ) : record.port !== null ? (
-                    <span className="mono small ellipsis">
+                    <span className="service__url mono muted">
                       {record.fqdn}:{record.port}
                     </span>
                   ) : null}
-                </span>
-                {record.member !== null ? (
-                  <span className="muted small ellipsis">
-                    {t.dns.targetOf(memberName(record.member))}
+                  <span className="service__target mono muted small">
+                    {record.cname ?? record.ip ?? t.dns.brokenRef}
                   </span>
-                ) : record.cname !== null ? (
-                  <span className="muted small ellipsis">{t.dns.cnameTag}</span>
-                ) : null}
-                <span className="mono muted">
-                  {record.cname ?? record.ip ?? t.dns.brokenRef}
-                </span>
+                </div>
                 {copyButton(record.fqdn)}
                 {record.url !== null && copyButton(record.url, t.dns.copyUrl)}
                 {isHost && (
