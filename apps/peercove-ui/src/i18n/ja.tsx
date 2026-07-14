@@ -49,6 +49,7 @@ export const ja = {
   },
 
   header: {
+    myDisplayName: (name: string) => `表示名: ${name}`,
     settings: "設定",
     settingsUnavailable:
       "設定ファイルがまだありません（ホストを始めるか参加してください）",

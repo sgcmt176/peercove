@@ -242,6 +242,8 @@ export default function App() {
   const detail = connection.kind === "ok" && openConfig !== null;
   const detailName = openTunnel?.network ?? openInfo?.name ?? "";
   const detailHost = (openTunnel?.role ?? openInfo?.role) === "hosting";
+  const myDisplayName =
+    openTunnel?.members.find((member) => member.isSelf)?.name?.trim() || null;
   const chatUnread = openTunnel ? totalUnread(openTunnel) : 0;
   const inboxBadge = openTunnel
     ? openTunnel.transfers.filter((tr) => !tr.done).length
@@ -450,6 +452,7 @@ export default function App() {
         {detail && (
           <DetailHeader
             name={detailName}
+            myDisplayName={myDisplayName}
             isHost={detailHost}
             running={openTunnel !== null}
             rejected={Boolean(openTunnel?.connectionError)}
@@ -554,6 +557,7 @@ export default function App() {
 /** ネットワーク詳細・設定ページのヘッダー(戻る・名前・状態・切断)。 */
 function DetailHeader({
   name,
+  myDisplayName,
   isHost,
   running,
   rejected,
@@ -562,6 +566,7 @@ function DetailHeader({
   onDisconnect,
 }: {
   name: string;
+  myDisplayName: string | null;
   isHost: boolean;
   running: boolean;
   rejected: boolean;
@@ -580,6 +585,14 @@ function DetailHeader({
         ←
       </button>
       <h2 className="detail__title">{name}</h2>
+      {myDisplayName && (
+        <span
+          className="detail__identity"
+          title={t.header.myDisplayName(myDisplayName)}
+        >
+          {t.header.myDisplayName(myDisplayName)}
+        </span>
+      )}
       <span className={running && !rejected ? "badge badge--on" : "badge"}>
         {rejected
           ? t.tunnel.rejectedBadge
