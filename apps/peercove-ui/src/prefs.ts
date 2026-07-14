@@ -9,6 +9,10 @@ export interface Prefs {
   linkPreview: boolean;
   /** GitHub Releases へ最新版を確認するか。 */
   updateChecks: boolean;
+  /** 通信品質の劣化通知。既定オフ(M3-23)。 */
+  qualityAlerts: boolean;
+  /** 3 窓連続で通知する損失率の閾値(%)。 */
+  qualityLossThreshold: number;
 }
 
 const KEY = "peercove-prefs";
@@ -17,6 +21,8 @@ export const DEFAULT_PREFS: Prefs = {
   notifications: true,
   linkPreview: true,
   updateChecks: true,
+  qualityAlerts: false,
+  qualityLossThreshold: 5,
 };
 
 export function loadPrefs(): Prefs {

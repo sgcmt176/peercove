@@ -16,6 +16,7 @@ import {
   diffTransfers,
   notifyChatEvents,
   notifyFileEvents,
+  notifyQualityEvents,
   notifyMemberEvents,
 } from "./notify";
 import { clearChat, syncChat, totalUnread } from "./chat";
@@ -140,6 +141,7 @@ export default function App() {
           tunnel.network,
         );
         previousTransfers.current.set(tunnel.config, tunnel.transfers);
+        void notifyQualityEvents(tunnel);
       }
       // 止まったネットワークは次回接続を「初回」に戻す(全員分の通知を防ぐ)
       for (const key of [...previousMembers.current.keys()]) {
@@ -486,6 +488,8 @@ export default function App() {
                 }
                 updateInfo={updateInfo}
                 onUpdateInfo={setUpdateInfo}
+                networks={networks}
+                onChanged={changed}
               />
             ) : (
               <NetworksView

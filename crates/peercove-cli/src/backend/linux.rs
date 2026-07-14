@@ -11,7 +11,8 @@ use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
 
-use super::{AclDeny, IsolatedPeer, PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use super::{IsolatedPeer, PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use peercove_core::acl::{AclAction, AclPolicy, AclProtocol, ResolvedRule};
 use peercove_core::proto::CONTROL_PORT;
 
 pub struct LinuxBackend {
@@ -20,9 +21,42 @@ pub struct LinuxBackend {
     /// ルーター役(ADR-0014)として適用中の状態。down で対解除する。
     router: RouterState,
     /// ACL(ADR-0018)で適用中の DROP ルールの (src, dst)。down で対解除する。
-    acl_rules: Vec<(String, String)>,
+    acl_rules: Vec<Vec<String>>,
+    acl_policy: Option<AclPolicy>,
+    acl_generation: u64,
     /// 承認待ち端末に適用中の仮想 IP。INPUT/OUTPUT/FORWARD の解除に使う。
     isolated_ips: Vec<std::net::Ipv4Addr>,
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+
+    #[test]
+    fn acl_rule_arguments_match_common_protocol_and_port_semantics() {
+        let rule = ResolvedRule {
+            id: "allow-game".into(),
+            action: AclAction::Allow,
+            source: vec!["10.0.0.0/24".parse().unwrap()],
+            destination: vec!["10.0.1.2/32".parse().unwrap()],
+            protocol: AclProtocol::Udp,
+            ports: vec![(25565, 25570)],
+        };
+        let args = acl_rule_args(
+            "-I",
+            "pcv0",
+            &rule,
+            "10.0.0.0/24",
+            "10.0.1.2/32",
+            Some((25565, 25570)),
+            "test",
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-p", "udp"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--dport", "25565:25570"]));
+        assert!(args.windows(2).any(|pair| pair == ["-j", "ACCEPT"]));
+    }
 }
 
 /// ルーター役の適用済み状態(サブネットごとの NAT ルールと、
@@ -102,28 +136,50 @@ fn forward_rule_args(op: &str, src: &str, dst: &str) -> Vec<String> {
 /// ACL の DROP ルールの引数(ADR-0018)。トンネル IF に入りトンネル IF から
 /// 出る(= ホストがリレーする)トラフィックだけを対象にする。`-I`(先頭挿入)で
 /// 既存の ACCEPT 系ルールより先に評価させる。
-fn acl_rule_args(op: &str, wg_if: &str, src: &str, dst: &str) -> Vec<String> {
-    [
-        op,
-        "FORWARD",
-        "-i",
-        wg_if,
-        "-o",
-        wg_if,
-        "-s",
-        src,
-        "-d",
-        dst,
-        "-j",
-        "DROP",
-        "-m",
-        "comment",
-        "--comment",
-        "peercove-acl",
+fn acl_rule_args(
+    op: &str,
+    wg_if: &str,
+    rule: &ResolvedRule,
+    src: &str,
+    dst: &str,
+    port: Option<(u16, u16)>,
+    comment: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        op, "FORWARD", "-i", wg_if, "-o", wg_if, "-s", src, "-d", dst,
     ]
     .iter()
-    .map(|s| s.to_string())
-    .collect()
+    .map(|value| value.to_string())
+    .collect();
+    match rule.protocol {
+        AclProtocol::Any => {}
+        AclProtocol::Tcp => args.extend(["-p".into(), "tcp".into()]),
+        AclProtocol::Udp => args.extend(["-p".into(), "udp".into()]),
+        AclProtocol::Icmp => args.extend(["-p".into(), "icmp".into()]),
+    }
+    if let Some((start, end)) = port {
+        args.extend([
+            "--dport".into(),
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}:{end}")
+            },
+        ]);
+    }
+    args.extend([
+        "-j".into(),
+        match rule.action {
+            AclAction::Allow => "ACCEPT",
+            AclAction::Deny => "DROP",
+        }
+        .into(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        comment.into(),
+    ]);
+    args
 }
 
 fn isolation_rule_args(op: &str, wg_if: &str, ip: std::net::Ipv4Addr) -> Vec<Vec<String>> {
@@ -166,17 +222,21 @@ impl LinuxBackend {
             api,
             router: RouterState::default(),
             acl_rules: Vec::new(),
+            acl_policy: None,
+            acl_generation: 0,
             isolated_ips: Vec::new(),
         })
     }
 
     /// 適用中の ACL ルールをすべて解除する(down・全解除の共通処理)。
     fn clear_acl(&mut self) {
-        for (src, dst) in std::mem::take(&mut self.acl_rules) {
-            if let Err(e) = iptables(&acl_rule_args("-D", &self.if_name, &src, &dst)) {
-                tracing::warn!("ACL ルールの削除に失敗しました({src}→{dst}): {e:#}");
+        for mut args in std::mem::take(&mut self.acl_rules) {
+            args[0] = "-D".to_string();
+            if let Err(e) = iptables(&args) {
+                tracing::warn!("ACL ルールの削除に失敗しました: {e:#}");
             }
         }
+        self.acl_policy = None;
     }
 
     fn clear_isolation(&mut self) {
@@ -413,54 +473,82 @@ impl WgBackend for LinuxBackend {
         }
     }
 
-    fn sync_acl(&mut self, denied: &[AclDeny]) -> anyhow::Result<()> {
-        // 望ましいルール集合: 各遮断組について「両側の /32 + 広告サブネット」の
-        // 全組合せ × 両方向
-        let mut desired: Vec<(String, String)> = Vec::new();
-        for deny in denied {
-            let side = |ip: std::net::Ipv4Addr, subnets: &[ipnet::Ipv4Net]| {
-                let mut nets = vec![format!("{ip}/32")];
-                nets.extend(subnets.iter().map(|s| s.to_string()));
-                nets
+    fn sync_acl(&mut self, policy: &AclPolicy) -> anyhow::Result<()> {
+        if self.acl_policy.as_ref() == Some(policy) {
+            return Ok(());
+        }
+        self.acl_generation = self.acl_generation.wrapping_add(1);
+        let generation = self.acl_generation;
+        let mut desired = Vec::new();
+        for rule in &policy.rules {
+            let sources: Vec<String> = if rule.source.is_empty() {
+                vec!["0.0.0.0/0".into()]
+            } else {
+                rule.source.iter().map(ToString::to_string).collect()
             };
-            for a in side(deny.a, &deny.a_subnets) {
-                for b in side(deny.b, &deny.b_subnets) {
-                    desired.push((a.clone(), b.clone()));
-                    desired.push((b, a.clone()));
+            let destinations: Vec<String> = if rule.destination.is_empty() {
+                vec!["0.0.0.0/0".into()]
+            } else {
+                rule.destination.iter().map(ToString::to_string).collect()
+            };
+            let ports: Vec<Option<(u16, u16)>> = if rule.ports.is_empty() {
+                vec![None]
+            } else {
+                rule.ports.iter().copied().map(Some).collect()
+            };
+            for src in &sources {
+                for dst in &destinations {
+                    for &port in &ports {
+                        desired.push(acl_rule_args(
+                            "-I",
+                            &self.if_name,
+                            rule,
+                            src,
+                            dst,
+                            port,
+                            &format!("peercove-acl-v2-{generation}-{}", rule.id),
+                        ));
+                    }
                 }
             }
         }
-        desired.sort_unstable();
-        desired.dedup();
-
-        // 解除されたルールを削除
-        let keep: std::collections::HashSet<_> = desired.iter().cloned().collect();
-        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.acl_rules)
-            .into_iter()
-            .partition(|rule| keep.contains(rule));
-        self.acl_rules = kept;
-        for (src, dst) in gone {
-            if let Err(e) = iptables(&acl_rule_args("-D", &self.if_name, &src, &dst)) {
-                tracing::warn!("ACL ルールの削除に失敗しました({src}→{dst}): {e:#}");
-            } else {
-                tracing::info!("ACL の遮断を解除しました({src} ⇔ {dst})");
-            }
+        if policy.default == AclAction::Deny {
+            let rule = ResolvedRule {
+                id: "default".into(),
+                action: AclAction::Deny,
+                source: vec![],
+                destination: vec![],
+                protocol: AclProtocol::Any,
+                ports: vec![],
+            };
+            desired.push(acl_rule_args(
+                "-I",
+                &self.if_name,
+                &rule,
+                "0.0.0.0/0",
+                "0.0.0.0/0",
+                None,
+                &format!("peercove-acl-v2-{generation}-default"),
+            ));
         }
-
-        // 新しいルールを適用(残骸との重複は -C で確認して避ける)
-        for (src, dst) in desired {
-            if self.acl_rules.contains(&(src.clone(), dst.clone())) {
-                continue;
+        let mut added: Vec<Vec<String>> = Vec::new();
+        for args in desired.iter().rev() {
+            if let Err(error) = iptables(args) {
+                for mut rollback in added {
+                    rollback[0] = "-D".into();
+                    let _ = iptables(&rollback);
+                }
+                return Err(error).context("ACL v2 ルールを設定できません。iptables が必要です (sudo apt install iptables)");
             }
-            if iptables(&acl_rule_args("-C", &self.if_name, &src, &dst)).is_err() {
-                iptables(&acl_rule_args("-I", &self.if_name, &src, &dst)).context(
-                    "ACL(DROP)ルールの設定に失敗しました。iptables が必要です \
-                     (sudo apt install iptables)",
-                )?;
-                tracing::info!("ACL で遮断しました({src} → {dst})");
-            }
-            self.acl_rules.push((src, dst));
+            added.push(args.clone());
         }
+        // 新規一式が先に入った後で旧世代を外すため、再読込中に全許可の窓を作らない。
+        for mut old in std::mem::take(&mut self.acl_rules) {
+            old[0] = "-D".into();
+            let _ = iptables(&old);
+        }
+        self.acl_rules = desired;
+        self.acl_policy = Some(policy.clone());
         Ok(())
     }
 

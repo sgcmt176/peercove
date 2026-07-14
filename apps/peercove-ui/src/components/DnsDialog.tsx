@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { DnsRecord, Member, api, errorMessage } from "../ipc";
+import {
+  DnsRecord,
+  HealthSettings,
+  Member,
+  ServiceHealth,
+  api,
+  errorMessage,
+} from "../ipc";
 import { t } from "../i18n";
+import { Modal } from "./Modal";
 
 /**
  * DNS 管理画面(M3-1c、ADR-0011 §1b、ADR-0022)。
@@ -43,6 +51,8 @@ export function DnsView({
   const [port, setPort] = useState("");
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [healthEditing, setHealthEditing] = useState<DnsRecord | null>(null);
+  const [checking, setChecking] = useState(false);
 
   // 固定サフィックス <ネットワーク名>.peercove.internal(メンバーの DNS 名から拝借)
   const suffix =
@@ -79,7 +89,26 @@ export function DnsView({
     reload();
   }, [reload]);
 
-  const shown = isHost ? records : distributed;
+  const shown = isHost
+    ? records.map((record) => ({
+        ...record,
+        health:
+          distributed.find((current) => current.fqdn === record.fqdn)?.health ??
+          record.health,
+      }))
+    : distributed;
+
+  const checkNow = async () => {
+    setChecking(true);
+    setError(null);
+    try {
+      await api.checkDnsHealth(configPath);
+      window.setTimeout(() => setChecking(false), 4000);
+    } catch (reason) {
+      setChecking(false);
+      setError(errorMessage(reason));
+    }
+  };
 
   const machineBase = baseKind !== "free";
   const machineRef = machineBase ? baseKind : undefined;
@@ -199,16 +228,26 @@ export function DnsView({
           </ul>
         )}
 
-        <h3 className="subhead">{t.dns.customHead}</h3>
+        <div className="dns-services__head">
+          <h3 className="subhead">{t.dns.customHead}</h3>
+          {isHost && shown.some((record) => record.port !== null) && (
+            <button
+              type="button"
+              className="button--ghost"
+              disabled={checking}
+              onClick={() => void checkNow()}
+            >
+              {checking ? t.dns.health.checking : t.dns.health.checkNow}
+            </button>
+          )}
+        </div>
         {shown.length === 0 ? (
           <p className="muted small">{t.dns.customEmpty}</p>
         ) : (
           <ul className="service-list">
             {shown.map((record) => (
               <li key={`${record.name}@${record.under ?? ""}`} className="service">
-                <span className="service__icon" aria-hidden>
-                  🔗
-                </span>
+                <ServiceIcon />
                 <div className="service__text">
                   <span className="service__name mono">{record.fqdn}</span>
                   {record.url !== null ? (
@@ -228,17 +267,32 @@ export function DnsView({
                   <span className="service__target mono muted small">
                     {record.cname ?? record.ip ?? t.dns.brokenRef}
                   </span>
+                  {record.port !== null && <HealthLine health={record.health} />}
+                  {record.health?.status === "unhealthy" && (
+                    <span className="service__warning small">
+                      {t.dns.health.openWarning}
+                    </span>
+                  )}
                 </div>
                 {copyButton(record.fqdn)}
                 {record.url !== null && copyButton(record.url, t.dns.copyUrl)}
                 {isHost && (
-                  <button
-                    type="button"
-                    className="button--link button--link-danger small"
-                    onClick={() => void remove(record)}
-                  >
-                    {t.dns.remove}
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="button--link small"
+                      onClick={() => setHealthEditing(record)}
+                    >
+                      {t.dns.health.settings}
+                    </button>
+                    <button
+                      type="button"
+                      className="button--link button--link-danger small"
+                      onClick={() => void remove(record)}
+                    >
+                      {t.dns.remove}
+                    </button>
+                  </>
                 )}
               </li>
             ))}
@@ -384,6 +438,183 @@ export function DnsView({
 
         {error && <p className="error-text">{error}</p>}
       </div>
+      {healthEditing?.healthSettings && (
+        <HealthDialog
+          configPath={configPath}
+          record={healthEditing}
+          onClose={() => setHealthEditing(null)}
+          onSaved={() => {
+            setHealthEditing(null);
+            reload();
+            void checkNow();
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function ServiceIcon() {
+  return (
+    <span className="service__icon" aria-hidden>
+      <svg viewBox="0 0 24 24" width="20" height="20">
+        <path
+          d="M10.5 13.5a4 4 0 0 0 5.7.1l2.4-2.4a4 4 0 0 0-5.7-5.7l-1.4 1.4m2 3.6a4 4 0 0 0-5.7-.1l-2.4 2.4a4 4 0 0 0 5.7 5.7l1.4-1.4"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+        />
+      </svg>
+    </span>
+  );
+}
+
+function HealthLine({ health }: { health: ServiceHealth | null }) {
+  const status = health?.status ?? "unknown";
+  const checked = health?.checkedAtUnixMs
+    ? new Intl.DateTimeFormat("ja-JP", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }).format(new Date(health.checkedAtUnixMs))
+    : t.dns.health.notChecked;
+  const detail =
+    health?.responseMs !== null && health?.responseMs !== undefined
+      ? `${health.responseMs} ms`
+      : reasonLabel(health?.reason);
+  return (
+    <span className={`service-health service-health--${status}`}>
+      <i aria-hidden />
+      <strong>{t.dns.health.status[status]}</strong>
+      <span>{detail}</span>
+      <span>{t.dns.health.checked(checked)}</span>
+    </span>
+  );
+}
+
+function reasonLabel(reason?: ServiceHealth["reason"]) {
+  if (!reason) return t.dns.health.reason.not_checked;
+  return t.dns.health.reason[reason];
+}
+
+function HealthDialog({
+  configPath,
+  record,
+  onClose,
+  onSaved,
+}: {
+  configPath: string;
+  record: DnsRecord;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const original = record.healthSettings as HealthSettings;
+  const [settings, setSettings] = useState<HealthSettings>(original);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isExternal = record.cname !== null;
+  const canHead = record.scheme === "http";
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.setDnsHealth(configPath, record, settings);
+      onSaved();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title={t.dns.health.dialogTitle} onClose={onClose}>
+      <p className="mono small">{record.fqdn}</p>
+      <label className="chat__pick-row">
+        <input
+          type="checkbox"
+          checked={settings.enabled}
+          onChange={(event) =>
+            setSettings({ ...settings, enabled: event.target.checked })
+          }
+        />
+        <span>{t.dns.health.enabled}</span>
+      </label>
+      <p className="muted small">{t.dns.health.enabledHint}</p>
+      {isExternal && (
+        <>
+          <label className="chat__pick-row">
+            <input
+              type="checkbox"
+              checked={settings.external}
+              onChange={(event) =>
+                setSettings({ ...settings, external: event.target.checked })
+              }
+            />
+            <span>{t.dns.health.external}</span>
+          </label>
+          <p className="muted small">{t.dns.health.externalHint}</p>
+        </>
+      )}
+      <label className="field">
+        <span>{t.dns.health.kind}</span>
+        <select
+          value={settings.kind}
+          onChange={(event) =>
+            setSettings({
+              ...settings,
+              kind: event.target.value as HealthSettings["kind"],
+            })
+          }
+        >
+          <option value="tcp">{t.dns.health.tcp}</option>
+          <option value="http_head" disabled={!canHead}>
+            {t.dns.health.httpHead}
+          </option>
+        </select>
+      </label>
+      {settings.kind === "http_head" && (
+        <div className="row">
+          <label className="field">
+            <span>{t.dns.health.path}</span>
+            <input
+              value={settings.path}
+              className="mono"
+              onChange={(event) =>
+                setSettings({ ...settings, path: event.target.value })
+              }
+            />
+          </label>
+          <label className="field">
+            <span>{t.dns.health.expected}</span>
+            <input
+              type="number"
+              min={100}
+              max={599}
+              placeholder="200–399"
+              value={settings.expectedStatus ?? ""}
+              onChange={(event) =>
+                setSettings({
+                  ...settings,
+                  expectedStatus:
+                    event.target.value === "" ? null : Number(event.target.value),
+                })
+              }
+            />
+          </label>
+        </div>
+      )}
+      {error && <p className="error-text">{error}</p>}
+      <div className="modal__actions">
+        <button type="button" className="button--ghost" onClick={onClose}>
+          {t.common.cancel}
+        </button>
+        <button type="button" disabled={busy} onClick={() => void save()}>
+          {busy ? t.common.saving : t.common.save}
+        </button>
+      </div>
+    </Modal>
   );
 }

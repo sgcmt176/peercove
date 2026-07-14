@@ -109,6 +109,8 @@ pub struct Distribution {
     /// ワイヤには載せず、送信時にメンバーごとのフィルタ
     /// ([`ledger_message_for`])の材料にする。
     pub deny: Vec<(Ipv4Addr, Ipv4Addr)>,
+    /// 細粒度ACLにより直接通信を禁止する組と、その理由となる先頭ルールID。
+    pub force_relay: Vec<(Ipv4Addr, Ipv4Addr, String)>,
 }
 
 /// 台帳スナップショットをメンバー向けにフィルタして Ledger メッセージにする
@@ -137,6 +139,7 @@ fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMes
             .any(|label| record.name.split('.').any(|part| part == label))
     });
     let deny = std::mem::take(&mut dist.deny);
+    let force_relay = std::mem::take(&mut dist.force_relay);
     for entry in &mut dist.members {
         let blocked = deny
             .iter()
@@ -145,6 +148,14 @@ fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMes
             entry.endpoint = None;
             entry.endpoint_age_secs = None;
             entry.blocked = true;
+        }
+        if let Some((_, _, rule_id)) = force_relay.iter().find(|(a, b, _)| {
+            (*a == member_ip && *b == entry.ip) || (*a == entry.ip && *b == member_ip)
+        }) {
+            entry.endpoint = None;
+            entry.endpoint_age_secs = None;
+            entry.force_relay = true;
+            entry.acl_rule_id = Some(rule_id.clone());
         }
     }
     ControlMessage::Ledger {
@@ -174,6 +185,8 @@ type LedgerDigest = (
         bool,                           // online
         bool,                           // is_host
         bool,                           // blocked(ACL、ADR-0018)
+        bool,                           // force_relay(ACL v2)
+        Option<String>,                 // acl_rule_id
         Vec<ipnet::Ipv4Net>,            // subnets(ADR-0014)
         Option<String>,                 // app_version(M3-12)
         Vec<String>,                    // capabilities(M3-12)
@@ -199,6 +212,8 @@ fn ledger_digest(
                     m.online,
                     m.is_host,
                     m.blocked,
+                    m.force_relay,
+                    m.acl_rule_id.clone(),
                     m.subnets.clone(),
                     m.app_version.clone(),
                     m.capabilities.clone(),
@@ -210,8 +225,72 @@ fn ledger_digest(
     )
 }
 
-/// 相手の仮想 IP → 直近の RTT(ミリ秒、M2-G5)。切断時にエントリを消す。
-pub type RttMap = Arc<Mutex<HashMap<Ipv4Addr, f64>>>;
+/// 1 回の supervisor 周期で回収する Ping/Pong 観測値。
+#[derive(Debug, Clone, Default)]
+pub struct ProbeWindow {
+    pub connected: bool,
+    pub sent: u32,
+    pub received: u32,
+    pub rtts_ms: Vec<f64>,
+}
+
+/// RTT 最新値と、品質履歴用の未回収 Ping/Pong 観測値。
+#[derive(Default)]
+pub struct RttState {
+    latest: HashMap<Ipv4Addr, f64>,
+    pending: HashMap<Ipv4Addr, ProbeWindow>,
+}
+
+impl RttState {
+    #[cfg(test)]
+    fn get(&self, ip: &Ipv4Addr) -> Option<&f64> {
+        self.latest.get(ip)
+    }
+
+    pub fn latest(&self) -> HashMap<Ipv4Addr, f64> {
+        self.latest.clone()
+    }
+
+    pub fn drain_probes(&mut self) -> HashMap<Ipv4Addr, ProbeWindow> {
+        self.pending
+            .iter_mut()
+            .map(|(ip, window)| {
+                let drained = ProbeWindow {
+                    connected: window.connected,
+                    sent: std::mem::take(&mut window.sent),
+                    received: std::mem::take(&mut window.received),
+                    rtts_ms: std::mem::take(&mut window.rtts_ms),
+                };
+                (*ip, drained)
+            })
+            .collect()
+    }
+
+    fn connected(&mut self, ip: Ipv4Addr) {
+        self.pending.entry(ip).or_default().connected = true;
+    }
+
+    fn disconnected(&mut self, ip: Ipv4Addr) {
+        self.latest.remove(&ip);
+        self.pending.entry(ip).or_default().connected = false;
+    }
+
+    fn issued(&mut self, ip: Ipv4Addr) {
+        let window = self.pending.entry(ip).or_default();
+        window.connected = true;
+        window.sent = window.sent.saturating_add(1);
+    }
+
+    fn observed(&mut self, ip: Ipv4Addr, ms: f64) {
+        self.latest.insert(ip, ms);
+        let window = self.pending.entry(ip).or_default();
+        window.connected = true;
+        window.received = window.received.saturating_add(1);
+        window.rtts_ms.push(ms);
+    }
+}
+
+pub type RttMap = Arc<Mutex<RttState>>;
 
 /// メンバー側コントロールチャネルと supervisor の橋渡し(ADR-0020、M3-11)。
 /// supervisor が鍵ローテーションの依頼を接続中の送信キューへ差し込み、
@@ -584,7 +663,7 @@ fn handle_ping_pong(
         }
         ControlMessage::Pong { nonce } => {
             if let Some(ms) = ping.lock().unwrap().observe(nonce) {
-                rtt.lock().unwrap().insert(peer_ip, ms);
+                rtt.lock().unwrap().observed(peer_ip, ms);
             }
             true
         }
@@ -713,6 +792,7 @@ async fn handle_member(
     let (connection, mut close_rx) = ConnectionInfo::new(tx.clone(), app_version, capabilities);
     let connection_id = connection.connection_id;
     register_connection(connections, member_ip, connection);
+    rtt.lock().unwrap().connected(member_ip);
 
     // 現在の台帳を即送信。borrow_and_update で「見た」ことにして、
     // 直後の changed() が同じ内容をもう一度送るのを防ぐ
@@ -728,6 +808,7 @@ async fn handle_member(
         rx,
         Arc::clone(&ping),
         Arc::clone(&isolation),
+        Arc::clone(rtt),
     ));
     let mut read_task = tokio::spawn(host_reader(
         reader,
@@ -757,7 +838,7 @@ async fn handle_member(
         result.unwrap_or_else(|e| Err(anyhow::anyhow!("制御タスクが異常終了しました: {e}")));
     let removed_current = unregister_connection(connections, member_ip, connection_id);
     if removed_current {
-        rtt.lock().unwrap().remove(&member_ip);
+        rtt.lock().unwrap().disconnected(member_ip);
     }
     result
 }
@@ -770,6 +851,7 @@ fn unix_secs() -> u64 {
 }
 
 /// 書き側。分岐はすべてキャンセル安全なものだけにすること。
+#[allow(clippy::too_many_arguments)]
 async fn host_writer(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     member_ip: Ipv4Addr,
@@ -778,6 +860,7 @@ async fn host_writer(
     mut rx: mpsc::UnboundedReceiver<ControlMessage>,
     ping: SharedPing,
     isolation: Arc<AtomicBool>,
+    rtt: RttMap,
 ) -> anyhow::Result<()> {
     if !isolation.load(Ordering::Relaxed) {
         write_half
@@ -819,6 +902,7 @@ async fn host_writer(
             }
             _ = ping_tick.tick() => {
                 let message = ping.lock().unwrap().issue();
+                rtt.lock().unwrap().issued(member_ip);
                 write_half.write_all(encode_line(&message).as_bytes()).await?;
             }
         }
@@ -914,13 +998,13 @@ pub async fn run_member_client(
                 link.detach();
                 if let Some(message) = connection_error {
                     tracing::warn!("ホストが参加を拒否したため再接続を停止します: {message}");
-                    rtt.lock().unwrap().remove(&host_ip);
+                    rtt.lock().unwrap().disconnected(host_ip);
                     return;
                 }
                 if let Err(e) = result {
                     tracing::debug!("制御接続が終了しました(再接続します): {e:#}");
                 }
-                rtt.lock().unwrap().remove(&host_ip);
+                rtt.lock().unwrap().disconnected(host_ip);
                 if removed.load(Ordering::Relaxed) {
                     tracing::info!("削除通知を受けたので再接続を停止します");
                     return;
@@ -962,9 +1046,16 @@ async fn member_session(
     .expect("受信側はこの後 spawn する");
     // supervisor が鍵ローテーション依頼を差し込めるようにする(ADR-0020)
     link.attach(tx.clone());
+    rtt.lock().unwrap().connected(host_ip);
 
     let ping: SharedPing = Default::default();
-    let mut writer = tokio::spawn(member_writer(write_half, rx, Arc::clone(&ping)));
+    let mut writer = tokio::spawn(member_writer(
+        write_half,
+        rx,
+        Arc::clone(&ping),
+        host_ip,
+        Arc::clone(rtt),
+    ));
     let mut read_task = tokio::spawn(member_reader(
         line_reader(read_half),
         host_ip,
@@ -991,6 +1082,8 @@ async fn member_writer(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<ControlMessage>,
     ping: SharedPing,
+    host_ip: Ipv4Addr,
+    rtt: RttMap,
 ) -> anyhow::Result<()> {
     let mut ping_tick = tokio::time::interval(PING_INTERVAL);
     loop {
@@ -1003,6 +1096,7 @@ async fn member_writer(
             }
             _ = ping_tick.tick() => {
                 let message = ping.lock().unwrap().issue();
+                rtt.lock().unwrap().issued(host_ip);
                 write_half.write_all(encode_line(&message).as_bytes()).await?;
             }
         }
@@ -1054,6 +1148,7 @@ async fn member_reader(
                         dns_records,
                         cname_records,
                         deny: vec![], // deny はワイヤに載らない(blocked で受ける)
+                        force_relay: vec![],
                     },
                     received_at: Instant::now(),
                 });
@@ -1111,6 +1206,8 @@ mod tests {
             endpoint_age_secs: None,
             subnets: vec![],
             blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
         }
     }
 
@@ -1202,6 +1299,7 @@ mod tests {
             dns_records: vec![],
             cname_records: vec![],
             deny: vec![],
+            force_relay: vec![],
         });
         let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
         let host_rtt: RttMap = Default::default();
@@ -1262,6 +1360,7 @@ mod tests {
                     ip: "100.100.42.50".parse().unwrap(),
                     scheme: Some("https".to_string()),
                     port: Some(8443),
+                    health: None,
                 }],
                 cname_records: vec![CnameRecord {
                     name: "docs".to_string(),
@@ -1269,8 +1368,10 @@ mod tests {
                     resolved_ip: None,
                     scheme: None,
                     port: None,
+                    health: None,
                 }],
                 deny: vec![],
+                force_relay: vec![],
             })
             .unwrap();
         wait_for(&latest, |l| members_len(l) == Some(2)).await;
@@ -1322,6 +1423,7 @@ mod tests {
             dns_records: vec![],
             cname_records: vec![],
             deny: vec![("100.100.42.2".parse().unwrap(), member_ip)],
+            force_relay: vec![],
         };
 
         let ControlMessage::Ledger { members, .. } = ledger_message_for(dist.clone(), member_ip)
@@ -1355,9 +1457,11 @@ mod tests {
                 ip: "100.100.42.2".parse().unwrap(),
                 scheme: None,
                 port: None,
+                health: None,
             }],
             cname_records: vec![],
             deny: vec![],
+            force_relay: vec![],
         };
         let ControlMessage::Ledger {
             members,

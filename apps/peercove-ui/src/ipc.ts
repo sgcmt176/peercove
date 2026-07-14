@@ -38,10 +38,14 @@ export interface Member {
   subnets: string[];
   /** 自分とこのメンバーの間がホストの ACL で遮断されている（M3-10、ADR-0018）。 */
   blocked: boolean;
+  /** ACL v2のためホスト中継へ固定されている。 */
+  forceRelay: boolean;
+  aclRuleId: string | null;
 }
 
 /** カスタム DNS レコード（M3-1c、ADR-0022 で拡張）。 */
 export interface DnsRecord {
+  id: string | null;
   name: string;
   /** 解決済みの現在の IP（メンバー参照が切れている場合のみ null）。 */
   ip: string | null;
@@ -57,6 +61,31 @@ export interface DnsRecord {
   port: number | null;
   /** スキームがある場合にバックエンドで組み立て済みの URL。 */
   url: string | null;
+  health: ServiceHealth | null;
+  healthSettings: HealthSettings | null;
+}
+
+export interface ServiceHealth {
+  status: "healthy" | "unhealthy" | "unknown" | "disabled";
+  reason:
+    | "not_checked"
+    | "offline"
+    | "timeout"
+    | "connection_failed"
+    | "name_resolution_failed"
+    | "unexpected_status"
+    | "disabled";
+  checkedAtUnixMs: number | null;
+  responseMs: number | null;
+  httpStatus: number | null;
+}
+
+export interface HealthSettings {
+  enabled: boolean;
+  kind: "tcp" | "http_head";
+  path: string;
+  expectedStatus: number | null;
+  external: boolean;
 }
 
 export interface Peer {
@@ -220,6 +249,23 @@ export interface NetworkInfo {
   address: string;
 }
 
+export interface BackupPreview {
+  networkName: string;
+  role: "host" | "member";
+  sourceOs: string;
+  createdAtUnixMs: number;
+  categories: string[];
+  configFile: string;
+  memberKeyRotationRecommended: boolean;
+}
+
+export type AclAction = "allow" | "deny";
+export type AclProtocol = "any" | "tcp" | "udp" | "icmp";
+export type AclTarget = "any" | { member: string } | { group: string } | { subnet: string } | { service: string };
+export interface AclGroup { id: string; members: string[]; }
+export interface AclRule { id: string; action: AclAction; source: AclTarget; destination: AclTarget; protocol: AclProtocol; ports: string[]; enabled: boolean; }
+export interface AclPolicySettings { default: AclAction; groups: AclGroup[]; rules: AclRule[]; }
+
 export interface InitResult {
   configPath: string;
   network: string;
@@ -336,6 +382,34 @@ export interface DiagnosticReport {
   }>;
 }
 
+export interface QualityPoint {
+  windowStartUnixMs: number;
+  windowSecs: number;
+  publicKey: string;
+  ip: string;
+  name: string | null;
+  availability: "connected" | "disconnected" | "unmeasured";
+  rttLatestMs: number | null;
+  rttMinMs: number | null;
+  rttAvgMs: number | null;
+  rttP95Ms: number | null;
+  jitterMs: number | null;
+  probesSent: number;
+  probesReceived: number;
+  lossPercent: number | null;
+  route: "direct" | "relay" | "trying";
+  routeSwitches: number;
+  rxBytes: number;
+  txBytes: number;
+}
+
+export interface QualityReport {
+  generatedAtUnixMs: number;
+  retentionDays: number;
+  skippedCorruptLines: number;
+  samples: QualityPoint[];
+}
+
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =
   | { kind: "connecting" }
@@ -345,6 +419,13 @@ export type Connection =
 // ---- コマンド ----
 
 export const api = {
+  createBackup: (configPath: string, passphrase: string) =>
+    invoke<string | null>("create_backup", { configPath, passphrase }),
+  pickBackup: () => invoke<string | null>("pick_backup"),
+  inspectBackup: (path: string, passphrase: string) =>
+    invoke<BackupPreview>("inspect_backup", { path, passphrase }),
+  restoreBackup: (path: string, passphrase: string, slug: string, replace: boolean) =>
+    invoke<string>("restore_backup", { path, passphrase, slug, replace }),
   daemonStatus: () => invoke<Status>("daemon_status"),
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
   startHost: (configPath: string, upnp: boolean) =>
@@ -394,6 +475,8 @@ export const api = {
   listAcl: (configPath: string) => invoke<[string, string][]>("list_acl", { configPath }),
   setAcl: (configPath: string, deny: [string, string][]) =>
     invoke<void>("set_acl", { configPath, deny }),
+  readAclPolicy: (configPath: string) => invoke<AclPolicySettings>("read_acl_policy", { configPath }),
+  writeAclPolicy: (configPath: string, policy: AclPolicySettings) => invoke<void>("write_acl_policy", { configPath, policy }),
   // チャット（ADR-0016、M3-13b/c）。peer 指定で 1:1、group 指定でグループ宛、
   // どちらも null でネットワーク全体宛
   chatSend: (
@@ -439,6 +522,8 @@ export const api = {
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
   diagnoseNetwork: (configPath: string) =>
     invoke<DiagnosticReport>("diagnose_network", { configPath }),
+  qualityHistory: (configPath: string, sinceUnixMs: number) =>
+    invoke<QualityReport>("quality_history", { configPath, sinceUnixMs }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),
   // ターゲットは ip（固定）か member（メンバー参照 = IP 自動追随）のどちらか。
@@ -463,6 +548,22 @@ export const api = {
     }),
   removeDnsRecord: (configPath: string, name: string, under?: string | null) =>
     invoke<void>("remove_dns_record", { configPath, name, under: under ?? null }),
+  setDnsHealth: (
+    configPath: string,
+    record: Pick<DnsRecord, "name" | "under">,
+    settings: HealthSettings,
+  ) => invoke<void>("set_dns_health", {
+    configPath,
+    name: record.name,
+    under: record.under,
+    enabled: settings.enabled,
+    kind: settings.kind,
+    path: settings.path,
+    expectedStatus: settings.expectedStatus,
+    external: settings.external,
+  }),
+  checkDnsHealth: (configPath: string) =>
+    invoke<void>("check_dns_health", { configPath }),
   readSettings: (configPath: string) =>
     invoke<Settings>("read_settings", { configPath }),
   saveSettings: (configPath: string, update: SettingsUpdate) =>

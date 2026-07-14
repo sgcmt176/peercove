@@ -6,7 +6,86 @@ use peercove_core::ipc::{
     ChatMessageInfo, DaemonStatus, LogLine, PeerSummary, TunnelInfo, TunnelRole, IPC_VERSION,
 };
 use peercove_core::proto::LedgerEntry;
+use peercove_core::quality::{
+    QualityAvailability, QualityReport as CoreQualityReport, QualityRoute, QualitySample,
+};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityReport {
+    pub generated_at_unix_ms: u64,
+    pub retention_days: u32,
+    pub skipped_corrupt_lines: u32,
+    pub samples: Vec<QualityPoint>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityPoint {
+    pub window_start_unix_ms: u64,
+    pub window_secs: u32,
+    pub public_key: String,
+    pub ip: String,
+    pub name: Option<String>,
+    pub availability: &'static str,
+    pub rtt_latest_ms: Option<f64>,
+    pub rtt_min_ms: Option<f64>,
+    pub rtt_avg_ms: Option<f64>,
+    pub rtt_p95_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub probes_sent: u32,
+    pub probes_received: u32,
+    pub loss_percent: Option<f64>,
+    pub route: &'static str,
+    pub route_switches: u32,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+impl From<CoreQualityReport> for QualityReport {
+    fn from(report: CoreQualityReport) -> Self {
+        Self {
+            generated_at_unix_ms: report.generated_at_unix_ms,
+            retention_days: report.retention_days,
+            skipped_corrupt_lines: report.skipped_corrupt_lines,
+            samples: report.samples.iter().map(QualityPoint::from).collect(),
+        }
+    }
+}
+
+impl From<&QualitySample> for QualityPoint {
+    fn from(sample: &QualitySample) -> Self {
+        Self {
+            window_start_unix_ms: sample.window_start_unix_ms,
+            window_secs: sample.window_secs,
+            public_key: sample.public_key.clone(),
+            ip: sample.ip.to_string(),
+            name: sample.name.clone(),
+            availability: match sample.availability {
+                QualityAvailability::Connected => "connected",
+                QualityAvailability::Disconnected => "disconnected",
+                QualityAvailability::Unmeasured => "unmeasured",
+            },
+            rtt_latest_ms: sample.rtt_latest_ms,
+            rtt_min_ms: sample.rtt_min_ms,
+            rtt_avg_ms: sample.rtt_avg_ms,
+            rtt_p95_ms: sample.rtt_p95_ms,
+            jitter_ms: sample.jitter_ms,
+            probes_sent: sample.probes_sent,
+            probes_received: sample.probes_received,
+            loss_percent: sample.loss_percent,
+            route: match sample.route {
+                QualityRoute::Direct => "direct",
+                QualityRoute::Relay => "relay",
+                QualityRoute::Trying => "trying",
+            },
+            route_switches: sample.route_switches,
+            rx_bytes: sample.rx_bytes,
+            tx_bytes: sample.tx_bytes,
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +112,8 @@ pub struct Member {
     /// 自分とこのメンバーの間がホストの ACL で遮断されているか
     /// (ADR-0018、M3-10)。UI はバッジ表示 + チャット/ファイル送信の抑止に使う。
     pub blocked: bool,
+    pub force_relay: bool,
+    pub acl_rule_id: Option<String>,
 }
 
 impl Member {
@@ -57,6 +138,8 @@ impl Member {
             is_self,
             subnets: entry.subnets.iter().map(|s| s.to_string()).collect(),
             blocked: entry.blocked,
+            force_relay: entry.force_relay,
+            acl_rule_id: entry.acl_rule_id.clone(),
         }
     }
 }
@@ -338,6 +421,7 @@ impl From<&TunnelInfo> for Tunnel {
                         peercove_core::dns::DNS_SUFFIX
                     );
                     DnsRecordDto {
+                        id: None,
                         name: record.name.clone(),
                         ip: Some(record.ip.to_string()),
                         cname: None,
@@ -351,6 +435,8 @@ impl From<&TunnelInfo> for Tunnel {
                         under: None,
                         scheme: record.scheme.clone(),
                         port: record.port,
+                        health: record.health.as_ref().map(ServiceHealthDto::from),
+                        health_settings: None,
                     }
                 })
                 .chain(info.cname_records.iter().map(|record| {
@@ -361,6 +447,7 @@ impl From<&TunnelInfo> for Tunnel {
                         peercove_core::dns::DNS_SUFFIX
                     );
                     DnsRecordDto {
+                        id: None,
                         name: record.name.clone(),
                         ip: None,
                         cname: Some(record.target.clone()),
@@ -374,6 +461,8 @@ impl From<&TunnelInfo> for Tunnel {
                         under: None,
                         scheme: record.scheme.clone(),
                         port: record.port,
+                        health: record.health.as_ref().map(ServiceHealthDto::from),
+                        health_settings: None,
                     }
                 }))
                 .collect(),
@@ -488,6 +577,7 @@ impl From<&peercove_ops::networks::NetworkEntry> for NetworkDto {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsRecordDto {
+    pub id: Option<String>,
     pub name: String,
     /// 解決済みの現在の IP(メンバー参照が切れている場合・CNAME は None)
     pub ip: Option<String>,
@@ -501,6 +591,55 @@ pub struct DnsRecordDto {
     pub scheme: Option<String>,
     pub port: Option<u16>,
     pub url: Option<String>,
+    pub health: Option<ServiceHealthDto>,
+    /// ホストの設定ファイルを直接読んだ場合だけ付く編集情報。
+    pub health_settings: Option<HealthSettingsDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceHealthDto {
+    pub status: &'static str,
+    pub reason: &'static str,
+    pub checked_at_unix_ms: Option<u64>,
+    pub response_ms: Option<u64>,
+    pub http_status: Option<u16>,
+}
+
+impl From<&peercove_core::dns::ServiceHealth> for ServiceHealthDto {
+    fn from(health: &peercove_core::dns::ServiceHealth) -> Self {
+        use peercove_core::dns::{ServiceHealthReason as Reason, ServiceHealthStatus as Status};
+        Self {
+            status: match health.status {
+                Status::Healthy => "healthy",
+                Status::Unhealthy => "unhealthy",
+                Status::Unknown => "unknown",
+                Status::Disabled => "disabled",
+            },
+            reason: match health.reason {
+                Reason::NotChecked => "not_checked",
+                Reason::Offline => "offline",
+                Reason::Timeout => "timeout",
+                Reason::ConnectionFailed => "connection_failed",
+                Reason::NameResolutionFailed => "name_resolution_failed",
+                Reason::UnexpectedStatus => "unexpected_status",
+                Reason::Disabled => "disabled",
+            },
+            checked_at_unix_ms: health.checked_at_unix_ms,
+            response_ms: health.response_ms,
+            http_status: health.http_status,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthSettingsDto {
+    pub enabled: bool,
+    pub kind: &'static str,
+    pub path: String,
+    pub expected_status: Option<u16>,
+    pub external: bool,
 }
 
 impl From<peercove_ops::dns::RecordDetail> for DnsRecordDto {
@@ -513,6 +652,7 @@ impl From<peercove_ops::dns::RecordDetail> for DnsRecordDto {
             peercove_ops::dns::RecordTarget::Cname(domain) => (None, Some(domain.clone())),
         };
         Self {
+            id: detail.id,
             name: detail.name,
             ip: detail.resolved_ip.map(|ip| ip.to_string()),
             cname,
@@ -522,6 +662,17 @@ impl From<peercove_ops::dns::RecordDetail> for DnsRecordDto {
             scheme: detail.scheme,
             port: detail.port,
             url: detail.url,
+            health: None,
+            health_settings: Some(HealthSettingsDto {
+                enabled: detail.health.enabled,
+                kind: match detail.health.kind {
+                    peercove_core::dns::HealthCheckKind::Tcp => "tcp",
+                    peercove_core::dns::HealthCheckKind::HttpHead => "http_head",
+                },
+                path: detail.health.path,
+                expected_status: detail.health.expected_status,
+                external: detail.health.external,
+            }),
         }
     }
 }
@@ -707,6 +858,8 @@ mod tests {
                 endpoint_age_secs: None,
                 subnets: vec![],
                 blocked: false,
+                force_relay: false,
+                acl_rule_id: None,
             }],
             peers: vec![],
             removed: false,
@@ -720,6 +873,7 @@ mod tests {
                 ip: "10.100.42.2".parse().unwrap(),
                 scheme: Some("http".to_string()),
                 port: Some(8080),
+                health: None,
             }],
             cname_records: vec![peercove_core::dns::CnameRecord {
                 name: "docs".to_string(),
@@ -727,6 +881,7 @@ mod tests {
                 resolved_ip: None,
                 scheme: None,
                 port: None,
+                health: None,
             }],
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
@@ -808,6 +963,8 @@ mod tests {
             endpoint_age_secs: None,
             subnets: vec![],
             blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
         };
         let mut direct = std::collections::HashMap::new();
         direct.insert(
@@ -947,6 +1104,7 @@ mod tests {
     fn host_record_detail_keeps_service_url() {
         let ip = "10.100.42.2".parse().unwrap();
         let dto = DnsRecordDto::from(peercove_ops::dns::RecordDetail {
+            id: Some("svc-test".to_string()),
             name: "gamehost".to_string(),
             under: None,
             relative: "gamehost".to_string(),
@@ -956,6 +1114,13 @@ mod tests {
             scheme: Some("https".to_string()),
             port: Some(443),
             url: Some("https://gamehost.home.peercove.internal/".to_string()),
+            health: peercove_ops::dns::HealthSettings {
+                enabled: true,
+                kind: peercove_core::dns::HealthCheckKind::Tcp,
+                path: "/".to_string(),
+                expected_status: None,
+                external: false,
+            },
         });
         let json = serde_json::to_value(dto).unwrap();
         assert_eq!(json["scheme"], "https");

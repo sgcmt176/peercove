@@ -75,6 +75,10 @@ struct Active {
     /// (member)制御接続への差し込み口(ADR-0021)。IPC の SetDnsName が
     /// ここからホストへ依頼を送り、応答を待つ
     member_link: Arc<crate::control::MemberLink>,
+    /// 1 分粒度の端末ローカル通信品質履歴(M3-23)。
+    quality: crate::quality::SharedQuality,
+    /// DNS サービスの直近ヘルス状態と手動再確認要求(M3-14e)。
+    health: crate::health::SharedHealth,
 }
 
 impl DaemonShared {
@@ -119,6 +123,30 @@ impl DaemonShared {
             IpcRequest::Diagnose { config } => Ok(IpcResponse::Diagnostic {
                 report: self.diagnose(config).await,
             }),
+            IpcRequest::Quality {
+                config,
+                since_unix_ms,
+            } => {
+                let key = Self::key_for(&config);
+                let active = self.active.lock().await;
+                let tunnel = active
+                    .get(&key)
+                    .ok_or_else(|| anyhow::anyhow!("このネットワークは稼働していません"))?;
+                let report = tunnel.quality.lock().unwrap().report(since_unix_ms);
+                Ok(IpcResponse::Quality { report })
+            }
+            IpcRequest::CheckDnsHealth { config } => {
+                let key = Self::key_for(&config);
+                let active = self.active.lock().await;
+                let tunnel = active
+                    .get(&key)
+                    .ok_or_else(|| anyhow::anyhow!("このネットワークは稼働していません"))?;
+                if tunnel.role != Role::Host {
+                    bail!("サービスの確認はホストでだけ実行できます");
+                }
+                tunnel.health.lock().unwrap().request_now();
+                Ok(IpcResponse::Done)
+            }
             IpcRequest::SendFile {
                 config,
                 peer,
@@ -812,12 +840,16 @@ impl DaemonShared {
         // チャット履歴・グループ情報の読み込み(数 MB 程度の同期 I/O。起動時のみ)
         let chat = crate::chat::ChatLog::load(&config);
         let groups = crate::groups::GroupStore::load(&config);
+        let quality = crate::quality::QualityStore::load(&config);
+        let health: crate::health::SharedHealth = Default::default();
         let task_snapshot = Arc::clone(&snapshot);
         let task_transfers = Arc::clone(&transfers);
         let task_chat = Arc::clone(&chat);
         let task_groups = Arc::clone(&groups);
         let task_rotate = Arc::clone(&rotate_request);
         let task_link = Arc::clone(&member_link);
+        let task_quality = Arc::clone(&quality);
+        let task_health = Arc::clone(&health);
         let task_config = config.clone();
         // Linux のスプリット DNS は per-link 設定のため、鍵ローテーションの
         // 入れ直し(インターフェース再作成)後に付け直す(ADR-0020)
@@ -837,6 +869,8 @@ impl DaemonShared {
                         Arc::clone(&task_groups),
                         Arc::clone(&task_rotate),
                         Arc::clone(&task_link),
+                        Arc::clone(&task_quality),
+                        Arc::clone(&task_health),
                     )
                     .await;
                 match result {
@@ -901,6 +935,8 @@ impl DaemonShared {
                 groups,
                 rotate_request,
                 member_link,
+                quality,
+                health,
             },
         );
         drop(active);
@@ -1225,15 +1261,31 @@ impl DaemonShared {
                 ));
             }
             let blocked = tunnel.ledger.iter().filter(|member| member.blocked).count();
+            let forced = tunnel
+                .ledger
+                .iter()
+                .filter(|member| member.force_relay)
+                .count();
+            let mut rule_ids: Vec<_> = tunnel
+                .ledger
+                .iter()
+                .filter_map(|member| member.acl_rule_id.clone())
+                .collect();
+            rule_ids.sort();
+            rule_ids.dedup();
             checks.push(diagnostic_check(
                 "tunnel.acl",
                 DiagnosticCategory::Tunnel,
-                if blocked == 0 {
+                if blocked == 0 && forced == 0 {
                     DiagnosticStatus::Pass
                 } else {
                     DiagnosticStatus::Warning
                 },
-                [("blocked_members", blocked.to_string())],
+                [
+                    ("blocked_members", blocked.to_string()),
+                    ("force_relay_members", forced.to_string()),
+                    ("acl_rule_ids", rule_ids.join(",")),
+                ],
             ));
         }
 

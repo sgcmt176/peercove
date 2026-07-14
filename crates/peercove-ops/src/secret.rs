@@ -12,6 +12,28 @@ pub fn write_secret(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// バイナリの秘密情報を保存する。暗号化バックアップにも同じ権限制限を適用する。
+pub fn write_secret_bytes(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, contents)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, contents)?;
+    restrict_acl(path);
+    Ok(())
+}
+
 /// Windows では秘密ファイルの ACL を「現在のユーザー + SYSTEM のみ」に
 /// 制限する(Unix の 600 相当)。失敗しても処理は続行し、手動対処を促す。
 ///
@@ -19,7 +41,7 @@ pub fn write_secret(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// (LocalSystem)として動かすため(M2-G7、ADR-0010)。これが無いと
 /// サービスが秘密鍵を読めずトンネル起動に失敗する。SID 表記なのは
 /// 「SYSTEM」というアカウント名が OS の言語でローカライズされるため。
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn restrict_acl(path: &Path) {
     let username = match std::env::var("USERNAME") {
         Ok(name) => name,
@@ -48,5 +70,5 @@ fn restrict_acl(path: &Path) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn restrict_acl(_path: &Path) {}

@@ -117,20 +117,11 @@ pub struct Device {
     relay: bool,
     /// ACL の遮断組(ADR-0018)。仮想 IP の正規化済みペア(小さい方が先)。
     /// リレー時に「来たピア × 出るピア」の組で判定して破棄する。
-    acl_denied: RwLock<std::collections::HashSet<(Ipv4Addr, Ipv4Addr)>>,
+    acl_policy: RwLock<peercove_core::acl::AclPolicy>,
     /// 承認待ち端末の仮想 IP。ホストのコントロール TCP 以外を破棄する。
     isolated: RwLock<std::collections::HashSet<Ipv4Addr>>,
     isolation_host: RwLock<Option<Ipv4Addr>>,
     shutdown: AtomicBool,
-}
-
-/// 順不同ペアの正規化(小さい IP を先に)。
-fn ordered(a: Ipv4Addr, b: Ipv4Addr) -> (Ipv4Addr, Ipv4Addr) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
 }
 
 impl Device {
@@ -159,7 +150,10 @@ impl Device {
             tun,
             peers: RwLock::new(PeerTable::default()),
             relay,
-            acl_denied: RwLock::new(std::collections::HashSet::new()),
+            acl_policy: RwLock::new(peercove_core::acl::AclPolicy {
+                default: peercove_core::acl::AclAction::Allow,
+                rules: vec![],
+            }),
             isolated: RwLock::new(std::collections::HashSet::new()),
             isolation_host: RwLock::new(None),
             shutdown: AtomicBool::new(false),
@@ -167,10 +161,8 @@ impl Device {
     }
 
     /// ACL の遮断組を丸ごと差し替える(ADR-0018。冪等、空で全解除)。
-    pub fn set_acl(&self, denied: &[(Ipv4Addr, Ipv4Addr)]) {
-        let normalized: std::collections::HashSet<_> =
-            denied.iter().map(|&(a, b)| ordered(a, b)).collect();
-        *self.acl_denied.write().unwrap() = normalized;
+    pub fn set_acl(&self, policy: peercove_core::acl::AclPolicy) {
+        *self.acl_policy.write().unwrap() = policy;
     }
 
     pub fn set_isolated(&self, isolated: &[Ipv4Addr], host_ip: Ipv4Addr) {
@@ -337,11 +329,14 @@ impl Device {
                         return;
                     }
                     // ACL(ADR-0018): 遮断組のリレーは破棄(TUN にも渡さない)
-                    if let (Some(a), Some(b)) = (from.virtual_ip(), target.virtual_ip()) {
-                        if self.acl_denied.read().unwrap().contains(&ordered(a, b)) {
-                            tracing::trace!("ACL により {a} ⇔ {b} のリレーを破棄しました");
-                            return;
-                        }
+                    let policy = self.acl_policy.read().unwrap();
+                    let decision = policy.evaluate_ipv4_packet(packet);
+                    if decision.action == peercove_core::acl::AclAction::Deny {
+                        tracing::trace!(
+                            "ACL によりリレーを破棄しました(rule={:?})",
+                            decision.rule_id
+                        );
+                        return;
                     }
                     tracing::trace!("宛先 {dst} のピアへ直接リレーします");
                     let mut buf = [0u8; BUF_SIZE];
@@ -970,8 +965,18 @@ mod tests {
         let before = ipv4_packet(a_ip, b_ip, b"before acl");
         expect_via_tunnel(&a, &b, before, "遮断前の A->B パケット");
 
-        // 遮断(逆順で渡しても正規化される)
-        host.device.set_acl(&[(b_ip, a_ip)]);
+        let deny = peercove_core::acl::ResolvedRule {
+            id: "test-deny".into(),
+            action: peercove_core::acl::AclAction::Deny,
+            source: vec![ipnet::Ipv4Net::new(a_ip, 32).unwrap()],
+            destination: vec![ipnet::Ipv4Net::new(b_ip, 32).unwrap()],
+            protocol: peercove_core::acl::AclProtocol::Any,
+            ports: vec![],
+        };
+        host.device.set_acl(peercove_core::acl::AclPolicy {
+            default: peercove_core::acl::AclAction::Allow,
+            rules: vec![deny],
+        });
         let blocked = ipv4_packet(a_ip, b_ip, b"blocked");
         a.tun.os_out_tx.send(blocked).unwrap();
         std::thread::sleep(Duration::from_millis(600));
@@ -990,7 +995,10 @@ mod tests {
         assert_eq!(received, a2h);
 
         // 解除すれば再び通る
-        host.device.set_acl(&[]);
+        host.device.set_acl(peercove_core::acl::AclPolicy {
+            default: peercove_core::acl::AclAction::Allow,
+            rules: vec![],
+        });
         let after = ipv4_packet(a_ip, b_ip, b"after acl");
         let received = expect_via_tunnel(&a, &b, after.clone(), "解除後の A->B パケット");
         assert_eq!(received, after);

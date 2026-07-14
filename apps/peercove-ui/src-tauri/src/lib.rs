@@ -38,6 +38,89 @@ fn config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("設定ディレクトリを特定できません: {e}"))
 }
 
+// ---- 暗号化バックアップ / 復元 (M3-24, ADR-0034) ----
+
+#[tauri::command]
+async fn create_backup(
+    app: tauri::AppHandle,
+    config_path: String,
+    passphrase: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let network = peercove_core::config::Config::load(Path::new(&config_path))
+        .map_err(|e| e.to_string())?
+        .network_name()
+        .to_string();
+    let suggested = format!("{network}.pcvbackup");
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("PeerCove backup", &["pcvbackup"])
+            .set_file_name(&suggested)
+            .blocking_save_file()
+            .map(|path| path.to_string())
+    })
+    .await
+    .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))?;
+    let Some(output) = picked else {
+        return Ok(None);
+    };
+    peercove_ops::backup::create(Path::new(&config_path), Path::new(&output), &passphrase)
+        .map_err(to_message)?;
+    Ok(Some(output))
+}
+
+#[tauri::command]
+async fn pick_backup(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("PeerCove backup", &["pcvbackup"])
+            .blocking_pick_file()
+            .map(|path| path.to_string())
+    })
+    .await
+    .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))
+}
+
+#[tauri::command]
+fn inspect_backup(
+    path: String,
+    passphrase: String,
+) -> Result<peercove_ops::backup::BackupPreview, String> {
+    peercove_ops::backup::inspect(Path::new(&path), &passphrase).map_err(to_message)
+}
+
+#[tauri::command]
+async fn restore_backup(
+    app: tauri::AppHandle,
+    path: String,
+    passphrase: String,
+    slug: String,
+    replace: bool,
+) -> Result<String, String> {
+    let base = config_dir(&app)?;
+    let target = peercove_ops::networks::networks_dir(&base).join(&slug);
+    if let Ok(IpcResponse::Status(status)) = peercove_ipc::request_async(IpcRequest::Status).await {
+        let target = std::fs::canonicalize(&target).unwrap_or(target);
+        if status.tunnels.iter().any(|tunnel| {
+            let parent = tunnel.config.parent().unwrap_or(Path::new(""));
+            std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()) == target
+        }) {
+            return Err("稼働中のネットワークは置換できません。先に切断してください".to_string());
+        }
+    }
+    let mode = if replace {
+        peercove_ops::backup::RestoreMode::Replace
+    } else {
+        peercove_ops::backup::RestoreMode::New
+    };
+    peercove_ops::backup::restore(Path::new(&path), &passphrase, &base, &slug, mode)
+        .map(|result| result.config_path.display().to_string())
+        .map_err(to_message)
+}
+
 /// anyhow のエラーチェーンを人間向け 1 行に潰す。
 fn to_message(e: anyhow::Error) -> String {
     format!("{e:#}")
@@ -160,6 +243,24 @@ async fn diagnose_network(config_path: String) -> Result<DiagnosticReport, Strin
         Ok(IpcResponse::Diagnostic { report }) => Ok(report),
         Ok(other) => Err(format!("想定外の応答です: {other:?}")),
         Err(error) => Err(to_message(error)),
+    }
+}
+
+#[tauri::command]
+async fn quality_history(
+    config_path: String,
+    since_unix_ms: u64,
+) -> Result<dto::QualityReport, String> {
+    let config = canonical(&config_path)?;
+    match peercove_ipc::request_async(IpcRequest::Quality {
+        config,
+        since_unix_ms,
+    })
+    .await
+    {
+        Ok(IpcResponse::Quality { report }) => Ok(report.into()),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
     }
 }
 
@@ -904,6 +1005,19 @@ fn set_acl(config_path: String, deny: Vec<[String; 2]>) -> Result<(), String> {
     peercove_ops::acl::set_deny(Path::new(&config_path), &parsed).map_err(to_message)
 }
 
+#[tauri::command]
+fn read_acl_policy(config_path: String) -> Result<peercove_ops::acl::PolicySettings, String> {
+    peercove_ops::acl::read_policy(Path::new(&config_path)).map_err(to_message)
+}
+
+#[tauri::command]
+fn write_acl_policy(
+    config_path: String,
+    policy: peercove_ops::acl::PolicySettings,
+) -> Result<(), String> {
+    peercove_ops::acl::write_policy(Path::new(&config_path), &policy).map_err(to_message)
+}
+
 // ---- カスタム DNS レコード(M3-1c、ADR-0011 §1b、ADR-0022) ----
 
 /// メンバー参照("host" または公開鍵 base64)を解析する。
@@ -993,6 +1107,53 @@ fn remove_dns_record(
     peercove_ops::dns::remove_record(Path::new(&config_path), &name, under).map_err(to_message)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn set_dns_health(
+    config_path: String,
+    name: String,
+    under: Option<String>,
+    enabled: bool,
+    kind: String,
+    path: String,
+    expected_status: Option<u16>,
+    external: bool,
+) -> Result<(), String> {
+    let under = under
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(parse_member_ref)
+        .transpose()?;
+    let kind = match kind.as_str() {
+        "tcp" => peercove_core::dns::HealthCheckKind::Tcp,
+        "http_head" => peercove_core::dns::HealthCheckKind::HttpHead,
+        _ => return Err("ヘルスチェック方式が不正です".to_string()),
+    };
+    peercove_ops::dns::set_health(
+        Path::new(&config_path),
+        &name,
+        under,
+        &peercove_ops::dns::HealthSettings {
+            enabled,
+            kind,
+            path,
+            expected_status,
+            external,
+        },
+    )
+    .map_err(to_message)
+}
+
+#[tauri::command]
+async fn check_dns_health(config_path: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    match peercove_ipc::request_async(IpcRequest::CheckDnsHealth { config }).await {
+        Ok(IpcResponse::Done) => Ok(()),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(error) => Err(to_message(error)),
+    }
+}
+
 /// 設定ファイルの現在値を読む(M2-G5)。
 #[tauri::command]
 fn read_settings(config_path: String) -> Result<Settings, String> {
@@ -1063,10 +1224,15 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            create_backup,
+            pick_backup,
+            inspect_backup,
+            restore_backup,
             daemon_status,
             check_update,
             daemon_logs,
             diagnose_network,
+            quality_history,
             start_host,
             start_member,
             stop_tunnel,
@@ -1088,6 +1254,8 @@ pub fn run() {
             set_member_subnets,
             list_acl,
             set_acl,
+            read_acl_policy,
+            write_acl_policy,
             pick_file,
             send_file,
             chat_send,
@@ -1104,6 +1272,8 @@ pub fn run() {
             list_dns_records,
             add_dns_record,
             remove_dns_record,
+            set_dns_health,
+            check_dns_health,
             read_settings,
             save_settings,
         ])

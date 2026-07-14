@@ -362,6 +362,8 @@ mod tests {
             endpoint_age_secs: None,
             subnets: vec![],
             blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
         };
         let networks = vec![
             (
@@ -372,6 +374,7 @@ mod tests {
                     ip: "10.1.0.50".parse().unwrap(),
                     scheme: None,
                     port: None,
+                    health: None,
                 }],
                 vec![CnameRecord {
                     name: "docs".to_string(),
@@ -379,6 +382,7 @@ mod tests {
                     resolved_ip: None,
                     scheme: None,
                     port: None,
+                    health: None,
                 }],
             ),
             (

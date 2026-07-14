@@ -6,7 +6,9 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
+use peercove_core::acl::{AclAction, AclGroup, AclRule, AclTarget};
 use peercove_core::config::Config;
+use serde::{Deserialize, Serialize};
 
 use crate::peers::{load_doc, write_validated};
 
@@ -21,6 +23,116 @@ pub fn set_deny(config_path: &Path, deny: &[(Ipv4Addr, Ipv4Addr)]) -> anyhow::Re
     let mut doc = load_doc(config_path)?;
     write_deny(&mut doc, deny);
     write_validated(config_path, &doc.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicySettings {
+    pub default: AclAction,
+    pub groups: Vec<AclGroup>,
+    pub rules: Vec<AclRule>,
+}
+
+/// 旧deny pairは、画面上で同じ結果の双方向v2ルールへ展開する。
+pub fn read_policy(config_path: &Path) -> anyhow::Result<PolicySettings> {
+    let config = Config::load(config_path)?;
+    let mut rules = Vec::new();
+    for (index, (a, b)) in config.acl.normalized_deny().into_iter().enumerate() {
+        for (suffix, source, destination) in [("a-b", a, b), ("b-a", b, a)] {
+            rules.push(AclRule {
+                id: format!("legacy-{index}-{suffix}"),
+                action: AclAction::Deny,
+                source: AclTarget::Subnet {
+                    subnet: ipnet::Ipv4Net::new(source, 32).unwrap(),
+                },
+                destination: AclTarget::Subnet {
+                    subnet: ipnet::Ipv4Net::new(destination, 32).unwrap(),
+                },
+                protocol: peercove_core::acl::AclProtocol::Any,
+                ports: vec![],
+                enabled: true,
+            });
+        }
+    }
+    rules.extend(config.acl.rules);
+    Ok(PolicySettings {
+        default: config.acl.default,
+        groups: config.acl.groups,
+        rules,
+    })
+}
+
+/// ACL v2全体を原子的に差し替える。保存時に旧deny pairはv2へ移行される。
+pub fn write_policy(config_path: &Path, policy: &PolicySettings) -> anyhow::Result<()> {
+    let mut doc = load_doc(config_path)?;
+    let mut acl = toml_edit::Table::new();
+    acl["default"] = toml_edit::value(match policy.default {
+        AclAction::Allow => "allow",
+        AclAction::Deny => "deny",
+    });
+    if !policy.groups.is_empty() {
+        let mut groups = toml_edit::ArrayOfTables::new();
+        for group in &policy.groups {
+            let mut table = toml_edit::Table::new();
+            table["id"] = toml_edit::value(&group.id);
+            let mut members = toml_edit::Array::new();
+            for member in &group.members {
+                members.push(member.to_base64());
+            }
+            table["members"] = toml_edit::value(members);
+            groups.push(table);
+        }
+        acl["group"] = toml_edit::Item::ArrayOfTables(groups);
+    }
+    if !policy.rules.is_empty() {
+        let mut rules = toml_edit::ArrayOfTables::new();
+        for rule in &policy.rules {
+            let mut table = toml_edit::Table::new();
+            table["id"] = toml_edit::value(&rule.id);
+            table["action"] = toml_edit::value(match rule.action {
+                AclAction::Allow => "allow",
+                AclAction::Deny => "deny",
+            });
+            table["source"] = target_item(&rule.source);
+            table["destination"] = target_item(&rule.destination);
+            table["protocol"] = toml_edit::value(match rule.protocol {
+                peercove_core::acl::AclProtocol::Any => "any",
+                peercove_core::acl::AclProtocol::Tcp => "tcp",
+                peercove_core::acl::AclProtocol::Udp => "udp",
+                peercove_core::acl::AclProtocol::Icmp => "icmp",
+            });
+            if !rule.ports.is_empty() {
+                let mut ports = toml_edit::Array::new();
+                for port in &rule.ports {
+                    ports.push(port);
+                }
+                table["ports"] = toml_edit::value(ports);
+            }
+            if !rule.enabled {
+                table["enabled"] = toml_edit::value(false);
+            }
+            rules.push(table);
+        }
+        acl["rule"] = toml_edit::Item::ArrayOfTables(rules);
+    }
+    doc["acl"] = toml_edit::Item::Table(acl);
+    write_validated(config_path, &doc.to_string())
+}
+
+fn target_item(target: &AclTarget) -> toml_edit::Item {
+    match target {
+        AclTarget::Any(_) => toml_edit::value("any"),
+        AclTarget::Member { member } => inline("member", &member.to_base64()),
+        AclTarget::Group { group } => inline("group", group),
+        AclTarget::Subnet { subnet } => inline("subnet", &subnet.to_string()),
+        AclTarget::Service { service } => inline("service", service),
+    }
+}
+
+fn inline(key: &str, value: &str) -> toml_edit::Item {
+    let mut table = toml_edit::InlineTable::new();
+    table.insert(key, toml_edit::Value::from(value));
+    toml_edit::Item::Value(toml_edit::Value::InlineTable(table))
 }
 
 /// toml_edit ドキュメントへ遮断組を書き込む(remove-peer の掃除と共用)。
@@ -171,5 +283,71 @@ mod tests {
             list_deny(&config).unwrap(),
             vec![pair("10.100.42.2", "10.100.42.4")]
         );
+    }
+
+    #[test]
+    fn v2_policy_roundtrip_and_legacy_migration() {
+        let config = setup("v2");
+        add(&config, "alice", "10.100.42.2");
+        add(&config, "bob", "10.100.42.3");
+        set_deny(&config, &[pair("10.100.42.2", "10.100.42.3")]).unwrap();
+        let policy = read_policy(&config).unwrap();
+        assert_eq!(policy.rules.len(), 2);
+        write_policy(&config, &policy).unwrap();
+        let loaded = Config::load(&config).unwrap();
+        assert!(loaded.acl.deny.is_empty());
+        assert_eq!(loaded.acl.rules.len(), 2);
+        let evaluated = peercove_core::acl::AclPolicy::compile(&loaded).unwrap();
+        assert_eq!(
+            evaluated
+                .evaluate(
+                    "10.100.42.2".parse().unwrap(),
+                    "10.100.42.3".parse().unwrap(),
+                    6,
+                    Some(80)
+                )
+                .action,
+            AclAction::Deny
+        );
+    }
+
+    #[test]
+    fn removing_member_cleans_v2_group_and_rules() {
+        let config = setup("v2-remove");
+        add(&config, "alice", "10.100.42.2");
+        add(&config, "bob", "10.100.42.3");
+        let loaded = Config::load(&config).unwrap();
+        let bob = loaded
+            .peers
+            .iter()
+            .find(|peer| peer.name.as_deref() == Some("bob"))
+            .unwrap()
+            .public_key;
+        write_policy(
+            &config,
+            &PolicySettings {
+                default: AclAction::Allow,
+                groups: vec![AclGroup {
+                    id: "servers".into(),
+                    members: vec![bob],
+                }],
+                rules: vec![AclRule {
+                    id: "deny-servers".into(),
+                    action: AclAction::Deny,
+                    source: AclTarget::Any("any".into()),
+                    destination: AclTarget::Group {
+                        group: "servers".into(),
+                    },
+                    protocol: peercove_core::acl::AclProtocol::Any,
+                    ports: vec![],
+                    enabled: true,
+                }],
+            },
+        )
+        .unwrap();
+        remove_peer(&config, &Selector::Name("bob")).unwrap();
+        let after = Config::load(&config).unwrap();
+        assert!(after.acl.groups.is_empty());
+        assert!(after.acl.rules.is_empty());
     }
 }

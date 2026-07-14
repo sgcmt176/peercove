@@ -3,6 +3,8 @@ import { Prefs, loadPrefs, savePrefs } from "../prefs";
 import { UpdateInfo, api, errorMessage } from "../ipc";
 import { checkForUpdate, clearUpdateCache } from "../update";
 import { t } from "../i18n";
+import { NetworkInfo } from "../ipc";
+import { BackupView } from "./BackupView";
 
 /**
  * アプリ全体の設定ページ(M3-13e → M3-16 でページ化)。localStorage 保存で
@@ -16,17 +18,21 @@ export function AppSettingsView({
   daemonVersion,
   updateInfo,
   onUpdateInfo,
+  networks,
+  onChanged,
 }: {
   version: string;
   daemonVersion: string | null;
   updateInfo: UpdateInfo | null;
   onUpdateInfo: (info: UpdateInfo | null) => void;
+  networks: NetworkInfo[];
+  onChanged: () => void;
 }) {
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
   const [checking, setChecking] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
-  const toggle = (key: keyof Prefs) => {
+  const toggle = (key: "notifications" | "linkPreview" | "updateChecks" | "qualityAlerts") => {
     const next = { ...prefs, [key]: !prefs[key] };
     setPrefs(next);
     savePrefs(next);
@@ -80,6 +86,36 @@ export function AppSettingsView({
           <span>{t.update.enabled}</span>
         </label>
         <p className="muted small prefs__hint">{t.update.enabledHint}</p>
+        <label className="chat__pick-row">
+          <input
+            type="checkbox"
+            checked={prefs.qualityAlerts}
+            onChange={() => toggle("qualityAlerts")}
+          />
+          <span>{t.prefs.qualityAlerts}</span>
+        </label>
+        <p className="muted small prefs__hint">{t.prefs.qualityAlertsHint}</p>
+        {prefs.qualityAlerts && (
+          <label className="prefs__threshold">
+            <span>{t.prefs.qualityLossThreshold}</span>
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={prefs.qualityLossThreshold}
+              onChange={(event) => {
+                const next = {
+                  ...prefs,
+                  qualityLossThreshold: Math.min(100, Math.max(1, Number(event.target.value) || 5)),
+                };
+                setPrefs(next);
+                savePrefs(next);
+              }}
+            />
+            <span>%</span>
+          </label>
+        )}
 
         <section className="prefs__update" aria-labelledby="update-title">
           <h3 id="update-title">{t.update.title}</h3>
@@ -122,6 +158,7 @@ export function AppSettingsView({
             )}
           </div>
         </section>
+        <BackupView networks={networks} onChanged={onChanged} />
         <p className="muted small">{t.prefs.note}</p>
         <p className="muted small prefs__license">{t.footer}</p>
       </div>

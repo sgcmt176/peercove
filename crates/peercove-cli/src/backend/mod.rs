@@ -15,6 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::SystemTime;
 
 use ipnet::Ipv4Net;
+use peercove_core::acl::AclPolicy;
 use peercove_core::keys::{PresharedKey, PrivateKey, PublicKey};
 
 /// トンネル 1 本の設定。設定 TOML から組み立てる。
@@ -44,14 +45,6 @@ pub struct PeerSpec {
 /// (ADR-0014)。サブネットも渡すのは、Linux の iptables ルールが
 /// パケットの src/dst で判定するため(Windows はピアの身元で判定するので
 /// 仮想 IP の組しか使わない)。
-#[derive(Clone, PartialEq, Eq)]
-pub struct AclDeny {
-    pub a: Ipv4Addr,
-    pub a_subnets: Vec<Ipv4Net>,
-    pub b: Ipv4Addr,
-    pub b_subnets: Vec<Ipv4Net>,
-}
-
 /// 承認待ち端末の隔離対象。仮想 IP 単位で、ホストのコントロール TCP 以外を
 /// OS 境界で破棄する(M3-22c)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -100,7 +93,7 @@ pub trait WgBackend: Send {
     /// メンバー間の遮断組(ADR-0018、M3-10)を同期する。冪等で、空なら全解除。
     /// ホストのみ呼ぶ。Windows はデバイス内リレーの判定表、Linux は
     /// iptables FORWARD の DROP ルールとして反映する。
-    fn sync_acl(&mut self, denied: &[AclDeny]) -> anyhow::Result<()>;
+    fn sync_acl(&mut self, policy: &AclPolicy) -> anyhow::Result<()>;
 
     /// 承認待ち端末を隔離する。冪等で、空配列は隔離をすべて解除する。
     fn sync_isolation(&mut self, isolated: &[IsolatedPeer]) -> anyhow::Result<()>;

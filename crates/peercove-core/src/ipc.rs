@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::quality::QualityReport;
+
 use crate::diagnostics::DiagnosticReport;
 use crate::msg::{ChatContext, ChatScope, GroupInfo};
 use crate::proto::LedgerEntry;
@@ -55,6 +57,14 @@ pub enum IpcRequest {
     },
     /// 指定ネットワークを変更せずに診断する(M3-21、ADR-0030)。
     Diagnose { config: PathBuf },
+    /// 指定時刻以降の端末ローカル通信品質履歴を取得する(M3-23、ADR-0032)。
+    Quality {
+        config: PathBuf,
+        #[serde(default)]
+        since_unix_ms: u64,
+    },
+    /// ホストの DNS サービス監視を間隔前でも再実行する(M3-14e)。
+    CheckDnsHealth { config: PathBuf },
     /// 稼働中トンネルのメンバーへファイルを送る(ADR-0015、M3-9)。
     /// 進捗は Status 応答の [`TunnelInfo::transfers`] で追う。
     /// 追加メソッドなので [`IPC_VERSION`] は上げない(旧デーモンは解析エラーを返す)。
@@ -163,6 +173,8 @@ pub enum IpcResponse {
     },
     /// Diagnose への構造化された応答。
     Diagnostic { report: DiagnosticReport },
+    /// Quality への応答。履歴は外部へ送信せず、稼働端末からだけ取得する。
+    Quality { report: QualityReport },
     /// SendFile への応答。`id` で [`TunnelInfo::transfers`] から進捗を引ける。
     Transfer { id: String },
     /// ChatSend / ChatFetch への応答(ADR-0016、M3-13)。`seq` は履歴全体の

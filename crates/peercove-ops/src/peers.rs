@@ -216,6 +216,66 @@ pub fn remove_peer(config_path: &Path, selector: &Selector) -> anyhow::Result<Re
             crate::acl::write_deny(&mut doc, &keep);
         }
     }
+    // ACL v2: 公開鍵参照をグループから外し、直接参照ルールと空になった
+    // グループを参照するルールを削除する。
+    let removed_service_ids: std::collections::HashSet<String> = config
+        .dns_records
+        .iter()
+        .filter(|record| {
+            record.member == Some(peercove_core::config::MemberRef::Key(public_key))
+                || record.under == Some(peercove_core::config::MemberRef::Key(public_key))
+        })
+        .filter_map(|record| record.id.clone())
+        .collect();
+    let mut removed_groups = std::collections::HashSet::new();
+    if let Some(groups) = doc
+        .get_mut("acl")
+        .and_then(|item| item.get_mut("group"))
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+    {
+        for group in groups.iter_mut() {
+            if let Some(members) = group
+                .get_mut("members")
+                .and_then(toml_edit::Item::as_array_mut)
+            {
+                members.retain(|member| member.as_str() != Some(target_key.as_str()));
+                if members.is_empty() {
+                    if let Some(id) = group.get("id").and_then(toml_edit::Item::as_str) {
+                        removed_groups.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        groups.retain(|group| {
+            group
+                .get("id")
+                .and_then(toml_edit::Item::as_str)
+                .is_none_or(|id| !removed_groups.contains(id))
+        });
+    }
+    if let Some(rules) = doc
+        .get_mut("acl")
+        .and_then(|item| item.get_mut("rule"))
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+    {
+        rules.retain(|rule| {
+            !["source", "destination"].iter().any(|field| {
+                let target = rule.get(field).and_then(toml_edit::Item::as_inline_table);
+                target.is_some_and(|target| {
+                    target.get("member").and_then(toml_edit::Value::as_str)
+                        == Some(target_key.as_str())
+                        || target
+                            .get("group")
+                            .and_then(toml_edit::Value::as_str)
+                            .is_some_and(|id| removed_groups.contains(id))
+                        || target
+                            .get("service")
+                            .and_then(toml_edit::Value::as_str)
+                            .is_some_and(|id| removed_service_ids.contains(id))
+                })
+            })
+        });
+    }
     // 削除メンバーを参照するカスタムレコードも掃除する(ADR-0022 §5。
     // 残すと Config::validate の参照先チェックで設定全体が壊れる)
     if let Some(records) = doc

@@ -41,11 +41,20 @@ pub struct Config {
 pub struct AclConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>,
+    #[serde(default, skip_serializing_if = "is_default_acl_action")]
+    pub default: crate::acl::AclAction,
+    #[serde(default, rename = "group", skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<crate::acl::AclGroup>,
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::acl::AclRule>,
 }
 
 impl AclConfig {
     pub fn is_empty(&self) -> bool {
         self.deny.is_empty()
+            && self.default == crate::acl::AclAction::Allow
+            && self.groups.is_empty()
+            && self.rules.is_empty()
     }
 
     /// 順不同の組を正規化(小さい IP を先)して返す。重複は除去。
@@ -79,6 +88,9 @@ impl AclConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsRecordConfig {
+    /// ACL等から名前変更に影響されず参照する安定ID。新規レコードには自動付与する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// 正規化済みラベル(単一。ドットは持たない — 階層は `under` で表す)
     pub name: String,
     /// ターゲット A: 固定 IP
@@ -99,6 +111,22 @@ pub struct DnsRecordConfig {
     /// URL コピー用のサービス待受ポート(ADR-0023)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// None は既定動作(A/member + scheme/port は有効、外部 CNAME は無効)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_kind: Option<crate::dns::HealthCheckKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_expect_status: Option<u16>,
+    /// 外部 CNAME へ明示的に接続してよいか。既定 false。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub health_external: bool,
+}
+
+fn is_default_acl_action(value: &crate::acl::AclAction) -> bool {
+    *value == crate::acl::AclAction::Allow
 }
 
 /// メンバー参照(ADR-0022)。ホスト自身は公開鍵が host.toml に無いため
@@ -528,6 +556,7 @@ impl Config {
             MemberRef::Key(key) => self.peers.iter().any(|p| p.public_key == *key),
         };
         let mut seen_records = std::collections::HashSet::new();
+        let mut seen_record_ids = std::collections::HashSet::new();
         for record in &self.dns_records {
             // 相対名(サブドメイン)+ 先頭 * ワイルドカードを許す(ADR-0024)
             if !crate::names::is_custom_dns_name(&record.name) {
@@ -538,6 +567,11 @@ impl Config {
             }
             if !seen_records.insert((record.name.as_str(), record.under)) {
                 return invalid(format!("dns_record \"{}\" が重複しています", record.name));
+            }
+            if let Some(id) = &record.id {
+                if !crate::names::is_dns_label(id) || !seen_record_ids.insert(id.as_str()) {
+                    return invalid(format!("dns_record id \"{id}\" が不正または重複しています"));
+                }
             }
             // ターゲットは ip / member / cname のちょうど 1 つ(ADR-0025)
             let targets = [
@@ -610,6 +644,67 @@ impl Config {
                     record.name
                 ));
             }
+            let health_enabled = record.health_check.unwrap_or(
+                record.cname.is_none() && record.scheme.is_some() && record.port.is_some(),
+            );
+            if health_enabled && (record.scheme.is_none() || record.port.is_none()) {
+                return invalid(format!(
+                    "dns_record \"{}\" のヘルスチェックには scheme と port の両方が必要です",
+                    record.name
+                ));
+            }
+            if record.health_external && record.cname.is_none() {
+                return invalid(format!(
+                    "dns_record \"{}\" の health_external は CNAME にだけ指定できます",
+                    record.name
+                ));
+            }
+            if record.health_kind == Some(crate::dns::HealthCheckKind::HttpHead) {
+                if record.scheme.as_deref() != Some("http") {
+                    return invalid(format!(
+                        "dns_record \"{}\" の HTTP HEAD チェックは scheme = \"http\" の場合だけ使用できます",
+                        record.name
+                    ));
+                }
+                let path = record.health_path.as_deref().unwrap_or("/");
+                if !path.starts_with('/') || path.len() > 256 || path.chars().any(char::is_control)
+                {
+                    return invalid(format!(
+                        "dns_record \"{}\" の health_path は / で始まる 256 文字以内のパスにしてください",
+                        record.name
+                    ));
+                }
+            }
+            if record
+                .health_expect_status
+                .is_some_and(|status| !(100..=599).contains(&status))
+            {
+                return invalid(format!(
+                    "dns_record \"{}\" の health_expect_status は 100〜599 で指定してください",
+                    record.name
+                ));
+            }
+        }
+        let mut group_ids = std::collections::HashSet::new();
+        for group in &self.acl.groups {
+            if !crate::names::is_dns_label(&group.id) || !group_ids.insert(group.id.as_str()) {
+                return invalid(format!(
+                    "acl.group id \"{}\" が不正または重複しています",
+                    group.id
+                ));
+            }
+        }
+        let mut rule_ids = std::collections::HashSet::new();
+        for rule in &self.acl.rules {
+            if !crate::names::is_dns_label(&rule.id) || !rule_ids.insert(rule.id.as_str()) {
+                return invalid(format!(
+                    "acl.rule id \"{}\" が不正または重複しています",
+                    rule.id
+                ));
+            }
+        }
+        if let Err(error) = crate::acl::AclPolicy::compile(self) {
+            return invalid(error);
         }
         Ok(())
     }
@@ -853,6 +948,7 @@ under = "{peer_key}"
         // 親が違えば同名可、同じ親なら重複
         let mut ok = config.clone();
         ok.dns_records.push(DnsRecordConfig {
+            id: None,
             name: "web".to_string(),
             ip: None,
             member: Some(MemberRef::Key(peer_key)),
@@ -860,6 +956,11 @@ under = "{peer_key}"
             under: Some(MemberRef::Key(peer_key)),
             scheme: None,
             port: None,
+            health_check: None,
+            health_kind: None,
+            health_path: None,
+            health_expect_status: None,
+            health_external: false,
         });
         ok.validate().unwrap();
         let mut dup = ok.clone();

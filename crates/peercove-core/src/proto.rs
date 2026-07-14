@@ -20,9 +20,11 @@ pub const PROTO_VERSION: u32 = 1;
 /// 一度公開した名前は変更・再利用しない(ADR-0029、M3-12)。
 pub const CURRENT_CAPABILITIES: &[&str] = &[
     "acl_v1",
+    "acl_v2",
     "chat",
     "direct",
     "dns_cname",
+    "dns_health",
     "dns_service_url",
     "file_transfer",
     "key_rotation",
@@ -170,6 +172,11 @@ pub struct LedgerEntry {
     /// (このとき endpoint も落とす)。互換規則は endpoint と同じ。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub blocked: bool,
+    /// 細粒度ACLにより、この相手との直接通信を禁止してホスト中継へ固定する。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_relay: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl_rule_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -193,6 +200,8 @@ mod tests {
             endpoint_age_secs: Some(3),
             subnets: vec![],
             blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
         }
     }
 
@@ -225,6 +234,7 @@ mod tests {
                     ip: "100.100.42.50".parse().unwrap(),
                     scheme: None,
                     port: None,
+                    health: None,
                 }],
                 cname_records: vec![crate::dns::CnameRecord {
                     name: "docs".to_string(),
@@ -232,6 +242,7 @@ mod tests {
                     resolved_ip: None,
                     scheme: None,
                     port: None,
+                    health: None,
                 }],
             },
             ControlMessage::Removed {
@@ -313,6 +324,7 @@ mod tests {
             ip: "100.100.42.50".parse().unwrap(),
             scheme: None,
             port: None,
+            health: None,
         })
         .unwrap();
         assert_eq!(json, r#"{"name":"nas","ip":"100.100.42.50"}"#);

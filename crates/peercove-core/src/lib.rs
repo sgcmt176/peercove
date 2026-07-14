@@ -4,6 +4,7 @@
 //! - [`config`]: TOML 設定ファイルの型と読み込み
 //! - [`ipalloc`]: 仮想 IP 割当ヘルパ
 
+pub mod acl;
 pub mod config;
 pub mod diagnostics;
 pub mod dns;
@@ -13,6 +14,7 @@ pub mod keys;
 pub mod msg;
 pub mod names;
 pub mod proto;
+pub mod quality;
 pub mod token;
 
 use std::path::PathBuf;

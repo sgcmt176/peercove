@@ -188,6 +188,8 @@ mod tests {
                 endpoint_age_secs: None,
                 subnets: vec![],
                 blocked: false,
+                force_relay: false,
+                acl_rule_id: None,
             },
             LedgerEntry {
                 name: Some("alice".to_string()),
@@ -204,6 +206,8 @@ mod tests {
                 endpoint_age_secs: None,
                 subnets: vec![],
                 blocked: false,
+                force_relay: false,
+                acl_rule_id: None,
             },
         ];
         let text = render(&[], Some(&ledger));

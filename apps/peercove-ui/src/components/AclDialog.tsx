@@ -1,137 +1,103 @@
-import { useEffect, useState } from "react";
-import { Member, api, errorMessage } from "../ipc";
+import { useEffect, useMemo, useState } from "react";
+import { AclPolicySettings, AclProtocol, AclRule, AclTarget, DnsRecord, Member, api, errorMessage } from "../ipc";
 import { Modal } from "./Modal";
-import { Avatar } from "./Avatar";
 import { t } from "../i18n";
 
-/** 順不同の組を一意なキーにする（表示・保存の突き合わせ用）。 */
-function pairKey(a: string, b: string): string {
-  return a <= b ? `${a}|${b}` : `${b}|${a}`;
-}
+type TargetKind = "any" | "member" | "group" | "subnet" | "service";
 
-/**
- * メンバー間の通信制御（ACL — M3-10、ADR-0018）。ホストのみ。
- * メンバーの全組み合わせを一覧し、チェックした組を遮断する。
- * 変更は即保存され、実行中のデーモンが約 5 秒で反映する
- * （リレー遮断 + 台帳の再配布 → 直接通信も解除）。
- */
-export function AclDialog({
-  configPath,
-  members,
-  onClose,
-}: {
-  configPath: string;
-  members: Member[];
-  onClose: () => void;
-}) {
-  /** 遮断中の組（pairKey の集合）。 */
-  const [deny, setDeny] = useState<Set<string>>(new Set());
-  const [loaded, setLoaded] = useState(false);
+export function AclDialog({ configPath, members, onClose }: { configPath: string; members: Member[]; onClose: () => void; }) {
+  const [policy, setPolicy] = useState<AclPolicySettings | null>(null);
+  const [services, setServices] = useState<DnsRecord[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [action, setAction] = useState<"allow" | "deny">("deny");
+  const [sourceKind, setSourceKind] = useState<TargetKind>("any");
+  const [sourceValue, setSourceValue] = useState("");
+  const [destinationKind, setDestinationKind] = useState<TargetKind>("member");
+  const [destinationValue, setDestinationValue] = useState("");
+  const [protocol, setProtocol] = useState<AclProtocol>("any");
+  const [ports, setPorts] = useState("");
+  const [groupName, setGroupName] = useState("");
+  const [groupMembers, setGroupMembers] = useState<Set<string>>(new Set());
 
-  const candidates = members.filter((member) => !member.isHost);
-  const pairs: [Member, Member][] = [];
-  for (let i = 0; i < candidates.length; i += 1) {
-    for (let j = i + 1; j < candidates.length; j += 1) {
-      pairs.push([candidates[i], candidates[j]]);
-    }
-  }
-
-  const load = async () => {
-    try {
-      const current = await api.listAcl(configPath);
-      setDeny(new Set(current.map(([a, b]) => pairKey(a, b))));
-      setLoaded(true);
-    } catch (e) {
-      setError(errorMessage(e));
-    }
-  };
-
+  const peers = members.filter((member) => !member.isHost);
+  const usableServices = services.filter((record) => record.id && !record.cname && record.port);
   useEffect(() => {
-    void load();
-    // 開いたときに 1 度だけ読む
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    Promise.all([api.readAclPolicy(configPath), api.listDnsRecords(configPath)])
+      .then(([loaded, dns]) => { setPolicy(loaded); setServices(dns); setDestinationValue(peers[0]?.publicKey ?? ""); })
+      .catch((cause) => setError(errorMessage(cause)));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [configPath]);
 
-  const toggle = async (a: Member, b: Member) => {
-    const key = pairKey(a.ip, b.ip);
-    const next = new Set(deny);
-    if (next.has(key)) {
-      next.delete(key);
-    } else {
-      next.add(key);
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      await api.setAcl(
-        configPath,
-        [...next].map((entry) => entry.split("|") as [string, string]),
-      );
-      setDeny(next);
-    } catch (e) {
-      setError(errorMessage(e));
-      void load(); // 失敗したら実際の設定に合わせ直す
-    } finally {
-      setBusy(false);
-    }
+  const save = async (next: AclPolicySettings) => {
+    setBusy(true); setError(null);
+    try { await api.writeAclPolicy(configPath, next); setPolicy(next); }
+    catch (cause) { setError(errorMessage(cause)); }
+    finally { setBusy(false); }
   };
 
-  const name = (member: Member) => member.name ?? member.ip;
+  const target = (kind: TargetKind, value: string): AclTarget => {
+    if (kind === "any") return "any";
+    return { [kind]: value } as AclTarget;
+  };
+  const labelTarget = (value: AclTarget) => {
+    if (value === "any") return t.acl.any;
+    if ("member" in value) return peers.find((m) => m.publicKey === value.member)?.name ?? value.member.slice(0, 8);
+    if ("group" in value) return `${t.acl.group}: ${value.group}`;
+    if ("subnet" in value) return value.subnet;
+    return usableServices.find((s) => s.id === value.service)?.fqdn ?? value.service;
+  };
+  const portsList = ports.split(",").map((value) => value.trim()).filter(Boolean);
+  const preview = `${action === "allow" ? t.acl.allow : t.acl.deny}：${labelTarget(target(sourceKind, sourceValue))} → ${labelTarget(target(destinationKind, destinationValue))} / ${protocol.toUpperCase()}${portsList.length ? ` ${portsList.join(", ")}` : ""}`;
 
-  return (
-    <Modal title={t.acl.title} onClose={onClose}>
-      <div className="modal__body">
-        <p className="muted small">{t.acl.intro}</p>
-        {pairs.length === 0 ? (
-          <p className="muted small">{t.acl.needTwo}</p>
-        ) : (
-          <ul className="chat__pick">
-            {pairs.map(([a, b]) => {
-              const blocked = deny.has(pairKey(a.ip, b.ip));
-              return (
-                <li key={pairKey(a.ip, b.ip)}>
-                  <label className="chat__pick-row">
-                    <input
-                      type="checkbox"
-                      disabled={!loaded || busy}
-                      checked={blocked}
-                      onChange={() => void toggle(a, b)}
-                    />
-                    <Avatar
-                      publicKey={a.publicKey}
-                      name={a.name}
-                      online={a.online}
-                      onlineLabel=""
-                    />
-                    <span className="ellipsis">{name(a)}</span>
-                    <span className="muted">⇔</span>
-                    <Avatar
-                      publicKey={b.publicKey}
-                      name={b.name}
-                      online={b.online}
-                      onlineLabel=""
-                    />
-                    <span className="ellipsis">{name(b)}</span>
-                    {blocked && (
-                      <span className="tag tag--blocked">
-                        {t.acl.blockedTag}
-                      </span>
-                    )}
-                  </label>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-        {error && <p className="error-text small">{error}</p>}
-      </div>
-      <div className="modal__actions">
-        <button type="button" onClick={onClose}>
-          {t.common.close}
-        </button>
-      </div>
-    </Modal>
-  );
+  const addRule = () => {
+    if (!policy) return;
+    if (sourceKind !== "any" && !sourceValue) { setError(t.acl.targetRequired); return; }
+    if (destinationKind !== "any" && !destinationValue) { setError(t.acl.targetRequired); return; }
+    const rule: AclRule = { id: `rule-${Date.now().toString(36)}`, action, source: target(sourceKind, sourceValue), destination: target(destinationKind, destinationValue), protocol, ports: portsList, enabled: true };
+    void save({ ...policy, rules: [...policy.rules, rule] });
+  };
+  const updateRule = (index: number, change: Partial<AclRule>) => {
+    if (!policy) return;
+    const rules = policy.rules.map((rule, i) => i === index ? { ...rule, ...change } : rule);
+    void save({ ...policy, rules });
+  };
+  const move = (index: number, offset: number) => {
+    if (!policy || index + offset < 0 || index + offset >= policy.rules.length) return;
+    const rules = [...policy.rules];
+    [rules[index], rules[index + offset]] = [rules[index + offset], rules[index]];
+    void save({ ...policy, rules });
+  };
+  const groupId = useMemo(() => groupName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 63), [groupName]);
+  const addGroup = () => {
+    if (!policy || !groupId || groupMembers.size === 0) return;
+    void save({ ...policy, groups: [...policy.groups, { id: groupId, members: [...groupMembers] }] });
+    setGroupName(""); setGroupMembers(new Set());
+  };
+
+  return <Modal title={t.acl.title} onClose={onClose} wide>
+    <div className="modal__body acl-v2">
+      <p className="muted small">{t.acl.introV2}</p>
+      {!policy ? <p className="muted">{t.common.loading}</p> : <>
+        <div className="acl-v2__default"><span>{t.acl.defaultAction}</span><select value={policy.default} disabled={busy} onChange={(event) => void save({ ...policy, default: event.target.value as "allow" | "deny" })}><option value="allow">{t.acl.allow}</option><option value="deny">{t.acl.deny}</option></select></div>
+        <section><h3>{t.acl.rules}</h3>
+          {policy.rules.length === 0 ? <p className="muted small">{t.acl.noRules}</p> : <div className="acl-v2__table-wrap"><table className="acl-v2__table"><thead><tr><th>{t.acl.order}</th><th>{t.acl.action}</th><th>{t.acl.source}</th><th>{t.acl.destination}</th><th>{t.acl.protocol}</th><th>{t.acl.ports}</th><th>{t.acl.state}</th><th>{t.acl.actions}</th></tr></thead><tbody>{policy.rules.map((rule, index) => <tr key={rule.id}><td>{index + 1}</td><td><span className={`tag ${rule.action === "deny" ? "tag--blocked" : ""}`}>{rule.action === "allow" ? t.acl.allow : t.acl.deny}</span></td><td>{labelTarget(rule.source)}</td><td>{labelTarget(rule.destination)}</td><td>{rule.protocol.toUpperCase()}</td><td>{rule.ports.join(", ") || t.acl.allPorts}</td><td><label className="chat__pick-row"><input type="checkbox" checked={rule.enabled} disabled={busy} onChange={(event) => updateRule(index, { enabled: event.target.checked })}/><span>{rule.enabled ? t.acl.enabled : t.acl.disabled}</span></label></td><td><div className="row"><button type="button" className="button--icon" aria-label={t.acl.moveUp} disabled={busy || index === 0} onClick={() => move(index, -1)}>↑</button><button type="button" className="button--icon" aria-label={t.acl.moveDown} disabled={busy || index === policy.rules.length - 1} onClick={() => move(index, 1)}>↓</button><button type="button" className="button--icon" aria-label={t.common.delete} disabled={busy} onClick={() => void save({ ...policy, rules: policy.rules.filter((_, i) => i !== index) })}>×</button></div></td></tr>)}</tbody></table></div>}
+        </section>
+        <section className="acl-v2__builder"><h3>{t.acl.addRule}</h3><div className="acl-v2__form">
+          <label>{t.acl.action}<select value={action} onChange={(e) => setAction(e.target.value as "allow" | "deny")}><option value="deny">{t.acl.deny}</option><option value="allow">{t.acl.allow}</option></select></label>
+          <TargetInput label={t.acl.source} kind={sourceKind} value={sourceValue} setKind={setSourceKind} setValue={setSourceValue} members={peers} groups={policy.groups.map((g) => g.id)} services={usableServices} allowService={false}/>
+          <TargetInput label={t.acl.destination} kind={destinationKind} value={destinationValue} setKind={setDestinationKind} setValue={setDestinationValue} members={peers} groups={policy.groups.map((g) => g.id)} services={usableServices} allowService/>
+          <label>{t.acl.protocol}<select value={protocol} onChange={(e) => { setProtocol(e.target.value as AclProtocol); if (!['tcp','udp'].includes(e.target.value)) setPorts(""); }}><option value="any">ANY</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label>
+          {(protocol === "tcp" || protocol === "udp") && <label>{t.acl.ports}<input value={ports} placeholder="443, 8000-8100" onChange={(e) => setPorts(e.target.value)}/></label>}
+        </div><p className="acl-v2__preview">{preview}</p><p className="notice small">{t.acl.relayWarning}</p><button type="button" disabled={busy} onClick={addRule}>{t.acl.addRule}</button></section>
+        <section className="acl-v2__groups"><h3>{t.acl.groups}</h3>{policy.groups.map((group) => <div className="row" key={group.id}><strong>{group.id}</strong><span className="muted small">{group.members.length}{t.acl.people}</span><button type="button" className="button--ghost" onClick={() => void save({ ...policy, groups: policy.groups.filter((g) => g.id !== group.id), rules: policy.rules.filter((r) => !(typeof r.source !== 'string' && 'group' in r.source && r.source.group === group.id) && !(typeof r.destination !== 'string' && 'group' in r.destination && r.destination.group === group.id)) })}>{t.common.delete}</button></div>)}<label>{t.acl.groupName}<input value={groupName} onChange={(e) => setGroupName(e.target.value)}/></label><div className="acl-v2__member-checks">{peers.map((member) => <label className="chat__pick-row" key={member.publicKey}><input type="checkbox" checked={groupMembers.has(member.publicKey)} onChange={(e) => { const next = new Set(groupMembers); e.target.checked ? next.add(member.publicKey) : next.delete(member.publicKey); setGroupMembers(next); }}/><span>{member.name ?? member.ip}</span></label>)}</div><button type="button" className="button--ghost" disabled={!groupId || groupMembers.size === 0 || busy} onClick={addGroup}>{t.acl.addGroup}</button></section>
+      </>}
+      {error && <p role="alert" className="error-text small">{error}</p>}
+    </div><div className="modal__actions"><button type="button" onClick={onClose}>{t.common.close}</button></div>
+  </Modal>;
+}
+
+function TargetInput({ label, kind, value, setKind, setValue, members, groups, services, allowService }: { label: string; kind: TargetKind; value: string; setKind: (kind: TargetKind) => void; setValue: (value: string) => void; members: Member[]; groups: string[]; services: DnsRecord[]; allowService: boolean; }) {
+  const selectKind = (next: TargetKind) => { setKind(next); setValue(next === "member" ? members[0]?.publicKey ?? "" : next === "group" ? groups[0] ?? "" : next === "service" ? services[0]?.id ?? "" : ""); };
+  return <fieldset className="acl-v2__target"><legend>{label}</legend><select value={kind} onChange={(e) => selectKind(e.target.value as TargetKind)}><option value="any">{t.acl.any}</option><option value="member">{t.acl.member}</option><option value="group">{t.acl.group}</option><option value="subnet">{t.acl.subnet}</option>{allowService && <option value="service">{t.acl.service}</option>}</select>{kind === "member" && <select value={value} onChange={(e) => setValue(e.target.value)}>{members.map((m) => <option key={m.publicKey} value={m.publicKey}>{m.name ?? m.ip}</option>)}</select>}{kind === "group" && <select value={value} onChange={(e) => setValue(e.target.value)}>{groups.map((g) => <option key={g}>{g}</option>)}</select>}{kind === "subnet" && <input value={value} placeholder="10.99.0.0/24" onChange={(e) => setValue(e.target.value)}/>} {kind === "service" && <select value={value} onChange={(e) => setValue(e.target.value)}>{services.map((s) => <option key={s.id!} value={s.id!}>{s.fqdn}:{s.port}</option>)}</select>}</fieldset>;
 }

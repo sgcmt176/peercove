@@ -8,9 +8,7 @@ use peercove_core::config::{Config, PeerConfig, DEFAULT_LISTEN_PORT};
 use peercove_core::keys::{read_preshared_key_file, read_private_key_file};
 use peercove_core::proto::LedgerEntry;
 
-use crate::backend::{
-    create_backend, AclDeny, IsolatedPeer, PeerSpec, PeerStats, TunnelSpec, WgBackend,
-};
+use crate::backend::{create_backend, IsolatedPeer, PeerSpec, PeerStats, TunnelSpec, WgBackend};
 use crate::commands::status;
 use crate::control;
 
@@ -175,6 +173,8 @@ impl ActiveTunnel {
         groups: crate::groups::SharedGroups,
         rotate_request: Arc<std::sync::atomic::AtomicBool>,
         member_link: Arc<control::MemberLink>,
+        quality: crate::quality::SharedQuality,
+        health: crate::health::SharedHealth,
     ) -> anyhow::Result<SuperviseExit> {
         supervise(
             config_path,
@@ -188,6 +188,8 @@ impl ActiveTunnel {
             groups,
             rotate_request,
             member_link,
+            quality,
+            health,
         )
         .await
     }
@@ -281,6 +283,8 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
                 crate::chat::ChatLog::load(config_path),
                 crate::groups::GroupStore::load(config_path),
                 Default::default(),
+                Default::default(),
+                crate::quality::QualityStore::load(config_path),
                 Default::default(),
             )
             .await;
@@ -377,6 +381,8 @@ pub async fn supervise(
     groups: crate::groups::SharedGroups,
     rotate_request: Arc<std::sync::atomic::AtomicBool>,
     member_link: Arc<control::MemberLink>,
+    quality: crate::quality::SharedQuality,
+    health: crate::health::SharedHealth,
 ) -> anyhow::Result<SuperviseExit> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
@@ -411,7 +417,7 @@ pub async fn supervise(
         let mut cname_ips: HashMap<String, (std::net::Ipv4Addr, std::time::Instant)> =
             HashMap::new();
         // (host)適用済み ACL(ADR-0018)。変更があった周期だけ同期する
-        let mut applied_acl: Option<Vec<AclDeny>> = None;
+        let mut applied_acl: Option<peercove_core::acl::AclPolicy> = None;
         let mut acl_error_logged = false;
         let mut applied_isolation: Option<Vec<IsolatedPeer>> = None;
         let mut isolation_error_logged = false;
@@ -564,7 +570,8 @@ pub async fn supervise(
                                         entry.capabilities = info.capabilities.clone();
                                     }
                                 }
-                                let dns_records = peercove_core::dns::resolve_records(
+                                crate::health::schedule(&health, config, &members);
+                                let mut dns_records = peercove_core::dns::resolve_records(
                                     &config.dns_records,
                                     &members,
                                 );
@@ -579,10 +586,40 @@ pub async fn supervise(
                                     record.resolved_ip =
                                         flatten_cname(&record.target, &mut cname_ips).await;
                                 }
+                                health
+                                    .lock()
+                                    .unwrap()
+                                    .enrich(&mut dns_records, &mut cname_records);
+                                let policy = peercove_core::acl::AclPolicy::compile(config)
+                                    .expect("validated ACL policy");
+                                let member_ips: Vec<_> = config.peers.iter()
+                                    .filter_map(|peer| peer.allowed_ips.first().map(|net| net.addr()))
+                                    .collect();
+                                let force_relay = policy.force_relay_pairs(&member_ips).into_iter()
+                                    .map(|(a, b)| {
+                                        let id = policy.rules.iter().find(|rule| {
+                                            let hit = |nets: &[ipnet::Ipv4Net], ip| nets.is_empty() || nets.iter().any(|net| net.contains(&ip));
+                                            (hit(&rule.source, a) && hit(&rule.destination, b)) || (hit(&rule.source, b) && hit(&rule.destination, a))
+                                        }).map(|rule| rule.id.clone()).unwrap_or_else(|| "acl-policy".into());
+                                        (a, b, id)
+                                    }).collect();
+                                let mut deny = config.acl.normalized_deny();
+                                for (index, &a) in member_ips.iter().enumerate() {
+                                    for &b in &member_ips[index + 1..] {
+                                        if policy.evaluate(a, b, 6, Some(peercove_core::proto::CONTROL_PORT)).action == peercove_core::acl::AclAction::Deny
+                                            && policy.evaluate(b, a, 6, Some(peercove_core::proto::CONTROL_PORT)).action == peercove_core::acl::AclAction::Deny
+                                        {
+                                            deny.push(if a <= b { (a, b) } else { (b, a) });
+                                        }
+                                    }
+                                }
+                                deny.sort_unstable();
+                                deny.dedup();
                                 let dist = control::Distribution {
                                     dns_records,
                                     cname_records,
-                                    deny: config.acl.normalized_deny(),
+                                    deny,
+                                    force_relay,
                                     members,
                                 };
                                 ledger_tx.send_if_modified(|current| {
@@ -676,6 +713,18 @@ pub async fn supervise(
                         }
                     }
                     let ledger = distribution.as_ref().map(|dist| dist.members.clone());
+                    let probes = rtt.lock().unwrap().drain_probes();
+                    if let Some(ledger) = &ledger {
+                        quality.lock().unwrap().observe(
+                            crate::quality::now_unix_ms(),
+                            role,
+                            spec.address.addr(),
+                            ledger,
+                            &stats,
+                            &probes,
+                            &direct_routes,
+                        );
+                    }
                     // メッセージングのピア表(自分以外の 仮想 IP → 表示名)を台帳から更新
                     if let Some(ledger) = &ledger {
                         let map: HashMap<std::net::Ipv4Addr, String> = ledger
@@ -738,7 +787,7 @@ pub async fn supervise(
                             ledger,
                             dns_records,
                             cname_records,
-                            rtt_ms: rtt.lock().unwrap().clone(),
+                            rtt_ms: rtt.lock().unwrap().latest(),
                             removed: removed.load(std::sync::atomic::Ordering::Relaxed),
                             connection_error: member_link.connection_error(),
                             direct: direct_routes,
@@ -783,6 +832,8 @@ fn build_ledger(
         endpoint_age_secs: None,
         subnets: vec![],
         blocked: false,
+        force_relay: false,
+        acl_rule_id: None,
     }];
     for peer in &config.peers {
         let invite_status = match peer.invite_state(unix_secs()) {
@@ -829,6 +880,8 @@ fn build_ledger(
             // 配布時にメンバーごとのフィルタで立てる(ADR-0018)。
             // ホスト自身のスナップショットでは常に false
             blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
         });
     }
     ledger
@@ -879,37 +932,28 @@ fn apply_invite_isolation(
 fn apply_acl(
     config: &Config,
     backend: &mut dyn WgBackend,
-    applied: &mut Option<Vec<AclDeny>>,
+    applied: &mut Option<peercove_core::acl::AclPolicy>,
     error_logged: &mut bool,
 ) {
-    let subnets_of = |ip: std::net::Ipv4Addr| -> Vec<ipnet::Ipv4Net> {
-        config
-            .peers
-            .iter()
-            .find(|p| p.allowed_ips.first().map(|net| net.addr()) == Some(ip))
-            .map(|p| p.subnets.clone())
-            .unwrap_or_default()
+    let policy = match peercove_core::acl::AclPolicy::compile(config) {
+        Ok(policy) => policy,
+        Err(error) => {
+            if !*error_logged {
+                tracing::warn!("ACL の構築に失敗しました: {error}");
+                *error_logged = true;
+            }
+            return;
+        }
     };
-    let denied: Vec<AclDeny> = config
-        .acl
-        .normalized_deny()
-        .into_iter()
-        .map(|(a, b)| AclDeny {
-            a,
-            a_subnets: subnets_of(a),
-            b,
-            b_subnets: subnets_of(b),
-        })
-        .collect();
-    if applied.as_ref() == Some(&denied) {
+    if applied.as_ref() == Some(&policy) {
         return;
     }
-    match backend.sync_acl(&denied) {
+    match backend.sync_acl(&policy) {
         Ok(()) => {
-            if !denied.is_empty() || applied.is_some() {
-                tracing::info!("ACL を適用しました(遮断 {} 組)", denied.len());
+            if !policy.rules.is_empty() || applied.is_some() {
+                tracing::info!("ACL を適用しました({} ルール)", policy.rules.len());
             }
-            *applied = Some(denied);
+            *applied = Some(policy);
             *error_logged = false;
         }
         Err(e) => {

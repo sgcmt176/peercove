@@ -24,6 +24,59 @@ pub const DNS_TTL_SECS: u32 = 30;
 /// サービス情報に載せる URI スキームの最大長(ADR-0023)。
 pub const MAX_SERVICE_SCHEME_LEN: usize = 31;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCheckKind {
+    Tcp,
+    HttpHead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHealthStatus {
+    Healthy,
+    Unhealthy,
+    Unknown,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceHealthReason {
+    NotChecked,
+    Offline,
+    Timeout,
+    ConnectionFailed,
+    NameResolutionFailed,
+    UnexpectedStatus,
+    Disabled,
+}
+
+/// ホストが観測し、DNS レコードと一緒に任意配布するサービス状態。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceHealth {
+    pub status: ServiceHealthStatus,
+    pub reason: ServiceHealthReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+impl ServiceHealth {
+    pub fn unknown(reason: ServiceHealthReason) -> Self {
+        Self {
+            status: ServiceHealthStatus::Unknown,
+            reason,
+            checked_at_unix_ms: None,
+            response_ms: None,
+            http_status: None,
+        }
+    }
+}
+
 /// 文字列がサービス情報用の URI スキームとして正規形かどうか。
 /// 先頭は小文字英字、以降は小文字英数字または `+.-`、最大 31 文字。
 pub fn is_service_scheme(input: &str) -> bool {
@@ -63,6 +116,8 @@ pub struct DnsRecord {
     pub scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ServiceHealth>,
 }
 
 /// カスタム CNAME レコード(ADR-0025、M3-17)。`name` を別ドメイン `target` の
@@ -84,6 +139,8 @@ pub struct CnameRecord {
     pub scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ServiceHealth>,
 }
 
 /// ゾーンの 1 エントリ。
@@ -236,6 +293,7 @@ pub fn resolve_records(
             ip,
             scheme: record.scheme.clone(),
             port: record.port,
+            health: None,
         });
     }
     resolved
@@ -283,6 +341,7 @@ pub fn resolve_cnames(
             resolved_ip: None, // ホスト(poc)が外部解決してから埋める
             scheme: record.scheme.clone(),
             port: record.port,
+            health: None,
         });
     }
     resolved
@@ -324,6 +383,8 @@ mod tests {
             endpoint_age_secs: None,
             subnets: vec![],
             blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
         }
     }
 
@@ -419,6 +480,7 @@ mod tests {
 
         let records = vec![
             DnsRecordConfig {
+                id: None,
                 // エイリアス(要望 10/11): メンバー参照 → IP 追随
                 name: "gamehost".to_string(),
                 ip: None,
@@ -427,8 +489,14 @@ mod tests {
                 under: None,
                 scheme: Some("http".to_string()),
                 port: Some(8080),
+                health_check: None,
+                health_kind: None,
+                health_path: None,
+                health_expect_status: None,
+                health_external: false,
             },
             DnsRecordConfig {
+                id: None,
                 // 端末配下サブドメイン(要望 12): ホスト配下
                 name: "web".to_string(),
                 ip: None,
@@ -437,8 +505,14 @@ mod tests {
                 under: Some(MemberRef::Host),
                 scheme: None,
                 port: None,
+                health_check: None,
+                health_kind: None,
+                health_path: None,
+                health_expect_status: None,
+                health_external: false,
             },
             DnsRecordConfig {
+                id: None,
                 // LAN 機器(要望 14): alice 配下の固定 IP
                 name: "printer".to_string(),
                 ip: Some("192.168.10.50".parse().unwrap()),
@@ -447,8 +521,14 @@ mod tests {
                 under: Some(MemberRef::Key(alice_key)),
                 scheme: None,
                 port: Some(9100),
+                health_check: None,
+                health_kind: None,
+                health_path: None,
+                health_expect_status: None,
+                health_external: false,
             },
             DnsRecordConfig {
+                id: None,
                 // 参照先が台帳に居ない(削除直後)→ 黙って外す
                 name: "ghost".to_string(),
                 ip: None,
@@ -457,8 +537,14 @@ mod tests {
                 under: None,
                 scheme: None,
                 port: None,
+                health_check: None,
+                health_kind: None,
+                health_path: None,
+                health_expect_status: None,
+                health_external: false,
             },
             DnsRecordConfig {
+                id: None,
                 // CNAME(ADR-0025): 外部ドメインの別名
                 name: "docs".to_string(),
                 ip: None,
@@ -467,6 +553,11 @@ mod tests {
                 under: None,
                 scheme: None,
                 port: None,
+                health_check: None,
+                health_kind: None,
+                health_path: None,
+                health_expect_status: None,
+                health_external: false,
             },
         ];
         let resolved = resolve_records(&records, &ledger);
@@ -511,12 +602,14 @@ mod tests {
                 ip: "10.1.0.2".parse().unwrap(),
                 scheme: None,
                 port: None,
+                health: None,
             },
             DnsRecord {
                 name: "Bad.alice".to_string(), // 大文字ラベル → 無視
                 ip: "10.1.0.3".parse().unwrap(),
                 scheme: None,
                 port: None,
+                health: None,
             },
         ];
         let zone = zone_for("home", &ledger, &custom);
@@ -538,18 +631,21 @@ mod tests {
                 ip: "10.1.0.99".parse().unwrap(),
                 scheme: None,
                 port: None,
+                health: None,
             },
             DnsRecord {
                 name: "printer".to_string(),
                 ip: "10.1.0.50".parse().unwrap(),
                 scheme: None,
                 port: None,
+                health: None,
             },
             DnsRecord {
                 name: "Bad Label".to_string(), // 不正 → 無視
                 ip: "10.1.0.51".parse().unwrap(),
                 scheme: None,
                 port: None,
+                health: None,
             },
         ];
         let zone = zone_for("home", &ledger, &custom);

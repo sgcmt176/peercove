@@ -38,6 +38,7 @@ pub struct NewRecord<'a> {
 /// 一覧表示用に解決済みの情報を添えたレコード。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordDetail {
+    pub id: Option<String>,
     /// 正規化済みラベル(設定の `name` そのもの)
     pub name: String,
     /// 親メンバー(端末配下サブドメインのとき)
@@ -54,6 +55,16 @@ pub struct RecordDetail {
     pub port: Option<u16>,
     /// scheme がある場合に組み立て済みの URL。既定ポートは省略する。
     pub url: Option<String>,
+    pub health: HealthSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthSettings {
+    pub enabled: bool,
+    pub kind: peercove_core::dns::HealthCheckKind,
+    pub path: String,
+    pub expected_status: Option<u16>,
+    pub external: bool,
 }
 
 /// メンバー参照の現在の DNS ラベルを設定から引く(表示・相対名の組み立て用。
@@ -84,7 +95,35 @@ fn ip_of(config: &Config, reference: &MemberRef) -> Option<Ipv4Addr> {
 
 /// 設定のカスタムレコード一覧(表示用の解決情報つき)。
 pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
-    let config = Config::load(config_path)?;
+    let mut config = Config::load(config_path)?;
+    // ADR-0035以前のレコードにも、一度だけ安定IDを補う。名前変更後もIDは維持される。
+    if config.dns_records.iter().any(|record| record.id.is_none()) {
+        let mut doc = load_doc(config_path)?;
+        let records = doc["dns_record"]
+            .as_array_of_tables_mut()
+            .context("dns_record が配列テーブルではありません")?;
+        let mut used: std::collections::HashSet<String> = config
+            .dns_records
+            .iter()
+            .filter_map(|record| record.id.clone())
+            .collect();
+        for (index, table) in records.iter_mut().enumerate() {
+            if table.get("id").is_some() {
+                continue;
+            }
+            let mut serial = index + 1;
+            let id = loop {
+                let candidate = format!("svc-{serial}");
+                if used.insert(candidate.clone()) {
+                    break candidate;
+                }
+                serial += 1;
+            };
+            table.insert("id", toml_edit::value(id));
+        }
+        write_validated(config_path, &doc.to_string())?;
+        config = Config::load(config_path)?;
+    }
     let network = config.network_name().to_string();
     Ok(config
         .dns_records
@@ -106,7 +145,19 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
             };
             let fqdn = format!("{relative}.{network}.{DNS_SUFFIX}");
             let url = service_url(&fqdn, record.scheme.as_deref(), record.port);
+            let health = HealthSettings {
+                enabled: record.health_check.unwrap_or(
+                    record.cname.is_none() && record.scheme.is_some() && record.port.is_some(),
+                ),
+                kind: record
+                    .health_kind
+                    .unwrap_or(peercove_core::dns::HealthCheckKind::Tcp),
+                path: record.health_path.clone().unwrap_or_else(|| "/".into()),
+                expected_status: record.health_expect_status,
+                external: record.health_external,
+            };
             RecordDetail {
+                id: record.id.clone(),
                 name: record.name.clone(),
                 under: record.under,
                 fqdn,
@@ -116,9 +167,63 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
                 scheme: record.scheme.clone(),
                 port: record.port,
                 url,
+                health,
             }
         })
         .collect())
+}
+
+/// 既存レコードのヘルスチェック設定を更新する(M3-14e-b)。
+pub fn set_health(
+    config_path: &Path,
+    name: &str,
+    under: Option<MemberRef>,
+    settings: &HealthSettings,
+) -> anyhow::Result<()> {
+    let under_string = under.map(|reference| reference.to_config_string());
+    let mut doc = load_doc(config_path)?;
+    let records = doc
+        .get_mut("dns_record")
+        .and_then(|item| item.as_array_of_tables_mut())
+        .context("dns_record が配列テーブルではありません")?;
+    let table = records
+        .iter_mut()
+        .find(|table| {
+            table
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                == Some(name)
+                && table
+                    .get("under")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    == under_string.as_deref()
+        })
+        .ok_or_else(|| anyhow::anyhow!("レコード \"{name}\" は存在しません"))?;
+    for key in [
+        "health_check",
+        "health_kind",
+        "health_path",
+        "health_expect_status",
+        "health_external",
+    ] {
+        table.remove(key);
+    }
+    table.insert("health_check", toml_edit::value(settings.enabled));
+    if settings.kind != peercove_core::dns::HealthCheckKind::Tcp {
+        table.insert("health_kind", toml_edit::value("http_head"));
+    }
+    if settings.path != "/" {
+        table.insert("health_path", toml_edit::value(settings.path.as_str()));
+    }
+    if let Some(status) = settings.expected_status {
+        table.insert("health_expect_status", toml_edit::value(i64::from(status)));
+    }
+    if settings.external {
+        table.insert("health_external", toml_edit::value(true));
+    }
+    write_validated(config_path, &doc.to_string())
 }
 
 /// カスタムレコードを追加する。`name` は表示名のままでよく、ここで正規化する。
@@ -187,6 +292,14 @@ pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<
         .as_array_of_tables_mut()
         .context("dns_record が配列テーブルではありません(手編集の可能性)")?;
     let mut table = toml_edit::Table::new();
+    let stable_id = format!(
+        "svc-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    table.insert("id", toml_edit::value(stable_id));
     table.insert("name", toml_edit::value(name.as_str()));
     match &record.target {
         RecordTarget::Ip(ip) => {
@@ -223,6 +336,11 @@ pub fn remove_record(
     under: Option<MemberRef>,
 ) -> anyhow::Result<()> {
     let under_string = under.map(|reference| reference.to_config_string());
+    let removed_id = Config::load(config_path)?
+        .dns_records
+        .into_iter()
+        .find(|record| record.name == name && record.under == under)
+        .and_then(|record| record.id);
     let mut doc = load_doc(config_path)?;
     let Some(records) = doc
         .get_mut("dns_record")
@@ -239,6 +357,23 @@ pub fn remove_record(
     });
     if records.len() == before {
         bail!("レコード \"{name}\" は存在しません");
+    }
+    if let Some(id) = removed_id {
+        if let Some(rules) = doc
+            .get_mut("acl")
+            .and_then(|item| item.get_mut("rule"))
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+        {
+            rules.retain(|rule| {
+                !["source", "destination"].iter().any(|field| {
+                    rule.get(field)
+                        .and_then(toml_edit::Item::as_inline_table)
+                        .and_then(|target| target.get("service"))
+                        .and_then(toml_edit::Value::as_str)
+                        == Some(id.as_str())
+                })
+            });
+        }
     }
     write_validated(config_path, &doc.to_string())
 }
@@ -304,6 +439,73 @@ mod tests {
 
         // 設定全体が有効なまま(Config::load が通る)
         Config::load(&config).unwrap();
+    }
+
+    #[test]
+    fn health_settings_roundtrip_and_validate() {
+        let config = setup("health");
+        add_record(
+            &config,
+            &NewRecord {
+                name: "web",
+                target: ip("10.68.1.50"),
+                under: None,
+                scheme: Some("http"),
+                port: Some(8080),
+            },
+        )
+        .unwrap();
+        let settings = HealthSettings {
+            enabled: true,
+            kind: peercove_core::dns::HealthCheckKind::HttpHead,
+            path: "/ready".into(),
+            expected_status: Some(204),
+            external: false,
+        };
+        set_health(&config, "web", None, &settings).unwrap();
+        let records = list_records(&config).unwrap();
+        assert_eq!(records[0].health, settings);
+        Config::load(&config).unwrap();
+
+        let mut invalid = records[0].health.clone();
+        invalid.path = "no-leading-slash".into();
+        assert!(set_health(&config, "web", None, &invalid).is_err());
+    }
+
+    #[test]
+    fn removing_service_cleans_acl_reference() {
+        let config = setup("acl-service-remove");
+        add_record(
+            &config,
+            &NewRecord {
+                name: "web",
+                target: ip("10.68.1.50"),
+                under: None,
+                scheme: Some("http"),
+                port: Some(8080),
+            },
+        )
+        .unwrap();
+        let id = list_records(&config).unwrap()[0].id.clone().unwrap();
+        crate::acl::write_policy(
+            &config,
+            &crate::acl::PolicySettings {
+                default: peercove_core::acl::AclAction::Allow,
+                groups: vec![],
+                rules: vec![peercove_core::acl::AclRule {
+                    id: "deny-web".into(),
+                    action: peercove_core::acl::AclAction::Deny,
+                    source: peercove_core::acl::AclTarget::Any("any".into()),
+                    destination: peercove_core::acl::AclTarget::Service { service: id },
+                    protocol: peercove_core::acl::AclProtocol::Tcp,
+                    ports: vec!["8080".into()],
+                    enabled: true,
+                }],
+            },
+        )
+        .unwrap();
+        remove_record(&config, "web", None).unwrap();
+        assert!(Config::load(&config).unwrap().acl.rules.is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@
 // を frontend から使うと npm 依存が 1 つ増え、許可の問い合わせも要るため。
 
 import { invoke } from "@tauri-apps/api/core";
-import { ChatMessage, Group, Member, Transfer } from "./ipc";
+import { ChatMessage, Group, Member, Transfer, Tunnel, api } from "./ipc";
 import { conversationOf, isViewing } from "./chat";
 import { loadPrefs } from "./prefs";
 import { t } from "./i18n";
@@ -173,5 +173,61 @@ export async function notifyFileEvents(
     } catch {
       // 通知の失敗で UI を止めない
     }
+  }
+}
+
+const qualityCheckedAt = new Map<string, number>();
+const qualityNotifiedWindow = new Map<string, number>();
+const qualityRoute = new Map<string, string>();
+
+/** 品質通知。status の高頻度ポーリングから呼ばれるため、内部で 1 分に抑える。 */
+export async function notifyQualityEvents(tunnel: Tunnel): Promise<void> {
+  const prefs = loadPrefs();
+  if (!prefs.notifications || !prefs.qualityAlerts) return;
+  const now = Date.now();
+  if (now - (qualityCheckedAt.get(tunnel.config) ?? 0) < 60_000) return;
+  qualityCheckedAt.set(tunnel.config, now);
+  try {
+    const report = await api.qualityHistory(tunnel.config, now - 5 * 60_000);
+    const byPeer = new Map<string, typeof report.samples>();
+    for (const sample of report.samples) {
+      const list = byPeer.get(sample.publicKey) ?? [];
+      list.push(sample);
+      byPeer.set(sample.publicKey, list);
+    }
+    for (const [key, list] of byPeer) {
+      list.sort((a, b) => a.windowStartUnixMs - b.windowStartUnixMs);
+      const latest = list.at(-1);
+      if (!latest) continue;
+      const stateKey = `${tunnel.config}:${key}`;
+      const label = latest.name || latest.ip;
+      const lastThree = list.filter((sample) => sample.windowSecs >= 60).slice(-3);
+      if (
+        lastThree.length === 3 &&
+        lastThree.every(
+          (sample) =>
+            sample.availability === "connected" &&
+            sample.lossPercent !== null &&
+            sample.lossPercent > prefs.qualityLossThreshold,
+        ) &&
+        qualityNotifiedWindow.get(stateKey) !== latest.windowStartUnixMs
+      ) {
+        qualityNotifiedWindow.set(stateKey, latest.windowStartUnixMs);
+        await invoke("notify", {
+          title: "通信品質が低下しています",
+          body: `${label} との損失率が ${prefs.qualityLossThreshold}% を3分連続で超えました（${tunnel.network}）。`,
+        });
+      }
+      const previousRoute = qualityRoute.get(stateKey);
+      if (previousRoute === "direct" && latest.route === "relay") {
+        await invoke("notify", {
+          title: "通信経路が切り替わりました",
+          body: `${label} との通信が直接経路からホスト経由へ切り替わりました（${tunnel.network}）。`,
+        });
+      }
+      qualityRoute.set(stateKey, latest.route);
+    }
+  } catch {
+    // 品質履歴がまだ無い／旧デーモンでも通常の状態更新を止めない。
   }
 }

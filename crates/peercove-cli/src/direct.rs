@@ -270,7 +270,7 @@ impl DirectManager {
             .filter_map(|entry| {
                 // blocked は ACL の遮断相手(ADR-0018)。ホストは endpoint も
                 // 落として配るが、こちらでも張らない(二重の守り)
-                if entry.is_host || !entry.online || entry.blocked {
+                if entry.is_host || !entry.online || entry.blocked || entry.force_relay {
                     return None;
                 }
                 let key = *entry.public_key.as_bytes();
@@ -377,6 +377,8 @@ mod tests {
             endpoint_age_secs: endpoint.map(|_| age),
             subnets: vec![],
             blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
         }
     }
 
@@ -387,6 +389,7 @@ mod tests {
                 dns_records: vec![],
                 cname_records: vec![],
                 deny: vec![],
+                force_relay: vec![],
             },
             received_at: at,
         }
@@ -505,6 +508,37 @@ mod tests {
             backend.ops,
             vec![format!("add:{peer}"), format!("remove:{peer}")],
             "遮断されたら直接ピアを解除して中継(→ホストで遮断)へ戻す"
+        );
+    }
+
+    #[test]
+    fn acl_force_relay_removes_an_established_direct_peer() {
+        let me = PrivateKey::generate().public_key();
+        let peer = PrivateKey::generate().public_key();
+        let mut manager = manager(&me);
+        let mut backend = MockBackend::default();
+        let now = Instant::now();
+        let open = entry(&peer, "10.100.42.3", Some("198.51.100.3:3"), 0);
+        manager.tick(
+            now,
+            true,
+            Some(&received(vec![open.clone()], now)),
+            &[],
+            &mut backend,
+        );
+        let mut forced = open;
+        forced.force_relay = true;
+        forced.acl_rule_id = Some("deny-game".into());
+        manager.tick(
+            now + Duration::from_secs(5),
+            true,
+            Some(&received(vec![forced], now)),
+            &[],
+            &mut backend,
+        );
+        assert_eq!(
+            backend.ops,
+            vec![format!("add:{peer}"), format!("remove:{peer}")]
         );
     }
 

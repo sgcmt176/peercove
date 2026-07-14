@@ -10,11 +10,10 @@ import {
   baseName,
   errorMessage,
   formatBytes,
-  formatHandshake,
   formatRate,
   formatRtt,
 } from "../ipc";
-import { rateSeries, rttSeries } from "../history";
+import { rateSeries } from "../history";
 import { ConfirmModal, Modal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { DnsView } from "./DnsDialog";
@@ -24,6 +23,7 @@ import { Avatar } from "./Avatar";
 import { ChatPanel } from "./ChatPanel";
 import { Sparkline } from "./Sparkline";
 import { t } from "../i18n";
+import { QualityView } from "./QualityView";
 
 /**
  * ネットワーク詳細の中身(トンネル稼働中)。表示するビューはサイドバーで
@@ -275,16 +275,7 @@ export function TunnelView({
       ) : view === "chat" ? (
         <ChatPanel tunnel={tunnel} initialConversation={chatTarget} />
       ) : view === "stats" ? (
-        <section className="card">
-          <h2 className="card-title">{t.tunnel.tabs.stats}</h2>
-          {tunnel.peers.length === 0 ? (
-            <p className="muted">{t.tunnel.peers.empty}</p>
-          ) : (
-            <div className="table-scroll">
-              <PeersTable config={tunnel.config} peers={tunnel.peers} />
-            </div>
-          )}
-        </section>
+        <QualityView tunnel={tunnel} />
       ) : view === "inbox" ? (
         <section className="card">
           <InboxPanel
@@ -651,56 +642,6 @@ function TransferRow({
   );
 }
 
-/** WG のピア統計(暗号セッション単位)。転送速度は履歴バッファから出す。 */
-function PeersTable({ config, peers }: { config: string; peers: Peer[] }) {
-  return (
-    <table className="peers">
-      <thead>
-        <tr>
-          <th>{t.tunnel.peers.publicKey}</th>
-          <th>{t.tunnel.peers.endpoint}</th>
-          <th>{t.tunnel.peers.lastHandshake}</th>
-          <th>{t.tunnel.peers.rtt}</th>
-          <th>{t.tunnel.peers.rate}</th>
-          <th>{t.tunnel.peers.rx}</th>
-          <th>{t.tunnel.peers.tx}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {peers.map((peer) => {
-          const rates = rateSeries(config, peer.publicKey);
-          const rtts = rttSeries(config, peer.publicKey);
-          return (
-            <tr key={peer.publicKey}>
-              <td className="mono ellipsis" title={peer.publicKey}>
-                {peer.publicKey.slice(0, 12)}…
-              </td>
-              <td className="mono">
-                {peer.endpoint ?? t.tunnel.peers.notConnected}
-              </td>
-              <td>{formatHandshake(peer.lastHandshakeAgeSecs)}</td>
-              <td title={t.tunnel.peers.rttTitle}>
-                <span className="cell-trend">
-                  <Sparkline values={rtts} title={t.tunnel.peers.rttTitle} />
-                  <span className="stat stat--rtt">{formatRtt(peer.rttMs)}</span>
-                </span>
-              </td>
-              <td title={t.tunnel.peers.rateTitle}>
-                <span className="cell-trend">
-                  <Sparkline values={rates} title={t.tunnel.peers.rateTitle} />
-                  <span className="stat">{formatRate(rates.at(-1) ?? null)}</span>
-                </span>
-              </td>
-              <td>{formatBytes(peer.rxBytes)}</td>
-              <td>{formatBytes(peer.txBytes)}</td>
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
-  );
-}
-
 function MemberRow({
   config,
   member,
@@ -798,7 +739,12 @@ function MemberRow({
                 className={`tag tag--route-${member.route}`}
                 title={t.tunnel.member.route.title}
               >
-                {t.tunnel.member.route[member.route]}
+                {member.forceRelay ? t.tunnel.member.route.aclRelay : t.tunnel.member.route[member.route]}
+              </span>
+            )}
+            {member.forceRelay && member.aclRuleId && (
+              <span className="muted small" title={t.tunnel.member.route.aclTitle}>
+                {member.aclRuleId}
               </span>
             )}
             {member.blocked && (
