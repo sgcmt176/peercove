@@ -197,10 +197,21 @@ function RttChart({ samples }: { samples: QualityPoint[] }) {
   if (values.length === 0) return <p className="muted quality__no-data">{t.quality.noRtt}</p>;
   const max = Math.max(1, ...values) * 1.1;
   const width = 720, height = 170, pad = 24;
-  const points = shown.map((sample, index) => sample.rttAvgMs === null ? null : ({
-    x: xAt(index, shown.length, width, pad),
-    y: height - pad - sample.rttAvgMs / max * (height - pad * 2),
-  }));
+  // 連続窓の想定間隔(最小の正の差)。これを大きく超える隙間は「デーモンが落ちて
+  // いた等で欠測した時間帯」なので、線でつながず途切れさせる(未測定を実測のように
+  // 見せない)。null 行の切断と同じ扱いにする。
+  const deltas = shown.slice(1).map((sample, index) => sample.windowStartUnixMs - shown[index].windowStartUnixMs).filter((delta) => delta > 0);
+  const stepMs = deltas.length ? Math.min(...deltas) : 0;
+  const points: Array<{ x: number; y: number } | null> = [];
+  shown.forEach((sample, index) => {
+    if (index > 0 && stepMs > 0 && sample.windowStartUnixMs - shown[index - 1].windowStartUnixMs > stepMs * 1.8) {
+      points.push(null);
+    }
+    points.push(sample.rttAvgMs === null ? null : {
+      x: xAt(index, shown.length, width, pad),
+      y: height - pad - sample.rttAvgMs / max * (height - pad * 2),
+    });
+  });
   const segments: Array<Array<{ x: number; y: number }>> = [];
   let current: Array<{ x: number; y: number }> = [];
   for (const point of points) {

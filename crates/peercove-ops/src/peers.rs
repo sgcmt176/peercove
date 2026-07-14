@@ -53,6 +53,8 @@ fn toml_string(value: &str) -> String {
 ///
 /// TOML 全体を再シリアライズするとコメントが失われるため、テキスト追記方式にする。
 pub fn append_peer(config_path: &Path, peer: &NewPeer) -> anyhow::Result<()> {
+    // 使用済み IP 検査から追記までを、他プロセスの書き込みと直列化する。
+    let lock = ConfigLock::acquire(config_path)?;
     let config = Config::load(config_path)?;
     let NewPeer { public_key, ip, .. } = *peer;
 
@@ -101,15 +103,64 @@ pub fn append_peer(config_path: &Path, peer: &NewPeer) -> anyhow::Result<()> {
         block.push_str(&format!("preshared_key_file = {}\n", toml_string(psk)));
     }
     let updated = format!("{original}{block}");
-    write_validated(config_path, &updated)
+    write_validated(lock, config_path, &updated)
 }
 
-/// 書き込む前に、結果が正しく解析・検証できることを確認する。
-pub(crate) fn write_validated(config_path: &Path, text: &str) -> anyhow::Result<()> {
+/// host.toml の read-modify-write を、UI プロセスとデーモンプロセスの間でも直列化する
+/// クロスプロセス助言ロック。`<config>.lock` を排他ロックし、Drop で解放する。
+/// これが無いと、失効(remove)と鍵ローテーション等の同時書き込みで lost update が
+/// 起き、失効したメンバーが復活しうる。
+#[must_use = "ロックを保持し続けるため write_validated まで束縛を維持すること"]
+pub struct ConfigLock {
+    _file: std::fs::File,
+}
+
+impl ConfigLock {
+    fn acquire(config_path: &Path) -> anyhow::Result<Self> {
+        let mut lock_path = config_path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = std::path::PathBuf::from(lock_path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("{} を開けません", lock_path.display()))?;
+        // ブロッキング排他ロック(std::fs::File::lock、Rust 1.89+)。ファイルを閉じると解放。
+        file.lock()
+            .with_context(|| format!("{} のロックに失敗しました", lock_path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// 設定ファイルの read-modify-write を、他プロセス(UI/デーモン)と直列化するロックを
+/// 取得する。ops の外(例: member.toml の鍵ローテーション)で同じ排他を得たいときに使う。
+pub fn lock_config(config_path: &Path) -> anyhow::Result<ConfigLock> {
+    ConfigLock::acquire(config_path)
+}
+
+/// ロックを取得したうえで host.toml を読み込む。返したロックは書き込みまで保持する。
+pub(crate) fn load_doc_locked(
+    config_path: &Path,
+) -> anyhow::Result<(ConfigLock, toml_edit::DocumentMut)> {
+    let lock = ConfigLock::acquire(config_path)?;
+    let doc = load_doc(config_path)?;
+    Ok((lock, doc))
+}
+
+/// 書き込む前に、結果が正しく解析・検証できることを確認する。ロックを消費し、
+/// 書き込み後に解放する(read-modify-write の全区間をロックが覆う)。
+pub(crate) fn write_validated(
+    lock: ConfigLock,
+    config_path: &Path,
+    text: &str,
+) -> anyhow::Result<()> {
     let parsed: Config = toml::from_str(text).context("編集結果の TOML が不正です")?;
     parsed.validate()?;
-    std::fs::write(config_path, text)
-        .with_context(|| format!("{} の書き込みに失敗しました", config_path.display()))
+    let result = std::fs::write(config_path, text)
+        .with_context(|| format!("{} の書き込みに失敗しました", config_path.display()));
+    drop(lock);
+    result
 }
 
 /// セレクタに一致するピアを 1 つだけ返す。
@@ -189,7 +240,7 @@ pub fn remove_peer(config_path: &Path, selector: &Selector) -> anyhow::Result<Re
 
     let removed_ip = target.allowed_ips.first().map(|net| net.addr());
 
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let peers = peer_tables(&mut doc)?;
     let before = peers.len();
     peers.retain(|table| {
@@ -292,7 +343,7 @@ pub fn remove_peer(config_path: &Path, selector: &Selector) -> anyhow::Result<Re
             doc.remove("dns_record");
         }
     }
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
 
     let removed_psk_file = psk_file.and_then(|path| match std::fs::remove_file(&path) {
         Ok(()) => Some(path),
@@ -324,7 +375,7 @@ pub fn rename_peer(config_path: &Path, selector: &Selector, new_name: &str) -> a
         bail!("名前 {new_name} は既に使われています");
     }
 
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let mut renamed = false;
     for table in peer_tables(&mut doc)?.iter_mut() {
         let matches = table
@@ -340,7 +391,7 @@ pub fn rename_peer(config_path: &Path, selector: &Selector, new_name: &str) -> a
     if !renamed {
         bail!("host.toml から対象ピアを特定できませんでした");
     }
-    write_validated(config_path, &doc.to_string())
+    write_validated(lock, config_path, &doc.to_string())
 }
 
 /// メンバーの広告サブネット(ADR-0014、M3-7)を設定する。空スライスで解除。
@@ -356,7 +407,7 @@ pub fn set_subnets(
     let target_key = target.public_key.to_base64();
     let display = target.name.clone().unwrap_or_else(|| target_key.clone());
 
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let mut updated = false;
     for table in peer_tables(&mut doc)?.iter_mut() {
         let matches = table
@@ -378,7 +429,7 @@ pub fn set_subnets(
     if !updated {
         bail!("host.toml から対象ピアを特定できませんでした");
     }
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
     Ok(display)
 }
 
@@ -414,7 +465,7 @@ pub fn rotate_peer_key(
     let target_key = target.public_key.to_base64();
     let display = target.name.clone().unwrap_or_else(|| member_ip.to_string());
 
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let mut updated = false;
     for table in peer_tables(&mut doc)?.iter_mut() {
         let matches = table
@@ -445,7 +496,7 @@ pub fn rotate_peer_key(
             }
         }
     }
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
     Ok(RotateOutcome::Applied { display })
 }
 
@@ -541,7 +592,7 @@ pub fn set_peer_dns_name(
     }
     let target_key = target.public_key.to_base64();
 
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let mut updated = false;
     for table in peer_tables(&mut doc)?.iter_mut() {
         let matches = table
@@ -557,7 +608,7 @@ pub fn set_peer_dns_name(
     if !updated {
         bail!("host.toml から対象ピアを特定できませんでした");
     }
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
     Ok(DnsNameOutcome::Applied { display, label })
 }
 
@@ -607,7 +658,7 @@ pub fn mark_invite_accepted_by_ip(
         bail!("招待の期限が切れています");
     }
     let target_key = target.public_key.to_base64();
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let mut updated = false;
     for table in peer_tables(&mut doc)?.iter_mut() {
         let matches = table
@@ -624,7 +675,7 @@ pub fn mark_invite_accepted_by_ip(
     if !updated {
         bail!("host.toml から対象ピアを特定できませんでした");
     }
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
     Ok(true)
 }
 
@@ -646,7 +697,7 @@ pub fn approve_invite(
         return Ok(());
     }
     let target_key = target.public_key.to_base64();
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let table = peer_tables(&mut doc)?
         .iter_mut()
         .find(|table| {
@@ -658,7 +709,7 @@ pub fn approve_invite(
         })
         .context("host.toml から対象ピアを特定できませんでした")?;
     table["invite_approved_at"] = toml_edit::value(approved_at as i64);
-    write_validated(config_path, &doc.to_string())
+    write_validated(lock, config_path, &doc.to_string())
 }
 
 /// ホスト自身の表示名を設定する(ADR-0027)。戻り値は確定した表示名。
@@ -666,13 +717,13 @@ pub fn approve_invite(
 pub fn set_host_display_name(config_path: &Path, input: &str) -> anyhow::Result<String> {
     let name = input.trim();
     crate::invite::validate_name(name)?;
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let interface = doc
         .get_mut("interface")
         .and_then(|item| item.as_table_mut())
         .context("[interface] が見つかりません")?;
     interface.insert("display_name", toml_edit::value(name));
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
     Ok(name.to_string())
 }
 
@@ -686,13 +737,13 @@ pub fn set_host_dns_name(config_path: &Path, input: &str) -> anyhow::Result<Stri
     if taken_dns_labels(&config, DnsExclude::Host).contains(&label) {
         bail!("DNS 名「{label}」はこのネットワークで既に使用されています");
     }
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let interface = doc
         .get_mut("interface")
         .and_then(|item| item.as_table_mut())
         .context("[interface] が見つかりません")?;
     interface.insert("dns_name", toml_edit::value(&label));
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
     Ok(label)
 }
 

@@ -334,25 +334,37 @@ impl Device {
                     }
                     // ACL(ADR-0018/0035): 新規セッションの開始方向を判定し、
                     // 許可された逆方向セッションの応答だけは deny 方向でも通す。
-                    let policy = self.acl_policy.read().unwrap();
-                    let decision = policy.evaluate_ipv4_packet(packet);
                     let mut sessions = self.acl_sessions.lock().unwrap();
                     let now = Instant::now();
-                    let established_reply = decision.action == peercove_core::acl::AclAction::Deny
-                        && sessions.allows_reply(packet, now);
-                    if decision.action == peercove_core::acl::AclAction::Allow {
-                        sessions.observe_allowed(packet, now);
-                    } else if established_reply {
-                        tracing::trace!(
-                            "ACL で許可済みセッションの応答をリレーします(rule={:?})",
-                            decision.rule_id
-                        );
+                    // 非先頭フラグメントはポートを持たないので評価に回さず、許可済みの
+                    // 先頭フラグメントに属するものだけ通す(Linux の再構成と同じ結果)。
+                    if peercove_core::acl::is_non_first_fragment(packet) {
+                        if !sessions.allows_fragment(packet, now) {
+                            tracing::trace!("ACL 対象外フラグメントを破棄しました");
+                            return;
+                        }
                     } else {
-                        tracing::trace!(
-                            "ACL によりリレーを破棄しました(rule={:?})",
-                            decision.rule_id
-                        );
-                        return;
+                        let policy = self.acl_policy.read().unwrap();
+                        let decision = policy.evaluate_ipv4_packet(packet);
+                        let established_reply = decision.action
+                            == peercove_core::acl::AclAction::Deny
+                            && sessions.allows_reply(packet, now);
+                        if decision.action == peercove_core::acl::AclAction::Allow {
+                            sessions.observe_allowed(packet, now);
+                        } else if established_reply {
+                            tracing::trace!(
+                                "ACL で許可済みセッションの応答をリレーします(rule={:?})",
+                                decision.rule_id
+                            );
+                        } else {
+                            tracing::trace!(
+                                "ACL によりリレーを破棄しました(rule={:?})",
+                                decision.rule_id
+                            );
+                            return;
+                        }
+                        // 通す先頭フラグメント(後続あり)なら、後続を追随させる印を残す。
+                        sessions.note_forwarded_fragment(packet, now);
                     }
                     tracing::trace!("宛先 {dst} のピアへ直接リレーします");
                     let mut buf = [0u8; BUF_SIZE];

@@ -27,6 +27,11 @@ struct Aggregate {
     name: Option<String>,
     availability: Option<QualityAvailability>,
     rtts: Vec<f64>,
+    /// `rtts` の中で「連続していない」区切り位置(切断・経路変更の直後の index)。
+    /// ジッターはこの境界をまたぐ差分を除外して求める(見かけのスパイクを防ぐ)。
+    rtt_breaks: Vec<usize>,
+    /// 次に RTT を積むとき区切りを入れるか。切断・経路変更で立てる。
+    discontinuity_pending: bool,
     sent: u32,
     received: u32,
     route_direct_secs: u32,
@@ -45,6 +50,8 @@ impl Default for Aggregate {
             name: None,
             availability: None,
             rtts: Vec::new(),
+            rtt_breaks: Vec::new(),
+            discontinuity_pending: false,
             sent: 0,
             received: 0,
             route_direct_secs: 0,
@@ -68,13 +75,20 @@ impl Aggregate {
                 .min(sorted.len() - 1);
             sorted[index]
         });
-        let jitter = (self.rtts.len() >= 2).then(|| {
-            self.rtts
-                .windows(2)
-                .map(|pair| (pair[1] - pair[0]).abs())
-                .sum::<f64>()
-                / (self.rtts.len() - 1) as f64
-        });
+        // 連続する RTT の差の平均(ADR-0032)。ただし切断・経路変更をまたぐ差分は
+        // 別フローの飛びなので除外する。
+        let jitter = {
+            let mut sum = 0.0;
+            let mut count = 0u32;
+            for i in 1..self.rtts.len() {
+                if self.rtt_breaks.contains(&i) {
+                    continue;
+                }
+                sum += (self.rtts[i] - self.rtts[i - 1]).abs();
+                count += 1;
+            }
+            (count > 0).then(|| sum / count as f64)
+        };
         let availability = self.availability.unwrap_or(QualityAvailability::Unmeasured);
         let loss_percent =
             (availability == QualityAvailability::Connected && self.sent > 0).then(|| {
@@ -182,10 +196,9 @@ impl QualityStore {
             } else {
                 Some(QualityAvailability::Unmeasured)
             };
-            if let Some(probe) = probes.get(&peer.ip) {
-                aggregate.sent = aggregate.sent.saturating_add(probe.sent);
-                aggregate.received = aggregate.received.saturating_add(probe.received);
-                aggregate.rtts.extend(probe.rtts_ms.iter().copied());
+            // 切断中は次に積む RTT との連続性が切れるので、ジッターの区切りを予約する。
+            if aggregate.availability == Some(QualityAvailability::Disconnected) {
+                aggregate.discontinuity_pending = true;
             }
 
             let route = if role == Role::Member && !peer.is_host {
@@ -203,6 +216,20 @@ impl QualityStore {
                 .is_some_and(|previous| previous != route)
             {
                 aggregate.route_switches = aggregate.route_switches.saturating_add(1);
+                // 経路が変わると RTT の水準も変わるため、ここで区切る。
+                aggregate.discontinuity_pending = true;
+            }
+
+            if let Some(probe) = probes.get(&peer.ip) {
+                aggregate.sent = aggregate.sent.saturating_add(probe.sent);
+                aggregate.received = aggregate.received.saturating_add(probe.received);
+                if !probe.rtts_ms.is_empty() {
+                    if aggregate.discontinuity_pending && !aggregate.rtts.is_empty() {
+                        aggregate.rtt_breaks.push(aggregate.rtts.len());
+                    }
+                    aggregate.rtts.extend(probe.rtts_ms.iter().copied());
+                    aggregate.discontinuity_pending = false;
+                }
             }
             match route {
                 QualityRoute::Direct => aggregate.route_direct_secs += 5,
@@ -224,6 +251,15 @@ impl QualityStore {
                 }
             }
         }
+
+        // 台帳から消えたピア(削除・退出)の残骸を捨てて、無制限増加を防ぐ。
+        let live: std::collections::HashSet<String> = ledger
+            .iter()
+            .filter(|entry| entry.ip != self_ip)
+            .map(|entry| entry.public_key.to_base64())
+            .collect();
+        self.previous_bytes.retain(|key, _| live.contains(key));
+        self.previous_routes.retain(|key, _| live.contains(key));
     }
 
     pub fn report(&self, since_unix_ms: u64) -> QualityReport {
@@ -468,6 +504,23 @@ mod tests {
         assert_eq!(sample.rtt_p95_ms, Some(40.0));
         assert_eq!(sample.loss_percent, Some(20.0));
         assert!((sample.jitter_ms.unwrap() - 34.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn jitter_excludes_discontinuity_boundary() {
+        // 窓内で relay→direct に切り替わり RTT 水準が跳ねたケース。区切り位置(index 3)を
+        // またぐ 10→200 の差分はジッターから除外し、実際の連続差だけを平均する。
+        let aggregate = Aggregate {
+            availability: Some(QualityAvailability::Connected),
+            rtts: vec![10.0, 11.0, 10.0, 200.0, 201.0],
+            rtt_breaks: vec![3],
+            sent: 5,
+            received: 5,
+            ..Default::default()
+        };
+        let sample = aggregate.sample(0, 60_000);
+        // |11-10|, |10-11|, (境界で除外), |201-200| → 平均 1.0
+        assert!((sample.jitter_ms.unwrap() - 1.0).abs() < 0.001);
     }
 
     #[test]

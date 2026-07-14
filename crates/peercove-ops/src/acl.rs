@@ -10,7 +10,7 @@ use peercove_core::acl::{AclAction, AclGroup, AclRule, AclTarget};
 use peercove_core::config::Config;
 use serde::{Deserialize, Serialize};
 
-use crate::peers::{load_doc, write_validated};
+use crate::peers::{load_doc_locked, write_validated};
 
 /// 現在の遮断組(正規化済み: 小さい IP が先、重複なし)を返す。
 pub fn list_deny(config_path: &Path) -> anyhow::Result<Vec<(Ipv4Addr, Ipv4Addr)>> {
@@ -20,9 +20,9 @@ pub fn list_deny(config_path: &Path) -> anyhow::Result<Vec<(Ipv4Addr, Ipv4Addr)>
 /// 遮断組を丸ごと差し替える。空なら `[acl]` セクションごと消す。
 /// ホスト IP を含む組・サブネット外の IP は検証(`Config::validate`)で拒否される。
 pub fn set_deny(config_path: &Path, deny: &[(Ipv4Addr, Ipv4Addr)]) -> anyhow::Result<()> {
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     write_deny(&mut doc, deny);
-    write_validated(config_path, &doc.to_string())
+    write_validated(lock, config_path, &doc.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +64,7 @@ pub fn read_policy(config_path: &Path) -> anyhow::Result<PolicySettings> {
 
 /// ACL v2全体を原子的に差し替える。保存時に旧deny pairはv2へ移行される。
 pub fn write_policy(config_path: &Path, policy: &PolicySettings) -> anyhow::Result<()> {
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let mut acl = toml_edit::Table::new();
     acl["default"] = toml_edit::value(match policy.default {
         AclAction::Allow => "allow",
@@ -116,7 +116,7 @@ pub fn write_policy(config_path: &Path, policy: &PolicySettings) -> anyhow::Resu
         acl["rule"] = toml_edit::Item::ArrayOfTables(rules);
     }
     doc["acl"] = toml_edit::Item::Table(acl);
-    write_validated(config_path, &doc.to_string())
+    write_validated(lock, config_path, &doc.to_string())
 }
 
 fn target_item(target: &AclTarget) -> toml_edit::Item {

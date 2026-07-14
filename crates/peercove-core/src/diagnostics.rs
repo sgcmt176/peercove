@@ -82,40 +82,6 @@ impl DiagnosticReport {
             DiagnosticOverall::Healthy
         }
     }
-
-    /// JSON と対で保存する、依存のない人間可読テキスト。
-    pub fn to_text(&self) -> String {
-        let mut out = format!(
-            "PeerCove diagnostic report\ngenerated_at_unix_ms: {}\noverall: {:?}\nconfig: {}\n",
-            self.generated_at_unix_ms, self.overall, self.scope.config
-        );
-        if let Some(network) = &self.scope.network {
-            out.push_str(&format!("network: {network}\n"));
-        }
-        if let Some(role) = &self.scope.role {
-            out.push_str(&format!("role: {role}\n"));
-        }
-        out.push_str("\nchecks:\n");
-        for check in &self.checks {
-            out.push_str(&format!(
-                "- [{:?}] {} ({:?})\n",
-                check.status, check.id, check.category
-            ));
-            for (key, value) in &check.evidence {
-                out.push_str(&format!("    {key}: {value}\n"));
-            }
-        }
-        if !self.logs.is_empty() {
-            out.push_str("\nrecent logs:\n");
-            for line in &self.logs {
-                out.push_str(&format!(
-                    "- {} {} {}: {}\n",
-                    line.unix_ms, line.level, line.target, line.message
-                ));
-            }
-        }
-        out
-    }
 }
 
 /// 診断エクスポート前の最後の防壁。秘密らしい行は一部だけ残さず行全体を隠す。

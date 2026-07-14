@@ -1021,6 +1021,7 @@ impl DaemonShared {
         };
         let network = active.network.clone();
         active.dns_task.abort();
+        active.health.lock().unwrap().stop();
         let _ = active.stop_tx.send(true);
         let stopped = active
             .task
@@ -1040,6 +1041,7 @@ impl DaemonShared {
         for active in all {
             let network = active.network.clone();
             active.dns_task.abort();
+            active.health.lock().unwrap().stop();
             let _ = active.stop_tx.send(true);
             match active.task.await {
                 Ok(Ok(())) => tracing::info!("トンネルを停止しました(network={network})"),

@@ -233,6 +233,8 @@ impl Rotation {
 
 /// member.toml の `[interface] key_source` を "self" にする(コメント保持)。
 fn mark_key_self(config_path: &Path) -> anyhow::Result<()> {
+    // 設定保存(UI)など他プロセスの書き込みと直列化する(peercove-ops と同じロック)。
+    let _lock = peercove_ops::peers::lock_config(config_path)?;
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("{} の読み込みに失敗しました", config_path.display()))?;
     let mut doc: toml_edit::DocumentMut = text

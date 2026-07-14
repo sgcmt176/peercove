@@ -13,7 +13,7 @@ use peercove_core::config::{Config, MemberRef};
 use peercove_core::dns::{is_service_scheme, service_url, DNS_SUFFIX};
 use peercove_core::names;
 
-use crate::peers::{load_doc, write_validated};
+use crate::peers::{load_doc_locked, write_validated};
 
 /// レコードのターゲット(ADR-0022 / ADR-0025)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +98,7 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
     let mut config = Config::load(config_path)?;
     // ADR-0035以前のレコードにも、一度だけ安定IDを補う。名前変更後もIDは維持される。
     if config.dns_records.iter().any(|record| record.id.is_none()) {
-        let mut doc = load_doc(config_path)?;
+        let (lock, mut doc) = load_doc_locked(config_path)?;
         let records = doc["dns_record"]
             .as_array_of_tables_mut()
             .context("dns_record が配列テーブルではありません")?;
@@ -121,7 +121,7 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
             };
             table.insert("id", toml_edit::value(id));
         }
-        write_validated(config_path, &doc.to_string())?;
+        write_validated(lock, config_path, &doc.to_string())?;
         config = Config::load(config_path)?;
     }
     let network = config.network_name().to_string();
@@ -181,7 +181,7 @@ pub fn set_health(
     settings: &HealthSettings,
 ) -> anyhow::Result<()> {
     let under_string = under.map(|reference| reference.to_config_string());
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let records = doc
         .get_mut("dns_record")
         .and_then(|item| item.as_array_of_tables_mut())
@@ -223,7 +223,7 @@ pub fn set_health(
     if settings.external {
         table.insert("health_external", toml_edit::value(true));
     }
-    write_validated(config_path, &doc.to_string())
+    write_validated(lock, config_path, &doc.to_string())
 }
 
 /// カスタムレコードを追加する。`name` は表示名のままでよく、ここで正規化する。
@@ -286,7 +286,7 @@ pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<
         },
     };
 
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let records = doc["dns_record"]
         .or_insert(toml_edit::Item::ArrayOfTables(Default::default()))
         .as_array_of_tables_mut()
@@ -325,7 +325,7 @@ pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<
         table.insert("port", toml_edit::value(i64::from(port)));
     }
     records.push(table);
-    write_validated(config_path, &doc.to_string())?;
+    write_validated(lock, config_path, &doc.to_string())?;
     Ok(relative)
 }
 
@@ -341,7 +341,7 @@ pub fn remove_record(
         .into_iter()
         .find(|record| record.name == name && record.under == under)
         .and_then(|record| record.id);
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let Some(records) = doc
         .get_mut("dns_record")
         .and_then(|item| item.as_array_of_tables_mut())
@@ -375,7 +375,7 @@ pub fn remove_record(
             });
         }
     }
-    write_validated(config_path, &doc.to_string())
+    write_validated(lock, config_path, &doc.to_string())
 }
 
 #[cfg(test)]

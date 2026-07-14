@@ -266,10 +266,16 @@ pub fn restore(
         std::process::id(),
         now_ms()
     ));
+    // staged dir には復号済みの秘密鍵・PSK が置かれているため、どの失敗経路でも
+    // 必ず削除する。target の退避に失敗した時点で stage を残さない。
     if target.exists() {
-        std::fs::rename(&target, &old).context("既存ネットワークを退避できません")?;
+        if let Err(error) = std::fs::rename(&target, &old) {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(error).context("既存ネットワークを退避できません");
+        }
     }
     if let Err(error) = std::fs::rename(&stage, &target) {
+        let _ = std::fs::remove_dir_all(&stage);
         if old.exists() {
             let _ = std::fs::rename(&old, &target);
         }

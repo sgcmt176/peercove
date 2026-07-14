@@ -101,7 +101,19 @@ pub struct AclDecision<'a> {
 #[derive(Debug, Default)]
 pub struct AclSessionTracker {
     replies: HashMap<ReplyKey, Session>,
+    /// 許可された先頭フラグメントの (src,dst,proto,ip-id)。後続フラグメントは
+    /// L4 ポートを持たないため、先頭の判定に追随させる(Linux の conntrack が
+    /// 再構成してから評価するのと同じ結果にする、ADR-0035)。
+    fragments: HashMap<FragmentKey, Session>,
     next_prune: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FragmentKey {
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: u8,
+    identification: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -130,6 +142,8 @@ struct Session {
 const TCP_SESSION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const UDP_SESSION_LIFETIME: Duration = Duration::from_secs(30);
 const ICMP_SESSION_LIFETIME: Duration = Duration::from_secs(10);
+/// 1 データグラムのフラグメント群が届く猶予。再構成待ちに合わせて短くする。
+const FRAGMENT_LIFETIME: Duration = Duration::from_secs(15);
 const MAX_ACL_SESSIONS: usize = 16_384;
 
 impl AclSessionTracker {
@@ -174,8 +188,29 @@ impl AclSessionTracker {
         true
     }
 
+    /// リレーを許可した先頭フラグメント(後続あり)を記録し、後続フラグメントを通せるようにする。
+    /// allow・許可応答のどちらの経路でも呼ぶ。
+    pub fn note_forwarded_fragment(&mut self, packet: &[u8], now: Instant) {
+        if is_initial_fragment(packet) && has_more_fragments(packet) {
+            if let Some(key) = fragment_key(packet) {
+                self.insert_fragment(key, now);
+            }
+        }
+    }
+
+    /// 非先頭フラグメント(offset != 0)が、許可済みの先頭フラグメントに属するか判定する。
+    /// 属していれば通す。ポリシー評価には回さない(ポートが読めないため)。
+    pub fn allows_fragment(&mut self, packet: &[u8], now: Instant) -> bool {
+        self.remove_expired(now);
+        let Some(key) = fragment_key(packet) else {
+            return false;
+        };
+        self.fragments.contains_key(&key)
+    }
+
     pub fn clear(&mut self) {
         self.replies.clear();
+        self.fragments.clear();
         self.next_prune = None;
     }
 
@@ -193,11 +228,25 @@ impl AclSessionTracker {
         );
     }
 
+    fn insert_fragment(&mut self, key: FragmentKey, now: Instant) {
+        if self.fragments.len() >= MAX_ACL_SESSIONS && !self.fragments.contains_key(&key) {
+            return;
+        }
+        self.fragments.insert(
+            key,
+            Session {
+                expires_at: now + FRAGMENT_LIFETIME,
+                lifetime: FRAGMENT_LIFETIME,
+            },
+        );
+    }
+
     fn remove_expired(&mut self, now: Instant) {
         if self.next_prune.is_some_and(|next| now < next) {
             return;
         }
         self.replies.retain(|_, session| session.expires_at > now);
+        self.fragments.retain(|_, session| session.expires_at > now);
         self.next_prune = Some(now + Duration::from_secs(1));
     }
 }
@@ -424,7 +473,13 @@ fn protocol_matches(expected: AclProtocol, actual: u8) -> bool {
 
 fn packet_fields(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, Option<u16>)> {
     let (src, dst, protocol, header_len) = ipv4_fields(packet)?;
-    let port = if matches!(protocol, 6 | 17) && packet.len() >= header_len + 4 {
+    // 非先頭フラグメント(offset != 0)では header_len 以降はポートではなく
+    // ペイロードなので、ポートを読まず None にする。ここを読むと後続フラグメントが
+    // ゴミポートで評価され、Linux(conntrack が再構成する)と食い違う(ADR-0035)。
+    let port = if matches!(protocol, 6 | 17)
+        && is_initial_fragment(packet)
+        && packet.len() >= header_len + 4
+    {
         Some(u16::from_be_bytes([
             packet[header_len + 2],
             packet[header_len + 3],
@@ -522,6 +577,28 @@ fn packet_reply_key(packet: &[u8]) -> Option<ReplyKey> {
 
 fn is_initial_fragment(packet: &[u8]) -> bool {
     packet.len() >= 8 && u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff == 0
+}
+
+/// 非先頭フラグメント(フラグメントオフセット != 0)か。IPv4 以外・短すぎるパケットは false。
+pub fn is_non_first_fragment(packet: &[u8]) -> bool {
+    packet.len() >= 20
+        && packet[0] >> 4 == 4
+        && u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff != 0
+}
+
+/// More Fragments フラグ。先頭フラグメント(offset==0)でこれが立つと後続がある。
+fn has_more_fragments(packet: &[u8]) -> bool {
+    packet.len() >= 8 && packet[6] & 0x20 != 0
+}
+
+fn fragment_key(packet: &[u8]) -> Option<FragmentKey> {
+    let (src, dst, protocol, _) = ipv4_fields(packet)?;
+    Some(FragmentKey {
+        src,
+        dst,
+        protocol,
+        identification: u16::from_be_bytes([packet[4], packet[5]]),
+    })
 }
 
 #[cfg(test)]
@@ -665,6 +742,65 @@ mod tests {
         packet[20] = kind;
         packet[24..26].copy_from_slice(&identifier.to_be_bytes());
         packet
+    }
+
+    /// フラグメント断片を作る。`offset_units` は 8 バイト単位、`more` は MF フラグ。
+    /// 先頭(offset==0)だけ dst_port を持つ(src_port は 40000 固定)。
+    fn fragment_packet(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        identification: u16,
+        offset_units: u16,
+        more: bool,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[4..6].copy_from_slice(&identification.to_be_bytes());
+        let flags_frag = (offset_units & 0x1fff) | if more { 0x2000 } else { 0 };
+        packet[6..8].copy_from_slice(&flags_frag.to_be_bytes());
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        if offset_units == 0 {
+            packet[20..22].copy_from_slice(&40_000u16.to_be_bytes());
+            packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        }
+        packet
+    }
+
+    #[test]
+    fn non_first_fragment_follows_allowed_head_not_default() {
+        // default=deny + allow A→B udp 51820。フラグメント化した UDP を通す。
+        let a: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let b: Ipv4Addr = "10.0.1.2".parse().unwrap();
+        let p = AclPolicy {
+            default: AclAction::Deny,
+            rules: vec![ResolvedRule {
+                id: "game".into(),
+                action: AclAction::Allow,
+                source: vec!["10.0.0.0/24".parse().unwrap()],
+                destination: vec!["10.0.1.2/32".parse().unwrap()],
+                protocol: AclProtocol::Udp,
+                ports: vec![(51820, 51820)],
+            }],
+        };
+        let now = Instant::now();
+        let mut tracker = AclSessionTracker::default();
+
+        // 先頭フラグメント(ポート 51820、後続あり)は許可され、印が残る。
+        let head = fragment_packet(a, b, 0x1234, 0, true, 51820);
+        assert_eq!(p.evaluate_ipv4_packet(&head).action, AclAction::Allow);
+        tracker.note_forwarded_fragment(&head, now);
+
+        // 非先頭フラグメント(ポートを持たない)は、印に追随して通る。
+        let tail = fragment_packet(a, b, 0x1234, 185, false, 0);
+        assert!(is_non_first_fragment(&tail));
+        assert!(tracker.allows_fragment(&tail, now));
+
+        // 別データグラム(ip-id 違い)の非先頭フラグメントは印が無く通らない。
+        let stray = fragment_packet(a, b, 0x9999, 185, false, 0);
+        assert!(!tracker.allows_fragment(&stray, now));
     }
 
     #[test]

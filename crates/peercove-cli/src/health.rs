@@ -1,6 +1,6 @@
 //! DNS サービスのホスト主体ヘルスチェック(M3-14e、ADR-0033)。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,6 +25,11 @@ pub struct HealthMonitor {
     last_started: Option<Instant>,
     running: bool,
     force: bool,
+    /// 実行中の監視バッチ。トンネル停止時に abort して外部接続を打ち切る。
+    batch: Option<tokio::task::JoinHandle<()>>,
+    /// 直近(約5秒ごと更新)のオンライン・メンバー IP。プローブ中にメンバーが
+    /// 落ちた場合、失敗を Unhealthy でなく Offline に落とすために参照する。
+    online_members: HashSet<Ipv4Addr>,
 }
 
 #[derive(Clone)]
@@ -42,12 +47,23 @@ struct Job {
     kind: HealthCheckKind,
     path: String,
     expected_status: Option<u16>,
+    /// member/under 参照レコードの対象メンバー IP。プローブ失敗時、このメンバーが
+    /// 既にオフラインなら結果を Offline(unknown)へ落とす。
+    gated_member_ip: Option<Ipv4Addr>,
 }
 
 impl HealthMonitor {
     /// 次の supervisor 周期で間隔を無視して再確認する。
     pub fn request_now(&mut self) {
         self.force = true;
+    }
+
+    /// トンネル停止時に実行中の監視バッチを打ち切り、外部への接続を残さない。
+    pub fn stop(&mut self) {
+        if let Some(batch) = self.batch.take() {
+            batch.abort();
+        }
+        self.running = false;
     }
 
     /// 直近結果を配布用レコードへ付ける。未測定は明示的な unknown とする。
@@ -76,6 +92,13 @@ impl HealthMonitor {
 pub fn schedule(shared: &SharedHealth, config: &Config, ledger: &[LedgerEntry]) {
     {
         let mut monitor = shared.lock().unwrap();
+        // オンライン集合は毎周期(約5秒)更新する。バッチ実行中でも最新化して、
+        // プローブ中に落ちたメンバーを検知できるようにする。
+        monitor.online_members = ledger
+            .iter()
+            .filter(|entry| entry.online)
+            .map(|entry| entry.ip)
+            .collect();
         let due = monitor
             .last_started
             .is_none_or(|last| last.elapsed() >= CHECK_INTERVAL);
@@ -88,8 +111,8 @@ pub fn schedule(shared: &SharedHealth, config: &Config, ledger: &[LedgerEntry]) 
     }
 
     let (jobs, immediate) = build_jobs(config, ledger);
-    let shared = Arc::clone(shared);
-    tokio::spawn(async move {
+    let task_shared = Arc::clone(shared);
+    let handle = tokio::spawn(async move {
         let queue = Arc::new(tokio::sync::Mutex::new(VecDeque::from(jobs)));
         let results = Arc::new(tokio::sync::Mutex::new(immediate));
         let workers = {
@@ -98,13 +121,30 @@ pub fn schedule(shared: &SharedHealth, config: &Config, ledger: &[LedgerEntry]) 
                 .map(|_| {
                     let queue = Arc::clone(&queue);
                     let results = Arc::clone(&results);
+                    let worker_shared = Arc::clone(&task_shared);
                     tokio::spawn(async move {
                         loop {
                             let Some(job) = queue.lock().await.pop_front() else {
                                 break;
                             };
                             let key = job.key.clone();
-                            let result = check(job).await;
+                            let gated = job.gated_member_ip;
+                            let mut result = check(job).await;
+                            // プローブ中にメンバーが落ちた場合、接続失敗を「停止」でなく
+                            // 「未確認(オフライン)」に落とす(ADR-0033)。
+                            if result.status == ServiceHealthStatus::Unhealthy {
+                                if let Some(ip) = gated {
+                                    if !worker_shared.lock().unwrap().online_members.contains(&ip) {
+                                        result = ServiceHealth {
+                                            status: ServiceHealthStatus::Unknown,
+                                            reason: ServiceHealthReason::Offline,
+                                            checked_at_unix_ms: result.checked_at_unix_ms,
+                                            response_ms: None,
+                                            http_status: None,
+                                        };
+                                    }
+                                }
+                            }
                             results.lock().await.insert(key, result);
                         }
                     })
@@ -115,10 +155,12 @@ pub fn schedule(shared: &SharedHealth, config: &Config, ledger: &[LedgerEntry]) 
             let _ = worker.await;
         }
         let completed = results.lock().await.clone();
-        let mut monitor = shared.lock().unwrap();
+        let mut monitor = task_shared.lock().unwrap();
         monitor.results = completed;
         monitor.running = false;
+        monitor.batch = None;
     });
+    shared.lock().unwrap().batch = Some(handle);
 }
 
 fn build_jobs(
@@ -130,10 +172,6 @@ fn build_jobs(
     let network = config.network_name();
     let now = unix_ms();
     for record in &config.dns_records {
-        let enabled_by_default =
-            record.cname.is_none() && record.scheme.is_some() && record.port.is_some();
-        let enabled = record.health_check.unwrap_or(enabled_by_default);
-
         let (key, target) = if let Some(cname) = &record.cname {
             (record_name(record, ledger), Target::Name(cname.clone()))
         } else {
@@ -144,6 +182,18 @@ fn build_jobs(
                 None => (record.name.clone(), Target::Ip(Ipv4Addr::UNSPECIFIED)),
             }
         };
+        // 既定 ON は「内部(トンネル/LAN の私設 IP)を指す」レコードだけ。素の公開 IP は
+        // 外部宛なので、明示的な health_check = true が無い限り自動確認しない(ADR-0033)。
+        let internal_target = match &target {
+            Target::Ip(ip) => is_internal_ip(*ip),
+            Target::Name(_) => false,
+        };
+        let enabled_by_default = record.cname.is_none()
+            && record.scheme.is_some()
+            && record.port.is_some()
+            && internal_target;
+        let enabled = record.health_check.unwrap_or(enabled_by_default);
+
         if !enabled || (record.cname.is_some() && !record.health_external) {
             immediate.insert(key, disabled());
             continue;
@@ -165,6 +215,14 @@ fn build_jobs(
             );
             continue;
         }
+        let gated_member_ip = if record.member.is_some() || record.under.is_some() {
+            match &target {
+                Target::Ip(ip) => Some(*ip),
+                Target::Name(_) => None,
+            }
+        } else {
+            None
+        };
         let fqdn = format!("{key}.{network}.{DNS_SUFFIX}");
         jobs.push(Job {
             key,
@@ -174,9 +232,15 @@ fn build_jobs(
             kind: record.health_kind.unwrap_or(HealthCheckKind::Tcp),
             path: record.health_path.clone().unwrap_or_else(|| "/".into()),
             expected_status: record.health_expect_status,
+            gated_member_ip,
         });
     }
     (jobs, immediate)
+}
+
+/// トンネル/LAN で到達する私設アドレスか。公開 IP は外部宛とみなす。
+fn is_internal_ip(ip: Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback()
 }
 
 fn record_name(record: &DnsRecordConfig, ledger: &[LedgerEntry]) -> String {
@@ -332,6 +396,7 @@ mod tests {
             kind,
             path: "/health".into(),
             expected_status: None,
+            gated_member_ip: None,
         }
     }
 

@@ -231,6 +231,7 @@ export const ja = {
     unknown: "不明",
     checkNow: "今すぐ確認",
     checking: "確認中…",
+    disabledHint: "更新の自動確認はオフです。確認するには上のスイッチを有効にしてください。",
     current: "最新バージョンを使用しています。",
     available: (version: string) => `v${version} を利用できます。`,
     openRelease: "リリースページを開く",

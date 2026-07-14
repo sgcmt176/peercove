@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use peercove_core::config::Config;
 
-use crate::peers::{load_doc, write_validated};
+use crate::peers::{load_doc_locked, write_validated};
 
 /// MTU の許容範囲。下限は [`Config::validate`] と揃える。上限はイーサネットの
 /// ペイロード上限(1500)。WG のヘッダ分を引いた 1420 が既定値。
@@ -159,7 +159,7 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
             Ok(label)
         })
         .transpose()?;
-    let mut doc = load_doc(config_path)?;
+    let (lock, mut doc) = load_doc_locked(config_path)?;
     let interface = doc
         .get_mut("interface")
         .and_then(|item| item.as_table_like_mut())
@@ -213,7 +213,7 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         peer["endpoint"] = toml_edit::value(endpoint.to_string());
     }
 
-    write_validated(config_path, &doc.to_string())
+    write_validated(lock, config_path, &doc.to_string())
 }
 
 #[cfg(test)]

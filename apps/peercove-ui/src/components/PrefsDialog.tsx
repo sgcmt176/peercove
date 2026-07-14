@@ -43,6 +43,8 @@ export function AppSettingsView({
   };
 
   const checkUpdate = async () => {
+    // 更新確認オフ時は外部(GitHub)へ一切接続しない。手動ボタンからも同様。
+    if (!prefs.updateChecks) return;
     setChecking(true);
     setUpdateError(null);
     try {
@@ -139,15 +141,20 @@ export function AppSettingsView({
             </p>
           )}
           {updateError && <p className="error-text small">{updateError}</p>}
+          {!prefs.updateChecks && (
+            <p className="muted small">{t.update.disabledHint}</p>
+          )}
           <div className="row">
-            <button
-              type="button"
-              className="button--ghost"
-              disabled={checking}
-              onClick={() => void checkUpdate()}
-            >
-              {checking ? t.update.checking : t.update.checkNow}
-            </button>
+            {prefs.updateChecks && (
+              <button
+                type="button"
+                className="button--ghost"
+                disabled={checking}
+                onClick={() => void checkUpdate()}
+              >
+                {checking ? t.update.checking : t.update.checkNow}
+              </button>
+            )}
             {updateInfo?.available && (
               <button
                 type="button"
