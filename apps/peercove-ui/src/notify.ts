@@ -14,7 +14,7 @@ import { loadPrefs } from "./prefs";
 import { t } from "./i18n";
 
 export interface MemberEvent {
-  kind: "joined" | "left";
+  kind: "joined" | "left" | "approval_requested";
   member: Member;
 }
 
@@ -35,11 +35,19 @@ export function diffMembers(
   const relevant = (m: Member) => !m.isHost && m.ip !== selfAddress;
   const nowByKey = new Map(current.map((m) => [m.publicKey, m]));
   const wasOnline = new Map(previous.map((m) => [m.publicKey, m.online]));
+  const wasStatus = new Map(previous.map((m) => [m.publicKey, m.inviteStatus]));
   const events: MemberEvent[] = [];
 
   for (const member of current) {
     if (!relevant(member)) continue;
     const before = wasOnline.get(member.publicKey);
+    if (
+      member.inviteStatus === "awaiting_approval" &&
+      wasStatus.get(member.publicKey) !== "awaiting_approval"
+    ) {
+      events.push({ kind: "approval_requested", member });
+      continue;
+    }
     // 新しく台帳に載ったメンバーは、オンラインになるまで通知しない
     if (before === undefined) {
       if (member.online) events.push({ kind: "joined", member });
@@ -66,6 +74,9 @@ export function describe(
 ): { title: string; body: string } {
   const name = event.member.name ?? event.member.ip;
   const body = t.notify.body(name, event.member.ip, network);
+  if (event.kind === "approval_requested") {
+    return { title: t.notify.approvalTitle, body };
+  }
   return event.kind === "joined"
     ? { title: t.notify.joinedTitle, body }
     : { title: t.notify.leftTitle, body };

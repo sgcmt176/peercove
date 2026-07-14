@@ -50,6 +50,8 @@ pub struct Settings {
     /// 受信するファイルサイズの上限(MB、ADR-0015 / M3-9)。0 で無制限。
     /// 反映は次の supervisor 周期(約 5 秒)— 再起動不要。
     pub max_recv_file_mb: u64,
+    /// (host のみ)新規招待を管理者承認まで隔離する。
+    pub require_invite_approval: bool,
 }
 
 impl Settings {
@@ -78,6 +80,7 @@ pub struct Update {
     pub direct: bool,
     /// 受信するファイルサイズの上限(MB)。0 で無制限。
     pub max_recv_file_mb: u64,
+    pub require_invite_approval: bool,
 }
 
 /// 現在の設定を読む。
@@ -100,6 +103,7 @@ pub fn read(config_path: &Path) -> anyhow::Result<Settings> {
         host_endpoint,
         direct: config.interface.direct,
         max_recv_file_mb: config.interface.max_recv_file_mb,
+        require_invite_approval: config.interface.require_invite_approval,
     })
 }
 
@@ -191,6 +195,12 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
             toml_edit::value(i64::try_from(update.max_recv_file_mb).unwrap_or(i64::MAX)),
         );
     }
+    if !current.is_member {
+        match update.require_invite_approval {
+            true => interface.insert("require_invite_approval", toml_edit::value(true)),
+            false => interface.remove("require_invite_approval"),
+        };
+    }
 
     // endpoint はメンバー設定(ピア 1 つ)のときだけ触る。ホスト設定のピアは
     // メンバーの登録なので、ここから書き換えてはいけない
@@ -276,6 +286,7 @@ allowed_ips = ["10.119.96.2/32"]
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
                 direct: false,
                 max_recv_file_mb: 500,
+                require_invite_approval: false,
             },
         )
         .unwrap();
@@ -308,6 +319,7 @@ allowed_ips = ["10.119.96.2/32"]
                 host_endpoint: None,
                 direct: true,
                 max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
+                require_invite_approval: false,
             },
         )
         .unwrap();
@@ -335,6 +347,7 @@ allowed_ips = ["10.119.96.2/32"]
             host_endpoint: None,
             direct: true,
             max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
+            require_invite_approval: false,
         };
         update(
             &path,
@@ -396,6 +409,7 @@ allowed_ips = ["10.119.96.2/32"]
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
                 direct: true,
                 max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
+                require_invite_approval: false,
             },
         )
         .unwrap();
@@ -416,6 +430,7 @@ allowed_ips = ["10.119.96.2/32"]
             host_endpoint: None,
             direct: true,
             max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
+            require_invite_approval: false,
         };
 
         let bad_mtu = Update {
@@ -460,6 +475,7 @@ allowed_ips = ["10.119.96.2/32"]
             host_endpoint: current.host_endpoint.clone(),
             direct: current.direct,
             max_recv_file_mb: current.max_recv_file_mb,
+            require_invite_approval: current.require_invite_approval,
         };
         assert!(!current.restart_required(&same));
         assert!(

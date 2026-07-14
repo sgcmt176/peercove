@@ -100,6 +100,21 @@ export function TunnelView({
     }
   };
 
+  const approve = async (member: Member) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.approveMember(tunnel.config, member.publicKey);
+      setNotice(t.tunnel.member.approved);
+      setTimeout(() => setNotice(null), 8000);
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // 表示名の変更(ADR-0021 / ADR-0027、M3-14a / M3-19)。DNS 名と同じく、
   // 自分の行はホスト = 直接 host.toml、メンバー = デーモン経由(ホストが検証)。
   // ホストから見た他メンバーの行は renameMember(host.toml を直接)。
@@ -241,6 +256,7 @@ export function TunnelView({
                           canEditDns={isHost || member.isSelf}
                           onChat={() => onOpenChat(member.ip)}
                           onRemove={() => setRemoving(member)}
+                          onApprove={() => void approve(member)}
                           onRename={(newName) => void rename(member, newName)}
                           onRenameDns={(label) => void renameDns(member, label)}
                         />
@@ -359,7 +375,9 @@ function SendFileDialog({
   const [path, setPath] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const candidates = tunnel.members.filter((member) => !member.isSelf);
+  const candidates = tunnel.members.filter(
+    (member) => !member.isSelf && member.inviteStatus !== "awaiting_approval",
+  );
 
   const toggle = (ip: string) => {
     setChecked((prev) => {
@@ -691,6 +709,7 @@ function MemberRow({
   canEditDns,
   onChat,
   onRemove,
+  onApprove,
   onRename,
   onRenameDns,
 }: {
@@ -704,6 +723,7 @@ function MemberRow({
   /** 1:1 チャットを開く(自分以外の行の 💬)。 */
   onChat: () => void;
   onRemove: () => void;
+  onApprove: () => void;
   onRename: (newName: string) => void;
   /** DNS 名(先頭ラベルのみ)の変更(ADR-0021、M3-14a)。 */
   onRenameDns: (label: string) => void;
@@ -763,6 +783,16 @@ function MemberRow({
                 {t.tunnel.member.self}
               </span>
             )}
+            <span
+              className="tag member__version"
+              title={
+                member.appVersion
+                  ? t.update.memberVersion(member.appVersion)
+                  : t.update.memberVersionUnknown
+              }
+            >
+              {member.appVersion ? `v${member.appVersion}` : "v?"}
+            </span>
             {member.route && (
               <span
                 className={`tag tag--route-${member.route}`}
@@ -777,6 +807,20 @@ function MemberRow({
                 title={t.tunnel.member.blockedTitle}
               >
                 🚫 {t.tunnel.member.blocked}
+              </span>
+            )}
+            {!member.isHost && member.inviteStatus && (
+              <span
+                className={`tag tag--invite-${member.inviteStatus}`}
+                title={
+                  member.inviteExpiresAt
+                    ? t.tunnel.member.inviteExpires(
+                        new Date(member.inviteExpiresAt * 1000).toLocaleString(),
+                      )
+                    : t.invite.never
+                }
+              >
+                {t.tunnel.member.inviteStatus[member.inviteStatus]}
               </span>
             )}
             {member.subnets.map((subnet) => (
@@ -853,7 +897,12 @@ function MemberRow({
         )}
       </td>
       <td className="member-table__actions">
-        {!member.isSelf && (
+        {canManage && member.inviteStatus === "awaiting_approval" && (
+          <button type="button" className="small" onClick={onApprove}>
+            {t.tunnel.member.approve}
+          </button>
+        )}
+        {!member.isSelf && member.inviteStatus !== "awaiting_approval" && (
           <button
             type="button"
             className="button--icon"

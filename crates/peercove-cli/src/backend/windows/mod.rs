@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use anyhow::{bail, Context};
 
 use self::device::{Device, TunIo};
-use super::{AclDeny, PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use super::{AclDeny, IsolatedPeer, PeerSpec, PeerStats, TunnelSpec, WgBackend};
 
 /// wintun アダプタの「トンネル種別」表示名。
 const TUNNEL_TYPE: &str = "PeerCove";
@@ -27,6 +27,7 @@ pub struct WindowsBackend {
 
 struct Running {
     device: Arc<Device>,
+    host_ip: Ipv4Addr,
     // ドロップ順: スレッド停止 → セッション → アダプタ(削除)
     _adapter: Arc<wintun::Adapter>,
     threads: Vec<JoinHandle<()>>,
@@ -200,6 +201,7 @@ impl WgBackend for WindowsBackend {
         ];
         self.running = Some(Running {
             device,
+            host_ip: spec.address.addr(),
             _adapter: adapter,
             threads,
         });
@@ -285,6 +287,15 @@ impl WgBackend for WindowsBackend {
         if subnets.is_empty() {
             self.router_warned = false;
         }
+        Ok(())
+    }
+
+    fn sync_isolation(&mut self, isolated: &[IsolatedPeer]) -> anyhow::Result<()> {
+        let Some(running) = &self.running else {
+            bail!("トンネルが起動していません");
+        };
+        let ips: Vec<Ipv4Addr> = isolated.iter().map(|peer| peer.ip).collect();
+        running.device.set_isolated(&ips, running.host_ip);
         Ok(())
     }
 

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostics::DiagnosticReport;
 use crate::msg::{ChatContext, ChatScope, GroupInfo};
 use crate::proto::LedgerEntry;
 
@@ -52,6 +53,8 @@ pub enum IpcRequest {
         #[serde(default)]
         after_seq: u64,
     },
+    /// 指定ネットワークを変更せずに診断する(M3-21、ADR-0030)。
+    Diagnose { config: PathBuf },
     /// 稼働中トンネルのメンバーへファイルを送る(ADR-0015、M3-9)。
     /// 進捗は Status 応答の [`TunnelInfo::transfers`] で追う。
     /// 追加メソッドなので [`IPC_VERSION`] は上げない(旧デーモンは解析エラーを返す)。
@@ -158,6 +161,8 @@ pub enum IpcResponse {
         #[serde(default)]
         dropped: u64,
     },
+    /// Diagnose への構造化された応答。
+    Diagnostic { report: DiagnosticReport },
     /// SendFile への応答。`id` で [`TunnelInfo::transfers`] から進捗を引ける。
     Transfer { id: String },
     /// ChatSend / ChatFetch への応答(ADR-0016、M3-13)。`seq` は履歴全体の
@@ -253,6 +258,9 @@ pub struct DaemonStatus {
     /// 状態が「全部停止中」に見える事故が実機で起きた)。
     #[serde(default)]
     pub version: u32,
+    /// デーモン実行ファイルの製品バージョン。旧デーモンは None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
     #[serde(default)]
     pub tunnels: Vec<TunnelInfo>,
 }
@@ -418,6 +426,7 @@ mod tests {
                 id: 2,
                 result: IpcResult::Ok(IpcResponse::Status(DaemonStatus {
                     version: IPC_VERSION,
+                    app_version: Some("0.1.0".to_string()),
                     tunnels: vec![],
                 })),
             },
@@ -447,6 +456,7 @@ mod tests {
             id: 7,
             result: IpcResult::Ok(IpcResponse::Status(DaemonStatus {
                 version: IPC_VERSION,
+                app_version: None,
                 tunnels: vec![],
             })),
         })
@@ -462,6 +472,7 @@ mod tests {
         match old.result {
             IpcResult::Ok(IpcResponse::Status(status)) => {
                 assert_eq!(status.version, 0);
+                assert_eq!(status.app_version, None);
                 assert!(status.tunnels.is_empty());
             }
             other => panic!("Status を期待: {other:?}"),

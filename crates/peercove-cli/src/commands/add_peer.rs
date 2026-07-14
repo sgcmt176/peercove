@@ -19,6 +19,9 @@ pub fn run(config_path: &Path, pubkey: &str, ip: Ipv4Addr) -> anyhow::Result<()>
             name: None,
             dns_name: None,
             preshared_key_file: None,
+            invite_id: None,
+            invite_issued_at: None,
+            invite_expires_at: None,
         },
     )?;
     println!("ピアを追加しました: {public_key} -> {ip}/32");

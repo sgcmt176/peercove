@@ -8,13 +8,17 @@
 //! トランスポート非依存の部分(`handle_connection` / `request_over`)は
 //! 任意の AsyncRead+AsyncWrite で動き、テストは `tokio::io::duplex` で行う。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context};
+use peercove_core::diagnostics::{
+    redact_log_line, DiagnosticCategory, DiagnosticCheck, DiagnosticReport, DiagnosticScope,
+    DiagnosticStatus,
+};
 use peercove_core::ipc::{
     ChatMessageInfo, DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult,
     PeerSummary, TunnelInfo, TunnelRole, IPC_VERSION,
@@ -112,6 +116,9 @@ impl DaemonShared {
                 let (lines, dropped) = crate::logbuf::ring().since(after_seq);
                 Ok(IpcResponse::Logs { lines, dropped })
             }
+            IpcRequest::Diagnose { config } => Ok(IpcResponse::Diagnostic {
+                report: self.diagnose(config).await,
+            }),
             IpcRequest::SendFile {
                 config,
                 peer,
@@ -1016,9 +1023,288 @@ impl DaemonShared {
         tunnels.sort_by(|a, b| a.config.cmp(&b.config));
         DaemonStatus {
             version: IPC_VERSION,
+            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             tunnels,
         }
     }
+
+    /// 現在状態と設定ファイルを読むだけの診断。OS やトンネルは変更しない。
+    async fn diagnose(&self, config_path: PathBuf) -> DiagnosticReport {
+        let status = self.status().await;
+        let key = Self::key_for(&config_path);
+        let tunnel = status.tunnels.iter().find(|tunnel| tunnel.config == key);
+        let loaded = peercove_core::config::Config::load(&config_path);
+        let mut checks = Vec::new();
+
+        checks.push(diagnostic_check(
+            "app.ipc_compatible",
+            DiagnosticCategory::App,
+            if status.version == IPC_VERSION {
+                DiagnosticStatus::Pass
+            } else {
+                DiagnosticStatus::Fail
+            },
+            [("ipc_version", status.version.to_string())],
+        ));
+        checks.push(diagnostic_check(
+            "app.version_known",
+            DiagnosticCategory::App,
+            if status.app_version.is_some() {
+                DiagnosticStatus::Pass
+            } else {
+                DiagnosticStatus::Warning
+            },
+            status
+                .app_version
+                .as_ref()
+                .map(|version| [("version", version.clone())].into_iter())
+                .into_iter()
+                .flatten(),
+        ));
+
+        match &loaded {
+            Ok(config) => {
+                checks.push(diagnostic_check(
+                    "config.valid",
+                    DiagnosticCategory::App,
+                    DiagnosticStatus::Pass,
+                    [("mtu", config.interface.mtu.to_string())],
+                ));
+                let mut missing = Vec::new();
+                let mut insecure = Vec::new();
+                let mut permissions_unknown = false;
+                let secret_paths = std::iter::once(&config.interface.private_key_file).chain(
+                    config
+                        .peers
+                        .iter()
+                        .filter_map(|peer| peer.preshared_key_file.as_ref()),
+                );
+                for path in secret_paths {
+                    match std::fs::metadata(path) {
+                        Ok(metadata) => match secret_permissions_are_private(&metadata) {
+                            Some(false) => insecure.push(mask_path(path)),
+                            None => permissions_unknown = true,
+                            Some(true) => {}
+                        },
+                        Err(_) => missing.push(mask_path(path)),
+                    }
+                }
+                let secret_status = if !missing.is_empty() {
+                    DiagnosticStatus::Fail
+                } else if !insecure.is_empty() {
+                    DiagnosticStatus::Warning
+                } else if permissions_unknown {
+                    DiagnosticStatus::Unknown
+                } else {
+                    DiagnosticStatus::Pass
+                };
+                checks.push(diagnostic_check(
+                    "permissions.secret_files",
+                    DiagnosticCategory::Permissions,
+                    secret_status,
+                    [
+                        ("missing", missing.join(", ")),
+                        ("insecure", insecure.join(", ")),
+                        (
+                            "permission_check",
+                            if permissions_unknown {
+                                "not_available"
+                            } else {
+                                "complete"
+                            }
+                            .to_string(),
+                        ),
+                    ]
+                    .into_iter()
+                    .filter(|(_, value)| !value.is_empty()),
+                ));
+            }
+            Err(error) => checks.push(diagnostic_check(
+                "config.valid",
+                DiagnosticCategory::App,
+                DiagnosticStatus::Fail,
+                [("error", error.to_string())],
+            )),
+        }
+
+        checks.push(diagnostic_check(
+            "tunnel.running",
+            DiagnosticCategory::Tunnel,
+            if tunnel.is_some() {
+                DiagnosticStatus::Pass
+            } else {
+                DiagnosticStatus::Fail
+            },
+            tunnel
+                .map(|value| [("interface", value.interface_name.clone())].into_iter())
+                .into_iter()
+                .flatten(),
+        ));
+
+        if let Some(tunnel) = tunnel {
+            checks.push(diagnostic_check(
+                "tunnel.interface_ready",
+                DiagnosticCategory::Tunnel,
+                if tunnel.interface_name.is_empty() {
+                    DiagnosticStatus::Warning
+                } else {
+                    DiagnosticStatus::Pass
+                },
+                [
+                    ("interface", tunnel.interface_name.clone()),
+                    ("address", tunnel.address.to_string()),
+                ],
+            ));
+            let handshake_count = tunnel
+                .peers
+                .iter()
+                .filter(|peer| peer.last_handshake_age_secs.is_some())
+                .count();
+            checks.push(diagnostic_check(
+                "tunnel.handshake",
+                DiagnosticCategory::Tunnel,
+                if tunnel.peers.is_empty() {
+                    DiagnosticStatus::Unknown
+                } else if handshake_count > 0 {
+                    DiagnosticStatus::Pass
+                } else {
+                    DiagnosticStatus::Warning
+                },
+                [
+                    ("peers", tunnel.peers.len().to_string()),
+                    ("with_handshake", handshake_count.to_string()),
+                ],
+            ));
+            checks.push(diagnostic_check(
+                "internet.reachability_evidence",
+                DiagnosticCategory::Internet,
+                if handshake_count > 0 {
+                    DiagnosticStatus::Pass
+                } else {
+                    DiagnosticStatus::Unknown
+                },
+                [("handshakes", handshake_count.to_string())],
+            ));
+            checks.push(diagnostic_check(
+                "dns.zone_available",
+                DiagnosticCategory::Dns,
+                if tunnel.ledger.is_empty() {
+                    DiagnosticStatus::Warning
+                } else {
+                    DiagnosticStatus::Pass
+                },
+                [
+                    ("members", tunnel.ledger.len().to_string()),
+                    (
+                        "custom_records",
+                        (tunnel.dns_records.len() + tunnel.cname_records.len()).to_string(),
+                    ),
+                ],
+            ));
+            let unknown_versions = tunnel
+                .ledger
+                .iter()
+                .filter(|member| member.online && member.app_version.is_none())
+                .count();
+            checks.push(diagnostic_check(
+                "app.peer_compatibility",
+                DiagnosticCategory::App,
+                if unknown_versions == 0 {
+                    DiagnosticStatus::Pass
+                } else {
+                    DiagnosticStatus::Warning
+                },
+                [("unknown_versions", unknown_versions.to_string())],
+            ));
+            if tunnel.removed {
+                checks.push(diagnostic_check(
+                    "tunnel.host_removed_member",
+                    DiagnosticCategory::Tunnel,
+                    DiagnosticStatus::Fail,
+                    std::iter::empty::<(&str, String)>(),
+                ));
+            }
+            let blocked = tunnel.ledger.iter().filter(|member| member.blocked).count();
+            checks.push(diagnostic_check(
+                "tunnel.acl",
+                DiagnosticCategory::Tunnel,
+                if blocked == 0 {
+                    DiagnosticStatus::Pass
+                } else {
+                    DiagnosticStatus::Warning
+                },
+                [("blocked_members", blocked.to_string())],
+            ));
+        }
+
+        let (logs, _) = crate::logbuf::ring().since(0);
+        let logs = logs.iter().map(redact_log_line).collect();
+        let overall = DiagnosticReport::calculate_overall(&checks);
+        let config = loaded.as_ref().ok();
+        DiagnosticReport {
+            generated_at_unix_ms: unix_ms(),
+            scope: DiagnosticScope {
+                config: config_path.display().to_string(),
+                network: tunnel
+                    .map(|value| value.network.clone())
+                    .or_else(|| config.map(|value| value.network_name().to_string())),
+                role: tunnel.map(|value| match value.role {
+                    TunnelRole::Host => "host".to_string(),
+                    TunnelRole::Member => "member".to_string(),
+                }),
+            },
+            overall,
+            checks,
+            logs,
+        }
+    }
+}
+
+fn diagnostic_check<K, V>(
+    id: &str,
+    category: DiagnosticCategory,
+    status: DiagnosticStatus,
+    evidence: impl IntoIterator<Item = (K, V)>,
+) -> DiagnosticCheck
+where
+    K: Into<String>,
+    V: Into<String>,
+{
+    DiagnosticCheck {
+        id: id.to_string(),
+        category,
+        status,
+        evidence: evidence
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<BTreeMap<_, _>>(),
+    }
+}
+
+fn mask_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<secret-file>")
+        .to_string()
+}
+
+#[cfg(unix)]
+fn secret_permissions_are_private(metadata: &std::fs::Metadata) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode() & 0o077 == 0)
+}
+
+#[cfg(windows)]
+fn secret_permissions_are_private(_metadata: &std::fs::Metadata) -> Option<bool> {
+    // Windows ACL の詳細検査は OS API 境界として別段階。存在だけをここで確認する。
+    None
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 1 トンネル分の status 応答を組み立てる。
@@ -1482,6 +1768,32 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn diagnostics_keep_independent_failures_in_one_report() {
+        let (shared, _rx) = test_shared();
+        let missing = std::env::temp_dir().join(format!(
+            "peercove-diagnostic-missing-{}-{}.toml",
+            std::process::id(),
+            unix_ms()
+        ));
+        let report = shared.diagnose(missing).await;
+        assert_eq!(
+            report.overall,
+            peercove_core::diagnostics::DiagnosticOverall::Problem
+        );
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| { check.id == "config.valid" && check.status == DiagnosticStatus::Fail }));
+        assert!(report.checks.iter().any(|check| {
+            check.id == "tunnel.running" && check.status == DiagnosticStatus::Fail
+        }));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.id == "app.ipc_compatible"));
+    }
+
     /// duplex ストリーム越しに start → status → stop → shutdown の一連を流す。
     #[tokio::test]
     async fn ipc_lifecycle_over_duplex() {
@@ -1498,6 +1810,7 @@ mod tests {
             response,
             IpcResponse::Status(DaemonStatus {
                 version: IPC_VERSION,
+                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 tunnels: vec![]
             })
         );
@@ -1551,6 +1864,7 @@ mod tests {
             response,
             IpcResponse::Status(DaemonStatus {
                 version: IPC_VERSION,
+                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 tunnels: vec![]
             })
         );

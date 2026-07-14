@@ -14,6 +14,10 @@ pub struct Member {
     pub name: Option<String>,
     pub ip: String,
     pub public_key: String,
+    pub app_version: Option<String>,
+    pub capabilities: Vec<String>,
+    pub invite_status: Option<String>,
+    pub invite_expires_at: Option<u64>,
     pub online: bool,
     pub is_host: bool,
     /// このメンバーの DNS 名(M3-1)。台帳から決定的に導出される
@@ -42,6 +46,10 @@ impl Member {
             name: entry.name.clone(),
             ip: entry.ip.to_string(),
             public_key: entry.public_key.to_base64(),
+            app_version: entry.app_version.clone(),
+            capabilities: entry.capabilities.clone(),
+            invite_status: entry.invite_status.clone(),
+            invite_expires_at: entry.invite_expires_at,
             online: entry.online,
             is_host: entry.is_host,
             dns_name,
@@ -415,6 +423,8 @@ pub struct Status {
     /// デーモンの IPC バージョンが UI と一致しない(旧デーモンが動いている)。
     /// 状態表示が信用できないため、UI は警告を出して更新を促す。
     pub daemon_outdated: bool,
+    /// デーモン実行ファイルの製品バージョン。旧デーモンは null。
+    pub daemon_version: Option<String>,
 }
 
 impl From<DaemonStatus> for Status {
@@ -431,6 +441,7 @@ impl From<DaemonStatus> for Status {
             tunnel,
             tunnels,
             daemon_outdated: status.version != IPC_VERSION,
+            daemon_version: status.app_version,
         }
     }
 }
@@ -534,6 +545,9 @@ pub struct InviteResult {
     pub ip: String,
     pub endpoints: Vec<String>,
     pub psk: bool,
+    pub invite_id: String,
+    pub issued_at: u64,
+    pub expires_at: Option<u64>,
 }
 
 /// 参加(join)の結果。
@@ -564,6 +578,7 @@ pub struct Settings {
     pub direct: bool,
     /// 受信するファイルサイズの上限(MB、ADR-0015)。0 で無制限。
     pub max_recv_file_mb: u64,
+    pub require_invite_approval: bool,
     /// 既定値。UI の入力欄のプレースホルダに使う。
     pub default_mtu: u16,
     pub default_listen_port: u16,
@@ -583,6 +598,7 @@ impl From<peercove_ops::settings::Settings> for Settings {
             is_member: settings.is_member,
             direct: settings.direct,
             max_recv_file_mb: settings.max_recv_file_mb,
+            require_invite_approval: settings.require_invite_approval,
             default_mtu: peercove_core::config::DEFAULT_MTU,
             default_listen_port: peercove_core::config::DEFAULT_LISTEN_PORT,
             default_max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
@@ -602,6 +618,8 @@ pub struct SettingsUpdate {
     pub host_endpoint: Option<String>,
     pub direct: bool,
     pub max_recv_file_mb: u64,
+    #[serde(default)]
+    pub require_invite_approval: bool,
 }
 
 impl From<SettingsUpdate> for peercove_ops::settings::Update {
@@ -614,6 +632,7 @@ impl From<SettingsUpdate> for peercove_ops::settings::Update {
             host_endpoint: update.host_endpoint,
             direct: update.direct,
             max_recv_file_mb: update.max_recv_file_mb,
+            require_invite_approval: update.require_invite_approval,
         }
     }
 }
@@ -675,6 +694,10 @@ mod tests {
                 dns_name: None,
                 ip: "10.100.42.2".parse().unwrap(),
                 public_key: PrivateKey::generate().public_key(),
+                app_version: Some("0.1.0".to_string()),
+                capabilities: peercove_core::proto::current_capabilities(),
+                invite_status: Some("joined".to_string()),
+                invite_expires_at: Some(1_700_086_400),
                 online: true,
                 is_host: false,
                 endpoint: None,
@@ -704,6 +727,7 @@ mod tests {
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: peercove_core::ipc::IPC_VERSION,
+            app_version: Some("0.1.0".to_string()),
             tunnels: vec![info],
         }))
         .unwrap();
@@ -743,6 +767,7 @@ mod tests {
 
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: IPC_VERSION,
+            app_version: Some("0.1.0".to_string()),
             tunnels: vec![],
         }))
         .unwrap();
@@ -753,6 +778,7 @@ mod tests {
         // 旧デーモン(version 欠落 = 0)は明示フラグで検出できる
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: 0,
+            app_version: None,
             tunnels: vec![],
         }))
         .unwrap();
@@ -768,6 +794,10 @@ mod tests {
             dns_name: None,
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
+            app_version: None,
+            capabilities: vec![],
+            invite_status: None,
+            invite_expires_at: None,
             online: true,
             is_host,
             endpoint: None,
@@ -876,6 +906,7 @@ mod tests {
             is_member: true,
             direct: true,
             max_recv_file_mb: 100,
+            require_invite_approval: false,
         }))
         .unwrap();
         assert_eq!(json["hostEndpoint"], "203.0.113.5:51820");
@@ -932,6 +963,9 @@ mod tests {
             ip: "10.100.42.2".to_string(),
             endpoints: vec!["192.168.0.12:51820".to_string()],
             psk: true,
+            invite_id: "0123456789abcdef0123456789abcdef".to_string(),
+            issued_at: 1_700_000_000,
+            expires_at: Some(1_700_086_400),
         })
         .unwrap();
         assert_eq!(json["qrSvg"], "<svg/>");

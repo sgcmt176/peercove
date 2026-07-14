@@ -307,6 +307,9 @@ mod tests {
             endpoints: vec!["203.0.113.5:51820".parse().unwrap()],
             name: "carol".to_string(),
             network: None,
+            invite_id: None,
+            issued_at: None,
+            expires_at: None,
         };
         let result = crate::join::join(&token.encode().unwrap(), &base, false).unwrap();
         let text = std::fs::read_to_string(&result.config_path).unwrap();

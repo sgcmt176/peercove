@@ -77,6 +77,9 @@ function SettingsForm({
   const [maxRecvFileMb, setMaxRecvFileMb] = useState(
     String(settings.maxRecvFileMb),
   );
+  const [requireInviteApproval, setRequireInviteApproval] = useState(
+    settings.requireInviteApproval,
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -127,6 +130,7 @@ function SettingsForm({
             : null,
         direct,
         maxRecvFileMb: maxFileValue,
+        requireInviteApproval,
       });
       setNotice(
         result.restartRequired
@@ -226,6 +230,20 @@ function SettingsForm({
             <span>
               {t.settings.directLabel}
               <small className="muted"> {t.settings.directHint}</small>
+            </span>
+          </label>
+        )}
+
+        {!settings.isMember && (
+          <label className="field--check">
+            <input
+              type="checkbox"
+              checked={requireInviteApproval}
+              onChange={(event) => setRequireInviteApproval(event.target.checked)}
+            />
+            <span>
+              {t.settings.inviteApprovalLabel}
+              <small className="muted"> {t.settings.inviteApprovalHint}</small>
             </span>
           </label>
         )}

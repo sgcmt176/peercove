@@ -22,6 +22,9 @@ pub struct NewPeer<'a> {
     pub dns_name: Option<&'a str>,
     /// 設定ファイルからの相対パス(invite --psk のとき)
     pub preshared_key_file: Option<&'a str>,
+    pub invite_id: Option<&'a str>,
+    pub invite_issued_at: Option<u64>,
+    pub invite_expires_at: Option<u64>,
 }
 
 /// 削除・変更対象の指定(いずれか 1 つ)。
@@ -79,6 +82,18 @@ pub fn append_peer(config_path: &Path, peer: &NewPeer) -> anyhow::Result<()> {
     }
     if let Some(dns_name) = peer.dns_name {
         block.push_str(&format!("dns_name = {}\n", toml_string(dns_name)));
+    }
+    if let Some(invite_id) = peer.invite_id {
+        block.push_str(&format!("invite_id = {}\n", toml_string(invite_id)));
+    }
+    if let Some(issued_at) = peer.invite_issued_at {
+        block.push_str(&format!("invite_issued_at = {issued_at}\n"));
+    }
+    if let Some(expires_at) = peer.invite_expires_at {
+        block.push_str(&format!("invite_expires_at = {expires_at}\n"));
+    }
+    if config.interface.require_invite_approval && peer.invite_id.is_some() {
+        block.push_str("invite_requires_approval = true\n");
     }
     block.push_str(&format!("public_key = \"{public_key}\"\n"));
     block.push_str(&format!("allowed_ips = [\"{ip}/32\"]\n"));
@@ -509,6 +524,83 @@ pub fn set_peer_display_name_by_ip(
     Ok(name.to_string())
 }
 
+/// 招待 v3 の初回認証済み Hello を記録する。旧招待・既に記録済みなら変更しない。
+pub fn mark_invite_accepted_by_ip(
+    config_path: &Path,
+    member_ip: Ipv4Addr,
+    accepted_at: u64,
+    device_id: Option<&str>,
+) -> anyhow::Result<bool> {
+    let config = Config::load(config_path)?;
+    let target = find_peer(&config, &Selector::Ip(member_ip))?;
+    if target.invite_id.is_none() {
+        return Ok(false);
+    }
+    let device_id = device_id.context("招待 v3 の端末 ID がありません")?;
+    if target.invite_accepted_at.is_some() {
+        if target.invite_device_id.as_deref() == Some(device_id) {
+            return Ok(false);
+        }
+        bail!("この招待は別の端末で既に使用されています");
+    }
+    if !target.invite_allows_connection(accepted_at) {
+        bail!("招待の期限が切れています");
+    }
+    let target_key = target.public_key.to_base64();
+    let mut doc = load_doc(config_path)?;
+    let mut updated = false;
+    for table in peer_tables(&mut doc)?.iter_mut() {
+        let matches = table
+            .get("public_key")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            == Some(target_key.as_str());
+        if matches {
+            table["invite_accepted_at"] = toml_edit::value(accepted_at as i64);
+            table["invite_device_id"] = toml_edit::value(device_id);
+            updated = true;
+        }
+    }
+    if !updated {
+        bail!("host.toml から対象ピアを特定できませんでした");
+    }
+    write_validated(config_path, &doc.to_string())?;
+    Ok(true)
+}
+
+/// 承認待ちの参加端末を承認し、隔離解除時刻を host.toml に永続化する。
+pub fn approve_invite(
+    config_path: &Path,
+    selector: &Selector,
+    approved_at: u64,
+) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let target = find_peer(&config, selector)?;
+    if !target.invite_requires_approval {
+        bail!("このメンバーは参加承認の対象ではありません");
+    }
+    if target.invite_accepted_at.is_none() {
+        bail!("端末からの参加要求をまだ受信していません");
+    }
+    if target.invite_approved_at.is_some() {
+        return Ok(());
+    }
+    let target_key = target.public_key.to_base64();
+    let mut doc = load_doc(config_path)?;
+    let table = peer_tables(&mut doc)?
+        .iter_mut()
+        .find(|table| {
+            table
+                .get("public_key")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                == Some(target_key.as_str())
+        })
+        .context("host.toml から対象ピアを特定できませんでした")?;
+    table["invite_approved_at"] = toml_edit::value(approved_at as i64);
+    write_validated(config_path, &doc.to_string())
+}
+
 /// ホスト自身の表示名を設定する(ADR-0027)。戻り値は確定した表示名。
 /// 空文字は許さない(表示名は必須)。`[interface].display_name` を書く。
 pub fn set_host_display_name(config_path: &Path, input: &str) -> anyhow::Result<String> {
@@ -574,6 +666,9 @@ mod tests {
                 name: Some(name),
                 dns_name: None,
                 preshared_key_file: None,
+                invite_id: None,
+                invite_issued_at: None,
+                invite_expires_at: None,
             },
         )
         .unwrap();
@@ -606,6 +701,7 @@ mod tests {
             ip: None,
             extra_endpoints: &[],
             psk: true,
+            expires_in_secs: None,
         })
         .unwrap();
 
@@ -688,6 +784,9 @@ mod tests {
             name: None,
             dns_name: None,
             preshared_key_file: None,
+            invite_id: None,
+            invite_issued_at: None,
+            invite_expires_at: None,
         };
         assert!(append_peer(&config, &dup).is_err(), "公開鍵の重複");
 
@@ -699,6 +798,9 @@ mod tests {
                 name: None,
                 dns_name: None,
                 preshared_key_file: None,
+                invite_id: None,
+                invite_issued_at: None,
+                invite_expires_at: None,
             };
             assert!(
                 append_peer(&config, &peer).is_err(),

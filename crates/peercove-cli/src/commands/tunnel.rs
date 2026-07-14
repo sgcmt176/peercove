@@ -8,7 +8,9 @@ use peercove_core::config::{Config, PeerConfig, DEFAULT_LISTEN_PORT};
 use peercove_core::keys::{read_preshared_key_file, read_private_key_file};
 use peercove_core::proto::LedgerEntry;
 
-use crate::backend::{create_backend, AclDeny, PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use crate::backend::{
+    create_backend, AclDeny, IsolatedPeer, PeerSpec, PeerStats, TunnelSpec, WgBackend,
+};
 use crate::commands::status;
 use crate::control;
 
@@ -136,6 +138,13 @@ pub fn bring_up(
     };
 
     backend.up(&spec)?;
+    if role == Role::Host {
+        let isolated = invite_isolation(&config);
+        if let Err(error) = backend.sync_isolation(&isolated) {
+            let _ = backend.down();
+            return Err(error.context("承認待ち端末の初期隔離に失敗しました"));
+        }
+    }
     tracing::info!(
         "トンネル {if_name} を作成しました(network={} address={} mtu={} peers={})",
         config.network_name(),
@@ -402,6 +411,8 @@ pub async fn supervise(
         // (host)適用済み ACL(ADR-0018)。変更があった周期だけ同期する
         let mut applied_acl: Option<Vec<AclDeny>> = None;
         let mut acl_error_logged = false;
+        let mut applied_isolation: Option<Vec<IsolatedPeer>> = None;
+        let mut isolation_error_logged = false;
         let mut tasks = Vec::new();
         // メッセージング基盤(ADR-0015、M3-9): 両ロールとも自分の仮想 IP で
         // 待受ける。接続元の照合に使うピア表と受信サイズ上限は毎周期更新する
@@ -450,6 +461,7 @@ pub async fn supervise(
                         tasks.push(tokio::spawn(control::run_member_client(
                             host_ip,
                             config.interface.display_name.clone(),
+                            config.interface.device_id.clone(),
                             Arc::clone(&member_ledger),
                             Arc::clone(&rtt),
                             Arc::clone(&removed),
@@ -491,6 +503,17 @@ pub async fn supervise(
                     }
                     if role == Role::Host {
                         if let Some(config) = &config {
+                            // 招待隔離は peer の追加より先に適用する。新規 peer を
+                            // add してから隔離する短い許可窓を作らないため。
+                            let isolation_ready = apply_invite_isolation(
+                                config,
+                                backend,
+                                &mut applied_isolation,
+                                &mut isolation_error_logged,
+                            );
+                            if !isolation_ready {
+                                continue;
+                            }
                             sync_peers(
                                 config,
                                 backend,
@@ -531,7 +554,14 @@ pub async fn supervise(
                     let distribution = match role {
                         Role::Host => {
                             if let Some(config) = config.as_ref() {
-                                let members = build_ledger(config, &host_public_key, &stats);
+                                let mut members = build_ledger(config, &host_public_key, &stats);
+                                let connected = connections.lock().unwrap().clone();
+                                for entry in &mut members {
+                                    if let Some(info) = connected.get(&entry.ip) {
+                                        entry.app_version = info.app_version.clone();
+                                        entry.capabilities = info.capabilities.clone();
+                                    }
+                                }
                                 let dns_records = peercove_core::dns::resolve_records(
                                     &config.dns_records,
                                     &members,
@@ -648,7 +678,10 @@ pub async fn supervise(
                     if let Some(ledger) = &ledger {
                         let map: HashMap<std::net::Ipv4Addr, String> = ledger
                             .iter()
-                            .filter(|e| e.ip != spec.address.addr())
+                            .filter(|e| {
+                                e.ip != spec.address.addr()
+                                    && e.invite_status.as_deref() != Some("awaiting_approval")
+                            })
                             .map(|e| {
                                 (e.ip, e.name.clone().unwrap_or_else(|| e.ip.to_string()))
                             })
@@ -661,7 +694,11 @@ pub async fn supervise(
                         // 遷移検知でなく ack ベースにしている(検証 FB)
                         let online: HashSet<std::net::Ipv4Addr> = ledger
                             .iter()
-                            .filter(|e| e.online && e.ip != spec.address.addr())
+                            .filter(|e| {
+                                e.online
+                                    && e.ip != spec.address.addr()
+                                    && e.invite_status.as_deref() != Some("awaiting_approval")
+                            })
                             .map(|e| e.ip)
                             .collect();
                         let pending = groups.lock().unwrap().pending_sync(
@@ -732,6 +769,10 @@ fn build_ledger(
         dns_name: config.interface.dns_name.clone(),
         ip: config.interface.address.addr(),
         public_key: *host_public_key,
+        app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        capabilities: peercove_core::proto::current_capabilities(),
+        invite_status: None,
+        invite_expires_at: None,
         online: true,
         is_host: true,
         // ホスト自身のエンドポイントは載せない(メンバーは設定で持っている)
@@ -741,6 +782,14 @@ fn build_ledger(
         blocked: false,
     }];
     for peer in &config.peers {
+        let invite_status = match peer.invite_state(unix_secs()) {
+            peercove_core::config::InviteState::Legacy => "legacy",
+            peercove_core::config::InviteState::Pending => "pending",
+            peercove_core::config::InviteState::Joined => "joined",
+            peercove_core::config::InviteState::AwaitingApproval => "awaiting_approval",
+            peercove_core::config::InviteState::Expired => "expired",
+            peercove_core::config::InviteState::ClockInvalid => "clock_invalid",
+        };
         let stats = by_key.get(peer.public_key.as_bytes());
         let handshake_age = stats
             .and_then(|s| s.last_handshake)
@@ -763,6 +812,10 @@ fn build_ledger(
                 .map(|net| net.addr())
                 .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
             public_key: peer.public_key,
+            app_version: None,
+            capabilities: vec![],
+            invite_status: Some(invite_status.to_string()),
+            invite_expires_at: peer.invite_expires_at,
             online,
             is_host: false,
             endpoint,
@@ -776,6 +829,45 @@ fn build_ledger(
         });
     }
     ledger
+}
+
+fn invite_isolation(config: &Config) -> Vec<IsolatedPeer> {
+    let mut isolated: Vec<_> = config
+        .peers
+        .iter()
+        .filter(|peer| peer.invite_is_isolated())
+        .filter_map(|peer| peer.allowed_ips.first())
+        .map(|net| IsolatedPeer { ip: net.addr() })
+        .collect();
+    isolated.sort_unstable_by_key(|peer| peer.ip);
+    isolated.dedup();
+    isolated
+}
+
+fn apply_invite_isolation(
+    config: &Config,
+    backend: &mut dyn WgBackend,
+    applied: &mut Option<Vec<IsolatedPeer>>,
+    error_logged: &mut bool,
+) -> bool {
+    let desired = invite_isolation(config);
+    if applied.as_ref() == Some(&desired) {
+        return true;
+    }
+    match backend.sync_isolation(&desired) {
+        Ok(()) => {
+            *applied = Some(desired);
+            *error_logged = false;
+            true
+        }
+        Err(error) => {
+            if !*error_logged {
+                tracing::warn!("承認待ち端末の隔離同期に失敗しました: {error:#}");
+                *error_logged = true;
+            }
+            false
+        }
+    }
 }
 
 /// 設定の ACL(ADR-0018、M3-10)をバックエンドへ同期する。組ごとに両側の
@@ -868,24 +960,27 @@ fn sync_peers(
     pending_removal: &mut HashSet<[u8; 32]>,
     connections: &control::Connections,
 ) {
+    let now = unix_secs();
+    let eligible = |peer: &&PeerConfig| peer.invite_allows_connection(now);
     let config_keys: HashSet<[u8; 32]> = config
         .peers
         .iter()
+        .filter(eligible)
         .map(|p| *p.public_key.as_bytes())
         .collect();
 
     // 鍵ローテーション: 旧鍵の除去(追加より先)
-    let rotated: Vec<([u8; 32], std::net::Ipv4Addr)> = known
-        .iter()
-        .filter(|(key, fingerprint)| {
-            !config_keys.contains(*key)
-                && config
-                    .peers
-                    .iter()
-                    .any(|p| p.allowed_ips.first().map(|net| net.addr()) == Some(fingerprint.ip))
-        })
-        .map(|(key, fingerprint)| (*key, fingerprint.ip))
-        .collect();
+    let rotated: Vec<([u8; 32], std::net::Ipv4Addr)> =
+        known
+            .iter()
+            .filter(|(key, fingerprint)| {
+                !config_keys.contains(*key)
+                    && config.peers.iter().filter(eligible).any(|p| {
+                        p.allowed_ips.first().map(|net| net.addr()) == Some(fingerprint.ip)
+                    })
+            })
+            .map(|(key, fingerprint)| (*key, fingerprint.ip))
+            .collect();
     for (key, ip) in rotated {
         let public_key = peercove_core::keys::PublicKey::from_bytes(key);
         match backend.remove_peer(&public_key) {
@@ -899,7 +994,7 @@ fn sync_peers(
     }
 
     // 追加・変更
-    for peer in &config.peers {
+    for peer in config.peers.iter().filter(eligible) {
         let key = *peer.public_key.as_bytes();
         let spec = match build_peer_spec(peer, Role::Host) {
             Ok(spec) => spec,
@@ -949,8 +1044,8 @@ fn sync_peers(
         let public_key = peercove_core::keys::PublicKey::from_bytes(key);
         if pending_removal.insert(key) {
             // 1 周期目: 本人へ削除通知(接続していなければ何もしない)
-            if let Some(tx) = connections.lock().unwrap().get(&ip) {
-                let _ = tx.send(peercove_core::proto::ControlMessage::Removed {
+            if let Some(connection) = connections.lock().unwrap().get(&ip) {
+                connection.send(peercove_core::proto::ControlMessage::Removed {
                     message: "ホストによってこのネットワークから削除されました".to_string(),
                 });
                 tracing::info!("ピア {public_key}({ip})へ削除通知を送りました");
@@ -1001,9 +1096,11 @@ pub fn build_spec(config: &Config, role: Role) -> anyhow::Result<TunnelSpec> {
         }
     }
 
+    let now = unix_secs();
     let peers = config
         .peers
         .iter()
+        .filter(|peer| role != Role::Host || peer.invite_allows_connection(now))
         .map(|peer| build_peer_spec(peer, role))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -1026,6 +1123,13 @@ pub fn build_spec(config: &Config, role: Role) -> anyhow::Result<TunnelSpec> {
         forwarding: role == Role::Host,
         peers,
     })
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn build_peer_spec(peer: &PeerConfig, role: Role) -> anyhow::Result<PeerSpec> {
@@ -1122,6 +1226,30 @@ mod tests {
         assert!(host.allowed_ips.contains(&subnet));
         let member = build_peer_spec(&config.peers[0], Role::Member).unwrap();
         assert!(!member.allowed_ips.contains(&subnet));
+    }
+
+    #[test]
+    fn expired_unused_invite_is_not_added_to_backend() {
+        let key = PrivateKey::generate().public_key().to_base64();
+        let config = host_config(&format!(
+            "[[peer]]\nname = \"expired\"\ninvite_id = \"0123456789abcdef0123456789abcdef\"\ninvite_issued_at = 1\ninvite_expires_at = 2\npublic_key = \"{key}\"\nallowed_ips = [\"10.100.42.2/32\"]\n"
+        ));
+        config.validate().unwrap();
+        let mut backend = MockBackend::default();
+        let mut known = HashMap::new();
+        let mut pending = HashSet::new();
+        sync_peers(
+            &config,
+            &mut backend,
+            &mut known,
+            &mut pending,
+            &Default::default(),
+        );
+        assert!(backend
+            .ops
+            .iter()
+            .all(|operation| !operation.starts_with("add:")));
+        assert!(known.is_empty());
     }
 
     fn host_config(peers_toml: &str) -> Config {
@@ -1232,10 +1360,14 @@ mod tests {
         let connections: control::Connections = Default::default();
         // alice の制御接続を模擬(誤って削除通知が送られたら検出できるように)
         let (tx, mut member_inbox) = tokio::sync::mpsc::unbounded_channel();
-        connections
-            .lock()
-            .unwrap()
-            .insert("10.100.42.2".parse().unwrap(), tx);
+        connections.lock().unwrap().insert(
+            "10.100.42.2".parse().unwrap(),
+            control::ConnectionInfo {
+                outbox: tx,
+                app_version: None,
+                capabilities: vec![],
+            },
+        );
 
         let config = host_config(&peer_toml(&old_key));
         sync_peers(

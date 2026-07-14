@@ -10,6 +10,19 @@ export interface Member {
   name: string | null;
   ip: string;
   publicKey: string;
+  /** 相手が Hello で広告した製品バージョン。旧版は null。 */
+  appVersion: string | null;
+  /** 相手が広告した追加機能 ID。旧版は空。 */
+  capabilities: string[];
+  inviteStatus:
+    | "legacy"
+    | "pending"
+    | "joined"
+    | "awaiting_approval"
+    | "expired"
+    | "clock_invalid"
+    | null;
+  inviteExpiresAt: number | null;
   online: boolean;
   isHost: boolean;
   /** DNS 名（M3-1。例: alice.game.peercove.internal）。 */
@@ -182,6 +195,17 @@ export interface Status {
   tunnels: Tunnel[];
   /** デーモンが古い（IPC バージョン不一致）。状態表示は信用できない。 */
   daemonOutdated: boolean;
+  /** デーモン実行ファイルの製品バージョン。旧デーモンは null。 */
+  daemonVersion: string | null;
+}
+
+export interface UpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  available: boolean;
+  releaseUrl: string;
+  releaseName: string | null;
+  publishedAt: string | null;
 }
 
 /** 設定済みネットワーク 1 件（M3-0c）。稼働状態は Status.tunnels と configPath で突き合わせる。 */
@@ -210,6 +234,9 @@ export interface InviteResult {
   ip: string;
   endpoints: string[];
   psk: boolean;
+  inviteId: string;
+  issuedAt: number;
+  expiresAt: number | null;
 }
 
 export interface JoinResult {
@@ -235,6 +262,8 @@ export interface Settings {
   direct: boolean;
   /** 受信するファイルサイズの上限（MB、ADR-0015）。0 で無制限。 */
   maxRecvFileMb: number;
+  /** ホストのみ。新規参加端末を承認まで隔離する。 */
+  requireInviteApproval: boolean;
   defaultMtu: number;
   defaultListenPort: number;
   defaultMaxRecvFileMb: number;
@@ -249,6 +278,7 @@ export interface SettingsUpdate {
   hostEndpoint: string | null;
   direct: boolean;
   maxRecvFileMb: number;
+  requireInviteApproval: boolean;
 }
 
 export interface SaveResult {
@@ -270,6 +300,40 @@ export interface Logs {
   dropped: number;
 }
 
+export type DiagnosticStatus = "pass" | "warning" | "fail" | "unknown";
+export type DiagnosticOverall = "healthy" | "attention" | "problem";
+export type DiagnosticCategory =
+  | "app"
+  | "tunnel"
+  | "internet"
+  | "dns"
+  | "permissions";
+
+export interface DiagnosticCheck {
+  id: string;
+  category: DiagnosticCategory;
+  status: DiagnosticStatus;
+  evidence: Record<string, string>;
+}
+
+export interface DiagnosticReport {
+  generated_at_unix_ms: number;
+  scope: {
+    config: string;
+    network?: string;
+    role?: string;
+  };
+  overall: DiagnosticOverall;
+  checks: DiagnosticCheck[];
+  logs: Array<{
+    seq: number;
+    unix_ms: number;
+    level: string;
+    target: string;
+    message: string;
+  }>;
+}
+
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =
   | { kind: "connecting" }
@@ -280,6 +344,7 @@ export type Connection =
 
 export const api = {
   daemonStatus: () => invoke<Status>("daemon_status"),
+  checkUpdate: () => invoke<UpdateInfo>("check_update"),
   startHost: (configPath: string, upnp: boolean) =>
     invoke<void>("start_host", { configPath, upnp }),
   startMember: (configPath: string) =>
@@ -296,11 +361,14 @@ export const api = {
     name: string | null,
     psk: boolean,
     endpoints: string[],
-  ) => invoke<InviteResult>("create_invite", { configPath, name, psk, endpoints }),
+    expiresInSecs: number | null,
+  ) => invoke<InviteResult>("create_invite", { configPath, name, psk, endpoints, expiresInSecs }),
   joinNetwork: (token: string, force: boolean) =>
     invoke<JoinResult>("join_network", { token, force }),
   removeMember: (configPath: string, publicKey: string) =>
     invoke<string>("remove_member", { configPath, publicKey }),
+  approveMember: (configPath: string, publicKey: string) =>
+    invoke<void>("approve_member", { configPath, publicKey }),
   renameMember: (configPath: string, publicKey: string, newName: string) =>
     invoke<void>("rename_member", { configPath, publicKey, newName }),
   // DNS 名（ADR-0021、M3-14a）。ホストは任意メンバーを直接、メンバー本人は
@@ -367,6 +435,10 @@ export const api = {
   openLink: (url: string) => invoke<void>("open_link", { url }),
   linkPreview: (url: string) => invoke<LinkPreview>("link_preview", { url }),
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
+  diagnoseNetwork: (configPath: string) =>
+    invoke<DiagnosticReport>("diagnose_network", { configPath }),
+  saveDiagnosticReport: (report: DiagnosticReport) =>
+    invoke<string | null>("save_diagnostic_report", { report }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),
   // ターゲットは ip（固定）か member（メンバー参照 = IP 自動追随）のどちらか。

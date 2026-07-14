@@ -87,6 +87,9 @@ enum Command {
         /// メンバー用の事前共有鍵も発行する
         #[arg(long)]
         psk: bool,
+        /// 招待の有効時間(時間)。0 は無期限
+        #[arg(long, default_value_t = 168)]
+        expires_hours: u64,
         /// トークンの保存先ファイル
         #[arg(long, default_value = "invite.token")]
         out: PathBuf,
@@ -311,6 +314,7 @@ fn run(command: Command, log_level: Option<String>) -> anyhow::Result<()> {
             ip,
             endpoints,
             psk,
+            expires_hours,
             out,
             print,
             qr,
@@ -321,6 +325,7 @@ fn run(command: Command, log_level: Option<String>) -> anyhow::Result<()> {
             ip,
             extra_endpoints: &endpoints,
             psk,
+            expires_in_secs: (expires_hours != 0).then_some(expires_hours.saturating_mul(3600)),
             out: &out,
             force,
             print,

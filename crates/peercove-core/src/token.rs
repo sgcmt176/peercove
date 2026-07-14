@@ -22,6 +22,10 @@
 //! u8       name_len (1..=MAX_NAME_LEN) + name (UTF-8)
 //! -- ここまで version 1。version 2(ADR-0012)は末尾に追加:
 //! u8       network_len (1..=63) + network (正規化済み DNS ラベル)
+//! -- version 3(M3-22)は network_len(0 = 既定名)の後ろに追加:
+//! [u8;16]  invite_id
+//! u64      issued_at (be, UNIX 秒)
+//! u64      expires_at (be, 0 = 無期限)
 //! ```
 //! `network` が無い場合(既定名)は version 1 としてエンコードする。これにより
 //! 既定名のトークンは旧バイナリでも読める。v1 のパースは `network = None`。
@@ -42,6 +46,8 @@ use crate::{Error, Result};
 pub const TOKEN_PREFIX: &str = "pcv1.";
 const VERSION_1: u8 = 1;
 const VERSION_2: u8 = 2;
+const VERSION_3: u8 = 3;
+const INVITE_ID_LEN: usize = 16;
 const FLAG_PSK: u8 = 0b0000_0001;
 pub const MAX_ENDPOINTS: usize = 4;
 pub const MAX_NAME_LEN: usize = 64;
@@ -65,6 +71,11 @@ pub struct InviteToken {
     /// ネットワーク名(ADR-0012、正規化済み DNS ラベル)。
     /// `None` は既定名(旧トークン、または既定名のまま運用しているホスト)。
     pub network: Option<String>,
+    /// v3 の招待識別子。秘密ではないが、ホスト側台帳との照合にだけ使う。
+    pub invite_id: Option<String>,
+    /// v3 の発行・期限時刻(UNIX 秒)。expires_at = None は無期限。
+    pub issued_at: Option<u64>,
+    pub expires_at: Option<u64>,
 }
 
 impl fmt::Debug for InviteToken {
@@ -80,6 +91,9 @@ impl fmt::Debug for InviteToken {
             .field("endpoints", &self.endpoints)
             .field("name", &self.name)
             .field("network", &self.network)
+            .field("invite_id", &self.invite_id)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
@@ -113,6 +127,18 @@ impl InviteToken {
                 ));
             }
         }
+        match (&self.invite_id, self.issued_at) {
+            (Some(id), Some(issued_at)) => {
+                decode_invite_id(id)?;
+                if let Some(expires_at) = self.expires_at {
+                    if expires_at <= issued_at {
+                        return invalid("招待期限は発行時刻より後にしてください".to_string());
+                    }
+                }
+            }
+            (None, None) if self.expires_at.is_none() => {}
+            _ => return invalid("招待 v3 のメタデータが不完全です".to_string()),
+        }
         Ok(())
     }
 
@@ -121,7 +147,9 @@ impl InviteToken {
         self.validate()?;
         let mut buf = Vec::with_capacity(160);
         // 既定名(network なし)は v1 のまま = 旧バイナリでも読める
-        buf.push(if self.network.is_some() {
+        buf.push(if self.invite_id.is_some() {
+            VERSION_3
+        } else if self.network.is_some() {
             VERSION_2
         } else {
             VERSION_1
@@ -149,6 +177,15 @@ impl InviteToken {
             buf.push(network.len() as u8);
             buf.extend_from_slice(network.as_bytes());
         }
+        if let (Some(invite_id), Some(issued_at)) = (&self.invite_id, self.issued_at) {
+            // v3 は network を常に 1 バイト長付きで持つ(None は長さ 0)。
+            if self.network.is_none() {
+                buf.push(0);
+            }
+            buf.extend_from_slice(&decode_invite_id(invite_id)?);
+            buf.extend_from_slice(&issued_at.to_be_bytes());
+            buf.extend_from_slice(&self.expires_at.unwrap_or(0).to_be_bytes());
+        }
         Ok(format!("{TOKEN_PREFIX}{}", B64URL.encode(&buf)))
     }
 
@@ -165,7 +202,7 @@ impl InviteToken {
         let mut r = Reader::new(&bytes);
 
         let version = r.u8()?;
-        if version != VERSION_1 && version != VERSION_2 {
+        if version != VERSION_1 && version != VERSION_2 && version != VERSION_3 {
             return Err(Error::InvalidToken(format!(
                 "未対応のトークンバージョンです({version})。新しい peercove に更新してください"
             )));
@@ -200,9 +237,17 @@ impl InviteToken {
             let len = r.u8()? as usize;
             let text = String::from_utf8(r.bytes(len)?.to_vec())
                 .map_err(|_| invalid("ネットワーク名が UTF-8 ではありません"))?;
-            Some(text)
+            (!text.is_empty()).then_some(text)
         } else {
             None
+        };
+        let (invite_id, issued_at, expires_at) = if version >= VERSION_3 {
+            let id = encode_invite_id(&r.array::<INVITE_ID_LEN>()?);
+            let issued = u64::from_be_bytes(r.array::<8>()?);
+            let expires = u64::from_be_bytes(r.array::<8>()?);
+            (Some(id), Some(issued), (expires != 0).then_some(expires))
+        } else {
+            (None, None, None)
         };
         r.finish()?;
 
@@ -215,10 +260,38 @@ impl InviteToken {
             endpoints,
             name,
             network,
+            invite_id,
+            issued_at,
+            expires_at,
         };
         token.validate()?;
         Ok(token)
     }
+}
+
+/// OS CSPRNG で v3 招待 ID を作る。表示・設定保存用に小文字 hex を返す。
+pub fn generate_invite_id() -> String {
+    use rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; INVITE_ID_LEN];
+    OsRng.fill_bytes(&mut bytes);
+    encode_invite_id(&bytes)
+}
+
+fn encode_invite_id(bytes: &[u8; INVITE_ID_LEN]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_invite_id(value: &str) -> Result<[u8; INVITE_ID_LEN]> {
+    if value.len() != INVITE_ID_LEN * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidToken("招待 ID が不正です".to_string()));
+    }
+    let mut bytes = [0u8; INVITE_ID_LEN];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(chunk).expect("ASCII は UTF-8");
+        bytes[index] = u8::from_str_radix(text, 16)
+            .map_err(|_| Error::InvalidToken("招待 ID が不正です".to_string()))?;
+    }
+    Ok(bytes)
 }
 
 /// 長さ検査付きの単純なバイナリリーダ。
@@ -289,6 +362,9 @@ mod tests {
             ],
             name: "member-a".to_string(),
             network: Some("my-game-lan".to_string()),
+            invite_id: None,
+            issued_at: None,
+            expires_at: None,
         }
     }
 
@@ -337,6 +413,21 @@ mod tests {
             InviteToken::parse(&encoded).unwrap().network.as_deref(),
             Some("my-game-lan")
         );
+    }
+
+    #[test]
+    fn invite_metadata_encodes_as_v3_and_roundtrips() {
+        let mut token = sample();
+        token.invite_id = Some("0123456789abcdef0123456789abcdef".to_string());
+        token.issued_at = Some(1_700_000_000);
+        token.expires_at = Some(1_700_086_400);
+        let encoded = token.encode().unwrap();
+        let bytes = B64URL.decode(&encoded[TOKEN_PREFIX.len()..]).unwrap();
+        assert_eq!(bytes[0], VERSION_3);
+        let parsed = InviteToken::parse(&encoded).unwrap();
+        assert_eq!(parsed.invite_id, token.invite_id);
+        assert_eq!(parsed.issued_at, token.issued_at);
+        assert_eq!(parsed.expires_at, token.expires_at);
     }
 
     #[test]

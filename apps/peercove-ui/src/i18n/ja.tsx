@@ -69,6 +69,7 @@ export const ja = {
     inbox: "受信",
     dns: "DNS",
     subnets: "サブネット",
+    diagnostics: "診断",
     settings: "設定",
     connected: "接続中",
     disconnected: "未接続",
@@ -78,6 +79,85 @@ export const ja = {
         : "外観: ダーク（クリックでライト）",
     logs: "ログ",
     version: (v: string) => `v${v}`,
+  },
+
+  diagnostics: {
+    title: "接続診断",
+    lead: "設定と現在の状態を変更せずに確認します。外部の診断サーバーへは送信しません。",
+    rerun: "再診断",
+    running: "診断しています…",
+    export: "診断結果を保存",
+    saved: (path: string) => `診断結果を保存しました: ${path}（同じ場所に TXT も保存）`,
+    noIssues: "確認できた範囲に問題はありません。",
+    passed: (count: number) => `正常な項目（${count}）`,
+    unknownAction: "詳細な判定に必要な情報がありません。",
+    overall: {
+      healthy: "正常",
+      attention: "確認が必要",
+      problem: "問題があります",
+    },
+    status: {
+      pass: "正常",
+      warning: "警告",
+      fail: "失敗",
+      unknown: "判定不能",
+    },
+    exportConfirmTitle: "診断結果を保存しますか？",
+    exportConfirmBody:
+      "JSON と人が読める TXT をローカルに保存します。自動アップロードは行いません。",
+    exportConfirmDetail:
+      "秘密鍵・PSK・招待トークンは除外します。設定パス、仮想 IP、公開鍵、接続先、直近ログは含まれる場合があります。",
+    exportConfirm: "内容を確認して保存",
+    check: {
+      "app.ipc_compatible": {
+        summary: "UI とデーモンの IPC は互換です",
+        action: "不一致の場合は UI とデーモンを同じ版へ更新してください。",
+      },
+      "app.version_known": {
+        summary: "デーモンのバージョン情報",
+        action: "不明な場合はデーモンを更新してください。接続自体は継続できます。",
+      },
+      "app.peer_compatibility": {
+        summary: "接続メンバーのバージョン互換性",
+        action: "不明なメンバーは旧版の可能性があります。必要な機能が使えない場合は更新してください。",
+      },
+      "config.valid": {
+        summary: "設定ファイルの読み込みと検証",
+        action: "失敗した場合は表示された設定エラーを修正してください。",
+      },
+      "permissions.secret_files": {
+        summary: "秘密ファイルの存在と権限",
+        action: "不足ファイルを復元し、他ユーザーから読めない権限にしてください。",
+      },
+      "tunnel.running": {
+        summary: "トンネルの稼働状態",
+        action: "停止中ならネットワーク画面から接続してください。",
+      },
+      "tunnel.interface_ready": {
+        summary: "仮想インターフェース",
+        action: "名前やアドレスが無い場合は再接続し、管理者権限を確認してください。",
+      },
+      "tunnel.handshake": {
+        summary: "ピアとのハンドシェイク",
+        action: "応答が無い場合は接続先、ファイアウォール、ホストの稼働を確認してください。",
+      },
+      "internet.reachability_evidence": {
+        summary: "インターネット到達の証拠",
+        action: "外部サーバーを使わないため、実ハンドシェイクが無い場合は判定できません。",
+      },
+      "dns.zone_available": {
+        summary: "内蔵 DNS のゾーン情報",
+        action: "台帳が届かない場合は、先にホストとの接続を回復してください。",
+      },
+      "tunnel.host_removed_member": {
+        summary: "ホストからこのメンバーが削除されています",
+        action: "切断して、ホスト管理者から新しい招待を受け取ってください。",
+      },
+      "tunnel.acl": {
+        summary: "アクセス制御による遮断",
+        action: "意図した遮断かホストの通信制御設定を確認してください。",
+      },
+    },
   },
 
   footer: (
@@ -98,6 +178,25 @@ export const ja = {
     linkPreviewHint:
       "URL を含むメッセージを表示したとき、この端末がそのページへ情報（タイトルや画像）を取りに行きます。相手のサイトにあなたの IP アドレスが伝わるのが気になる場合はオフにしてください。",
     note: "この設定はこのマシンにだけ保存されます（即時反映）。",
+  },
+
+  update: {
+    title: "更新とバージョン",
+    enabled: "新しいバージョンを自動で確認する",
+    enabledHint:
+      "1日1回、GitHub Releasesへ最新版だけを確認します。設定やネットワーク情報は送信しません。",
+    uiVersion: "アプリ",
+    daemonVersion: "デーモン",
+    latestVersion: "最新版",
+    unknown: "不明",
+    checkNow: "今すぐ確認",
+    checking: "確認中…",
+    current: "最新バージョンを使用しています。",
+    available: (version: string) => `v${version} を利用できます。`,
+    openRelease: "リリースページを開く",
+    sidebar: (version: string) => `v${version} · 更新あり`,
+    memberVersion: (version: string) => `PeerCove v${version}`,
+    memberVersionUnknown: "PeerCove バージョン不明",
   },
 
   daemonOutdated: {
@@ -315,6 +414,17 @@ export const ja = {
       blocked: "通信不可",
       blockedTitle:
         "ホストの通信制御により、このメンバーとの通信は遮断されています",
+      inviteStatus: {
+        legacy: "既存",
+        pending: "未使用",
+        joined: "参加済み",
+        awaiting_approval: "承認待ち",
+        expired: "期限切れ",
+        clock_invalid: "時刻エラー",
+      },
+      approve: "承認",
+      approved: "参加端末を承認しました。隔離は数秒以内に解除されます。",
+      inviteExpires: (value: string) => `招待期限: ${value}`,
     },
     // 直接通信の説明(M3-4)。外部 IP の共有について明記する(ADR-0013 条件 3)
     directNote:
@@ -505,6 +615,8 @@ export const ja = {
     allocatedIp: "割当 IP",
     endpoints: "接続先候補",
     psk: "事前共有鍵",
+    expires: "有効期限",
+    never: "無期限",
     yes: "あり",
     no: "なし",
     copied: "コピーしました",
@@ -522,6 +634,12 @@ export const ja = {
     externalHint: "LAN 内の接続先は自動で入ります。省略しても構いません。",
     externalPlaceholder: "203.0.113.5:51820",
     pskLabel: "事前共有鍵（PSK）も発行する",
+    expiryLabel: "招待の有効期限",
+    expiryHour: "1 時間",
+    expiryDay: "1 日",
+    expiryWeek: "7 日（推奨）",
+    expiryMonth: "30 日",
+    expiryHint: "期限切れ後は、まだ参加していない端末からの接続をホストが拒否します。",
     issuing: "発行中…",
     issue: "招待を発行",
   },
@@ -567,6 +685,8 @@ export const ja = {
     directLabel: "メンバーと直接通信する（推奨）",
     directHint:
       "— 可能なら相手と直接つなぎます（速く・ホスト回線の負荷なし）。あなたのグローバル IP がネットワーク内のメンバーに共有されます。オフにすると常にホスト経由。約 10 秒で反映されます",
+    inviteApprovalLabel: "新しい端末の参加を承認する",
+    inviteApprovalHint: "— 承認まではコントロール通信以外を隔離します",
     // 受信ファイルサイズ上限(ADR-0015、M3-9)
     maxFileLabel: "受信ファイルの上限（MB）",
     maxFileHint: (defaultMb: number) =>
@@ -589,6 +709,7 @@ export const ja = {
 
   // OS 通知(notify.ts)
   notify: {
+    approvalTitle: "PeerCove: 新しい参加要求",
     joinedTitle: "メンバーが参加しました",
     leftTitle: "メンバーが切断しました",
     body: (name: string, ip: string, network: string) =>

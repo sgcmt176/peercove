@@ -20,6 +20,7 @@ export function InviteDialog({
   const [name, setName] = useState("");
   const [psk, setPsk] = useState(false);
   const [externalEndpoint, setExternalEndpoint] = useState("");
+  const [expiry, setExpiry] = useState("604800");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<InviteResult | null>(null);
@@ -31,7 +32,13 @@ export function InviteDialog({
     try {
       const endpoints = externalEndpoint.trim() ? [externalEndpoint.trim()] : [];
       setResult(
-        await api.createInvite(configPath, name.trim() || null, psk, endpoints),
+        await api.createInvite(
+          configPath,
+          name.trim() || null,
+          psk,
+          endpoints,
+          expiry === "none" ? null : Number(expiry),
+        ),
       );
     } catch (e) {
       setError(errorMessage(e));
@@ -76,6 +83,12 @@ export function InviteDialog({
                 <dd className="mono">{result.endpoints.join(", ")}</dd>
                 <dt>{t.invite.psk}</dt>
                 <dd>{result.psk ? t.invite.yes : t.invite.no}</dd>
+                <dt>{t.invite.expires}</dt>
+                <dd>
+                  {result.expiresAt
+                    ? new Date(result.expiresAt * 1000).toLocaleString()
+                    : t.invite.never}
+                </dd>
               </dl>
               <textarea className="token" readOnly value={result.token} rows={3} />
               <div className="row">
@@ -135,6 +148,17 @@ export function InviteDialog({
             onChange={(event) => setPsk(event.target.checked)}
           />
           <span>{t.invite.pskLabel}</span>
+        </label>
+        <label className="field">
+          <span>{t.invite.expiryLabel}</span>
+          <select value={expiry} onChange={(event) => setExpiry(event.target.value)}>
+            <option value="3600">{t.invite.expiryHour}</option>
+            <option value="86400">{t.invite.expiryDay}</option>
+            <option value="604800">{t.invite.expiryWeek}</option>
+            <option value="2592000">{t.invite.expiryMonth}</option>
+            <option value="none">{t.invite.never}</option>
+          </select>
+          <small className="muted">{t.invite.expiryHint}</small>
         </label>
         {error && <p className="error-text">{error}</p>}
       </div>

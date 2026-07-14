@@ -28,6 +28,8 @@ pub struct InviteOptions<'a> {
     pub extra_endpoints: &'a [SocketAddrV4],
     /// メンバー用の事前共有鍵を発行する
     pub psk: bool,
+    /// None は無期限。UI/CLI の既定は 7 日。
+    pub expires_in_secs: Option<u64>,
 }
 
 pub struct InviteResult {
@@ -37,6 +39,9 @@ pub struct InviteResult {
     pub ip: Ipv4Addr,
     pub endpoints: Vec<SocketAddrV4>,
     pub psk: bool,
+    pub invite_id: String,
+    pub issued_at: u64,
+    pub expires_at: Option<u64>,
 }
 
 /// メンバーを host.toml に登録し、招待トークンを返す。
@@ -106,6 +111,19 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
     let member_public_key = member_private_key.public_key();
     let preshared_key = options.psk.then(PresharedKey::generate);
     let psk_file_name = format!("peer-{ip}.psk");
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("システム時刻が UNIX epoch より前です")?
+        .as_secs();
+    let expires_at = options
+        .expires_in_secs
+        .map(|seconds| {
+            issued_at
+                .checked_add(seconds)
+                .context("招待期限が時刻範囲を超えます")
+        })
+        .transpose()?;
+    let invite_id = peercove_core::token::generate_invite_id();
     if let Some(psk) = &preshared_key {
         let psk_path = options
             .config_path
@@ -124,6 +142,9 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
             name: Some(&name),
             dns_name: Some(&dns_name),
             preshared_key_file: preshared_key.as_ref().map(|_| psk_file_name.as_str()),
+            invite_id: Some(&invite_id),
+            invite_issued_at: Some(issued_at),
+            invite_expires_at: expires_at,
         },
     )?;
 
@@ -137,6 +158,9 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
         name: name.clone(),
         // 設定に名前が無い(旧設定)場合は None のまま = v1 トークン
         network: config.interface.network_name.clone(),
+        invite_id: Some(invite_id.clone()),
+        issued_at: Some(issued_at),
+        expires_at,
     };
 
     Ok(InviteResult {
@@ -145,6 +169,9 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
         ip,
         endpoints,
         psk: options.psk,
+        invite_id,
+        issued_at,
+        expires_at,
     })
 }
 
@@ -192,6 +219,7 @@ mod tests {
             ip: None,
             extra_endpoints: &[],
             psk: false,
+            expires_in_secs: Some(7 * 24 * 60 * 60),
         }
     }
 
@@ -216,6 +244,13 @@ mod tests {
         );
         assert_eq!(token.member_address.addr(), result.ip);
         assert_eq!(token.host_virtual_ip, config.interface.address.addr());
+        assert_eq!(token.invite_id.as_deref(), Some(result.invite_id.as_str()));
+        assert_eq!(token.issued_at, Some(result.issued_at));
+        assert_eq!(token.expires_at, result.expires_at);
+        assert_eq!(
+            config.peers[0].invite_id.as_deref(),
+            Some(result.invite_id.as_str())
+        );
         assert!(!token.endpoints.is_empty());
         assert_eq!(
             token.network.as_deref(),
@@ -226,6 +261,102 @@ mod tests {
         // 2 人目は次の空き IP
         let second = invite(&options(&config_path)).unwrap();
         assert_ne!(second.ip, result.ip);
+    }
+
+    #[test]
+    fn invite_expiry_and_first_device_are_host_enforced() {
+        let config_path = setup("lifecycle");
+        let mut opts = options(&config_path);
+        opts.expires_in_secs = Some(60);
+        let result = invite(&opts).unwrap();
+        let first_device = "11111111111111111111111111111111";
+        let other_device = "22222222222222222222222222222222";
+
+        assert!(crate::peers::mark_invite_accepted_by_ip(
+            &config_path,
+            result.ip,
+            result.issued_at + 1,
+            Some(first_device),
+        )
+        .unwrap());
+        assert!(!crate::peers::mark_invite_accepted_by_ip(
+            &config_path,
+            result.ip,
+            result.issued_at + 2,
+            Some(first_device),
+        )
+        .unwrap());
+        assert!(crate::peers::mark_invite_accepted_by_ip(
+            &config_path,
+            result.ip,
+            result.issued_at + 2,
+            Some(other_device),
+        )
+        .is_err());
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config.peers[0].invite_device_id.as_deref(),
+            Some(first_device)
+        );
+    }
+
+    #[test]
+    fn expired_unused_invite_is_rejected() {
+        let config_path = setup("expired");
+        let mut opts = options(&config_path);
+        opts.expires_in_secs = Some(1);
+        let result = invite(&opts).unwrap();
+        assert!(crate::peers::mark_invite_accepted_by_ip(
+            &config_path,
+            result.ip,
+            result.issued_at + 2,
+            Some("11111111111111111111111111111111"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn approval_required_invite_stays_isolated_until_approved() {
+        let config_path = setup("approval");
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            text.replacen(
+                "[interface]",
+                "[interface]\nrequire_invite_approval = true",
+                1,
+            ),
+        )
+        .unwrap();
+        let result = invite(&options(&config_path)).unwrap();
+        let device = "11111111111111111111111111111111";
+        crate::peers::mark_invite_accepted_by_ip(
+            &config_path,
+            result.ip,
+            result.issued_at + 1,
+            Some(device),
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        assert!(config.peers[0].invite_is_isolated());
+        assert_eq!(
+            config.peers[0].invite_state(result.issued_at + 2),
+            peercove_core::config::InviteState::AwaitingApproval
+        );
+
+        crate::peers::approve_invite(
+            &config_path,
+            &crate::peers::Selector::Ip(result.ip),
+            result.issued_at + 2,
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        assert!(!config.peers[0].invite_is_isolated());
+        assert_eq!(
+            config.peers[0].invite_state(result.issued_at + 3),
+            peercove_core::config::InviteState::Joined
+        );
     }
 
     #[test]

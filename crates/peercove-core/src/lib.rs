@@ -5,6 +5,7 @@
 //! - [`ipalloc`]: 仮想 IP 割当ヘルパ
 
 pub mod config;
+pub mod diagnostics;
 pub mod dns;
 pub mod ipalloc;
 pub mod ipc;

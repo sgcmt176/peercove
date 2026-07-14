@@ -173,6 +173,12 @@ pub struct InterfaceConfig {
     /// ADR-0021 以降は表示専用(DNS 名は `dns_name` / `[[peer]].dns_name` が別に持つ)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// 招待 v3 の join 時に端末上で生成する識別子。同じトークンの二重利用防止用。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// (host のみ)新しく発行する招待を、ホスト管理者の承認まで隔離する。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_invite_approval: bool,
     /// (host のみ)ホスト自身の DNS 名(ADR-0021、M3-14a)。正規化済みラベル。
     /// 省略時は従来どおり表示名から導出される(実質 `host`)。
     /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
@@ -232,6 +238,24 @@ pub struct PeerConfig {
     /// 旧バージョンでは読めない(明示エラーになる)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_name: Option<String>,
+    /// 招待 v3 のホスト側台帳。トークン本体や秘密鍵は保存しない(M3-22)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_issued_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_expires_at: Option<u64>,
+    /// 初回の認証済み Hello を受けた時刻。設定の期限後も参加済み端末は維持する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_accepted_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_device_id: Option<String>,
+    /// 招待発行時に承認必須だったか。既存 peer へ後付けでは適用しない。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invite_requires_approval: bool,
+    /// ホスト管理者が承認した時刻。None の承認必須 peer は隔離する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_approved_at: Option<u64>,
     /// このピア(ホスト)の仮想 IP。メンバー側でコントロールチャネルの
     /// 接続先として使う(join が設定する)。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +275,55 @@ pub struct PeerConfig {
     pub persistent_keepalive: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preshared_key_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteState {
+    Legacy,
+    Pending,
+    Joined,
+    AwaitingApproval,
+    Expired,
+    ClockInvalid,
+}
+
+impl PeerConfig {
+    pub fn invite_state(&self, now_unix_secs: u64) -> InviteState {
+        if self.invite_accepted_at.is_some()
+            && self.invite_requires_approval
+            && self.invite_approved_at.is_none()
+        {
+            InviteState::AwaitingApproval
+        } else if self.invite_accepted_at.is_some() {
+            InviteState::Joined
+        } else if self.invite_id.is_none() {
+            InviteState::Legacy
+        } else if now_unix_secs == 0 {
+            InviteState::ClockInvalid
+        } else if self
+            .invite_expires_at
+            .is_some_and(|expires| now_unix_secs >= expires)
+        {
+            InviteState::Expired
+        } else {
+            InviteState::Pending
+        }
+    }
+
+    pub fn invite_allows_connection(&self, now_unix_secs: u64) -> bool {
+        !matches!(
+            self.invite_state(now_unix_secs),
+            InviteState::Expired | InviteState::ClockInvalid
+        )
+    }
+
+    pub fn invite_is_isolated(&self) -> bool {
+        self.invite_requires_approval && self.invite_approved_at.is_none()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_mtu() -> u16 {
@@ -319,9 +392,66 @@ impl Config {
                 self.interface.mtu
             ));
         }
+        let valid_id =
+            |value: &str| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if self
+            .interface
+            .device_id
+            .as_deref()
+            .is_some_and(|id| !valid_id(id))
+        {
+            return invalid("interface.device_id が不正です".to_string());
+        }
         for (i, peer) in self.peers.iter().enumerate() {
             if peer.allowed_ips.is_empty() {
                 return invalid(format!("peer[{i}] の allowed_ips が空です"));
+            }
+            let has_v3 = peer.invite_id.is_some() || peer.invite_issued_at.is_some();
+            if has_v3 {
+                let Some(id) = &peer.invite_id else {
+                    return invalid(format!("peer[{i}] の invite_id がありません"));
+                };
+                if !valid_id(id) {
+                    return invalid(format!("peer[{i}] の invite_id が不正です"));
+                }
+                let Some(issued) = peer.invite_issued_at else {
+                    return invalid(format!("peer[{i}] の invite_issued_at がありません"));
+                };
+                if peer
+                    .invite_expires_at
+                    .is_some_and(|expires| expires <= issued)
+                {
+                    return invalid(format!("peer[{i}] の招待期限が発行時刻以前です"));
+                }
+                if peer
+                    .invite_accepted_at
+                    .is_some_and(|accepted| accepted < issued)
+                {
+                    return invalid(format!("peer[{i}] の参加時刻が発行時刻以前です"));
+                }
+                if peer
+                    .invite_device_id
+                    .as_deref()
+                    .is_some_and(|id| !valid_id(id))
+                {
+                    return invalid(format!("peer[{i}] の invite_device_id が不正です"));
+                }
+                if peer.invite_device_id.is_some() != peer.invite_accepted_at.is_some() {
+                    return invalid(format!("peer[{i}] の参加端末メタデータが不完全です"));
+                }
+                if peer.invite_approved_at.is_some() && !peer.invite_requires_approval {
+                    return invalid(format!("peer[{i}] は承認不要ですが承認時刻があります"));
+                }
+                if peer.invite_approved_at.is_some() && peer.invite_accepted_at.is_none() {
+                    return invalid(format!("peer[{i}] は参加前に承認されています"));
+                }
+            } else if peer.invite_expires_at.is_some()
+                || peer.invite_accepted_at.is_some()
+                || peer.invite_device_id.is_some()
+                || peer.invite_requires_approval
+                || peer.invite_approved_at.is_some()
+            {
+                return invalid(format!("peer[{i}] の招待メタデータが不完全です"));
             }
         }
         // 広告サブネット(ADR-0014)。仮想サブネットやピア間で重なると

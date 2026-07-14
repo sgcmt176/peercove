@@ -15,10 +15,12 @@
 mod dto;
 mod linkmeta;
 mod tray;
+mod update;
 
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 
+use peercove_core::diagnostics::DiagnosticReport;
 use peercove_core::ipc::{IpcRequest, IpcResponse};
 use peercove_ops::peers::Selector;
 use tauri::Manager;
@@ -51,6 +53,12 @@ async fn daemon_status() -> Result<Status, String> {
         Ok(other) => Err(format!("想定外の応答です: {other:?}")),
         Err(e) => Err(to_message(e)),
     }
+}
+
+/// GitHub Releases の最新安定版を確認する。失敗は UI の接続状態に影響させない。
+#[tauri::command]
+async fn check_update() -> Result<update::UpdateInfo, String> {
+    update::check().await.map_err(to_message)
 }
 
 /// トンネルを開始する(ホスト)。設定パスは絶対にしてからデーモンへ渡す。
@@ -142,6 +150,69 @@ async fn daemon_logs(after_seq: u64) -> Result<Logs, String> {
         Ok(other) => Err(format!("想定外の応答です: {other:?}")),
         Err(e) => Err(to_message(e)),
     }
+}
+
+/// 指定ネットワークの読み取り専用診断をデーモンに依頼する(M3-21)。
+#[tauri::command]
+async fn diagnose_network(config_path: String) -> Result<DiagnosticReport, String> {
+    let config = canonical(&config_path)?;
+    match peercove_ipc::request_async(IpcRequest::Diagnose { config }).await {
+        Ok(IpcResponse::Diagnostic { report }) => Ok(report),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(error) => Err(to_message(error)),
+    }
+}
+
+/// 診断結果を JSON と同名の TXT のペアでローカルへ保存する。自動送信はしない。
+#[tauri::command]
+async fn save_diagnostic_report(
+    app: tauri::AppHandle,
+    report: DiagnosticReport,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("診断 JSON を作成できません: {error}"))?;
+    let text = report.to_text();
+    if export_contains_secret(&json) || export_contains_secret(&text) {
+        return Err("診断結果に秘密情報らしい内容があるため保存を中止しました".to_string());
+    }
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name("peercove-diagnostic.json")
+            .blocking_save_file()
+            .map(|path| path.to_string())
+    })
+    .await
+    .map_err(|error| format!("ダイアログの表示に失敗しました: {error}"))?;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    let mut json_path = PathBuf::from(&path);
+    json_path.set_extension("json");
+    let mut text_path = json_path.clone();
+    text_path.set_extension("txt");
+    std::fs::write(&json_path, json)
+        .map_err(|error| format!("JSON の保存に失敗しました: {error}"))?;
+    if let Err(error) = std::fs::write(&text_path, text) {
+        let _ = std::fs::remove_file(&json_path);
+        return Err(format!("TXT の保存に失敗しました: {error}"));
+    }
+    Ok(Some(json_path.display().to_string()))
+}
+
+fn export_contains_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "private_key =",
+        "private_key\"",
+        "preshared_key",
+        "peercove://join?token=",
+        "invite token",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 // ---- ファイル送信・受信ボックス(ADR-0015、M3-9b) ----
@@ -685,6 +756,7 @@ fn create_invite(
     name: Option<String>,
     psk: bool,
     endpoints: Vec<String>,
+    expires_in_secs: Option<u64>,
 ) -> Result<InviteResult, String> {
     let extra: Vec<SocketAddrV4> = endpoints
         .iter()
@@ -701,6 +773,7 @@ fn create_invite(
         ip: None,
         extra_endpoints: &extra,
         psk,
+        expires_in_secs,
     })
     .map_err(to_message)?;
 
@@ -712,6 +785,9 @@ fn create_invite(
         ip: result.ip.to_string(),
         endpoints: result.endpoints.iter().map(|e| e.to_string()).collect(),
         psk: result.psk,
+        invite_id: result.invite_id,
+        issued_at: result.issued_at,
+        expires_at: result.expires_at,
     })
 }
 
@@ -760,6 +836,21 @@ fn remove_member(config_path: String, public_key: String) -> Result<String, Stri
     )
     .map_err(to_message)?;
     Ok(removed.display)
+}
+
+/// 承認待ち端末を承認し、次のデーモン同期で隔離を解除する。
+#[tauri::command]
+fn approve_member(config_path: String, public_key: String) -> Result<(), String> {
+    let approved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_secs();
+    peercove_ops::peers::approve_invite(
+        Path::new(&config_path),
+        &Selector::PublicKey(&public_key),
+        approved_at,
+    )
+    .map_err(to_message)
 }
 
 /// メンバーの表示名を変更する(台帳に反映される)。
@@ -1025,7 +1116,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            check_update,
             daemon_logs,
+            diagnose_network,
+            save_diagnostic_report,
             start_host,
             start_member,
             stop_tunnel,
@@ -1037,6 +1131,7 @@ pub fn run() {
             create_invite,
             join_network,
             remove_member,
+            approve_member,
             rename_member,
             set_member_dns_name,
             set_my_dns_name,
@@ -1067,4 +1162,19 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Tauri アプリの起動に失敗しました");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_export_deny_list_blocks_secret_shapes() {
+        assert!(export_contains_secret("private_key = 'abc'"));
+        assert!(export_contains_secret("peercove://join?token=abc"));
+        assert!(export_contains_secret("PRESHARED_KEY_FILE"));
+        assert!(!export_contains_secret(
+            "public_key: visible\naddress: 10.0.0.1"
+        ));
+    }
 }

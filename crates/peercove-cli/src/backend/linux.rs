@@ -11,7 +11,8 @@ use defguard_wireguard_rs::net::IpAddrMask;
 use defguard_wireguard_rs::peer::Peer;
 use defguard_wireguard_rs::{InterfaceConfiguration, Kernel, WGApi, WireguardInterfaceApi};
 
-use super::{AclDeny, PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use super::{AclDeny, IsolatedPeer, PeerSpec, PeerStats, TunnelSpec, WgBackend};
+use peercove_core::proto::CONTROL_PORT;
 
 pub struct LinuxBackend {
     if_name: String,
@@ -20,6 +21,8 @@ pub struct LinuxBackend {
     router: RouterState,
     /// ACL(ADR-0018)で適用中の DROP ルールの (src, dst)。down で対解除する。
     acl_rules: Vec<(String, String)>,
+    /// 承認待ち端末に適用中の仮想 IP。INPUT/OUTPUT/FORWARD の解除に使う。
+    isolated_ips: Vec<std::net::Ipv4Addr>,
 }
 
 /// ルーター役の適用済み状態(サブネットごとの NAT ルールと、
@@ -123,6 +126,32 @@ fn acl_rule_args(op: &str, wg_if: &str, src: &str, dst: &str) -> Vec<String> {
     .collect()
 }
 
+fn isolation_rule_args(op: &str, wg_if: &str, ip: std::net::Ipv4Addr) -> Vec<Vec<String>> {
+    let ip = format!("{ip}/32");
+    let port = CONTROL_PORT.to_string();
+    let rule = |parts: &[&str]| {
+        parts
+            .iter()
+            .copied()
+            .chain(["-m", "comment", "--comment", "peercove-invite-isolation"])
+            .map(str::to_string)
+            .collect()
+    };
+    // DROP を先に挿入し、ACCEPT を最後に -I することで許可規則が最上位になる。
+    vec![
+        rule(&[op, "FORWARD", "-i", wg_if, "-s", &ip, "-j", "DROP"]),
+        rule(&[op, "FORWARD", "-o", wg_if, "-d", &ip, "-j", "DROP"]),
+        rule(&[op, "INPUT", "-i", wg_if, "-s", &ip, "-j", "DROP"]),
+        rule(&[op, "OUTPUT", "-o", wg_if, "-d", &ip, "-j", "DROP"]),
+        rule(&[
+            op, "INPUT", "-i", wg_if, "-s", &ip, "-p", "tcp", "--dport", &port, "-j", "ACCEPT",
+        ]),
+        rule(&[
+            op, "OUTPUT", "-o", wg_if, "-d", &ip, "-p", "tcp", "--sport", &port, "-j", "ACCEPT",
+        ]),
+    ]
+}
+
 fn iptables(args: &[String]) -> anyhow::Result<String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run("iptables", &args)
@@ -137,6 +166,7 @@ impl LinuxBackend {
             api,
             router: RouterState::default(),
             acl_rules: Vec::new(),
+            isolated_ips: Vec::new(),
         })
     }
 
@@ -145,6 +175,17 @@ impl LinuxBackend {
         for (src, dst) in std::mem::take(&mut self.acl_rules) {
             if let Err(e) = iptables(&acl_rule_args("-D", &self.if_name, &src, &dst)) {
                 tracing::warn!("ACL ルールの削除に失敗しました({src}→{dst}): {e:#}");
+            }
+        }
+    }
+
+    fn clear_isolation(&mut self) {
+        for ip in std::mem::take(&mut self.isolated_ips) {
+            // 削除は挿入と逆順でなくても、各規則が一意なので安全。
+            for args in isolation_rule_args("-D", &self.if_name, ip) {
+                if let Err(e) = iptables(&args) {
+                    tracing::warn!("招待隔離ルールの削除に失敗しました({ip}): {e:#}");
+                }
             }
         }
     }
@@ -423,6 +464,28 @@ impl WgBackend for LinuxBackend {
         Ok(())
     }
 
+    fn sync_isolation(&mut self, isolated: &[IsolatedPeer]) -> anyhow::Result<()> {
+        let mut desired: Vec<_> = isolated.iter().map(|peer| peer.ip).collect();
+        desired.sort_unstable();
+        desired.dedup();
+        if desired == self.isolated_ips {
+            return Ok(());
+        }
+        self.clear_isolation();
+        for ip in &desired {
+            self.isolated_ips.push(*ip);
+            for args in isolation_rule_args("-I", &self.if_name, *ip) {
+                if let Err(error) = iptables(&args) {
+                    self.clear_isolation();
+                    return Err(
+                        error.context("承認待ち端末の隔離に失敗しました。iptables が必要です")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn sync_subnet_router(
         &mut self,
         virtual_subnet: ipnet::Ipv4Net,
@@ -491,6 +554,7 @@ impl WgBackend for LinuxBackend {
     fn down(&mut self) -> anyhow::Result<()> {
         Self::ensure_root()?;
         self.clear_router();
+        self.clear_isolation();
         self.clear_acl();
         match self.api.remove_interface() {
             Ok(()) => Ok(()),

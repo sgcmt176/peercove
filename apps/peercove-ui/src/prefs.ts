@@ -7,6 +7,8 @@ export interface Prefs {
   notifications: boolean;
   /** チャットの URL からページ情報(OGP)を取得してプレビューを出すか。 */
   linkPreview: boolean;
+  /** GitHub Releases へ最新版を確認するか。 */
+  updateChecks: boolean;
 }
 
 const KEY = "peercove-prefs";
@@ -14,6 +16,7 @@ const KEY = "peercove-prefs";
 export const DEFAULT_PREFS: Prefs = {
   notifications: true,
   linkPreview: true,
+  updateChecks: true,
 };
 
 export function loadPrefs(): Prefs {

@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { getVersion } from "@tauri-apps/api/app";
-import { Connection, Member, NetworkInfo, Transfer, api, errorMessage } from "./ipc";
+import {
+  Connection,
+  Member,
+  NetworkInfo,
+  Transfer,
+  UpdateInfo,
+  api,
+  errorMessage,
+} from "./ipc";
 import { t } from "./i18n";
 import {
   diffMembers,
@@ -18,6 +26,9 @@ import { TunnelView } from "./components/TunnelView";
 import { LogsView } from "./components/LogsDialog";
 import { NetworkSettingsView } from "./components/SettingsDialog";
 import { AppSettingsView } from "./components/PrefsDialog";
+import { DiagnosticsView } from "./components/DiagnosticsView";
+import { loadPrefs } from "./prefs";
+import { checkForUpdate } from "./update";
 
 /** サイドバーで選ぶ表示。openConfig の有無で有効な値が決まる(M3-16)。 */
 type View =
@@ -30,6 +41,7 @@ type View =
   | "inbox"
   | "dns"
   | "subnets"
+  | "diagnostics"
   | "net-settings";
 
 /** デーモンの状態を取りに行く間隔。CLI の status(5 秒)より短くしておく。 */
@@ -66,6 +78,8 @@ export default function App() {
   const [view, setView] = useState<View>("networks");
   /** アプリのバージョン(サイドバー下部に出す)。取得できなければ空。 */
   const [version, setVersion] = useState("");
+  /** GitHub Releases の更新確認結果。失敗時は null のまま通常動作を続ける。 */
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   /** 詳細ヘッダーの「切断」実行中。 */
   const [disconnecting, setDisconnecting] = useState(false);
   /**
@@ -180,6 +194,14 @@ export default function App() {
       unlisten?.();
     };
   }, []);
+
+  // 更新確認(M3-12)。接続状態の初期表示を妨げず、24 時間キャッシュを使う。
+  useEffect(() => {
+    if (!version || !loadPrefs().updateChecks) return;
+    void checkForUpdate(version)
+      .then(setUpdateInfo)
+      .catch(() => {});
+  }, [version]);
 
   useEffect(() => {
     refreshNetworks();
@@ -321,6 +343,12 @@ export default function App() {
                 />
               )}
               <SidebarItem
+                icon="✓"
+                label={t.sidebar.diagnostics}
+                active={view === "diagnostics"}
+                onClick={() => setView("diagnostics")}
+              />
+              <SidebarItem
                 icon="🧾"
                 label={t.sidebar.logs}
                 active={view === "logs"}
@@ -365,11 +393,23 @@ export default function App() {
         <div className="sidebar__foot">
           <ConnectionStatus connection={connection} />
           <div className="sidebar__foot-row">
-            {version && (
-              <span className="sidebar__version muted small">
-                {t.sidebar.version(version)}
-              </span>
-            )}
+            {version &&
+              (updateInfo?.available ? (
+                <button
+                  type="button"
+                  className="sidebar__update small"
+                  onClick={() => {
+                    setOpenConfig(null);
+                    setView("app-settings");
+                  }}
+                >
+                  {t.update.sidebar(version)}
+                </button>
+              ) : (
+                <span className="sidebar__version muted small">
+                  {t.sidebar.version(version)}
+                </span>
+              ))}
             <span className="sidebar__foot-actions">
               <button
                 type="button"
@@ -429,7 +469,16 @@ export default function App() {
             <LogsView />
           ) : !detail ? (
             view === "app-settings" ? (
-              <AppSettingsView />
+              <AppSettingsView
+                version={version}
+                daemonVersion={
+                  connection.kind === "ok"
+                    ? connection.status.daemonVersion
+                    : null
+                }
+                updateInfo={updateInfo}
+                onUpdateInfo={setUpdateInfo}
+              />
             ) : (
               <NetworksView
                 networks={networks}
@@ -446,6 +495,8 @@ export default function App() {
               configPath={openConfig!}
               liveInterfaceName={openTunnel?.interfaceName ?? null}
             />
+          ) : view === "diagnostics" ? (
+            <DiagnosticsView configPath={openConfig!} />
           ) : openTunnel !== null ? (
             <TunnelView
               tunnel={openTunnel}

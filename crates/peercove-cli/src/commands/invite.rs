@@ -16,6 +16,7 @@ pub struct CliOptions<'a> {
     pub ip: Option<Ipv4Addr>,
     pub extra_endpoints: &'a [SocketAddrV4],
     pub psk: bool,
+    pub expires_in_secs: Option<u64>,
     /// トークンの保存先
     pub out: &'a Path,
     pub force: bool,
@@ -37,6 +38,7 @@ pub fn run(options: &CliOptions) -> anyhow::Result<()> {
         ip: options.ip,
         extra_endpoints: options.extra_endpoints,
         psk: options.psk,
+        expires_in_secs: options.expires_in_secs,
     })?;
 
     write_secret(options.out, &format!("{}\n", result.token))?;
@@ -57,6 +59,13 @@ pub fn run(options: &CliOptions) -> anyhow::Result<()> {
             .join(", ")
     );
     println!("  PSK: {}", if result.psk { "あり" } else { "なし" });
+    println!(
+        "  有効期限: {}",
+        result
+            .expires_at
+            .map(|value| format!("UNIX {value}"))
+            .unwrap_or_else(|| "無期限".to_string())
+    );
     println!("トークンは秘密情報です。メンバー本人以外へ渡さず、受け渡し後は削除してください");
     println!("取り消すには remove-peer を使います");
 

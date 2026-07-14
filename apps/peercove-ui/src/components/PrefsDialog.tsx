@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { Prefs, loadPrefs, savePrefs } from "../prefs";
+import { UpdateInfo, api, errorMessage } from "../ipc";
+import { checkForUpdate, clearUpdateCache } from "../update";
 import { t } from "../i18n";
 
 /**
@@ -9,13 +11,42 @@ import { t } from "../i18n";
  *
  * サイドバーの「設定」(ネットワーク一覧を表示中)から開く 1 ページ。
  */
-export function AppSettingsView() {
+export function AppSettingsView({
+  version,
+  daemonVersion,
+  updateInfo,
+  onUpdateInfo,
+}: {
+  version: string;
+  daemonVersion: string | null;
+  updateInfo: UpdateInfo | null;
+  onUpdateInfo: (info: UpdateInfo | null) => void;
+}) {
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
+  const [checking, setChecking] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
 
   const toggle = (key: keyof Prefs) => {
     const next = { ...prefs, [key]: !prefs[key] };
     setPrefs(next);
     savePrefs(next);
+    if (key === "updateChecks") {
+      clearUpdateCache();
+      if (!next.updateChecks) onUpdateInfo(null);
+    }
+  };
+
+  const checkUpdate = async () => {
+    setChecking(true);
+    setUpdateError(null);
+    try {
+      const info = await checkForUpdate(version, true);
+      onUpdateInfo(info);
+    } catch (error) {
+      setUpdateError(errorMessage(error));
+    } finally {
+      setChecking(false);
+    }
   };
 
   return (
@@ -40,6 +71,57 @@ export function AppSettingsView() {
           <span>{t.prefs.linkPreview}</span>
         </label>
         <p className="muted small prefs__hint">{t.prefs.linkPreviewHint}</p>
+        <label className="chat__pick-row">
+          <input
+            type="checkbox"
+            checked={prefs.updateChecks}
+            onChange={() => toggle("updateChecks")}
+          />
+          <span>{t.update.enabled}</span>
+        </label>
+        <p className="muted small prefs__hint">{t.update.enabledHint}</p>
+
+        <section className="prefs__update" aria-labelledby="update-title">
+          <h3 id="update-title">{t.update.title}</h3>
+          <dl className="facts">
+            <dt>{t.update.uiVersion}</dt>
+            <dd className="mono">{version || t.update.unknown}</dd>
+            <dt>{t.update.daemonVersion}</dt>
+            <dd className="mono">{daemonVersion ?? t.update.unknown}</dd>
+            {updateInfo && (
+              <>
+                <dt>{t.update.latestVersion}</dt>
+                <dd className="mono">v{updateInfo.latestVersion}</dd>
+              </>
+            )}
+          </dl>
+          {updateInfo && (
+            <p className={updateInfo.available ? "notice" : "muted small"}>
+              {updateInfo.available
+                ? t.update.available(updateInfo.latestVersion)
+                : t.update.current}
+            </p>
+          )}
+          {updateError && <p className="error-text small">{updateError}</p>}
+          <div className="row">
+            <button
+              type="button"
+              className="button--ghost"
+              disabled={checking}
+              onClick={() => void checkUpdate()}
+            >
+              {checking ? t.update.checking : t.update.checkNow}
+            </button>
+            {updateInfo?.available && (
+              <button
+                type="button"
+                onClick={() => void api.openLink(updateInfo.releaseUrl)}
+              >
+                {t.update.openRelease}
+              </button>
+            )}
+          </div>
+        </section>
         <p className="muted small">{t.prefs.note}</p>
         <p className="muted small prefs__license">{t.footer}</p>
       </div>

@@ -52,6 +52,13 @@ pub struct AclDeny {
     pub b_subnets: Vec<Ipv4Net>,
 }
 
+/// 承認待ち端末の隔離対象。仮想 IP 単位で、ホストのコントロール TCP 以外を
+/// OS 境界で破棄する(M3-22c)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IsolatedPeer {
+    pub ip: Ipv4Addr,
+}
+
 #[derive(Clone)]
 pub struct PeerStats {
     pub public_key: PublicKey,
@@ -94,6 +101,9 @@ pub trait WgBackend: Send {
     /// ホストのみ呼ぶ。Windows はデバイス内リレーの判定表、Linux は
     /// iptables FORWARD の DROP ルールとして反映する。
     fn sync_acl(&mut self, denied: &[AclDeny]) -> anyhow::Result<()>;
+
+    /// 承認待ち端末を隔離する。冪等で、空配列は隔離をすべて解除する。
+    fn sync_isolation(&mut self, isolated: &[IsolatedPeer]) -> anyhow::Result<()>;
 
     /// ルーター役(自分の背後 LAN を広告している)としての転送設定を同期する。
     /// 冪等で、`subnets` が空なら全解除。`snat` は将来「LAN 側静的ルート前提」

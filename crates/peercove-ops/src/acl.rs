@@ -80,6 +80,9 @@ mod tests {
                 name: Some(name),
                 dns_name: None,
                 preshared_key_file: None,
+                invite_id: None,
+                invite_issued_at: None,
+                invite_expires_at: None,
             },
         )
         .unwrap();

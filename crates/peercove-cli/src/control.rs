@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use peercove_core::dns::{CnameRecord, DnsRecord};
 use peercove_core::proto::{ControlMessage, LedgerEntry, CONTROL_PORT, PROTO_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -32,8 +33,22 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// UI の表示が 1 周期ごとに 1 回は更新されるようにする。
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 接続中メンバー(仮想 IP → 送信キュー)。削除通知(M1-G3)で使う。
-pub type Connections = Arc<Mutex<HashMap<Ipv4Addr, mpsc::UnboundedSender<ControlMessage>>>>;
+/// 接続中メンバーの送信口と、Hello で広告された製品情報(M3-12)。
+#[derive(Clone)]
+pub struct ConnectionInfo {
+    pub(crate) outbox: mpsc::UnboundedSender<ControlMessage>,
+    pub app_version: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+impl ConnectionInfo {
+    pub fn send(&self, message: ControlMessage) -> bool {
+        self.outbox.send(message).is_ok()
+    }
+}
+
+/// 接続中メンバー(仮想 IP → 接続情報)。削除通知と台帳の製品情報に使う。
+pub type Connections = Arc<Mutex<HashMap<Ipv4Addr, ConnectionInfo>>>;
 
 /// ホストが配布する内容一式(台帳 + カスタム DNS レコード — M3-1)。
 /// watch チャネルでまとめて流し、どれかが変わったら再配布される。
@@ -53,6 +68,27 @@ pub struct Distribution {
 /// (ADR-0018、M3-10)。`member_ip` と遮断関係にある相手のエントリは
 /// endpoint を落とし(直接通信をさせない)、`blocked` を立てる(UI 表示用)。
 fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMessage {
+    let isolated_ips: Vec<Ipv4Addr> = dist
+        .members
+        .iter()
+        .filter(|entry| entry.invite_status.as_deref() == Some("awaiting_approval"))
+        .map(|entry| entry.ip)
+        .collect();
+    let isolated_labels: Vec<String> = dist
+        .members
+        .iter()
+        .filter(|entry| isolated_ips.contains(&entry.ip))
+        .filter_map(|entry| entry.dns_name.clone())
+        .collect();
+    dist.members
+        .retain(|entry| !isolated_ips.contains(&entry.ip));
+    dist.dns_records
+        .retain(|record| !isolated_ips.contains(&record.ip));
+    dist.cname_records.retain(|record| {
+        !isolated_labels
+            .iter()
+            .any(|label| record.name.split('.').any(|part| part == label))
+    });
     let deny = std::mem::take(&mut dist.deny);
     for entry in &mut dist.members {
         let blocked = deny
@@ -92,6 +128,8 @@ type LedgerDigest = (
         bool,                           // is_host
         bool,                           // blocked(ACL、ADR-0018)
         Vec<ipnet::Ipv4Net>,            // subnets(ADR-0014)
+        Option<String>,                 // app_version(M3-12)
+        Vec<String>,                    // capabilities(M3-12)
     )>,
     Vec<DnsRecord>,
     Vec<CnameRecord>,
@@ -115,6 +153,8 @@ fn ledger_digest(
                     m.is_host,
                     m.blocked,
                     m.subnets.clone(),
+                    m.app_version.clone(),
+                    m.capabilities.clone(),
                 )
             })
             .collect(),
@@ -370,6 +410,34 @@ impl HostRequests {
             }
         }
     }
+
+    /// 招待 v3 の期限をホスト正本で確認し、初回 Hello を永続化する。
+    async fn accept_invite(
+        &self,
+        member_ip: Ipv4Addr,
+        device_id: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.lock.lock().await;
+        let path = self.config_path.clone();
+        let accepted_at = unix_secs();
+        tokio::task::spawn_blocking(move || {
+            peercove_ops::peers::mark_invite_accepted_by_ip(
+                &path,
+                member_ip,
+                accepted_at,
+                device_id.as_deref(),
+            )?;
+            let config = peercove_core::config::Config::load(&path)?;
+            let peer = config
+                .peers
+                .iter()
+                .find(|peer| peer.allowed_ips.first().map(|net| net.addr()) == Some(member_ip))
+                .context("参加端末が host.toml に見つかりません")?;
+            Ok::<_, anyhow::Error>(peer.invite_is_isolated())
+        })
+        .await
+        .context("招待状態の更新タスクが失敗しました")?
+    }
 }
 
 fn encode_line(message: &ControlMessage) -> String {
@@ -506,8 +574,6 @@ pub async fn run_host_server(
                     {
                         tracing::debug!("メンバー {member_ip} との制御接続が終了: {e:#}");
                     }
-                    connections.lock().unwrap().remove(&member_ip);
-                    rtt.lock().unwrap().remove(&member_ip);
                     tracing::info!("メンバー {member_ip} の制御接続が切断されました");
                 });
             }
@@ -542,8 +608,15 @@ async fn handle_member(
     if hello.is_none() {
         anyhow::bail!("Hello の前に切断されました");
     }
-    match serde_json::from_str::<ControlMessage>(&line) {
-        Ok(ControlMessage::Hello { version, name }) => {
+    let (app_version, capabilities, device_id) = match serde_json::from_str::<ControlMessage>(&line)
+    {
+        Ok(ControlMessage::Hello {
+            version,
+            name,
+            app_version,
+            capabilities,
+            device_id,
+        }) => {
             if version != PROTO_VERSION {
                 tracing::warn!(
                     "メンバー {member_ip} のプロトコルバージョン {version} は未対応です\
@@ -551,22 +624,44 @@ async fn handle_member(
                 );
             }
             tracing::info!(
-                "メンバー {member_ip}({})が接続しました",
-                name.as_deref().unwrap_or("名前なし")
+                "メンバー {member_ip}({})が接続しました(version={})",
+                name.as_deref().unwrap_or("名前なし"),
+                app_version.as_deref().unwrap_or("不明")
             );
+
+            (app_version, capabilities, device_id)
         }
         Ok(other) => anyhow::bail!("Hello 以外のメッセージが届きました: {other:?}"),
         Err(e) => anyhow::bail!("Hello の解析に失敗しました: {e}"),
-    }
+    };
+
+    let isolated = requests
+        .accept_invite(member_ip, device_id)
+        .await
+        .with_context(|| format!("メンバー {member_ip} の招待を受け付けられません"))?;
 
     // 送信キューを登録(台帳変更・削除通知・Pong の配送口)
     let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
-    connections.lock().unwrap().insert(member_ip, tx.clone());
+    {
+        let mut connections = connections.lock().unwrap();
+        if connections.contains_key(&member_ip) {
+            anyhow::bail!("同じ招待を使った接続が既に存在します");
+        }
+        connections.insert(
+            member_ip,
+            ConnectionInfo {
+                outbox: tx.clone(),
+                app_version,
+                capabilities,
+            },
+        );
+    }
 
     // 現在の台帳を即送信。borrow_and_update で「見た」ことにして、
     // 直後の changed() が同じ内容をもう一度送るのを防ぐ
     let snapshot = ledger_rx.borrow_and_update().clone();
     let ping: SharedPing = Default::default();
+    let isolation = Arc::new(AtomicBool::new(isolated));
 
     let mut writer = tokio::spawn(host_writer(
         write_half,
@@ -575,6 +670,7 @@ async fn handle_member(
         ledger_rx,
         rx,
         Arc::clone(&ping),
+        Arc::clone(&isolation),
     ));
     let mut read_task = tokio::spawn(host_reader(
         reader,
@@ -584,6 +680,7 @@ async fn handle_member(
         Arc::clone(rtt),
         line,
         requests,
+        isolation,
     ));
 
     // どちらかが終わったら接続を畳む。
@@ -594,7 +691,18 @@ async fn handle_member(
         joined = &mut writer => { read_task.abort(); joined }
         joined = &mut read_task => { writer.abort(); joined }
     };
-    result.unwrap_or_else(|e| Err(anyhow::anyhow!("制御タスクが異常終了しました: {e}")))
+    let result =
+        result.unwrap_or_else(|e| Err(anyhow::anyhow!("制御タスクが異常終了しました: {e}")));
+    connections.lock().unwrap().remove(&member_ip);
+    rtt.lock().unwrap().remove(&member_ip);
+    result
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// 書き側。分岐はすべてキャンセル安全なものだけにすること。
@@ -605,10 +713,13 @@ async fn host_writer(
     mut ledger_rx: watch::Receiver<Distribution>,
     mut rx: mpsc::UnboundedReceiver<ControlMessage>,
     ping: SharedPing,
+    isolation: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    write_half
-        .write_all(encode_line(&ledger_message_for(initial, member_ip)).as_bytes())
-        .await?;
+    if !isolation.load(Ordering::Relaxed) {
+        write_half
+            .write_all(encode_line(&ledger_message_for(initial, member_ip)).as_bytes())
+            .await?;
+    }
 
     let mut ping_tick = tokio::time::interval(PING_INTERVAL);
     loop {
@@ -618,9 +729,16 @@ async fn host_writer(
                     return Ok(()); // 送信側(supervisor)終了
                 }
                 let snapshot = ledger_rx.borrow_and_update().clone();
-                write_half
-                    .write_all(encode_line(&ledger_message_for(snapshot, member_ip)).as_bytes())
-                    .await?;
+                let isolated = snapshot.members.iter().any(|entry| {
+                    entry.ip == member_ip
+                        && entry.invite_status.as_deref() == Some("awaiting_approval")
+                });
+                isolation.store(isolated, Ordering::Relaxed);
+                if !isolated {
+                    write_half
+                        .write_all(encode_line(&ledger_message_for(snapshot, member_ip)).as_bytes())
+                        .await?;
+                }
             }
             queued = rx.recv() => {
                 match queued {
@@ -644,6 +762,7 @@ async fn host_writer(
 }
 
 /// 読み側。`select!` を使わない素直なループ(read_line のキャンセル安全性のため)。
+#[allow(clippy::too_many_arguments)]
 async fn host_reader(
     mut reader: LineReader,
     member_ip: Ipv4Addr,
@@ -652,6 +771,7 @@ async fn host_reader(
     rtt: RttMap,
     mut line: String,
     requests: Arc<HostRequests>,
+    isolation: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     loop {
         if read_line(&mut reader, &mut line).await?.is_none() {
@@ -659,6 +779,14 @@ async fn host_reader(
         }
         match serde_json::from_str::<ControlMessage>(&line) {
             Ok(message) if handle_ping_pong(&message, member_ip, &out, &ping, &rtt) => {}
+            Ok(ControlMessage::RotateKey { .. }) if isolation.load(Ordering::Relaxed) => {
+                tracing::debug!("承認待ち端末 {member_ip} からの鍵更新依頼を拒否しました");
+            }
+            Ok(ControlMessage::SetDnsName { .. } | ControlMessage::SetDisplayName { .. })
+                if isolation.load(Ordering::Relaxed) =>
+            {
+                tracing::debug!("承認待ち端末 {member_ip} からの設定変更依頼を拒否しました");
+            }
             Ok(ControlMessage::RotateKey { new_public_key }) => {
                 // 鍵ローテーション(ADR-0020)。apply は host.toml への永続化のみで、
                 // WG ピアの入れ替えは supervisor の次回再読込(≤5 秒)が行う。
@@ -694,6 +822,7 @@ async fn host_reader(
 pub async fn run_member_client(
     host_ip: Ipv4Addr,
     display_name: Option<String>,
+    device_id: Option<String>,
     latest_ledger: Arc<Mutex<Option<ReceivedDistribution>>>,
     rtt: RttMap,
     removed: Arc<AtomicBool>,
@@ -709,6 +838,7 @@ pub async fn run_member_client(
                 let session = member_session(
                     stream,
                     &display_name,
+                    &device_id,
                     &latest_ledger,
                     host_ip,
                     &rtt,
@@ -739,9 +869,11 @@ pub async fn run_member_client(
 }
 
 /// メンバー側 1 接続。ホスト側と同じく読みと書きを分ける。
+#[allow(clippy::too_many_arguments)]
 async fn member_session(
     stream: TcpStream,
     display_name: &Option<String>,
+    device_id: &Option<String>,
     latest_ledger: &Arc<Mutex<Option<ReceivedDistribution>>>,
     host_ip: Ipv4Addr,
     rtt: &RttMap,
@@ -753,6 +885,9 @@ async fn member_session(
     tx.send(ControlMessage::Hello {
         version: PROTO_VERSION,
         name: display_name.clone(),
+        app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        capabilities: peercove_core::proto::current_capabilities(),
+        device_id: device_id.clone(),
     })
     .expect("受信側はこの後 spawn する");
     // supervisor が鍵ローテーション依頼を差し込めるようにする(ADR-0020)
@@ -890,6 +1025,10 @@ mod tests {
             dns_name: None,
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
+            app_version: None,
+            capabilities: vec![],
+            invite_status: None,
+            invite_expires_at: None,
             online,
             is_host: false,
             endpoint: None,
@@ -899,12 +1038,19 @@ mod tests {
         }
     }
 
-    /// 鍵ローテーションを使わないテスト用のダミー文脈(host.toml は実在しない)。
+    /// 鍵ローテーションを使わないテスト用の旧招待(v1/v2)設定。
     fn test_requests() -> Arc<HostRequests> {
-        Arc::new(HostRequests::new(
-            std::env::temp_dir().join("peercove-control-no-host.toml"),
-            PrivateKey::generate().public_key(),
-        ))
+        let path =
+            std::env::temp_dir().join(format!("peercove-control-host-{}.toml", std::process::id()));
+        let peer_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\npublic_key = \"{peer_key}\"\nallowed_ips = [\"127.0.0.1/32\"]\n"
+            ),
+        )
+        .unwrap();
+        Arc::new(HostRequests::new(path, PrivateKey::generate().public_key()))
     }
 
     /// 受信ログの INFO/debug 判定(ADR-0019): エンドポイントとその観測経過
@@ -989,6 +1135,7 @@ mod tests {
             let _ = member_session(
                 stream,
                 &Some("alice".to_string()),
+                &None,
                 &client_latest,
                 host_ip,
                 &client_rtt,
@@ -1096,6 +1243,35 @@ mod tests {
         assert!(members[0].endpoint.is_some());
     }
 
+    #[test]
+    fn ledger_message_hides_approval_pending_members_and_dns() {
+        let mut pending = entry("pending", "100.100.42.2", true);
+        pending.invite_status = Some("awaiting_approval".to_string());
+        pending.dns_name = Some("pending".to_string());
+        let dist = Distribution {
+            members: vec![pending, entry("bob", "100.100.42.3", true)],
+            dns_records: vec![DnsRecord {
+                name: "pending-service".to_string(),
+                ip: "100.100.42.2".parse().unwrap(),
+                scheme: None,
+                port: None,
+            }],
+            cname_records: vec![],
+            deny: vec![],
+        };
+        let ControlMessage::Ledger {
+            members,
+            dns_records,
+            ..
+        } = ledger_message_for(dist, "100.100.42.3".parse().unwrap())
+        else {
+            panic!("Ledger メッセージになる");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].ip, "100.100.42.3".parse::<Ipv4Addr>().unwrap());
+        assert!(dns_records.is_empty());
+    }
+
     /// Removed を送るとメンバー側セッションが終了し、台帳がクリアされる。
     #[tokio::test]
     async fn removed_notification_ends_session() {
@@ -1134,6 +1310,7 @@ mod tests {
             member_session(
                 stream,
                 &None,
+                &None,
                 &client_latest,
                 host_ip,
                 &client_rtt,
@@ -1150,11 +1327,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        sender
-            .send(ControlMessage::Removed {
+        assert!(
+            sender.send(ControlMessage::Removed {
                 message: "テスト削除".to_string(),
-            })
-            .unwrap();
+            }),
+            "削除通知を送れること"
+        );
 
         let client_result = client.await.unwrap();
         assert!(client_result.is_err(), "削除通知でセッションが終わること");
@@ -1296,6 +1474,7 @@ mod tests {
             let _ = member_session(
                 stream,
                 &Some("alice".to_string()),
+                &None,
                 &Arc::new(Mutex::new(None)),
                 host_ip,
                 &Default::default(),

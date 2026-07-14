@@ -1640,6 +1640,16 @@ select {
   gap: 2px;
 }
 
+.sidebar__update {
+  padding: 3px 7px;
+  min-height: 28px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  background: transparent;
+  white-space: nowrap;
+}
+
 .app__main {
   flex: 1;
   min-width: 0;
@@ -2031,6 +2041,106 @@ select {
   line-height: 1.5;
 }
 
+.prefs__update {
+  margin: 20px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+}
+
+.prefs__update h3 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+}
+
+.diagnostics {
+  display: grid;
+  gap: 16px;
+}
+
+.diagnostics__head,
+.diagnostics__actions,
+.diagnostics__overall,
+.diagnostics__check,
+.diagnostics__evidence > div {
+  display: flex;
+  align-items: center;
+}
+
+.diagnostics__head,
+.diagnostics__overall {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.diagnostics__actions {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.diagnostics__overall {
+  min-height: 64px;
+  padding: 14px 18px;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.diagnostics__overall--healthy { border-left-color: var(--online); }
+.diagnostics__overall--attention { border-left-color: var(--accent); }
+.diagnostics__overall--problem { border-left-color: var(--danger); }
+
+.diagnostics__list {
+  display: grid;
+  gap: 10px;
+}
+
+.diagnostics__check {
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.diagnostics__status {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--offline);
+  font-weight: 700;
+}
+
+.diagnostics__check--pass .diagnostics__status { background: var(--online); }
+.diagnostics__check--warning .diagnostics__status { background: var(--accent); }
+.diagnostics__check--fail .diagnostics__status { background: var(--danger); }
+.diagnostics__check p { margin: 4px 0 0; }
+.diagnostics__passed summary { cursor: pointer; padding: 10px 0; }
+.diagnostics__passed[open] summary { margin-bottom: 8px; }
+
+.diagnostics__evidence {
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+
+.diagnostics__evidence > div { gap: 12px; }
+.diagnostics__evidence dt { min-width: 120px; color: var(--muted); }
+.diagnostics__evidence dd { margin: 0; overflow-wrap: anywhere; }
+.diagnostics__confirm { border-color: var(--accent); }
+
+.tag--invite-pending { color: var(--accent); border-color: var(--accent); }
+.tag--invite-awaiting_approval { color: var(--warning); border-color: var(--warning); }
+.tag--invite-joined { color: var(--online); border-color: var(--online); }
+.tag--invite-expired { color: var(--danger); border-color: var(--danger); }
+.tag--invite-clock_invalid { color: var(--danger); border-color: var(--danger); }
+
 /* 招待などタブ右端の主ボタン(塗り) */
 .tabs__action--primary {
   background: var(--accent);
@@ -2049,6 +2159,7 @@ select {
   .sidebar__brand-name,
   .sidebar__label,
   .sidebar__version,
+  .sidebar__update,
   .sidebar__status .muted {
     display: none;
   }

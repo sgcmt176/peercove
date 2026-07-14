@@ -16,6 +16,26 @@ use crate::keys::PublicKey;
 pub const CONTROL_PORT: u16 = 51821;
 pub const PROTO_VERSION: u32 = 1;
 
+/// 現行バイナリが対応する追加機能。文字列 ID は wire 上の安定名なので、
+/// 一度公開した名前は変更・再利用しない(ADR-0029、M3-12)。
+pub const CURRENT_CAPABILITIES: &[&str] = &[
+    "acl_v1",
+    "chat",
+    "direct",
+    "dns_cname",
+    "dns_service_url",
+    "file_transfer",
+    "key_rotation",
+    "subnet_router",
+];
+
+pub fn current_capabilities() -> Vec<String> {
+    CURRENT_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect()
+}
+
 /// 1 行 1 メッセージでやり取りする制御メッセージ。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -25,6 +45,15 @@ pub enum ControlMessage {
         version: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// 製品バージョン。旧メンバーは送らないので None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_version: Option<String>,
+        /// 対応する追加機能。旧メンバーは空。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+        /// 招待 v3 の join 先端末で生成した ID。旧招待は None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
     },
     /// host → member: 台帳スナップショット(接続時と変更時に送る)。
     ///
@@ -97,6 +126,17 @@ pub struct LedgerEntry {
     pub dns_name: Option<String>,
     pub ip: Ipv4Addr,
     pub public_key: PublicKey,
+    /// この端末が名乗った製品バージョン。ホスト自身はローカル版を載せる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    /// この端末が Hello で広告した追加機能。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// ホスト正本の招待状態(M3-22)。旧版・ホスト自身は None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_expires_at: Option<u64>,
     /// 最終ハンドシェイクが十分新しい(ホストから見て到達可能)か。
     pub online: bool,
     /// ホストかどうか。
@@ -138,6 +178,10 @@ mod tests {
             dns_name: None,
             ip: "100.100.42.2".parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
+            app_version: None,
+            capabilities: vec![],
+            invite_status: None,
+            invite_expires_at: None,
             online: true,
             is_host: false,
             endpoint: Some("203.0.113.5:51820".parse().unwrap()),
@@ -165,6 +209,9 @@ mod tests {
             ControlMessage::Hello {
                 version: PROTO_VERSION,
                 name: Some("alice".to_string()),
+                app_version: Some("0.1.0".to_string()),
+                capabilities: vec!["chat".to_string()],
+                device_id: None,
             },
             ControlMessage::Ledger {
                 members: vec![entry()],
@@ -223,9 +270,25 @@ mod tests {
         let json = serde_json::to_string(&ControlMessage::Hello {
             version: 1,
             name: None,
+            app_version: None,
+            capabilities: vec![],
+            device_id: None,
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"hello","version":1}"#);
+
+        // 追加フィールドが無い Hello は旧版と完全に同じ。旧 Hello も読める。
+        let old: ControlMessage = serde_json::from_str(r#"{"type":"hello","version":1}"#).unwrap();
+        assert_eq!(
+            old,
+            ControlMessage::Hello {
+                version: 1,
+                name: None,
+                app_version: None,
+                capabilities: vec![],
+                device_id: None,
+            }
+        );
 
         // dns_records / cname_records が空なら旧バージョンとワイヤ表現が一致する(互換維持)
         let json = serde_json::to_string(&ControlMessage::Ledger {
@@ -349,6 +412,21 @@ mod tests {
         let parsed: LedgerEntry =
             serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert!(parsed.blocked);
+    }
+
+    #[test]
+    fn version_and_capabilities_are_optional_on_the_wire() {
+        let mut e = entry();
+        let old = serde_json::to_string(&e).unwrap();
+        assert!(!old.contains("app_version"));
+        assert!(!old.contains("capabilities"));
+
+        e.app_version = Some("0.2.0".to_string());
+        e.capabilities = vec!["chat".to_string(), "dns_service_url".to_string()];
+        let parsed: LedgerEntry =
+            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(parsed.app_version.as_deref(), Some("0.2.0"));
+        assert_eq!(parsed.capabilities, e.capabilities);
     }
 
     /// エンドポイント(ADR-0013、M3-2)の互換規則:

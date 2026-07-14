@@ -21,6 +21,7 @@ use anyhow::Context;
 use boringtun::noise::{errors::WireGuardError, handshake, Packet, Tunn, TunnResult};
 use boringtun::x25519;
 use ipnet::Ipv4Net;
+use peercove_core::proto::CONTROL_PORT;
 
 use super::super::PeerSpec;
 
@@ -117,6 +118,9 @@ pub struct Device {
     /// ACL の遮断組(ADR-0018)。仮想 IP の正規化済みペア(小さい方が先)。
     /// リレー時に「来たピア × 出るピア」の組で判定して破棄する。
     acl_denied: RwLock<std::collections::HashSet<(Ipv4Addr, Ipv4Addr)>>,
+    /// 承認待ち端末の仮想 IP。ホストのコントロール TCP 以外を破棄する。
+    isolated: RwLock<std::collections::HashSet<Ipv4Addr>>,
+    isolation_host: RwLock<Option<Ipv4Addr>>,
     shutdown: AtomicBool,
 }
 
@@ -156,6 +160,8 @@ impl Device {
             peers: RwLock::new(PeerTable::default()),
             relay,
             acl_denied: RwLock::new(std::collections::HashSet::new()),
+            isolated: RwLock::new(std::collections::HashSet::new()),
+            isolation_host: RwLock::new(None),
             shutdown: AtomicBool::new(false),
         }))
     }
@@ -165,6 +171,35 @@ impl Device {
         let normalized: std::collections::HashSet<_> =
             denied.iter().map(|&(a, b)| ordered(a, b)).collect();
         *self.acl_denied.write().unwrap() = normalized;
+    }
+
+    pub fn set_isolated(&self, isolated: &[Ipv4Addr], host_ip: Ipv4Addr) {
+        *self.isolated.write().unwrap() = isolated.iter().copied().collect();
+        *self.isolation_host.write().unwrap() = Some(host_ip);
+    }
+
+    fn is_isolated(&self, peer: &DevicePeer) -> bool {
+        peer.virtual_ip()
+            .is_some_and(|ip| self.isolated.read().unwrap().contains(&ip))
+    }
+
+    /// IPv4/TCP のコントロールチャネルだけを識別する。inbound は member→host、
+    /// outbound は host→member の向き。
+    fn is_control_packet(packet: &[u8], inbound: bool) -> bool {
+        if packet.len() < 20 || packet[0] >> 4 != 4 || packet[9] != 6 {
+            return false;
+        }
+        let header_len = usize::from(packet[0] & 0x0f) * 4;
+        if header_len < 20 || packet.len() < header_len + 4 {
+            return false;
+        }
+        let src = u16::from_be_bytes([packet[header_len], packet[header_len + 1]]);
+        let dst = u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
+        if inbound {
+            dst == CONTROL_PORT
+        } else {
+            src == CONTROL_PORT
+        }
     }
 
     /// ピアを追加する。既存ピアなら AllowedIPs の更新として働く(upsert、
@@ -285,10 +320,22 @@ impl Device {
             }
         };
         tracing::trace!("復号 {} バイトを受信(宛先 {dst})", packet.len());
+        if self.is_isolated(from)
+            && (Some(dst) != *self.isolation_host.read().unwrap()
+                || self.find_peer_by_dst(dst).is_some()
+                || !Self::is_control_packet(packet, true))
+        {
+            tracing::trace!("承認待ち端末からの隔離対象パケットを破棄しました");
+            return;
+        }
         if self.relay {
             if let Some(target) = self.find_peer_by_dst(dst) {
                 // 送信元ピア宛への折り返しはループになるため TUN 側へ落とす
                 if !Arc::ptr_eq(&target, from) {
+                    if self.is_isolated(&target) {
+                        tracing::trace!("承認待ち端末宛のリレーパケットを破棄しました");
+                        return;
+                    }
                     // ACL(ADR-0018): 遮断組のリレーは破棄(TUN にも渡さない)
                     if let (Some(a), Some(b)) = (from.virtual_ip(), target.virtual_ip()) {
                         if self.acl_denied.read().unwrap().contains(&ordered(a, b)) {
@@ -445,6 +492,10 @@ impl Device {
                 tracing::warn!("宛先 {dst} に対応するピアがありません(AllowedIPs 未登録)");
                 continue;
             };
+            if self.is_isolated(&peer) && !Self::is_control_packet(bytes, false) {
+                tracing::trace!("承認待ち端末宛の隔離対象パケットを破棄しました");
+                continue;
+            }
             let mut tunn = peer.tunn.lock().unwrap();
             match tunn.encapsulate(bytes, &mut work_buf) {
                 TunnResult::WriteToNetwork(data) => {
@@ -568,6 +619,29 @@ mod tests {
         packet[16..20].copy_from_slice(&dst.octets());
         packet[20..].copy_from_slice(payload);
         packet
+    }
+
+    fn tcp_packet(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+        let mut packet = ipv4_packet(src, dst, &[0; 20]);
+        packet[9] = 6;
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn invite_isolation_only_recognizes_control_tcp() {
+        let member: Ipv4Addr = "10.99.0.2".parse().unwrap();
+        let host: Ipv4Addr = "10.99.0.1".parse().unwrap();
+        let inbound = tcp_packet(member, host, 49152, CONTROL_PORT);
+        let outbound = tcp_packet(host, member, CONTROL_PORT, 49152);
+        assert!(Device::is_control_packet(&inbound, true));
+        assert!(Device::is_control_packet(&outbound, false));
+        assert!(!Device::is_control_packet(&inbound, false));
+        assert!(!Device::is_control_packet(
+            &ipv4_packet(member, host, b"dns"),
+            true
+        ));
     }
 
     struct TestNode {

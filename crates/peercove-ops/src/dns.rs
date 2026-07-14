@@ -406,6 +406,7 @@ mod tests {
             ip: None,
             extra_endpoints: &[],
             psk: false,
+            expires_in_secs: None,
         });
         // init 環境ではエンドポイント検出に失敗する場合があるためスキップ可
         if result.is_ok() {
@@ -433,6 +434,9 @@ mod tests {
                 name: Some("山田"),
                 dns_name: Some("alice"),
                 preshared_key_file: None,
+                invite_id: None,
+                invite_issued_at: None,
+                invite_expires_at: None,
             },
         )
         .unwrap();
