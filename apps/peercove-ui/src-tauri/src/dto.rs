@@ -691,6 +691,7 @@ mod tests {
             cname_records: vec![peercove_core::dns::CnameRecord {
                 name: "docs".to_string(),
                 target: "example.com".to_string(),
+                resolved_ip: None,
                 scheme: None,
                 port: None,
             }],

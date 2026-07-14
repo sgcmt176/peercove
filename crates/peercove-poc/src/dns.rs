@@ -20,13 +20,21 @@ use peercove_core::dns::{zone_for, CnameRecord, DnsRecord, DNS_SUFFIX, DNS_TTL_S
 use peercove_core::names::is_custom_dns_name;
 use peercove_core::proto::LedgerEntry;
 
+/// CNAME の解決対象(ADR-0025)。`ip` が埋まっていればフラット化して A で返し、
+/// 無ければ CNAME RR で返す。
+#[derive(Debug, Clone)]
+pub struct CnameTarget {
+    pub target: String,
+    pub ip: Option<Ipv4Addr>,
+}
+
 /// 合算済みのゾーン表(A + CNAME、ADR-0025)。fqdn は小文字・末尾ドットなし。
 #[derive(Debug, Default, Clone)]
 pub struct Zone {
     /// fqdn → IPv4(A レコード)
     pub a: HashMap<String, Ipv4Addr>,
-    /// fqdn → 別名の指す先ドメイン(CNAME レコード)
-    pub cname: HashMap<String, String>,
+    /// fqdn → 別名(CNAME レコード。フラット化 IP つき)
+    pub cname: HashMap<String, CnameTarget>,
 }
 
 /// 全ネットワーク合算のゾーン共有テーブル。
@@ -77,7 +85,13 @@ pub fn merge_zones(networks: &[NetworkZoneData]) -> Zone {
             if zone.a.contains_key(&fqdn) {
                 continue;
             }
-            zone.cname.insert(fqdn, record.target.clone());
+            zone.cname.insert(
+                fqdn,
+                CnameTarget {
+                    target: record.target.clone(),
+                    ip: record.resolved_ip,
+                },
+            );
         }
     }
     zone
@@ -216,16 +230,33 @@ pub fn respond(query: &[u8], zone: &Zone) -> Option<Vec<u8>> {
         return Some(out);
     }
 
-    // CNAME: 完全一致 → 1 段ワイルドカード(ADR-0025)。CNAME は全タイプに適用。
-    // 応答は CNAME RR だけ返し、クライアントの stub リゾルバが追跡する
+    // CNAME: 完全一致 → 1 段ワイルドカード(ADR-0025)。
     let cname = zone
         .cname
         .get(&name)
         .cloned()
         .or_else(|| wildcard_lookup(&zone.cname, &name).cloned());
-    if let Some(target) = cname {
-        tracing::debug!("DNS CNAME {name} → {target}");
-        let rdata = (qclass == CLASS_IN).then(|| encode_name(&target));
+    if let Some(cn) = cname {
+        // フラット化済み(転送先を IPv4 へ解決済み)なら A で返す。スプリット DNS
+        // でもクライアントが直接使えるため、外部ドメインでも到達できる
+        if let Some(ip) = cn.ip {
+            tracing::debug!("DNS CNAME {name} → {} (A {ip})", cn.target);
+            let answer = (qtype == TYPE_A && qclass == CLASS_IN).then_some(ip);
+            let mut out = header(RCODE_NOERROR, u16::from(answer.is_some()), true);
+            out.extend_from_slice(question);
+            if let Some(ip) = answer {
+                out.extend_from_slice(&[0xC0, 0x0C]);
+                out.extend_from_slice(&TYPE_A.to_be_bytes());
+                out.extend_from_slice(&CLASS_IN.to_be_bytes());
+                out.extend_from_slice(&DNS_TTL_SECS.to_be_bytes());
+                out.extend_from_slice(&4u16.to_be_bytes());
+                out.extend_from_slice(&ip.octets());
+            }
+            return Some(out);
+        }
+        // 未解決(外部解決前・in-zone 先など)は CNAME RR で返し、追跡させる
+        tracing::debug!("DNS CNAME {name} → {} (未解決)", cn.target);
+        let rdata = (qclass == CLASS_IN).then(|| encode_name(&cn.target));
         let mut out = header(RCODE_NOERROR, u16::from(rdata.is_some()), true);
         out.extend_from_slice(question);
         if let Some(rdata) = rdata {
@@ -341,6 +372,7 @@ mod tests {
                 vec![CnameRecord {
                     name: "docs".to_string(),
                     target: "example.com".to_string(),
+                    resolved_ip: None,
                     scheme: None,
                     port: None,
                 }],
@@ -368,7 +400,7 @@ mod tests {
             "10.1.0.50"
         );
         assert_eq!(
-            merged.cname["docs.game.peercove.internal"], "example.com",
+            merged.cname["docs.game.peercove.internal"].target, "example.com",
             "CNAME は別枠で合算される"
         );
     }
@@ -431,10 +463,15 @@ mod tests {
 
     #[test]
     fn cname_returns_cname_rr_and_a_wins() {
+        let cn = |target: &str, ip: Option<Ipv4Addr>| CnameTarget {
+            target: target.to_string(),
+            ip,
+        };
         let mut map = zones();
+        // 未解決の CNAME は CNAME RR で返す
         map.cname.insert(
             "docs.home.peercove.internal".to_string(),
-            "example.com".to_string(),
+            cn("example.com", None),
         );
         let query = build_query(1, "docs.home.peercove.internal", TYPE_A);
         let response = respond(&query, &map).unwrap();
@@ -449,10 +486,24 @@ mod tests {
             "CNAME の RDATA にターゲットのエンコードが含まれる"
         );
 
+        // フラット化済み(解決 IP つき)は A レコードで返す(ADR-0025)
+        map.cname.insert(
+            "flat.home.peercove.internal".to_string(),
+            cn("example.com", Some("93.184.216.34".parse().unwrap())),
+        );
+        let query = build_query(1, "flat.home.peercove.internal", TYPE_A);
+        let response = respond(&query, &map).unwrap();
+        assert_eq!(ancount(&response), 1);
+        assert_eq!(
+            &response[response.len() - 4..],
+            &[93, 184, 216, 34],
+            "A で返る"
+        );
+
         // ワイルドカード CNAME も 1 段一致する
         map.cname.insert(
             "*.svc.home.peercove.internal".to_string(),
-            "api.example.com".to_string(),
+            cn("api.example.com", None),
         );
         let query = build_query(1, "any.svc.home.peercove.internal", TYPE_A);
         let response = respond(&query, &map).unwrap();
@@ -461,7 +512,7 @@ mod tests {
         // 同名に A と CNAME があれば A が優先(RFC 1912)
         map.cname.insert(
             "alice.home.peercove.internal".to_string(),
-            "somewhere.example".to_string(),
+            cn("somewhere.example", None),
         );
         let query = build_query(1, "alice.home.peercove.internal", TYPE_A);
         let response = respond(&query, &map).unwrap();

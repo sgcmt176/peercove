@@ -74,6 +74,11 @@ pub struct CnameRecord {
     pub name: String,
     /// 別名の指す先(小文字・末尾ドットなしの絶対ドメイン。外部可)
     pub target: String,
+    /// 転送先を IPv4 へ解決した結果(ADR-0025 フラット化)。ホストが解決して
+    /// 載せる。埋まっていればリゾルバは A レコードで返す(スプリット DNS でも
+    /// クライアントが直接使えるようにするため)。未解決なら CNAME RR で返す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ip: Option<Ipv4Addr>,
     /// UI の URL コピー用メタ情報(ADR-0023 と同じ)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
@@ -275,6 +280,7 @@ pub fn resolve_cnames(
         resolved.push(CnameRecord {
             name,
             target: target.clone(),
+            resolved_ip: None, // ホスト(poc)が外部解決してから埋める
             scheme: record.scheme.clone(),
             port: record.port,
         });

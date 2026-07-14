@@ -952,6 +952,7 @@ mod tests {
                 cname_records: vec![CnameRecord {
                     name: "docs".to_string(),
                     target: "example.com".to_string(),
+                    resolved_ip: None,
                     scheme: None,
                     port: None,
                 }],

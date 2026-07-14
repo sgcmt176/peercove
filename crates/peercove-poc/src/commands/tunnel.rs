@@ -293,6 +293,42 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
     supervise_result
 }
 
+/// CNAME 転送先を IPv4 へ解決する(フラット化 — ADR-0025)。5 分キャッシュし、
+/// 無い/古い先だけ外部 DNS を引く(3 秒でタイムアウト)。解決できなければ、
+/// 直近に解決できた値があればそれを、無ければ `None` を返す。
+async fn flatten_cname(
+    target: &str,
+    cache: &mut HashMap<String, (std::net::Ipv4Addr, std::time::Instant)>,
+) -> Option<std::net::Ipv4Addr> {
+    use std::time::{Duration, Instant};
+    if let Some((ip, at)) = cache.get(target) {
+        if at.elapsed() < Duration::from_secs(300) {
+            return Some(*ip);
+        }
+    }
+    let fresh = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::lookup_host((target, 0u16)),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .and_then(|mut addrs| {
+        addrs.find_map(|addr| match addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+    });
+    match fresh {
+        Some(ip) => {
+            cache.insert(target.to_string(), (ip, Instant::now()));
+            Some(ip)
+        }
+        // 解決失敗。直近に解決できていればそれを使い続ける(TTL は無視)
+        None => cache.get(target).map(|(ip, _)| *ip),
+    }
+}
+
 /// supervise が周期的に更新する状態(daemon の status 応答用)。
 #[derive(Default)]
 pub struct Snapshot {
@@ -359,6 +395,10 @@ pub async fn supervise(
         let mut routes: std::collections::BTreeSet<ipnet::Ipv4Net> = Default::default();
         let mut member_extra: Vec<ipnet::Ipv4Net> = Vec::new();
         let mut router_error_logged = false;
+        // (host)CNAME フラット化のキャッシュ(ADR-0025)。転送先ドメイン →
+        // (解決 IPv4, 解決時刻)。毎周期の外部 DNS 引きを避け、5 分で引き直す
+        let mut cname_ips: HashMap<String, (std::net::Ipv4Addr, std::time::Instant)> =
+            HashMap::new();
         // (host)適用済み ACL(ADR-0018)。変更があった周期だけ同期する
         let mut applied_acl: Option<Vec<AclDeny>> = None;
         let mut acl_error_logged = false;
@@ -489,30 +529,43 @@ pub async fn supervise(
                     // その時点の仮想 IP・DNS ラベルへ解決する(IP 追随)
                     let mut direct_routes = HashMap::new();
                     let distribution = match role {
-                        Role::Host => config.as_ref().map(|config| {
-                            let members = build_ledger(config, &host_public_key, &stats);
-                            let dist = control::Distribution {
-                                dns_records: peercove_core::dns::resolve_records(
+                        Role::Host => {
+                            if let Some(config) = config.as_ref() {
+                                let members = build_ledger(config, &host_public_key, &stats);
+                                let dns_records = peercove_core::dns::resolve_records(
                                     &config.dns_records,
                                     &members,
-                                ),
-                                cname_records: peercove_core::dns::resolve_cnames(
+                                );
+                                // CNAME フラット化(ADR-0025): 転送先を IPv4 へ解決し、
+                                // 解決できたものは A レコードとして配る(スプリット DNS
+                                // 越しでも外部ドメインへ到達できるようにするため)
+                                let mut cname_records = peercove_core::dns::resolve_cnames(
                                     &config.dns_records,
                                     &members,
-                                ),
-                                deny: config.acl.normalized_deny(),
-                                members,
-                            };
-                            ledger_tx.send_if_modified(|current| {
-                                if *current != dist {
-                                    *current = dist.clone();
-                                    true
-                                } else {
-                                    false
+                                );
+                                for record in &mut cname_records {
+                                    record.resolved_ip =
+                                        flatten_cname(&record.target, &mut cname_ips).await;
                                 }
-                            });
-                            dist
-                        }),
+                                let dist = control::Distribution {
+                                    dns_records,
+                                    cname_records,
+                                    deny: config.acl.normalized_deny(),
+                                    members,
+                                };
+                                ledger_tx.send_if_modified(|current| {
+                                    if *current != dist {
+                                        *current = dist.clone();
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                                Some(dist)
+                            } else {
+                                None
+                            }
+                        }
                         Role::Member => {
                             let received = member_ledger.lock().unwrap().clone();
                             // 直接ピアの追加・確認・除去(ADR-0013、M3-3)。
