@@ -147,7 +147,12 @@ pub fn respond(query: &[u8], zones: &HashMap<String, Ipv4Addr>) -> Option<Vec<u8
     };
     let question = &query[12..question_end];
 
-    let known_ip = zones.get(&name).copied();
+    // 完全一致 → 無ければ 1 段のワイルドカード(先頭ラベルを `*` に置換)。
+    // 例: `foo.app.net.peercove.internal` は `*.app.net.peercove.internal` に一致(ADR-0024)
+    let known_ip = zones.get(&name).copied().or_else(|| {
+        name.split_once('.')
+            .and_then(|(_, rest)| zones.get(&format!("*.{rest}")).copied())
+    });
     let answer_ip = match known_ip {
         Some(ip) if qtype == TYPE_A && qclass == CLASS_IN => Some(ip),
         Some(_) => None, // 名前はある = NOERROR/NODATA
@@ -312,6 +317,35 @@ mod tests {
         let response = respond(&query, &zones()).unwrap();
         assert_eq!(rcode(&response), RCODE_NXDOMAIN);
         assert_eq!(ancount(&response), 0);
+    }
+
+    #[test]
+    fn wildcard_matches_one_label_deep() {
+        let mut map = zones();
+        map.insert(
+            "*.app.home.peercove.internal".to_string(),
+            "10.68.9.9".parse().unwrap(),
+        );
+        // 先頭 1 ラベルはワイルドカードに一致
+        let query = build_query(1, "foo.app.home.peercove.internal", TYPE_A);
+        let response = respond(&query, &map).unwrap();
+        assert_eq!(rcode(&response), RCODE_NOERROR);
+        assert_eq!(ancount(&response), 1);
+        assert_eq!(&response[response.len() - 4..], &[10, 68, 9, 9]);
+
+        // 完全一致が優先される(ワイルドカードに食われない)
+        map.insert(
+            "exact.app.home.peercove.internal".to_string(),
+            "10.68.9.1".parse().unwrap(),
+        );
+        let query = build_query(1, "exact.app.home.peercove.internal", TYPE_A);
+        let response = respond(&query, &map).unwrap();
+        assert_eq!(&response[response.len() - 4..], &[10, 68, 9, 1]);
+
+        // 2 段深いラベルはワイルドカード(1 段)に一致しない
+        let query = build_query(1, "a.b.app.home.peercove.internal", TYPE_A);
+        let response = respond(&query, &map).unwrap();
+        assert_eq!(rcode(&response), RCODE_NXDOMAIN);
     }
 
     #[test]

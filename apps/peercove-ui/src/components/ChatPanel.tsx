@@ -50,10 +50,23 @@ interface ConversationItem {
  * ドラッグ&ドロップで、いま開いている会話の宛先へ送る。
  * 履歴は chat.ts のストア(App の 2 秒ポーリングが差分フェッチ済み)を読む。
  */
-export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
+export function ChatPanel({
+  tunnel,
+  initialConversation,
+}: {
+  tunnel: Tunnel;
+  /** メンバー行の 💬 から開くとき、その相手(仮想 IP)の 1:1 会話を選ぶ。 */
+  initialConversation?: { peer: string } | null;
+}) {
   const [conversation, setConversation] = useState<ConversationKey>(
-    NETWORK_CONVERSATION,
+    initialConversation?.peer ?? NETWORK_CONVERSATION,
   );
+
+  // 💬 で開かれた相手の会話へ切り替える(同じ相手を続けてクリックしても
+  // 参照が変わるので毎回ここを通る)
+  useEffect(() => {
+    if (initialConversation) setConversation(initialConversation.peer);
+  }, [initialConversation]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -164,6 +177,16 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
       rerender();
     }
   }, [tunnel.config, conversation, lastSeq]);
+
+  // メッセージ入力欄の自動高さ調整(複数行でも全体が見えるように — M3-16)。
+  // 内容に合わせて伸ばし、画面の 4 割で頭打ち(それ以上は入力欄内スクロール)
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, window.innerHeight * 0.4)}px`;
+  }, [draft]);
 
   // 自動スクロール: 最下部付近にいるときだけ追従する(遡り閲覧を邪魔しない)
   const listRef = useRef<HTMLDivElement>(null);
@@ -419,7 +442,9 @@ export function ChatPanel({ tunnel }: { tunnel: Tunnel }) {
             📎
           </button>
           <textarea
-            rows={2}
+            ref={inputRef}
+            rows={1}
+            className="chat__textarea"
             value={draft}
             placeholder={
               canSend

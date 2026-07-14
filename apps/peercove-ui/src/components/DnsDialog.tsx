@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { DnsRecord, Member, api, errorMessage } from "../ipc";
-import { Modal } from "./Modal";
 import { t } from "../i18n";
 
 /**
@@ -14,32 +13,52 @@ import { t } from "../i18n";
  *   配下(端末配下サブドメイン・LAN 機器)。設定に書かれ、5 秒の再読込 →
  *   解決 → 台帳と一緒に全メンバーへ配布される
  */
-export function DnsDialog({
+export function DnsView({
   configPath,
   members,
   distributed,
   isHost,
-  onClose,
 }: {
   configPath: string;
   members: Member[];
   /** status で配信された解決済みレコード(member の一覧表示用)。 */
   distributed: DnsRecord[];
   isHost: boolean;
-  onClose: () => void;
 }) {
   const [records, setRecords] = useState<DnsRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  // ターゲット: "ip" = IP 直指定 / それ以外 = メンバー参照("host" or 公開鍵)
+  // ドメイン名(ADR-0024):
+  //   <prefix>.<base>.<ネットワーク名>.peercove.internal
+  //   prefix   = 先頭の自由入力(空可・先頭 * でワイルドカード)
+  //   baseKind = "free"(自由入力)/ それ以外はマシン参照("host" or 公開鍵)。
+  //              リストで選び、"free" のときだけ baseFree を入力できる
+  const [prefix, setPrefix] = useState("");
+  const [baseKind, setBaseKind] = useState("free");
+  const [baseFree, setBaseFree] = useState("");
+  // 転送先: "ip" = IP 直指定 / それ以外 = メンバー参照("host" or 公開鍵)
   const [target, setTarget] = useState("ip");
   const [ip, setIp] = useState("");
-  // 配置: "" = 最上位 / それ以外 = 親メンバー("host" or 公開鍵)
-  const [under, setUnder] = useState("");
   const [scheme, setScheme] = useState("");
   const [port, setPort] = useState("");
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+
+  // 固定サフィックス <ネットワーク名>.peercove.internal(メンバーの DNS 名から拝借)
+  const suffix =
+    members.find((m) => m.dnsName)?.dnsName?.split(".").slice(1).join(".") ??
+    "peercove.internal";
+
+  /** メンバーの現在の DNS ラベル(先頭ラベル)。候補・表示に使う。 */
+  const labelOf = (member: Member): string =>
+    member.dnsName?.split(".")[0] ?? member.name ?? member.ip;
+
+  /** マシン参照("host" or 公開鍵)の現在の DNS ラベル。 */
+  const labelOfRef = (ref: string): string => {
+    const member = members.find((m) =>
+      ref === "host" ? m.isHost : m.publicKey === ref,
+    );
+    return member ? labelOf(member) : "";
+  };
 
   // ホスト = 設定ファイルから(編集用の参照情報つき)。
   // メンバー = 配信された status から(設定ファイルには載っていない)
@@ -66,19 +85,42 @@ export function DnsDialog({
     return member.name ?? member.dnsName?.split(".")[0] ?? member.ip;
   };
 
+  const machineBase = baseKind !== "free";
+  const machineRef = machineBase ? baseKind : undefined;
+  // 表示・登録に使う base ラベル(マシンなら現在ラベル、自由入力なら入力値)
+  const baseTrim = machineBase ? labelOfRef(baseKind) : baseFree.trim();
+  // 登録する相対名(net の左側)。base がマシンなら prefix だけ(under で親を指す)、
+  // 自由入力なら prefix + base を結合する
+  const relative = machineBase
+    ? prefix.trim()
+    : prefix.trim()
+      ? `${prefix.trim()}.${baseFree.trim()}`
+      : baseFree.trim();
+  const leftShown = prefix.trim()
+    ? baseTrim
+      ? `${prefix.trim()}.${baseTrim}`
+      : prefix.trim()
+    : baseTrim;
+  const previewFqdn = leftShown ? `${leftShown}.${suffix}` : suffix;
+
+  const canAdd =
+    (machineBase ? prefix.trim() !== "" : baseFree.trim() !== "") &&
+    (target !== "ip" || ip.trim() !== "");
+
   const add = async () => {
     setBusy(true);
     setError(null);
     try {
       await api.addDnsRecord(
         configPath,
-        name,
+        relative,
         target === "ip" ? { ip } : { member: target },
-        under === "" ? undefined : under,
+        machineRef,
         scheme.trim() === "" ? undefined : scheme.trim(),
         port.trim() === "" ? undefined : Number(port),
       );
-      setName("");
+      setPrefix("");
+      setBaseFree("");
       setIp("");
       setScheme("");
       setPort("");
@@ -120,12 +162,10 @@ export function DnsDialog({
     </button>
   );
 
-  const canAdd =
-    name.trim() !== "" && (target !== "ip" || ip.trim() !== "");
-
   return (
-    <Modal title={t.dns.title} onClose={onClose} wide>
-      <div className="modal__body">
+    <section className="card">
+      <h2 className="card-title">{t.dns.title}</h2>
+      <div className="page-body">
         <p className="muted small">{t.dns.intro}</p>
 
         <h3 className="subhead">{t.dns.autoHead}</h3>
@@ -191,28 +231,65 @@ export function DnsDialog({
         {isHost ? (
           <>
             <p className="muted small">{t.dns.customNote}</p>
+
+            {/* ドメイン名: <prefix>.<base>.<net>.peercove.internal(ADR-0024) */}
+            <span className="field__label">{t.dns.domainLabel}</span>
+            <div className="dns-domain">
+              <input
+                className="dns-domain__prefix mono"
+                value={prefix}
+                placeholder={t.dns.prefixPlaceholder}
+                onChange={(event) => setPrefix(event.target.value)}
+              />
+              <span className="dns-domain__dot">.</span>
+              <select
+                className="dns-domain__basekind"
+                value={baseKind}
+                onChange={(event) => setBaseKind(event.target.value)}
+              >
+                <option value="free">{t.dns.baseFree}</option>
+                {members.map((member) => (
+                  <option
+                    key={member.publicKey}
+                    value={member.isHost ? "host" : member.publicKey}
+                  >
+                    {labelOf(member)}
+                  </option>
+                ))}
+              </select>
+              {!machineBase && (
+                <input
+                  className="dns-domain__base mono"
+                  value={baseFree}
+                  placeholder={t.dns.baseFreePlaceholder}
+                  onChange={(event) => setBaseFree(event.target.value)}
+                />
+              )}
+              <span className="dns-domain__suffix mono muted">.{suffix}</span>
+            </div>
+            <p className="muted small">
+              {machineBase ? t.dns.baseIsMachine : t.dns.wildcardHint}
+            </p>
+            <p className="muted small">
+              {t.dns.previewLabel}:{" "}
+              <span className="mono">{previewFqdn}</span>
+            </p>
+
+            {/* 転送先: マシン(IP 自動追随)or IP アドレス直指定 */}
+            <span className="field__label">{t.dns.forwardLabel}</span>
             <div className="row">
               <label className="field">
-                <span>{t.dns.nameLabel}</span>
-                <input
-                  value={name}
-                  placeholder={t.dns.namePlaceholder}
-                  onChange={(event) => setName(event.target.value)}
-                />
-              </label>
-              <label className="field">
-                <span>{t.dns.targetLabel}</span>
                 <select
                   value={target}
                   onChange={(event) => setTarget(event.target.value)}
                 >
-                  <option value="ip">{t.dns.targetIp}</option>
+                  <option value="ip">{t.dns.forwardIp}</option>
                   {members.map((member) => (
                     <option
                       key={member.publicKey}
                       value={member.isHost ? "host" : member.publicKey}
                     >
-                      {t.dns.targetMember(
+                      {t.dns.forwardMember(
                         member.name ??
                           member.dnsName?.split(".")[0] ??
                           member.ip,
@@ -223,7 +300,6 @@ export function DnsDialog({
               </label>
               {target === "ip" && (
                 <label className="field">
-                  <span>{t.dns.ipLabel}</span>
                   <input
                     value={ip}
                     placeholder={t.dns.ipPlaceholder}
@@ -232,27 +308,10 @@ export function DnsDialog({
                   />
                 </label>
               )}
-              <label className="field">
-                <span>{t.dns.parentLabel}</span>
-                <select
-                  value={under}
-                  onChange={(event) => setUnder(event.target.value)}
-                >
-                  <option value="">{t.dns.parentTop}</option>
-                  {members.map((member) => (
-                    <option
-                      key={member.publicKey}
-                      value={member.isHost ? "host" : member.publicKey}
-                    >
-                      {t.dns.parentUnder(
-                        member.name ??
-                          member.dnsName?.split(".")[0] ??
-                          member.ip,
-                      )}
-                    </option>
-                  ))}
-                </select>
-              </label>
+            </div>
+
+            {/* サービス情報(任意): スキーム・ポート → URL 表示 */}
+            <div className="row">
               <label className="field">
                 <span>{t.dns.schemeLabel}</span>
                 <input
@@ -286,7 +345,6 @@ export function DnsDialog({
                 {busy ? t.dns.adding : t.dns.add}
               </button>
             </div>
-            <p className="muted small">{t.dns.parentHint}</p>
             <p className="muted small">{t.dns.serviceHint}</p>
           </>
         ) : (
@@ -295,11 +353,6 @@ export function DnsDialog({
 
         {error && <p className="error-text">{error}</p>}
       </div>
-      <div className="modal__actions">
-        <button type="button" className="button--ghost" onClick={onClose}>
-          {t.common.close}
-        </button>
-      </div>
-    </Modal>
+    </section>
   );
 }

@@ -16,11 +16,10 @@ import {
   formatRtt,
 } from "../ipc";
 import { rateSeries, rttSeries } from "../history";
-import { totalUnread } from "../chat";
 import { ConfirmModal, Modal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
-import { DnsDialog } from "./DnsDialog";
-import { SubnetDialog } from "./SubnetDialog";
+import { DnsView } from "./DnsDialog";
+import { SubnetView } from "./SubnetDialog";
 import { AclDialog } from "./AclDialog";
 import { Avatar } from "./Avatar";
 import { ChatPanel } from "./ChatPanel";
@@ -28,26 +27,27 @@ import { Sparkline } from "./Sparkline";
 import { t } from "../i18n";
 
 /**
- * ネットワーク詳細(トンネル稼働中)。ホストのときだけ招待・削除・名前変更ができる。
- *
- * 中身はタブ構成(M3-6)。タブの状態は App が持ち(M3-15)、サイドバーの
- * 「チャット」「受信」からも切り替えられる。ヘッダー直下に統計カード、
- * メンバーは表、最下部に DNS サービスカード(ADR-0023 の URL を活用)。
+ * ネットワーク詳細の中身(トンネル稼働中)。表示するビューはサイドバーで
+ * 選ばれ、`view` プロパティで渡ってくる(M3-16 でタブを廃止)。ヘッダー
+ * (戻る・状態・切断)とネットワーク設定ページは App 側が持つ。
  */
 export function TunnelView({
   tunnel,
-  tab,
-  onTab,
-  onBack,
+  view,
+  chatTarget,
+  onOpenChat,
+  onView,
   onChanged,
-  onSettings,
 }: {
   tunnel: Tunnel;
-  tab: "members" | "chat" | "stats" | "inbox";
-  onTab: (tab: "members" | "chat" | "stats" | "inbox") => void;
-  onBack: () => void;
+  view: "members" | "chat" | "stats" | "inbox" | "dns" | "subnets";
+  /** チャットで開く相手(メンバー行の 💬 → 1:1 会話)。 */
+  chatTarget: { peer: string } | null;
+  /** 相手を指定してチャットを開く(1:1 会話を選ぶ)。 */
+  onOpenChat: (peer: string) => void;
+  /** 別のビューへ切り替える(送信後に受信へ 等)。 */
+  onView: (view: "members" | "chat" | "stats" | "inbox" | "dns") => void;
   onChanged: () => void;
-  onSettings: () => void;
 }) {
   const isHost = tunnel.role === "hosting";
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
@@ -55,10 +55,7 @@ export function TunnelView({
   /** 受信ボックスの中身(M3-9b)。status のポーリングに合わせて読み直す。 */
   const [inbox, setInbox] = useState<InboxItem[]>([]);
   const [inviting, setInviting] = useState(false);
-  const [showDns, setShowDns] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
-  /** 広告サブネット編集の対象(M3-7b、ホストのみ)。 */
-  const [editingSubnets, setEditingSubnets] = useState<Member | null>(null);
   /** ファイル送信ダイアログ(M3-13e: 宛先をチェックボックスで選ぶ)。 */
   const [sendingFile, setSendingFile] = useState(false);
   /** 通信制御ダイアログ(M3-10、ADR-0018。ホストのみ)。 */
@@ -67,8 +64,7 @@ export function TunnelView({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  // 受信ボックス(ディレクトリ)は tunnel が 2 秒ごとに更新されるのに合わせて
-  // 読み直す。一覧はタブのバッジにも使うので、タブが閉じていても読む
+  // 受信ボックス(ディレクトリ)は tunnel が 2 秒ごとに更新されるのに合わせて読む
   useEffect(() => {
     let alive = true;
     api
@@ -82,32 +78,14 @@ export function TunnelView({
     };
   }, [tunnel]);
 
-  const activeTransfers = tunnel.transfers.filter(
-    (transfer) => !transfer.done,
-  ).length;
-  /** チャットの未読合計(M3-13b)。ストアは App のポーリングが同期済み。 */
-  const chatUnread = totalUnread(tunnel);
   const onlineCount = tunnel.members.filter((member) => member.online).length;
-  // 全ピアの直近速度の合計(ヘッダーの「転送速度」カード — M3-15)
+  // 全ピアの直近速度の合計(「転送速度」カード — M3-15)
   const totalRate = tunnel.peers.reduce(
     (sum, peer) => sum + (rateSeries(tunnel.config, peer.publicKey).at(-1) ?? 0),
     0,
   );
   // URL を組み立て済みのカスタムレコード(DNS サービスカード。ホスト・メンバー共通)
   const services = tunnel.dnsRecords.filter((record) => record.url !== null);
-
-  const stop = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.stopTunnel(tunnel.config);
-      onChanged();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const remove = async (member: Member) => {
     setBusy(true);
@@ -156,203 +134,138 @@ export function TunnelView({
 
   return (
     <>
-      {tunnel.removed && (
-        <section className="card card--error">
-          <h2>{t.tunnel.removedTitle}</h2>
-          <p>{t.tunnel.removedBody}</p>
-          <button
-            type="button"
-            className="button--danger"
-            onClick={() => void stop()}
-            disabled={busy}
-          >
-            {t.tunnel.disconnectConfirm}
-          </button>
-        </section>
-      )}
-
-      <div className="detail__head">
-        <button
-          type="button"
-          className="button--icon detail__back"
-          title={t.tunnel.back}
-          onClick={onBack}
-        >
-          ←
-        </button>
-        <h2 className="detail__title" title={tunnel.config}>
-          {tunnel.network}
-        </h2>
-        <span className="badge badge--on">{t.tunnel.connected}</span>
-        <span className="tag">
-          {isHost ? t.networks.roleHost : t.networks.roleMember}
-        </span>
-        <div className="detail__actions">
-          <button
-            type="button"
-            className="button--ghost"
-            onClick={() => setShowDns(true)}
-          >
-            🌐 {t.dns.button}
-          </button>
-          <button type="button" className="button--ghost" onClick={onSettings}>
-            ⚙ {t.networks.settings}
-          </button>
-          <button
-            type="button"
-            className="button--ghost button--ghost-danger"
-            onClick={() => void stop()}
-            disabled={busy}
-          >
-            ⏻ {t.tunnel.disconnect}
-          </button>
-        </div>
-      </div>
-
-      <div className="stat-cards">
-        <div className="stat-card">
-          <span className="stat-card__icon">IP</span>
-          <div className="stat-card__body">
-            <span className="stat-card__label">{t.tunnel.overview.virtualIp}</span>
-            <span className="stat-card__value mono">
-              {tunnel.address}
-              <CopyIcon value={tunnel.address} title={t.tunnel.table.copyIp} />
-            </span>
-          </div>
-        </div>
-        <div className="stat-card">
-          <span className="stat-card__icon">👥</span>
-          <div className="stat-card__body">
-            <span className="stat-card__label">{t.tunnel.overview.online}</span>
-            <span className="stat-card__value">
-              {t.tunnel.overview.onlineCount(onlineCount)}
-            </span>
-          </div>
-        </div>
-        <div className="stat-card">
-          <span className="stat-card__icon">📈</span>
-          <div className="stat-card__body">
-            <span className="stat-card__label">{t.tunnel.overview.rate}</span>
-            <span className="stat-card__value">{formatRate(totalRate)}</span>
-          </div>
-        </div>
-      </div>
-
       {error && <p className="error-text">{error}</p>}
       {notice && <p className="notice">{notice}</p>}
 
-      <section className="card">
-        <div className="tabs">
-          <button
-            type="button"
-            className={tab === "members" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => onTab("members")}
-          >
-            {t.tunnel.membersHead(tunnel.members.length)}
-          </button>
-          <button
-            type="button"
-            className={tab === "chat" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => onTab("chat")}
-          >
-            {t.tunnel.tabs.chat}
-            {chatUnread > 0 && <span className="tabs__badge">{chatUnread}</span>}
-          </button>
-          <button
-            type="button"
-            className={tab === "stats" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => onTab("stats")}
-          >
-            {t.tunnel.tabs.stats}
-          </button>
-          <button
-            type="button"
-            className={tab === "inbox" ? "tabs__tab tabs__tab--active" : "tabs__tab"}
-            onClick={() => onTab("inbox")}
-          >
-            {t.tunnel.tabs.inbox}
-            {inbox.length + activeTransfers > 0 && (
-              <span className="tabs__badge">{inbox.length + activeTransfers}</span>
-            )}
-          </button>
-          {tab === "members" && tunnel.members.some((m) => !m.isSelf) && (
-            <button
-              type="button"
-              className="tabs__action"
-              onClick={() => setSendingFile(true)}
-            >
-              {t.transfer.sendButton}
-            </button>
-          )}
-          {isHost &&
-            tab === "members" &&
-            tunnel.members.filter((m) => !m.isHost).length >= 2 && (
-              <button
-                type="button"
-                className="tabs__action"
-                onClick={() => setShowAcl(true)}
-              >
-                {t.acl.button}
-              </button>
-            )}
-          {isHost && tab === "members" && (
-            <button
-              type="button"
-              className="tabs__action tabs__action--primary"
-              onClick={() => setInviting(true)}
-            >
-              {t.tunnel.invite}
-            </button>
-          )}
-        </div>
-
-        {tab === "members" ? (
-          tunnel.members.length === 0 ? (
-            <p className="muted">{t.tunnel.ledgerPending}</p>
-          ) : (
-            <>
-              <div className="table-scroll">
-                <table className="member-table">
-                  <thead>
-                    <tr>
-                      <th>{t.tunnel.membersHead(tunnel.members.length)}</th>
-                      <th>{t.tunnel.table.role}</th>
-                      <th>{t.tunnel.table.virtualIp}</th>
-                      <th>{t.tunnel.table.rate}</th>
-                      <th>{t.tunnel.table.rtt}</th>
-                      <th className="member-table__actions-head">
-                        {t.tunnel.table.actions}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tunnel.members.map((member) => (
-                      <MemberRow
-                        key={member.publicKey}
-                        config={tunnel.config}
-                        member={member}
-                        peer={peerByKey.get(member.publicKey) ?? null}
-                        canManage={isHost && !member.isHost}
-                        canEditDns={isHost || member.isSelf}
-                        onChat={() => onTab("chat")}
-                        onRemove={() => setRemoving(member)}
-                        onRename={(newName) => void rename(member, newName)}
-                        onRenameDns={(label) => void renameDns(member, label)}
-                        onSubnets={() => setEditingSubnets(member)}
-                      />
-                    ))}
-                  </tbody>
-                </table>
+      {view === "members" ? (
+        <>
+          <div className="stat-cards">
+            <div className="stat-card">
+              <span className="stat-card__icon">IP</span>
+              <div className="stat-card__body">
+                <span className="stat-card__label">
+                  {t.tunnel.overview.virtualIp}
+                </span>
+                <span className="stat-card__value mono">
+                  {tunnel.address}
+                  <CopyIcon value={tunnel.address} title={t.tunnel.table.copyIp} />
+                </span>
               </div>
-              {/* 直接通信の説明(M3-4)。経路バッジが出るメンバー視点でのみ表示 */}
-              {!isHost && tunnel.members.some((member) => member.route) && (
-                <p className="muted small">{t.tunnel.directNote}</p>
-              )}
-            </>
-          )
-        ) : tab === "chat" ? (
-          <ChatPanel tunnel={tunnel} />
-        ) : tab === "inbox" ? (
+            </div>
+            <div className="stat-card">
+              <span className="stat-card__icon">👥</span>
+              <div className="stat-card__body">
+                <span className="stat-card__label">
+                  {t.tunnel.overview.online}
+                </span>
+                <span className="stat-card__value">
+                  {t.tunnel.overview.onlineCount(onlineCount)}
+                </span>
+              </div>
+            </div>
+            <div className="stat-card">
+              <span className="stat-card__icon">📈</span>
+              <div className="stat-card__body">
+                <span className="stat-card__label">{t.tunnel.overview.rate}</span>
+                <span className="stat-card__value">{formatRate(totalRate)}</span>
+              </div>
+            </div>
+          </div>
+
+          <section className="card">
+            <div className="detail__toolbar">
+              <h2 className="card-title">
+                {t.tunnel.membersHead(tunnel.members.length)}
+              </h2>
+              <div className="detail__toolbar-actions">
+                {tunnel.members.some((m) => !m.isSelf) && (
+                  <button
+                    type="button"
+                    className="button--ghost small"
+                    onClick={() => setSendingFile(true)}
+                  >
+                    {t.transfer.sendButton}
+                  </button>
+                )}
+                {isHost &&
+                  tunnel.members.filter((m) => !m.isHost).length >= 2 && (
+                    <button
+                      type="button"
+                      className="button--ghost small"
+                      onClick={() => setShowAcl(true)}
+                    >
+                      {t.acl.button}
+                    </button>
+                  )}
+                {isHost && (
+                  <button type="button" onClick={() => setInviting(true)}>
+                    {t.tunnel.invite}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {tunnel.members.length === 0 ? (
+              <p className="muted">{t.tunnel.ledgerPending}</p>
+            ) : (
+              <>
+                <div className="table-scroll">
+                  <table className="member-table">
+                    <thead>
+                      <tr>
+                        <th>{t.sidebar.members}</th>
+                        <th>{t.tunnel.table.role}</th>
+                        <th>{t.tunnel.table.virtualIp}</th>
+                        <th>{t.tunnel.table.rate}</th>
+                        <th>{t.tunnel.table.rtt}</th>
+                        <th className="member-table__actions-head">
+                          {t.tunnel.table.actions}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tunnel.members.map((member) => (
+                        <MemberRow
+                          key={member.publicKey}
+                          config={tunnel.config}
+                          member={member}
+                          peer={peerByKey.get(member.publicKey) ?? null}
+                          canManage={isHost && !member.isHost}
+                          canEditDns={isHost || member.isSelf}
+                          onChat={() => onOpenChat(member.ip)}
+                          onRemove={() => setRemoving(member)}
+                          onRename={(newName) => void rename(member, newName)}
+                          onRenameDns={(label) => void renameDns(member, label)}
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {/* 直接通信の説明(M3-4)。経路バッジが出るメンバー視点でのみ表示 */}
+                {!isHost && tunnel.members.some((member) => member.route) && (
+                  <p className="muted small">{t.tunnel.directNote}</p>
+                )}
+              </>
+            )}
+          </section>
+
+          {services.length > 0 && <ServiceCard services={services} />}
+        </>
+      ) : view === "chat" ? (
+        <ChatPanel tunnel={tunnel} initialConversation={chatTarget} />
+      ) : view === "stats" ? (
+        <section className="card">
+          <h2 className="card-title">{t.tunnel.tabs.stats}</h2>
+          {tunnel.peers.length === 0 ? (
+            <p className="muted">{t.tunnel.peers.empty}</p>
+          ) : (
+            <div className="table-scroll">
+              <PeersTable config={tunnel.config} peers={tunnel.peers} />
+            </div>
+          )}
+        </section>
+      ) : view === "inbox" ? (
+        <section className="card">
           <InboxPanel
             tunnel={tunnel}
             inbox={inbox}
@@ -363,15 +276,16 @@ export function TunnelView({
             }}
             onError={(text) => setError(text)}
           />
-        ) : tunnel.peers.length === 0 ? (
-          <p className="muted">{t.tunnel.peers.empty}</p>
-        ) : (
-          <PeersTable config={tunnel.config} peers={tunnel.peers} />
-        )}
-      </section>
-
-      {tab === "members" && services.length > 0 && (
-        <ServiceCard services={services} />
+        </section>
+      ) : view === "dns" ? (
+        <DnsView
+          configPath={tunnel.config}
+          members={tunnel.members}
+          distributed={tunnel.dnsRecords}
+          isHost={isHost}
+        />
+      ) : (
+        <SubnetView configPath={tunnel.config} members={tunnel.members} />
       )}
 
       {inviting && (
@@ -384,36 +298,12 @@ export function TunnelView({
         />
       )}
 
-      {showDns && (
-        <DnsDialog
-          configPath={tunnel.config}
-          members={tunnel.members}
-          distributed={tunnel.dnsRecords}
-          isHost={isHost}
-          onClose={() => {
-            setShowDns(false);
-            onChanged();
-          }}
-        />
-      )}
-
       {showAcl && (
         <AclDialog
           configPath={tunnel.config}
           members={tunnel.members}
           onClose={() => {
             setShowAcl(false);
-            onChanged();
-          }}
-        />
-      )}
-
-      {editingSubnets && (
-        <SubnetDialog
-          configPath={tunnel.config}
-          member={editingSubnets}
-          onClose={() => {
-            setEditingSubnets(null);
             onChanged();
           }}
         />
@@ -436,7 +326,7 @@ export function TunnelView({
           onClose={() => setSendingFile(false)}
           onSent={(count) => {
             setSendingFile(false);
-            onTab("inbox");
+            onView("inbox");
             setNotice(t.transfer.startedMany(count));
             setTimeout(() => setNotice(null), 8000);
           }}
@@ -798,7 +688,6 @@ function MemberRow({
   onRemove,
   onRename,
   onRenameDns,
-  onSubnets,
 }: {
   config: string;
   member: Member;
@@ -807,14 +696,12 @@ function MemberRow({
   canManage: boolean;
   /** DNS 名を変更できるか(ADR-0021。ホスト = 全員 / メンバー = 自分のみ)。 */
   canEditDns: boolean;
-  /** チャットタブを開く(自分以外の行の 💬)。 */
+  /** 1:1 チャットを開く(自分以外の行の 💬)。 */
   onChat: () => void;
   onRemove: () => void;
   onRename: (newName: string) => void;
   /** DNS 名(先頭ラベルのみ)の変更(ADR-0021、M3-14a)。 */
   onRenameDns: (label: string) => void;
-  /** 広告サブネットの編集を開く(M3-7b、ホストのみ)。 */
-  onSubnets: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(member.name ?? "");
@@ -973,14 +860,6 @@ function MemberRow({
         )}
         {canManage && !editing && (
           <>
-            <button
-              type="button"
-              className="button--icon"
-              title={t.subnet.edit}
-              onClick={onSubnets}
-            >
-              🖧
-            </button>
             <button
               type="button"
               className="button--icon"

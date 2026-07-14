@@ -396,9 +396,10 @@ impl Config {
         };
         let mut seen_records = std::collections::HashSet::new();
         for record in &self.dns_records {
-            if !crate::names::is_dns_label(&record.name) {
+            // 相対名(サブドメイン)+ 先頭 * ワイルドカードを許す(ADR-0024)
+            if !crate::names::is_custom_dns_name(&record.name) {
                 return invalid(format!(
-                    "dns_record \"{}\" が不正です(小文字英数とハイフンのみ、63 文字以内)",
+                    "dns_record \"{}\" が不正です(小文字英数とハイフン。ドットで区切り、先頭ラベルのみ * が使えます)",
                     record.name
                 ));
             }

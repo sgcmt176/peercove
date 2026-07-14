@@ -10,14 +10,26 @@ import {
   notifyFileEvents,
   notifyMemberEvents,
 } from "./notify";
-import { clearChat, syncChat } from "./chat";
+import { clearChat, syncChat, totalUnread } from "./chat";
 import { clearHistory, recordStatus } from "./history";
 import { Theme, applyTheme, loadTheme, nextTheme } from "./theme";
 import { NetworksView } from "./components/NetworksView";
 import { TunnelView } from "./components/TunnelView";
 import { LogsDialog } from "./components/LogsDialog";
-import { SettingsDialog } from "./components/SettingsDialog";
-import { PrefsDialog } from "./components/PrefsDialog";
+import { NetworkSettingsView } from "./components/SettingsDialog";
+import { AppSettingsView } from "./components/PrefsDialog";
+
+/** サイドバーで選ぶ表示。openConfig の有無で有効な値が決まる(M3-16)。 */
+type View =
+  | "networks"
+  | "app-settings"
+  | "members"
+  | "chat"
+  | "stats"
+  | "inbox"
+  | "dns"
+  | "subnets"
+  | "net-settings";
 
 /** デーモンの状態を取りに行く間隔。CLI の status(5 秒)より短くしておく。 */
 const POLL_INTERVAL_MS = 2000;
@@ -47,20 +59,21 @@ export default function App() {
   });
   /** 設定済みネットワークの一覧(M3-0c)。 */
   const [networks, setNetworks] = useState<NetworkInfo[]>([]);
-  const [dialog, setDialog] = useState<"logs" | "prefs" | null>(null);
-  /** 設定ダイアログの対象(ネットワークごと — カード/詳細の「設定」から)。 */
-  const [settingsFor, setSettingsFor] = useState<string | null>(null);
-  /** 詳細表示中のネットワーク(configPath)。null なら一覧。 */
+  /** デーモンのログ(モーダルのまま。診断用)。 */
+  const [logsOpen, setLogsOpen] = useState(false);
+  /** 詳細/設定を開いているネットワーク(configPath)。null なら一覧側。 */
   const [openConfig, setOpenConfig] = useState<string | null>(null);
-  /**
-   * ネットワーク詳細のタブ(M3-15 で App に持ち上げた)。サイドバーの
-   * 「チャット」「受信」からタブを切り替えられるように状態をここへ集約する。
-   */
-  const [detailTab, setDetailTab] = useState<
-    "members" | "chat" | "stats" | "inbox"
-  >("members");
+  /** サイドバーで選んでいる表示(M3-16)。 */
+  const [view, setView] = useState<View>("networks");
   /** アプリのバージョン(サイドバー下部に出す)。取得できなければ空。 */
   const [version, setVersion] = useState("");
+  /** 詳細ヘッダーの「切断」実行中。 */
+  const [disconnecting, setDisconnecting] = useState(false);
+  /**
+   * チャットで開く相手(メンバー行の 💬 から。1:1 会話を選ぶ)。オブジェクトで
+   * 包むのは同じ相手を続けてクリックしても再選択されるようにするため。
+   */
+  const [chatTarget, setChatTarget] = useState<{ peer: string } | null>(null);
   /**
    * ディープリンクで受けた招待トークン(M3-5)。オブジェクトで包むのは、
    * 同じリンクを 2 回クリックしても再度フォームを開くため(参照が変わる)。
@@ -154,7 +167,9 @@ export default function App() {
         const token = parseJoinUrl(url);
         if (token) {
           setPendingJoin({ token });
-          setOpenConfig(null); // 参加フォームのある一覧画面へ
+          // 参加フォームのある一覧画面へ
+          setOpenConfig(null);
+          setView("networks");
         }
       }
     }).then((fn) => {
@@ -193,34 +208,60 @@ export default function App() {
     openConfig === null
       ? null
       : (tunnels.find((tun) => tun.config === openConfig) ?? null);
+  const openInfo =
+    openConfig === null
+      ? null
+      : (networks.find((n) => n.configPath === openConfig) ?? null);
 
-  // ネットワークを開くときはメンバータブから始める(M3-15)
-  const openNetwork = (configPath: string) => {
-    setOpenConfig(configPath);
-    setDetailTab("members");
-  };
+  // ネットワークを開いていて、かつデーモンに接続できている(詳細/設定を出す)
+  const detail = connection.kind === "ok" && openConfig !== null;
+  const detailName = openTunnel?.network ?? openInfo?.name ?? "";
+  const detailHost = (openTunnel?.role ?? openInfo?.role) === "hosting";
+  const chatUnread = openTunnel ? totalUnread(openTunnel) : 0;
+  const inboxBadge = openTunnel
+    ? openTunnel.transfers.filter((tr) => !tr.done).length
+    : 0;
 
-  // サイドバーの「チャット」「受信」→ 開いている詳細のタブを切り替える。
-  // どれも開いていないときは、稼働中が 1 つならそれを開く。複数/0 なら一覧へ
-  const goToTab = (tab: "chat" | "inbox") => {
-    if (openTunnel) {
-      setDetailTab(tab);
-    } else if (tunnels.length === 1) {
-      setOpenConfig(tunnels[0].config);
-      setDetailTab(tab);
+  // 稼働していないネットワークの「稼働専用ビュー」に留まらないよう調整する
+  // (切断・削除後)。設定ページは停止中でも見られるのでそのまま
+  useEffect(() => {
+    if (connection.kind !== "ok" || openConfig === null) return;
+    const running = tunnels.some((tun) => tun.config === openConfig);
+    if (running || view === "net-settings") return;
+    if (networks.some((n) => n.configPath === openConfig)) {
+      setView("net-settings");
     } else {
       setOpenConfig(null);
+      setView("networks");
     }
-  };
+  }, [connection.kind, openConfig, tunnels, networks, view]);
 
-  // サイドバーで強調する項目。チャット/受信タブを見ているときはそれを、
-  // それ以外(一覧・メンバー・統計)は「ネットワーク」を強調する
-  const activeNav =
-    openTunnel && detailTab === "chat"
-      ? "chat"
-      : openTunnel && detailTab === "inbox"
-        ? "inbox"
-        : "networks";
+  // ネットワークを開く(一覧カードの「開く」)= メンバービューから始める
+  const openNetwork = (configPath: string) => {
+    setOpenConfig(configPath);
+    setView("members");
+  };
+  // ネットワーク設定ページを開く(一覧カードの「設定」= 停止中でも可)
+  const openNetworkSettings = (configPath: string) => {
+    setOpenConfig(configPath);
+    setView("net-settings");
+  };
+  const backToList = () => {
+    setOpenConfig(null);
+    setView("networks");
+  };
+  const disconnect = async () => {
+    if (openConfig === null) return;
+    setDisconnecting(true);
+    try {
+      await api.stopTunnel(openConfig);
+    } catch {
+      // 表示は次のポーリングで更新される
+    }
+    setDisconnecting(false);
+    backToList();
+    changed();
+  };
 
   return (
     <div className="app">
@@ -232,32 +273,80 @@ export default function App() {
           <span className="sidebar__brand-name">PeerCove</span>
         </div>
         <ul className="sidebar__nav">
-          <SidebarItem
-            icon="🖧"
-            label={t.sidebar.networks}
-            active={activeNav === "networks"}
-            onClick={() => setOpenConfig(null)}
-          />
-          <SidebarItem
-            icon="💬"
-            label={t.sidebar.chat}
-            active={activeNav === "chat"}
-            disabled={connection.kind !== "ok" || tunnels.length === 0}
-            onClick={() => goToTab("chat")}
-          />
-          <SidebarItem
-            icon="📥"
-            label={t.sidebar.inbox}
-            active={activeNav === "inbox"}
-            disabled={connection.kind !== "ok" || tunnels.length === 0}
-            onClick={() => goToTab("inbox")}
-          />
-          <SidebarItem
-            icon="⚙"
-            label={t.sidebar.settings}
-            active={false}
-            onClick={() => setDialog("prefs")}
-          />
+          {detail ? (
+            <>
+              <SidebarItem
+                icon="👥"
+                label={t.sidebar.members}
+                active={view === "members"}
+                disabled={openTunnel === null}
+                onClick={() => setView("members")}
+              />
+              <SidebarItem
+                icon="💬"
+                label={t.sidebar.chat}
+                active={view === "chat"}
+                disabled={openTunnel === null}
+                badge={chatUnread}
+                onClick={() => setView("chat")}
+              />
+              <SidebarItem
+                icon="📊"
+                label={t.sidebar.stats}
+                active={view === "stats"}
+                disabled={openTunnel === null}
+                onClick={() => setView("stats")}
+              />
+              <SidebarItem
+                icon="📥"
+                label={t.sidebar.inbox}
+                active={view === "inbox"}
+                disabled={openTunnel === null}
+                badge={inboxBadge}
+                onClick={() => setView("inbox")}
+              />
+              <SidebarItem
+                icon="🌐"
+                label={t.sidebar.dns}
+                active={view === "dns"}
+                disabled={openTunnel === null}
+                onClick={() => setView("dns")}
+              />
+              {detailHost && (
+                <SidebarItem
+                  icon="🖧"
+                  label={t.sidebar.subnets}
+                  active={view === "subnets"}
+                  disabled={openTunnel === null}
+                  onClick={() => setView("subnets")}
+                />
+              )}
+              <SidebarItem
+                icon="⚙"
+                label={t.sidebar.settings}
+                active={view === "net-settings"}
+                onClick={() => setView("net-settings")}
+              />
+            </>
+          ) : (
+            <>
+              <SidebarItem
+                icon="🖧"
+                label={t.sidebar.networks}
+                active={view === "networks"}
+                onClick={backToList}
+              />
+              <SidebarItem
+                icon="⚙"
+                label={t.sidebar.settings}
+                active={view === "app-settings"}
+                onClick={() => {
+                  setOpenConfig(null);
+                  setView("app-settings");
+                }}
+              />
+            </>
+          )}
         </ul>
         <div className="sidebar__foot">
           <ConnectionStatus connection={connection} />
@@ -281,7 +370,7 @@ export default function App() {
                 className="button--icon"
                 title={t.sidebar.logs}
                 disabled={connection.kind === "unreachable"}
-                onClick={() => setDialog("logs")}
+                onClick={() => setLogsOpen(true)}
               >
                 ☰
               </button>
@@ -300,45 +389,128 @@ export default function App() {
           </section>
         )}
 
-        {connection.kind === "unreachable" ? (
-          <DaemonUnreachable
-            message={connection.message}
-            onRetry={() => void refresh()}
-          />
-        ) : connection.kind === "connecting" ? (
-          <p className="muted">{t.state.connectingDaemon}</p>
-        ) : openTunnel !== null ? (
-          <TunnelView
-            tunnel={openTunnel}
-            tab={detailTab}
-            onTab={setDetailTab}
-            onBack={() => setOpenConfig(null)}
-            onChanged={changed}
-            onSettings={() => setSettingsFor(openTunnel.config)}
-          />
-        ) : (
-          <NetworksView
-            networks={networks}
-            tunnels={tunnels}
-            onChanged={changed}
-            onOpen={openNetwork}
-            onSettings={(configPath) => setSettingsFor(configPath)}
-            pendingJoin={pendingJoin}
-            onPendingJoinHandled={() => setPendingJoin(null)}
+        {detail && (
+          <DetailHeader
+            name={detailName}
+            isHost={detailHost}
+            running={openTunnel !== null}
+            disconnecting={disconnecting}
+            onBack={backToList}
+            onDisconnect={() => void disconnect()}
           />
         )}
+        {detail && openTunnel?.removed && (
+          <section className="card card--error">
+            <h2>{t.tunnel.removedTitle}</h2>
+            <p>{t.tunnel.removedBody}</p>
+          </section>
+        )}
+
+        <div
+          className={
+            detail && view === "chat"
+              ? "app__content app__content--flush"
+              : "app__content"
+          }
+        >
+          {connection.kind === "unreachable" ? (
+            <DaemonUnreachable
+              message={connection.message}
+              onRetry={() => void refresh()}
+            />
+          ) : connection.kind === "connecting" ? (
+            <p className="muted">{t.state.connectingDaemon}</p>
+          ) : !detail ? (
+            view === "app-settings" ? (
+              <AppSettingsView />
+            ) : (
+              <NetworksView
+                networks={networks}
+                tunnels={tunnels}
+                onChanged={changed}
+                onOpen={openNetwork}
+                onSettings={openNetworkSettings}
+                pendingJoin={pendingJoin}
+                onPendingJoinHandled={() => setPendingJoin(null)}
+              />
+            )
+          ) : view === "net-settings" ? (
+            <NetworkSettingsView configPath={openConfig!} />
+          ) : openTunnel !== null ? (
+            <TunnelView
+              tunnel={openTunnel}
+              view={
+                view === "chat" ||
+                view === "stats" ||
+                view === "inbox" ||
+                view === "dns" ||
+                view === "subnets"
+                  ? view
+                  : "members"
+              }
+              chatTarget={chatTarget}
+              onOpenChat={(peer) => {
+                setChatTarget({ peer });
+                setView("chat");
+              }}
+              onView={setView}
+              onChanged={changed}
+            />
+          ) : (
+            <p className="muted">{t.tunnel.ledgerPending}</p>
+          )}
+        </div>
       </main>
 
-      {dialog === "logs" && <LogsDialog onClose={() => setDialog(null)} />}
-      {dialog === "prefs" && <PrefsDialog onClose={() => setDialog(null)} />}
-      {settingsFor && (
-        <SettingsDialog
-          configPath={settingsFor}
-          onClose={() => {
-            setSettingsFor(null);
-            changed();
-          }}
-        />
+      {logsOpen && <LogsDialog onClose={() => setLogsOpen(false)} />}
+    </div>
+  );
+}
+
+/** ネットワーク詳細・設定ページのヘッダー(戻る・名前・状態・切断)。 */
+function DetailHeader({
+  name,
+  isHost,
+  running,
+  disconnecting,
+  onBack,
+  onDisconnect,
+}: {
+  name: string;
+  isHost: boolean;
+  running: boolean;
+  disconnecting: boolean;
+  onBack: () => void;
+  onDisconnect: () => void;
+}) {
+  return (
+    <div className="detail__head">
+      <button
+        type="button"
+        className="button--icon detail__back"
+        title={t.tunnel.back}
+        onClick={onBack}
+      >
+        ←
+      </button>
+      <h2 className="detail__title">{name}</h2>
+      <span className={running ? "badge badge--on" : "badge"}>
+        {running ? t.tunnel.connected : t.networks.stopped}
+      </span>
+      <span className="tag">
+        {isHost ? t.networks.roleHost : t.networks.roleMember}
+      </span>
+      {running && (
+        <div className="detail__actions">
+          <button
+            type="button"
+            className="button--ghost button--ghost-danger"
+            onClick={onDisconnect}
+            disabled={disconnecting}
+          >
+            ⏻ {t.tunnel.disconnect}
+          </button>
+        </div>
       )}
     </div>
   );
@@ -350,12 +522,15 @@ function SidebarItem({
   label,
   active,
   disabled,
+  badge,
   onClick,
 }: {
   icon: string;
   label: string;
   active: boolean;
   disabled?: boolean;
+  /** 0 なら出さない未読・件数バッジ。 */
+  badge?: number;
   onClick: () => void;
 }) {
   return (
@@ -373,6 +548,9 @@ function SidebarItem({
           {icon}
         </span>
         <span className="sidebar__label">{label}</span>
+        {badge !== undefined && badge > 0 && (
+          <span className="sidebar__badge">{badge}</span>
+        )}
       </button>
     </li>
   );

@@ -109,9 +109,9 @@ pub fn zone_for(network: &str, ledger: &[LedgerEntry], custom: &[DnsRecord]) -> 
     }
 
     for record in custom {
-        // ドット付きはサブドメインレコード(ADR-0022)。ラベル単位で正規形なら
-        // 受け入れる。単一ラベルはメンバー名との衝突で自動生成が勝つ
-        if !names::is_dns_name(&record.name) || taken.contains(&record.name) {
+        // ドット付きサブドメイン + 先頭 `*` ワイルドカード(ADR-0022 / ADR-0024)を
+        // ラベル単位で受け入れる。単一ラベルはメンバー名との衝突で自動生成が勝つ
+        if !names::is_custom_dns_name(&record.name) || taken.contains(&record.name) {
             continue; // 自動生成が勝つ / 不正ラベルは無視(doc コメント参照)
         }
         taken.insert(record.name.clone());

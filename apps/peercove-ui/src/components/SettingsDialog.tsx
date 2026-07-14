@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { Settings, api, errorMessage } from "../ipc";
-import { ConfirmModal, Modal } from "./Modal";
+import { ConfirmModal } from "./Modal";
 import { t } from "../i18n";
 
 /**
- * 設定編集(M2-G5)。編集できるのは「自分側の設定」だけ。
+ * ネットワークごとの設定ページ(M2-G5 → M3-16 でページ化)。編集できるのは
+ * 「自分側の設定」だけ。サイドバーの「設定」(ネットワーク詳細を表示中)、
+ * または一覧カードの「設定」から開く 1 ページ。
  *
  * メンバーの追加・削除・改名はメンバー一覧側の操作([[peer]] の編集)なので
  * ここには出さない。仮想 IP / サブネットは init・join のやり直しになるため
@@ -13,13 +15,7 @@ import { t } from "../i18n";
  * MTU・待受ポート・ホストのエンドポイントは、インターフェース生成時に決まる
  * ので**再接続するまで反映されない**。保存後にその旨を出す。
  */
-export function SettingsDialog({
-  configPath,
-  onClose,
-}: {
-  configPath: string;
-  onClose: () => void;
-}) {
+export function NetworkSettingsView({ configPath }: { configPath: string }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,15 +27,12 @@ export function SettingsDialog({
   }, [configPath]);
 
   return (
-    <Modal title={t.settings.title} onClose={onClose}>
+    <section className="card">
+      <h2 className="card-title">{t.settings.title}</h2>
       {settings ? (
-        <SettingsForm
-          configPath={configPath}
-          settings={settings}
-          onClose={onClose}
-        />
+        <SettingsForm configPath={configPath} settings={settings} />
       ) : (
-        <div className="modal__body">
+        <div className="page-body">
           {error ? (
             <p className="error-text">{error}</p>
           ) : (
@@ -47,18 +40,16 @@ export function SettingsDialog({
           )}
         </div>
       )}
-    </Modal>
+    </section>
   );
 }
 
 function SettingsForm({
   configPath,
   settings,
-  onClose,
 }: {
   configPath: string;
   settings: Settings;
-  onClose: () => void;
 }) {
   const [displayName, setDisplayName] = useState(settings.displayName ?? "");
   // (host のみ)自分の DNS 名(ADR-0021、M3-14a)。空なら既定(host)
@@ -136,7 +127,7 @@ function SettingsForm({
 
   return (
     <>
-      <div className="modal__body">
+      <div className="page-body">
         <dl className="facts">
           <dt>{t.settings.interface}</dt>
           <dd className="mono">{settings.interfaceName}</dd>
@@ -274,10 +265,7 @@ function SettingsForm({
         {error && <p className="error-text">{error}</p>}
         {notice && <p className="notice">{notice}</p>}
       </div>
-      <div className="modal__actions">
-        <button type="button" className="button--ghost" onClick={onClose}>
-          {t.common.close}
-        </button>
+      <div className="page-actions">
         <button type="button" onClick={() => void save()} disabled={busy}>
           {busy ? t.common.saving : t.common.save}
         </button>

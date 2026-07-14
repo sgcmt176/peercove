@@ -53,6 +53,33 @@ pub fn is_dns_name(input: &str) -> bool {
     !input.is_empty() && input.split('.').all(is_dns_label)
 }
 
+/// カスタムレコードの相対名(`web`, `web.app`, `*.app`)として正規形かどうか
+/// (ADR-0024)。先頭ラベルのみ `*`(ワイルドカード)を許し、他は
+/// [`is_dns_label`]。ワイルドカードは 1 段(`*.app` が `x.app` に一致)。
+pub fn is_custom_dns_name(input: &str) -> bool {
+    if input.is_empty() {
+        return false;
+    }
+    let mut labels = input.split('.');
+    let first = labels.next().unwrap();
+    (first == "*" || is_dns_label(first)) && labels.all(is_dns_label)
+}
+
+/// 自由入力の相対名を正規化する(ADR-0024)。各ラベルを [`dns_label`] で
+/// 正規化し(小文字化・空白/記号 → ハイフン)、先頭の `*` はそのまま残す。
+/// どれかのラベルが空になる(記号だけ・連続ドット・末尾ドット等)場合は `None`。
+pub fn normalize_custom_dns_name(input: &str) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (index, label) in input.split('.').enumerate() {
+        if index == 0 && label == "*" {
+            out.push("*".to_string());
+        } else {
+            out.push(dns_label(label)?);
+        }
+    }
+    Some(out.join("."))
+}
+
 /// DNS 名に使えない予約語(ADR-0021 §4)。将来の内部用途と
 /// 紛らわしい名前を先取りで塞ぐ。
 pub const RESERVED_DNS_LABELS: &[&str] = &[
@@ -69,6 +96,15 @@ pub const RESERVED_DNS_LABELS: &[&str] = &[
 /// ホスト専用のラベル(`host.<ネットワーク>.peercove.internal`)。
 /// メンバーの DNS 名としては予約語扱いで拒否する。
 pub const HOST_DNS_LABEL: &str = "host";
+
+/// 未参加メンバーの自動ラベル `member-<第4オクテット>` の形かどうか(ADR-0024)。
+/// カスタムレコード名では予約(将来の登録と衝突しうる)。実在メンバー自身の
+/// DNS 名としては許可する(重複はメンバー設定側の検証で弾く)。
+pub fn is_reserved_member_label(label: &str) -> bool {
+    label
+        .strip_prefix("member-")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// DNS 名の検証エラー(ADR-0021 §4)。
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -169,6 +205,29 @@ mod tests {
         assert!(!is_dns_name(".alice"));
         assert!(!is_dns_name("web.alice."));
         assert!(!is_dns_name(""));
+    }
+
+    #[test]
+    fn custom_dns_name_allows_leading_wildcard_only() {
+        assert!(is_custom_dns_name("web"));
+        assert!(is_custom_dns_name("web.app"));
+        assert!(is_custom_dns_name("*.app"));
+        assert!(is_custom_dns_name("*"));
+        assert!(!is_custom_dns_name("web.*"), "* は先頭ラベルのみ");
+        assert!(!is_custom_dns_name("*app"), "* 単体のラベルのみ");
+        assert!(!is_custom_dns_name("Web.app"));
+        assert!(!is_custom_dns_name(""));
+    }
+
+    #[test]
+    fn normalize_custom_dns_name_normalizes_each_label() {
+        assert_eq!(normalize_custom_dns_name("My App"), Some("my-app".into()));
+        assert_eq!(normalize_custom_dns_name("Web.App"), Some("web.app".into()));
+        assert_eq!(normalize_custom_dns_name("*.App"), Some("*.app".into()));
+        // 先頭以外の * はワイルドカードにならず、記号としてハイフン化 → 空 → None
+        assert_eq!(normalize_custom_dns_name("web.*"), None);
+        assert_eq!(normalize_custom_dns_name("web..app"), None);
+        assert_eq!(normalize_custom_dns_name("たろう"), None);
     }
 
     #[test]

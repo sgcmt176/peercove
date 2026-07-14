@@ -88,7 +88,8 @@ body {
 
 .app {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .app__footer {
@@ -293,6 +294,7 @@ button:hover {
   border-radius: 4px;
   padding: 0 6px;
   color: var(--muted);
+  white-space: nowrap;
 }
 
 .peers {
@@ -709,6 +711,33 @@ select {
   padding: 0;
 }
 
+/* ドメイン名の組み立て入力(prefix . base . <net>.peercove.internal — ADR-0024) */
+.dns-domain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 4px 0 4px;
+}
+
+.dns-domain input {
+  width: 130px;
+  padding: 6px 8px;
+}
+
+.dns-domain__basekind {
+  max-width: 170px;
+}
+
+.dns-domain__dot {
+  color: var(--muted);
+}
+
+.dns-domain__suffix {
+  white-space: nowrap;
+  font-size: 13px;
+}
+
 .dns-list__row {
   display: flex;
   align-items: center;
@@ -1008,7 +1037,8 @@ select {
 
 .chat {
   display: flex;
-  height: 460px;
+  flex: 1;
+  min-height: 0;
   border: 1px solid var(--border);
   border-radius: 9px;
   overflow: hidden;
@@ -1312,6 +1342,13 @@ select {
   font-size: 13px;
 }
 
+/* 入力欄は内容に合わせて伸びる(JS が高さを設定。上限は画面の 4 割) */
+.chat__textarea {
+  max-height: 40vh;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+
 /* 添付ボタン(M3-13d)。入力欄の高さに合わせる */
 .chat__attach {
   align-self: center;
@@ -1574,11 +1611,88 @@ select {
 .app__main {
   flex: 1;
   min-width: 0;
-  max-width: 1080px;
-  padding: 24px 28px 48px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 詳細ヘッダーと帯はスクロール領域の外(上部に固定) */
+.app__main > .detail__head {
+  padding: 18px 28px 8px;
+}
+
+.app__main > .card--error {
+  margin: 16px 28px 0;
+}
+
+/* 実際のページ内容。ここだけが縦スクロールする */
+.app__content {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 20px 28px 40px;
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+/* チャットは内部でスクロールし、入力欄を最下部に固定する(M3-16) */
+.app__content--flush {
+  overflow: hidden;
+  padding: 0 20px 16px;
+}
+
+/* ページ見出し・本文・操作行(設定 / DNS をページ化 — M3-16) */
+.card-title {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.page-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* メンバービューのツールバー(見出し + 招待/送信/通信制御) */
+.detail__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.detail__toolbar .card-title {
+  margin: 0;
+}
+
+.detail__toolbar-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* サイドバー項目の未読・件数バッジ */
+.sidebar__badge {
+  margin-left: auto;
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.sidebar__item--active .sidebar__badge {
+  background: var(--accent);
 }
 
 /* ---- ネットワーク詳細ヘッダー + 統計カード(M3-15) ---- */
@@ -1707,8 +1821,15 @@ select {
   background: var(--bg);
 }
 
-.member-cell {
+/* 各列は原則 1 行のまま(バッジ・IP・遅延を折り返さない) */
+.member-table td {
   white-space: nowrap;
+}
+
+/* メンバー列だけは可変。長い DNS 名はここで折り返す(他列を潰さない) */
+.member-cell {
+  white-space: normal;
+  min-width: 220px;
 }
 
 .member-cell .avatar {
@@ -1722,6 +1843,16 @@ select {
   vertical-align: middle;
   min-width: 0;
   line-height: 1.4;
+}
+
+.member-cell__text .member__meta {
+  white-space: normal;
+}
+
+.member-cell__text .mono.ellipsis {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
 }
 
 .member-table__ip {
@@ -1813,6 +1944,45 @@ select {
 .service__url:hover {
   filter: none;
   text-decoration: underline;
+}
+
+/* サブネット共有ページ(M3-16) */
+.subnet-list {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.subnet-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.subnet-row__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.subnet-row__name {
+  font-weight: 600;
+}
+
+.subnet-row__edit {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.subnet-row__edit input {
+  flex: 1;
 }
 
 /* アプリ設定のライセンス表記(旧フッターから移設) */

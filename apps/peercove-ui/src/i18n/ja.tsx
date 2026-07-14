@@ -63,8 +63,12 @@ export const ja = {
   // 左サイドバー(M3-15。外枠の刷新)
   sidebar: {
     networks: "ネットワーク",
+    members: "メンバー",
     chat: "チャット",
+    stats: "統計",
     inbox: "受信",
+    dns: "DNS",
+    subnets: "サブネット",
     settings: "設定",
     connected: "接続中",
     disconnected: "未接続",
@@ -402,16 +406,19 @@ export const ja = {
     deleted: (name: string) => `${name} を削除しました。`,
   },
 
-  // 広告サブネットの編集(M3-7b、ADR-0014)
+  // サブネット共有(M3-7b、ADR-0014 → M3-16 でページ化)
   subnet: {
-    title: (who: string) => `${who} のサブネット`,
+    pageTitle: "サブネット（背後 LAN の共有）",
     intro:
-      "このメンバーの背後にある LAN(NAS など)への経路を全メンバーに配ります。約 10 秒で反映されます。",
-    label: "広告するサブネット（CIDR）",
+      "あるメンバーの背後にある LAN(自宅の NAS・プリンタ・別の PC など)を、ネットワークの全員から使えるようにします。設定できるのはホストだけで、変更は約 10 秒で全員に反映されます。",
+    memberLabel: (name: string) => `${name} が公開する LAN`,
     placeholder: "192.168.10.0/24",
-    hint: "スペース区切りで複数指定できます。空にして保存すると解除します。",
-    note: "転送役になれるのは Linux のメンバーだけです（Windows は届く側としてのみ動作）。設定すると、この LAN は同じネットワークの全メンバーから到達可能になります。LAN 側の機器からは、アクセス元がすべてこのメンバーの端末に見えます（NAT）。",
-    edit: "サブネット",
+    hint: "IP レンジ(CIDR)で指定します。例: 192.168.10.0/24。スペース区切りで複数指定でき、空欄にして保存すると公開を解除します。",
+    empty:
+      "公開できるメンバーがまだいません(ホスト以外のメンバーが参加すると、ここで設定できます)。",
+    note: "LAN を公開できる(転送役になれる)のは Linux のメンバーだけです(Windows は届く側専用)。公開すると、その LAN は全メンバーから到達でき、LAN 側の機器にはアクセス元がそのメンバーの端末に見えます(NAT)。",
+    save: "保存",
+    saved: "保存しました。約 10 秒で全員に反映されます。",
     badgeTitle:
       "このメンバーが公開している背後 LAN のサブネット（全メンバーから到達可能）",
   },
@@ -442,21 +449,25 @@ export const ja = {
     customHead: "カスタムレコード",
     customEmpty: "カスタムレコードはありません。",
     customNote:
-      "ホストだけが追加・削除できます。追加すると約 10 秒で全メンバーに配布されます。" +
-      "ターゲットをメンバーにすると、そのメンバーの IP に自動で追随します（別名・サービス名）。",
+      "ホストだけが追加・削除できます。約 10 秒で全メンバーに配布されます。" +
+      "「この左側」にマシンを選ぶと、そのマシンのサブドメインになり、マシンの名前変更にも自動で追随します。",
     customNoteMember: "カスタムレコードはホストが管理します（ここでは閲覧のみ）。",
-    nameLabel: "名前（ラベル）",
-    namePlaceholder: "nas",
-    targetLabel: "ターゲット",
-    targetIp: "IP アドレス指定",
-    targetMember: (name: string) => `メンバー: ${name}`,
-    ipLabel: "IPv4 アドレス",
+    // ドメイン名の入力(ADR-0024)
+    domainLabel: "ドメイン名",
+    prefixPlaceholder: "* / web / api など（任意）",
+    baseFree: "自由入力",
+    baseFreePlaceholder: "app",
+    baseMember: (name: string) => `${name}（マシン）`,
+    wildcardHint:
+      "左側は空でも、web や api.v2 のようにドットで区切っても構いません。先頭に * を付けると、その 1 ラベルが任意になるワイルドカード（例: *.app）になります。候補からマシンを選ぶと、そのマシンのサブドメインにできます。",
+    baseIsMachine:
+      "このマシンのサブドメインになります（マシンの名前変更にも自動で追随）。左側（* や web など）を入力してください。",
+    previewLabel: "登録される名前",
+    // 転送先(ADR-0024)
+    forwardLabel: "転送先（このドメインが指す先）",
+    forwardIp: "IP アドレスを指定",
+    forwardMember: (name: string) => `マシン: ${name}`,
     ipPlaceholder: "10.68.1.50",
-    parentLabel: "配置",
-    parentTop: "最上位（name.ネットワーク名.…）",
-    parentUnder: (name: string) => `${name} の配下（name.メンバー名.…）`,
-    parentHint:
-      "メンバー配下 + IP 指定は、そのメンバーの広告サブネット内の機器（LAN 機器）だけ登録できます。",
     schemeLabel: "スキーム（任意）",
     schemePlaceholder: "http",
     portLabel: "ポート（任意）",

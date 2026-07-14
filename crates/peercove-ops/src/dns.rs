@@ -124,9 +124,10 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
 /// (ip + under)の広告サブネット内チェックは `Config::validate` が行う。
 /// 解決済みの相対名(`web.alice` 等)を返す。
 pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<String> {
-    let Some(label) = names::dns_label(record.name) else {
+    // 自由入力(サブドメイン・先頭 * ワイルドカード可)を各ラベル正規化する(ADR-0024)
+    let Some(name) = names::normalize_custom_dns_name(record.name) else {
         bail!(
-            "\"{}\" から有効なラベルを作れませんでした。半角英数字を含めてください",
+            "\"{}\" から有効な DNS 名を作れませんでした。英数字を含めてください(先頭ラベルのみ * が使えます)",
             record.name
         );
     };
@@ -149,24 +150,30 @@ pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<
     if config
         .dns_records
         .iter()
-        .any(|r| r.name == label && r.under == record.under)
+        .any(|r| r.name == name && r.under == record.under)
     {
-        bail!("レコード \"{label}\" は既に存在します(削除してから追加し直してください)");
+        bail!("レコード \"{name}\" は既に存在します(削除してから追加し直してください)");
     }
     if record.under.is_none() {
-        // 予約語・メンバー名との衝突は最上位のみ対象(ADR-0022 §4)
-        if names::RESERVED_DNS_LABELS.contains(&label.as_str()) {
-            bail!("「{label}」は予約されているためレコード名に使えません");
+        // 予約語・メンバー名との衝突は、ネットワーク直下のラベル(= 末尾ラベル。
+        // `web.app` なら `app`)で判定する(ADR-0022 §4 / ADR-0024)
+        let base = name.rsplit('.').next().unwrap_or(name.as_str());
+        if names::RESERVED_DNS_LABELS.contains(&base) || base == names::HOST_DNS_LABEL {
+            bail!("「{base}」は予約されているためレコード名に使えません");
         }
-        if crate::peers::taken_dns_labels(&config, crate::peers::DnsExclude::None).contains(&label)
-        {
-            bail!("DNS 名「{label}」はメンバーが使用しています(別の名前にしてください)");
+        // `member-<数字>` は未参加メンバーの自動ラベル用に予約(将来の登録と衝突しうる。
+        // 実在メンバー自身の DNS 名としてはメンバー設定側で許可 — ADR-0024)
+        if names::is_reserved_member_label(base) {
+            bail!("「{base}」は新しく参加するメンバーの自動名と衝突する可能性があるため、レコード名には使えません");
+        }
+        if crate::peers::taken_dns_labels(&config, crate::peers::DnsExclude::None).contains(base) {
+            bail!("DNS 名「{base}」はメンバーが使用しています(別の名前にしてください)");
         }
     }
     let relative = match &record.under {
-        None => label.clone(),
+        None => name.clone(),
         Some(reference) => match label_of(&config, reference) {
-            Some(parent) => format!("{label}.{parent}"),
+            Some(parent) => format!("{name}.{parent}"),
             None => bail!("親に指定したメンバーが登録されていません"),
         },
     };
@@ -177,7 +184,7 @@ pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<
         .as_array_of_tables_mut()
         .context("dns_record が配列テーブルではありません(手編集の可能性)")?;
     let mut table = toml_edit::Table::new();
-    table.insert("name", toml_edit::value(label.as_str()));
+    table.insert("name", toml_edit::value(name.as_str()));
     match record.target {
         RecordTarget::Ip(ip) => {
             table.insert("ip", toml_edit::value(ip.to_string()));
