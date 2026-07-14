@@ -145,13 +145,7 @@ function SettingsForm({
       <div className="page-body">
         <dl className="facts">
           <dt>{t.settings.interface}</dt>
-          <dd className="mono">
-            {interfaceName}
-            {liveInterfaceName &&
-              liveInterfaceName !== settings.interfaceName && (
-                <small className="muted"> {t.settings.interfaceRenamed}</small>
-              )}
-          </dd>
+          <dd className="mono">{interfaceName}</dd>
           <dt>{t.common.virtualIp}</dt>
           <dd className="mono">{settings.address}</dd>
           <dt>{t.common.configFile}</dt>
