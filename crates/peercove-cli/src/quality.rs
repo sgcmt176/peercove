@@ -316,7 +316,7 @@ impl QualityStore {
         self.apply_owner(&self.directory);
         let path = self
             .directory
-            .join(format!("{}.jsonl", utc_date(sample.window_start_unix_ms)));
+            .join(format!("{}.jsonl", local_date(sample.window_start_unix_ms)));
         let mut line = serde_json::to_string(sample)?;
         line.push('\n');
         let mut file = std::fs::OpenOptions::new()
@@ -395,7 +395,7 @@ impl QualityStore {
             })
             .collect();
         files.sort_by(|a, b| a.0.cmp(&b.0));
-        let cutoff_date = utc_date(cutoff);
+        let cutoff_date = local_date(cutoff);
         for (path, _) in &files {
             if path.file_stem().and_then(|value| value.to_str()) < Some(&cutoff_date) {
                 let _ = std::fs::remove_file(path);
@@ -429,8 +429,16 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// UNIX 日からグレゴリオ暦の日付を求める(UTC、外部時刻 crate を増やさない)。
-fn utc_date(unix_ms: u64) -> String {
+/// ローカルタイムゾーンの暦日(日次ファイル名・保持判定に使う。JST 等で
+/// 日付が変わったら別ファイルにするため、UTC ではなくローカルで区切る)。
+fn local_date(unix_ms: u64) -> String {
+    let shifted = (unix_ms as i64) + local_offset_ms();
+    civil_date(shifted.max(0) as u64)
+}
+
+/// UNIX ミリ秒からグレゴリオ暦の日付を求める(外部時刻 crate を増やさない)。
+/// タイムゾーン非依存の純関数。ローカル日付は [`local_date`] が offset を足して使う。
+fn civil_date(unix_ms: u64) -> String {
     let days = (unix_ms / 86_400_000) as i64;
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -443,6 +451,45 @@ fn utc_date(unix_ms: u64) -> String {
     let month = mp + if mp < 10 { 3 } else { -9 };
     year += (month <= 2) as i64;
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// ローカルタイムゾーンの UTC からのオフセット(ミリ秒、東が正)。
+/// 現在の DST 状態を用いる(日次ファイル名の用途では十分)。
+fn local_offset_ms() -> i64 {
+    local_offset_seconds() * 1_000
+}
+
+#[cfg(unix)]
+fn local_offset_seconds() -> i64 {
+    let now = (now_unix_ms() / 1_000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r は POSIX の再入可能 API。有効な time_t と tm ポインタを渡す。
+    let result = unsafe { libc::localtime_r(&now, &mut tm) };
+    if result.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
+#[cfg(windows)]
+fn local_offset_seconds() -> i64 {
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    let mut info: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: GetTimeZoneInformation は info を埋める Win32 API。有効なポインタを渡す。
+    let kind = unsafe { GetTimeZoneInformation(&mut info) };
+    // 戻り値: 1=STANDARD, 2=DAYLIGHT, それ以外(0/INVALID)は追加バイアスなし。
+    // UTC = local + Bias(分)。東が正のオフセットは -(Bias + 実効バイアス)。
+    let extra = match kind {
+        2 => info.DaylightBias,
+        1 => info.StandardBias,
+        _ => 0,
+    };
+    -((info.Bias + extra) as i64) * 60
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_offset_seconds() -> i64 {
+    0
 }
 
 #[cfg(test)]
@@ -483,9 +530,9 @@ mod tests {
     }
 
     #[test]
-    fn utc_dates_are_stable() {
-        assert_eq!(utc_date(0), "1970-01-01");
-        assert_eq!(utc_date(1_783_987_200_000), "2026-07-14");
+    fn civil_dates_are_stable() {
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(1_783_987_200_000), "2026-07-14");
     }
 
     #[test]
@@ -544,7 +591,7 @@ mod tests {
             .append(&persisted_sample(now))
             .unwrap();
         let directory = config.with_extension("quality");
-        let path = directory.join(format!("{}.jsonl", utc_date(now)));
+        let path = directory.join(format!("{}.jsonl", local_date(now)));
         let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         writeln!(file, "not-json").unwrap();
 
@@ -564,7 +611,7 @@ mod tests {
         let old = now.saturating_sub(RETENTION_MS + WINDOW_MS);
         let fresh = now.saturating_sub(RETENTION_MS - WINDOW_MS);
         for sample in [persisted_sample(old), persisted_sample(fresh)] {
-            let path = directory.join(format!("{}.jsonl", utc_date(sample.window_start_unix_ms)));
+            let path = directory.join(format!("{}.jsonl", local_date(sample.window_start_unix_ms)));
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

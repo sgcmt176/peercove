@@ -521,6 +521,25 @@ textarea.token {
   margin: 0 0 10px;
 }
 
+/* ヘルスチェック設定フォーム: 各行に一定の余白を持たせ、詰まりを解消する */
+.health-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.health-form p {
+  margin: 0;
+}
+
+.health-form__fqdn {
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+
 .modal__actions {
   display: flex;
   justify-content: flex-end;

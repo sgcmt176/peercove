@@ -533,82 +533,84 @@ function HealthDialog({
 
   return (
     <Modal title={t.dns.health.dialogTitle} onClose={onClose}>
-      <p className="mono small">{record.fqdn}</p>
-      <label className="chat__pick-row">
-        <input
-          type="checkbox"
-          checked={settings.enabled}
-          onChange={(event) =>
-            setSettings({ ...settings, enabled: event.target.checked })
-          }
-        />
-        <span>{t.dns.health.enabled}</span>
-      </label>
-      <p className="muted small">{t.dns.health.enabledHint}</p>
-      {isExternal && (
-        <>
-          <label className="chat__pick-row">
-            <input
-              type="checkbox"
-              checked={settings.external}
-              onChange={(event) =>
-                setSettings({ ...settings, external: event.target.checked })
-              }
-            />
-            <span>{t.dns.health.external}</span>
-          </label>
-          <p className="muted small">{t.dns.health.externalHint}</p>
-        </>
-      )}
-      <label className="field">
-        <span>{t.dns.health.kind}</span>
-        <select
-          value={settings.kind}
-          onChange={(event) =>
-            setSettings({
-              ...settings,
-              kind: event.target.value as HealthSettings["kind"],
-            })
-          }
-        >
-          <option value="tcp">{t.dns.health.tcp}</option>
-          <option value="http_head" disabled={!canHead}>
-            {t.dns.health.httpHead}
-          </option>
-        </select>
-      </label>
-      {settings.kind === "http_head" && (
-        <div className="row">
-          <label className="field">
-            <span>{t.dns.health.path}</span>
-            <input
-              value={settings.path}
-              className="mono"
-              onChange={(event) =>
-                setSettings({ ...settings, path: event.target.value })
-              }
-            />
-          </label>
-          <label className="field">
-            <span>{t.dns.health.expected}</span>
-            <input
-              type="number"
-              min={100}
-              max={599}
-              placeholder="200–399"
-              value={settings.expectedStatus ?? ""}
-              onChange={(event) =>
-                setSettings({
-                  ...settings,
-                  expectedStatus:
-                    event.target.value === "" ? null : Number(event.target.value),
-                })
-              }
-            />
-          </label>
-        </div>
-      )}
-      {error && <p className="error-text">{error}</p>}
+      <div className="modal__body health-form">
+        <p className="mono small health-form__fqdn">{record.fqdn}</p>
+        <label className="chat__pick-row">
+          <input
+            type="checkbox"
+            checked={settings.enabled}
+            onChange={(event) =>
+              setSettings({ ...settings, enabled: event.target.checked })
+            }
+          />
+          <span>{t.dns.health.enabled}</span>
+        </label>
+        <p className="muted small">{t.dns.health.enabledHint}</p>
+        {isExternal && (
+          <>
+            <label className="chat__pick-row">
+              <input
+                type="checkbox"
+                checked={settings.external}
+                onChange={(event) =>
+                  setSettings({ ...settings, external: event.target.checked })
+                }
+              />
+              <span>{t.dns.health.external}</span>
+            </label>
+            <p className="muted small">{t.dns.health.externalHint}</p>
+          </>
+        )}
+        <label className="field">
+          <span>{t.dns.health.kind}</span>
+          <select
+            value={settings.kind}
+            onChange={(event) =>
+              setSettings({
+                ...settings,
+                kind: event.target.value as HealthSettings["kind"],
+              })
+            }
+          >
+            <option value="tcp">{t.dns.health.tcp}</option>
+            <option value="http_head" disabled={!canHead}>
+              {t.dns.health.httpHead}
+            </option>
+          </select>
+        </label>
+        {settings.kind === "http_head" && (
+          <div className="row">
+            <label className="field">
+              <span>{t.dns.health.path}</span>
+              <input
+                value={settings.path}
+                className="mono"
+                onChange={(event) =>
+                  setSettings({ ...settings, path: event.target.value })
+                }
+              />
+            </label>
+            <label className="field">
+              <span>{t.dns.health.expected}</span>
+              <input
+                type="number"
+                min={100}
+                max={599}
+                placeholder="200–399"
+                value={settings.expectedStatus ?? ""}
+                onChange={(event) =>
+                  setSettings({
+                    ...settings,
+                    expectedStatus:
+                      event.target.value === "" ? null : Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+          </div>
+        )}
+        {error && <p className="error-text">{error}</p>}
+      </div>
       <div className="modal__actions">
         <button type="button" className="button--ghost" onClick={onClose}>
           {t.common.cancel}

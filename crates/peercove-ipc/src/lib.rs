@@ -10,8 +10,10 @@ use anyhow::{bail, Context};
 use peercove_core::ipc::{IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-/// 受信 1 行の上限(台帳が大きくても足りるサイズ)。
-pub const MAX_LINE_LEN: u64 = 256 * 1024;
+/// 受信 1 行の上限。品質履歴(7 日ぶん)の応答が大きくなるため、品質ストアの
+/// ディスク上限(32 MiB、`quality::MAX_TOTAL_BYTES`)を上回る余裕を取る。
+/// ローカルの信頼済みチャネルなので、この上限は暴走入力の歯止め用。
+pub const MAX_LINE_LEN: u64 = 64 * 1024 * 1024;
 
 #[cfg(windows)]
 pub type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
