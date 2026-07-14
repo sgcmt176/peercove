@@ -3,7 +3,7 @@
 //! UI(非特権)と CLI の双方から使う。プロトコル型は [`peercove_core::ipc`]。
 //! トランスポートは Windows = 名前付きパイプ / Linux = Unix ドメインソケット。
 //!
-//! サーバー側(デーモン本体)は `peercove-poc` の `daemon` モジュールにある。
+//! サーバー側(デーモン本体)は `peercove` の `daemon` モジュールにある。
 //! crate 分割の全体像は ADR-0007 を参照。
 
 use anyhow::{bail, Context};
@@ -63,7 +63,7 @@ async fn connect_impl() -> anyhow::Result<IpcStream> {
     use tokio::net::windows::named_pipe::ClientOptions;
     ClientOptions::new()
         .open(peercove_core::ipc::PIPE_NAME)
-        .context("デーモンに接続できません(`peercove-poc daemon run` が起動していますか?)")
+        .context("デーモンに接続できません(`peercove daemon run` が起動していますか?)")
 }
 
 #[cfg(unix)]
@@ -89,7 +89,7 @@ async fn connect_impl() -> anyhow::Result<IpcStream> {
         .join(", ");
     Err(last_error.expect("候補は 1 つ以上ある")).with_context(|| {
         format!(
-            "デーモンに接続できません(`peercove-poc daemon run` が起動していますか?)。\
+            "デーモンに接続できません(`peercove daemon run` が起動していますか?)。\
              探した場所: {places}"
         )
     })

@@ -1,4 +1,4 @@
-# CLAUDE.md — PeerCove リポジトリ指示
+# AGENTS.md — PeerCove リポジトリ指示
 
 このリポジトリは PeerCove(サーバーレス P2P VPN、WireGuard プロトコル利用)の開発リポジトリです。
 **M0(技術検証 PoC)と M1(招待トークン・コントロールチャネル・台帳・メンバー削除・init)は完了済み**(2026-07-08、実機検証済み)。現在は**次期トラックの選定段階**です(候補: M2 プロダクト化 / Phase 2 直接通信 / 品質・CI。`docs/roadmap.md` §6 参照)。

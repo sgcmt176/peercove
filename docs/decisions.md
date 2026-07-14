@@ -2052,6 +2052,39 @@ ADR-0022 でカスタム DNS レコードはエイリアス・サービス名・
 
 - CNAME チェーン(多段)、CNAME の TTL 個別指定、AAAA(IPv6)フラット化、MX/TXT 等
 
+## ADR-0026: バイナリ/クレートを peercove-poc から改名(M3-18)
+
+- **日付**: 2026-07-14
+- **背景**: `poc` は M0 技術検証(proof of concept)の名残。M0/M1 完了・製品化が進む
+  現状で実態と合わない。ADR-0010 では「バイナリ名は `peercove-poc` のまま M2 を出す
+  (製品名へのリネームは後回し)」と決めていた(§6)。その保留を解消する。
+
+### 決定
+
+1. **クレート**: `crates/peercove-poc` → `crates/peercove-cli`(`package.name = "peercove-cli"`)。
+   `cargo … -p peercove-cli` で参照する。
+2. **バイナリ**: `[[bin]] name = "peercove"` を明示。生成物は `peercove(.exe)`。
+   コマンドは `peercove daemon run` / `peercove host --config …` と製品名そのまま。
+   なお `module_path!()`(= `tracing` の target)は**パッケージ名でなくバイナリ名**に
+   従うため `peercove::daemon` 等になる(ログ target と関連テストもこれに合わせる)。
+3. **互換に影響なし**: OS/通信レベルの名前は既にクリーンで**変更しない** ——
+   Windows サービス名 `peercove-daemon`、名前付きパイプ `\\.\pipe\peercove-daemon`、
+   Unix ソケット `/run/peercove.sock`、systemd ユニット `peercove-daemon.service`。
+   よってサービス登録・IPC・ワイヤ互換はいずれも壊れない。
+4. **追随**: `ExecStart` / Tauri サイドカー / MSI(.wxs)/ deb / ZIP・tar / README・
+   CLAUDE.md・AGENTS.md・roadmap を新バイナリ名へ更新。過去のハンドオフ文書と本
+   decisions.md の既存 ADR 本文(ADR-0010 §6 等)は当時の記録として原文保持。
+
+### 理由
+
+- 名前を実態(製品 CLI + デーモン)に合わせる。クレート名 `-cli` と製品バイナリ名
+  `peercove` を分けることで、`cargo … -p peercove-cli` とユーザー向け `peercove …`
+  の役割が明確になる。OS 統合名を据え置くことで、既存インストールの再登録も不要。
+
+### 対象外
+
+- UI 実行ファイル名(`PeerCove` / `peercove-ui`)、サービス名・IPC 名の変更
+
 ## メモ: 仮想 IP レンジと Tailscale の衝突(M1 で要検討)
 
 - **日付**: 2026-07-07(G-2 実機検証で発覚)

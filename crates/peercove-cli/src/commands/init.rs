@@ -33,13 +33,13 @@ pub fn run(dir: &Path, name: &str, listen_port: u16, force: bool) -> anyhow::Res
     let config = result.config_path.display();
     #[cfg(windows)]
     {
-        println!("  1. (管理者ターミナルで) .\\peercove-poc.exe host --config {config}");
-        println!("  2. .\\peercove-poc.exe invite --config {config} --name <メンバー名>");
+        println!("  1. (管理者ターミナルで) .\\peercove.exe host --config {config}");
+        println!("  2. .\\peercove.exe invite --config {config} --name <メンバー名>");
     }
     #[cfg(not(windows))]
     {
-        println!("  1. sudo ./peercove-poc host --config {config}");
-        println!("  2. ./peercove-poc invite --config {config} --name <メンバー名>");
+        println!("  1. sudo ./peercove host --config {config}");
+        println!("  2. ./peercove invite --config {config} --name <メンバー名>");
     }
     Ok(())
 }

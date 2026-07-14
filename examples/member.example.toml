@@ -1,6 +1,6 @@
 # PeerCove メンバー設定の例。実際に使うときはリポジトリ外へコピーして編集する。
 [interface]
-private_key_file = "member_a.key" # peercove-poc keygen --out member_a.key で生成
+private_key_file = "member_a.key" # peercove keygen --out member_a.key で生成
 address = "100.100.42.2/24"       # ホストから割り当てられた仮想 IP
 mtu = 1420                        # PPPoE 環境では 1412 などへ下げる
 

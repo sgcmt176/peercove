@@ -17,7 +17,7 @@ cd apps/peercove-ui
 npm install     # 初回のみ
 
 # 別ターミナルでデーモンを起動しておく(管理者 / sudo)
-#   peercove-poc daemon run
+#   peercove daemon run
 
 npm run tauri dev     # UI をホットリロードで起動
 npm run build         # 型チェック + フロントエンドのビルド

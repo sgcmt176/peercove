@@ -4,7 +4,7 @@
 //! カスタムレコードから**決定的に**導出する。全ノードが同じ台帳から同じ結果を
 //! 得られるよう、ここは純関数のみ(I/O なし)。
 //!
-//! 実際の DNS 応答(UDP サーバ)とゾーンの合算は `peercove-poc` 側。
+//! 実際の DNS 応答(UDP サーバ)とゾーンの合算は `peercove` 側。
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;

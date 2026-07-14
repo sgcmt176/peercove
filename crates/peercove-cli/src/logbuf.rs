@@ -216,7 +216,7 @@ mod tests {
             line.message,
             r#"capture-marker トンネル 1 を作成 peer="alice""#
         );
-        assert!(line.target.starts_with("peercove_poc"));
+        assert!(line.target.starts_with("peercove"));
     }
 
     /// フィルタは fmt レイヤとリングバッファで共通(main.rs の `init_tracing` と同じ構成)。

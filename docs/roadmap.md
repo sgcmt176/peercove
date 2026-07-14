@@ -1,6 +1,6 @@
 # PeerCove ロードマップと開発引き継ぎガイド
 
-- **最終更新**: 2026-07-14(M3-17 転送先 CNAME(外部ドメイン対応)を実装(ADR-0025)。内蔵リゾルバに CNAME 応答 + 後方互換のワイヤ配布。M3-16 UI 刷新(ADR-0024)と合わせて実機検証中。M3-12 は Opus 担当予定)
+- **最終更新**: 2026-07-14(M3-18 バイナリ/クレートを `peercove-poc` → `peercove`(クレートは `peercove-cli`)へ改名(ADR-0026)。OS/IPC/サービス名は据え置きで互換影響なし。直前は M3-17 転送先 CNAME(ADR-0025)。M3-16 UI 刷新(ADR-0024)と合わせて実機検証中。M3-12 は Opus 担当予定)
 - **対象読者**: このリポジトリで作業するすべての AI アシスタント・開発者
 - **必読**: [CLAUDE.md](../CLAUDE.md)(規約)→ 本書(全体像)→ [decisions.md](decisions.md)(技術判断)
 
@@ -56,7 +56,7 @@ crates/
 │   ├─ init.rs / invite.rs / join.rs / peers.rs   # 鍵・トークン・[[peer]] 編集
 │   ├─ settings.rs           # [interface] と member の endpoint 編集(M2-G5)
 │   └─ secret.rs / net.rs    # 秘密ファイルの権限、ローカル IP の推定
-└─ peercove-poc/             # CLI + デーモン(将来 daemon-win / -linux に分離前提)
+└─ peercove-cli/             # CLI + デーモン(将来 daemon-win / -linux に分離前提)
     ├─ main.rs               # clap。keygen/host/member/add-peer/status/down/udp-*/daemon
     ├─ daemon.rs             # IPC サーバー(名前付きパイプ / UDS)
     ├─ logbuf.rs             # 直近 500 行のリングバッファ(tracing Layer、ADR-0009)
@@ -264,7 +264,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
    cargo-zigbuild clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
    ```
 5. Windows デバイス(device.rs)に触ったら、既存のループバックテスト
-   (`cargo test -p peercove-poc`)が通ることを必ず確認。挙動追加時はテストも追加
+   (`cargo test -p peercove-cli`)が通ることを必ず確認。挙動追加時はテストも追加
 6. 秘密鍵・PSK・トークンは**ログ・標準出力に出さない**(公開鍵は可)。
    新しい秘密型には redact された Debug 実装とそのテストを書く(keys.rs が手本)
 

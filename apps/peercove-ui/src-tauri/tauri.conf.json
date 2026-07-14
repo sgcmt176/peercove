@@ -67,7 +67,7 @@
         "depends": ["libayatana-appindicator3-1"],
         "desktopTemplate": "linux/peercove.desktop",
         "files": {
-          "/usr/bin/peercove-poc": "../../../target/release/peercove-poc",
+          "/usr/bin/peercove": "../../../target/release/peercove",
           "/usr/lib/systemd/system/peercove-daemon.service": "../../../packaging/systemd/peercove-daemon.service"
         },
         "preRemoveScript": "../../../packaging/deb/prerm.sh",

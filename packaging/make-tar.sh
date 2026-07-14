@@ -2,7 +2,7 @@
 # PeerCove ポータブル版(Linux tar.gz)を組み立てる(M2-G7b、上級者向け配布)。
 #
 # 前提(先に済ませておく):
-#   cargo build --release -p peercove-poc
+#   cargo build --release -p peercove-cli
 #   cd apps/peercove-ui && npm install && npm run tauri build   (UI 実行ファイルを作る)
 #
 # 使い方(リポジトリのどこからでも):
@@ -24,8 +24,8 @@ require() {
     fi
 }
 
-daemon="$root/target/release/peercove-poc"
-require "$daemon" "先に 'cargo build --release -p peercove-poc' を実行してください"
+daemon="$root/target/release/peercove"
+require "$daemon" "先に 'cargo build --release -p peercove-cli' を実行してください"
 require "$root/packaging/README-portable.md" "リポジトリの packaging にあるはず"
 
 # UI 実行ファイル名は cargo/tauri で異なりうるので候補を順に探す
@@ -46,10 +46,10 @@ out="$root/packaging/dist/PeerCove-portable-linux-x64.tar.gz"
 rm -rf "$stage"
 mkdir -p "$stage/PeerCove"
 
-cp "$daemon" "$stage/PeerCove/peercove-poc"
+cp "$daemon" "$stage/PeerCove/peercove"
 cp "$ui" "$stage/PeerCove/PeerCove"
 cp "$root/packaging/README-portable.md" "$stage/PeerCove/README.md"
-chmod +x "$stage/PeerCove/peercove-poc" "$stage/PeerCove/PeerCove"
+chmod +x "$stage/PeerCove/peercove" "$stage/PeerCove/PeerCove"
 
 mkdir -p "$root/packaging/dist"
 rm -f "$out"
@@ -57,4 +57,4 @@ tar -czf "$out" -C "$stage" PeerCove
 rm -rf "$stage"
 
 echo "作成しました: $out"
-echo "内容: PeerCove/{peercove-poc, PeerCove, README.md}"
+echo "内容: PeerCove/{peercove, PeerCove, README.md}"

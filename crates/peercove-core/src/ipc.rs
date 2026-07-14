@@ -479,7 +479,7 @@ mod tests {
                     seq: 1,
                     unix_ms: 1_700_000_000_000,
                     level: "INFO".to_string(),
-                    target: "peercove_poc::daemon".to_string(),
+                    target: "peercove::daemon".to_string(),
                     message: "トンネルを開始しました".to_string(),
                 }],
                 dropped: 0,
@@ -488,7 +488,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"id":9,"ok":{"type":"logs","lines":[{"seq":1,"unix_ms":1700000000000,"level":"INFO","target":"peercove_poc::daemon","message":"トンネルを開始しました"}],"dropped":0}}"#
+            r#"{"id":9,"ok":{"type":"logs","lines":[{"seq":1,"unix_ms":1700000000000,"level":"INFO","target":"peercove::daemon","message":"トンネルを開始しました"}],"dropped":0}}"#
         );
     }
 

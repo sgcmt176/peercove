@@ -182,7 +182,7 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         false => interface.insert("direct", toml_edit::value(false)),
     };
     // 受信サイズ上限(ADR-0015)も既定(100 MB)なら書かない。
-    // 既定以外を書いた設定は旧バージョンの peercove-poc では読めなくなる点に注意
+    // 既定以外を書いた設定は旧バージョンの peercove では読めなくなる点に注意
     if update.max_recv_file_mb == peercove_core::config::DEFAULT_MAX_RECV_FILE_MB {
         interface.remove("max_recv_file_mb");
     } else {

@@ -1,6 +1,6 @@
 //! デーモン(M2-G1a、ADR-0007)。
 //!
-//! `peercove-poc daemon run` で常駐し、ローカル IPC(Windows: 名前付きパイプ /
+//! `peercove daemon run` で常駐し、ローカル IPC(Windows: 名前付きパイプ /
 //! Linux: Unix ドメインソケット)でトンネルの開始・停止・状態取得を受け付ける。
 //! 招待・削除などの設定ファイル操作は IPC に乗せない(UI/CLI が直接行い、
 //! 実行中トンネルは 5 秒再読込で追随する)。
@@ -1265,7 +1265,7 @@ async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
         .with_context(|| {
             format!(
                 "名前付きパイプ {} を作成できません。既に peercove デーモンが\
-                 起動していないか確認してください(タスクマネージャーで peercove-poc を確認。\
+                 起動していないか確認してください(タスクマネージャーで peercove を確認。\
                  管理者で起動したデーモンは管理者ターミナルからしか終了できません)",
                 peercove_core::ipc::PIPE_NAME
             )
@@ -1395,7 +1395,7 @@ pub fn print_logs(follow: bool) -> anyhow::Result<()> {
     }
 }
 
-/// `12:34:56.789 INFO  peercove_poc::daemon: メッセージ`
+/// `12:34:56.789 INFO  peercove::daemon: メッセージ`
 ///
 /// 時刻は UTC(デーモンの標準エラー出力に出る `tracing` の既定表記に合わせる)。
 fn format_log_line(line: &peercove_core::ipc::LogLine) -> String {
@@ -1648,7 +1648,7 @@ mod tests {
         let after_seq = ring.since(0).0.last().map(|line| line.seq).unwrap_or(0);
         assert!(logs(after_seq).await.0.is_empty(), "新しい行はまだ無い");
 
-        ring.push("INFO", "peercove_poc::test", "テスト行".to_string());
+        ring.push("INFO", "peercove::test", "テスト行".to_string());
         let (lines, dropped) = logs(after_seq).await;
         assert_eq!(dropped, 0);
         assert_eq!(lines.len(), 1);

@@ -1,7 +1,7 @@
 #!/bin/sh
 # PeerCove deb: インストール後(configure)に systemd サービスを有効化・起動する
 # (M2-G7b、ADR-0010)。systemd unit は /usr/lib/systemd/system/peercove-daemon.service
-# に配置済み。ExecStart は /usr/bin/peercove-poc daemon run。
+# に配置済み。ExecStart は /usr/bin/peercove daemon run。
 #
 # Tauri の deb バンドラは生成する postinst にこの内容を差し込む。$1 は dpkg の
 # 引数(新規/更新とも "configure")。systemctl が無い環境でも壊さない。

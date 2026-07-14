@@ -2,8 +2,8 @@
 #
 # 2 つの経路でインストールされる:
 # - deb パッケージ: このファイルをそのまま /usr/lib/systemd/system/ へ配置
-#   (ExecStart は /usr/bin/peercove-poc のまま)
-# - `peercove-poc daemon service-install`(上級者向け): ExecStart の
+#   (ExecStart は /usr/bin/peercove のまま)
+# - `peercove daemon service-install`(上級者向け): ExecStart の
 #   バイナリパスを実行中の exe のパスに置換して /etc/systemd/system/ へ書く
 #
 # ログは journald へ(journalctl -u peercove-daemon)。UI のログビューは
@@ -17,7 +17,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/peercove-poc daemon run
+ExecStart=/usr/bin/peercove daemon run
 Restart=on-failure
 RestartSec=5
 # トンネル操作(TUN 作成・ルーティング)に root が必要

@@ -1063,6 +1063,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
+name = "peercove-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boringtun",
+ "clap",
+ "defguard_wireguard_rs",
+ "fast_qr",
+ "igd-next",
+ "ipnet",
+ "libc",
+ "peercove-core",
+ "peercove-ipc",
+ "peercove-ops",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "toml_edit 0.25.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "windows-service",
+ "windows-sys 0.59.0",
+ "wintun",
+]
+
+[[package]]
 name = "peercove-core"
 version = "0.1.0"
 dependencies = [
@@ -1098,33 +1125,6 @@ dependencies = [
  "toml",
  "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
-]
-
-[[package]]
-name = "peercove-poc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "boringtun",
- "clap",
- "defguard_wireguard_rs",
- "fast_qr",
- "igd-next",
- "ipnet",
- "libc",
- "peercove-core",
- "peercove-ipc",
- "peercove-ops",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
- "toml_edit 0.25.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "windows-service",
- "windows-sys 0.59.0",
- "wintun",
 ]
 
 [[package]]

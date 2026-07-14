@@ -323,7 +323,7 @@ mod unix_impl {
     const UNIT_TEMPLATE: &str = include_str!("../../../packaging/systemd/peercove-daemon.service");
     /// テンプレート内のバイナリパス(deb の配置先)。CLI インストール時は
     /// 実行中の exe のパスへ置換する。
-    const TEMPLATE_EXEC: &str = "/usr/bin/peercove-poc";
+    const TEMPLATE_EXEC: &str = "/usr/bin/peercove";
 
     fn unit_path() -> std::path::PathBuf {
         // /etc は管理者の設置場所(deb は /usr/lib/systemd/system を使い、

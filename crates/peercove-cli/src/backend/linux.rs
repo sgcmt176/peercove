@@ -269,7 +269,7 @@ impl WgBackend for LinuxBackend {
         self.api.create_interface().map_err(|e| {
             anyhow::anyhow!(e).context(format!(
                 "インターフェース {} の作成に失敗しました。既に存在する場合は \
-                 `peercove-poc down` で残骸を掃除してください。カーネル WireGuard \
+                 `peercove down` で残骸を掃除してください。カーネル WireGuard \
                  モジュールが無い場合は `sudo modprobe wireguard` を試してください",
                 self.if_name
             ))

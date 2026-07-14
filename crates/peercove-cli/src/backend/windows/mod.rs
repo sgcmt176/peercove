@@ -95,7 +95,7 @@ impl WindowsBackend {
         };
         result.context(
             "wintun.dll が読み込めませんでした。https://www.wintun.net から wintun \
-             をダウンロードし、bin/amd64/wintun.dll を peercove-poc.exe と同じフォルダに\
+             をダウンロードし、bin/amd64/wintun.dll を peercove.exe と同じフォルダに\
              配置してください",
         )
     }

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "peercove-poc", version, about = "PeerCove CLI / デーモン")]
+#[command(name = "peercove", version, about = "PeerCove CLI / デーモン")]
 struct Cli {
     /// ログの詳細度(error/warn/info/debug/trace)。RUST_LOG より優先する
     #[arg(long, global = true, value_name = "LEVEL")]

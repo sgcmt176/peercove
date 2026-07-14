@@ -51,9 +51,9 @@ pub fn run(options: &CliOptions) -> anyhow::Result<()> {
     println!("次の手順で接続します:");
     let config = result.config_path.display();
     #[cfg(windows)]
-    println!("  (管理者ターミナルで) .\\peercove-poc.exe member --config {config}");
+    println!("  (管理者ターミナルで) .\\peercove.exe member --config {config}");
     #[cfg(not(windows))]
-    println!("  sudo ./peercove-poc member --config {config}");
+    println!("  sudo ./peercove member --config {config}");
     println!("使い終わったトークン(文字列・ファイル)は削除してください");
     Ok(())
 }

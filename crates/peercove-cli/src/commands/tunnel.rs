@@ -103,7 +103,7 @@ pub fn bring_up(
         tracing::warn!(
             "トンネルのサブネット {} は CGNAT レンジ(100.64.0.0/10)内です。\
              Tailscale が動作しているマシンではパケットが破棄されます。\
-             `peercove-poc init` で生成した設定への移行を推奨します(ADR-0006)",
+             `peercove init` で生成した設定への移行を推奨します(ADR-0006)",
             config.interface.address.trunc()
         );
     }
@@ -980,7 +980,7 @@ pub fn run_down(config_path: &Path) -> anyhow::Result<()> {
 
 pub fn build_spec(config: &Config, role: Role) -> anyhow::Result<TunnelSpec> {
     let private_key = read_private_key_file(&config.interface.private_key_file)
-        .context("秘密鍵ファイルの読み込みに失敗しました(peercove-poc keygen で生成できます)")?;
+        .context("秘密鍵ファイルの読み込みに失敗しました(peercove keygen で生成できます)")?;
 
     let listen_port = match role {
         Role::Host => Some(config.interface.listen_port.unwrap_or(DEFAULT_LISTEN_PORT)),
