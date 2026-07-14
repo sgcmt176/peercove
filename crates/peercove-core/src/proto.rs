@@ -70,6 +70,17 @@ pub enum ControlMessage {
     /// host → member: [`ControlMessage::SetDnsName`] への応答。
     /// 拒否時は `message` に理由(重複・予約語など)が入る。
     SetDnsNameResult { accepted: bool, message: String },
+    /// member → host: 自分の表示名の変更依頼(ADR-0027、M3-19)。
+    /// 表示名は host.toml `[[peer]].name` が正本(ADR-0021)なので、本人からの
+    /// 変更もホストが適用する(DNS 名変更 = [`ControlMessage::SetDnsName`] と
+    /// 同じ「メンバー発 → ホストが host.toml へ適用」パターン)。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
+    /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
+    SetDisplayName { name: String },
+    /// host → member: [`ControlMessage::SetDisplayName`] への応答。
+    /// 拒否時は `message` に理由(重複・空など)が入る。
+    SetDisplayNameResult { accepted: bool, message: String },
 }
 
 /// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。
@@ -190,6 +201,13 @@ mod tests {
                 accepted: true,
                 message: "更新しました".to_string(),
             },
+            ControlMessage::SetDisplayName {
+                name: "山田のノート".to_string(),
+            },
+            ControlMessage::SetDisplayNameResult {
+                accepted: true,
+                message: "更新しました".to_string(),
+            },
         ];
         for message in messages {
             let json = serde_json::to_string(&message).unwrap();
@@ -284,6 +302,22 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"set_dns_name_result","accepted":false,"message":"既に使われています"}"#
+        );
+
+        // 表示名の変更依頼(ADR-0027、M3-19)。同じ「メンバー発 → ホスト適用」パターン
+        let json = serde_json::to_string(&ControlMessage::SetDisplayName {
+            name: "山田のノート".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"set_display_name","name":"山田のノート"}"#);
+        let json = serde_json::to_string(&ControlMessage::SetDisplayNameResult {
+            accepted: false,
+            message: "既に使われています".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"set_display_name_result","accepted":false,"message":"既に使われています"}"#
         );
 
         // dns_name が None ならワイヤに現れず、旧バージョンの台帳も読める

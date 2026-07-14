@@ -100,6 +100,19 @@ async fn set_my_dns_name(config_path: String, dns_name: String) -> Result<(), St
     .await
 }
 
+/// (member)自分の表示名の変更を要求する(ADR-0027、M3-19)。DNS 名変更と同じく
+/// デーモンがコントロールチャネルでホストへ届け、検証・適用の結果を待つ。
+/// 拒否(空・重複)やタイムアウトはエラー文字列で返る。
+#[tauri::command]
+async fn set_my_display_name(config_path: String, display_name: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::SetDisplayName {
+        config,
+        name: display_name,
+    })
+    .await
+}
+
 // ---- 通知(M2-G6) ----
 
 /// OS 通知を出す(メンバーの参加・切断)。
@@ -788,6 +801,14 @@ fn set_host_dns_name(config_path: String, dns_name: String) -> Result<String, St
         .map_err(to_message)
 }
 
+/// ホスト自身の表示名を変更する(ADR-0027、M3-19)。ホスト設定のみ有効。
+/// `[interface].display_name` を書く。確定した表示名を返す。
+#[tauri::command]
+fn set_host_display_name(config_path: String, display_name: String) -> Result<String, String> {
+    peercove_ops::peers::set_host_display_name(Path::new(&config_path), display_name.trim())
+        .map_err(to_message)
+}
+
 /// メンバーの広告サブネット(ADR-0014、M3-7)を設定する。空配列で解除。
 /// ホスト設定(host.toml)に対してのみ有効。約 10 秒で全メンバーへ配布される。
 #[tauri::command]
@@ -1020,6 +1041,8 @@ pub fn run() {
             set_member_dns_name,
             set_my_dns_name,
             set_host_dns_name,
+            set_my_display_name,
+            set_host_display_name,
             set_member_subnets,
             list_acl,
             set_acl,

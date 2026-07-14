@@ -100,10 +100,20 @@ export function TunnelView({
     }
   };
 
+  // 表示名の変更(ADR-0021 / ADR-0027、M3-14a / M3-19)。DNS 名と同じく、
+  // 自分の行はホスト = 直接 host.toml、メンバー = デーモン経由(ホストが検証)。
+  // ホストから見た他メンバーの行は renameMember(host.toml を直接)。
   const rename = async (member: Member, newName: string) => {
     setError(null);
     try {
-      await api.renameMember(tunnel.config, member.publicKey, newName);
+      if (member.isSelf) {
+        if (isHost) await api.setHostDisplayName(tunnel.config, newName);
+        else await api.setMyDisplayName(tunnel.config, newName);
+        setNotice(t.tunnel.member.displayRenamed);
+        setTimeout(() => setNotice(null), 8000);
+      } else {
+        await api.renameMember(tunnel.config, member.publicKey, newName);
+      }
       onChanged();
     } catch (e) {
       setError(errorMessage(e));
@@ -853,28 +863,28 @@ function MemberRow({
             💬
           </button>
         )}
+        {(canManage || member.isSelf) && !editing && (
+          <button
+            type="button"
+            className="button--icon"
+            title={t.tunnel.member.rename}
+            onClick={() => {
+              setDraft(member.name ?? "");
+              setEditing(true);
+            }}
+          >
+            ✎
+          </button>
+        )}
         {canManage && !editing && (
-          <>
-            <button
-              type="button"
-              className="button--icon"
-              title={t.tunnel.member.rename}
-              onClick={() => {
-                setDraft(member.name ?? "");
-                setEditing(true);
-              }}
-            >
-              ✎
-            </button>
-            <button
-              type="button"
-              className="button--icon button--icon-danger"
-              title={t.tunnel.member.remove}
-              onClick={onRemove}
-            >
-              ×
-            </button>
-          </>
+          <button
+            type="button"
+            className="button--icon button--icon-danger"
+            title={t.tunnel.member.remove}
+            onClick={onRemove}
+          >
+            ×
+          </button>
         )}
       </td>
     </tr>

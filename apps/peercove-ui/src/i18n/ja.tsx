@@ -294,7 +294,9 @@ export const ja = {
       noName: "(名前なし)",
       rttTitle: "トンネル内の往復時間",
       rateTitle: "このメンバーとの転送速度（受信+送信、直近約 90 秒の推移）",
-      rename: "名前を変更",
+      rename: "表示名を変更",
+      // 表示名の変更(ADR-0027、M3-19)。自分の行から本人が変更できる
+      displayRenamed: "表示名を変更しました。数秒で全員に反映されます。",
       // DNS 名の分離(ADR-0021、M3-14a)
       editDns: "DNS 名を変更（英数字とハイフンのみ。表示名とは独立）",
       dnsRenamed: "DNS 名を変更しました。数秒で全員に反映されます。",
@@ -549,13 +551,9 @@ export const ja = {
     savedRestart: "保存しました。切断して接続し直すと反映されます。",
     savedLive: "保存しました。数秒でトンネルに反映されます。",
     interface: "インターフェース",
-    displayNameLabel: "表示名（メンバー一覧に出る名前。日本語・空白可）",
-    displayNamePlaceholderMember: "（未設定）",
-    displayNamePlaceholderHost: "host",
-    // DNS 名の分離(ADR-0021、M3-14a)
-    dnsNameLabel: "DNS 名",
-    dnsNameHint:
-      " — <DNS 名>.<ネットワーク名>.peercove.internal の先頭部分。英数字とハイフンのみ（空欄なら host）",
+    // 表示名・DNS 名の変更はメンバー一覧へ一元化した(ADR-0027、M3-19)
+    nameMovedHint:
+      "表示名・DNS 名は「メンバー」一覧の自分の行にある ✎ から変更できます。",
     portLabel: "待受ポート（UDP）",
     portHint: (isMember: boolean, defaultPort: number) =>
       ` — 空欄なら${isMember ? "OS 任せ" : `既定の ${defaultPort}`}`,

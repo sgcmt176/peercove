@@ -121,6 +121,14 @@ pub enum IpcRequest {
     /// (peercove-ops)で行い、IPC には乗せない(ADR-0007)。
     /// 追加メソッドなので [`IPC_VERSION`] は上げない。
     SetDnsName { config: PathBuf, name: String },
+    /// (member のみ)自分の表示名の変更を要求する(ADR-0027、M3-19)。
+    /// 表示名は host.toml `[[peer]].name` が正本(ADR-0021)なので、DNS 名変更と
+    /// 同じくデーモンがコントロールチャネルでホストへ届け、検証・適用の結果を
+    /// 待って返す(成功 = Done / 拒否・タイムアウト = Err に理由)。
+    /// ホスト自身・ホストから見た各メンバーの表示名変更は設定ファイル操作
+    /// (peercove-ops)で行い、IPC には乗せない。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    SetDisplayName { config: PathBuf, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -382,6 +390,10 @@ mod tests {
             IpcRequest::SetDnsName {
                 config: PathBuf::from("member.toml"),
                 name: "yamada-dev".to_string(),
+            },
+            IpcRequest::SetDisplayName {
+                config: PathBuf::from("member.toml"),
+                name: "山田のノート".to_string(),
             },
         ];
         for (i, req) in requests.into_iter().enumerate() {

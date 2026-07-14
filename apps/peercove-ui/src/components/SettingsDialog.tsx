@@ -9,8 +9,9 @@ import { t } from "../i18n";
  * または一覧カードの「設定」から開く 1 ページ。
  *
  * メンバーの追加・削除・改名はメンバー一覧側の操作([[peer]] の編集)なので
- * ここには出さない。仮想 IP / サブネットは init・join のやり直しになるため
- * 表示のみ。
+ * ここには出さない。**表示名・DNS 名の変更もメンバー一覧に一元化**した
+ * (自分の行の ✎ から。ADR-0027、M3-19)。仮想 IP / サブネットは init・join の
+ * やり直しになるため表示のみ。
  *
  * MTU・待受ポート・ホストのエンドポイントは、インターフェース生成時に決まる
  * ので**再接続するまで反映されない**。保存後にその旨を出す。
@@ -51,9 +52,6 @@ function SettingsForm({
   configPath: string;
   settings: Settings;
 }) {
-  const [displayName, setDisplayName] = useState(settings.displayName ?? "");
-  // (host のみ)自分の DNS 名(ADR-0021、M3-14a)。空なら既定(host)
-  const [dnsName, setDnsName] = useState(settings.dnsName ?? "");
   const [listenPort, setListenPort] = useState(
     settings.listenPort === null ? "" : String(settings.listenPort),
   );
@@ -101,9 +99,10 @@ function SettingsForm({
         throw t.settings.maxFileInteger;
       }
       const result = await api.saveSettings(configPath, {
-        displayName: displayName.trim() === "" ? null : displayName.trim(),
-        dnsName:
-          settings.isMember || dnsName.trim() === "" ? null : dnsName.trim(),
+        // 表示名・DNS 名はメンバー一覧から変更する(ADR-0027、M3-19)。
+        // ここでは現在値をそのまま書き戻して消さない
+        displayName: settings.displayName,
+        dnsName: settings.dnsName,
         listenPort: portValue,
         mtu: mtuValue,
         hostEndpoint:
@@ -139,34 +138,7 @@ function SettingsForm({
           </dd>
         </dl>
 
-        <label className="field">
-          <span>{t.settings.displayNameLabel}</span>
-          <input
-            type="text"
-            value={displayName}
-            placeholder={
-              settings.isMember
-                ? t.settings.displayNamePlaceholderMember
-                : t.settings.displayNamePlaceholderHost
-            }
-            onChange={(event) => setDisplayName(event.target.value)}
-          />
-        </label>
-
-        {!settings.isMember && (
-          <label className="field">
-            <span>
-              {t.settings.dnsNameLabel}
-              <small className="muted">{t.settings.dnsNameHint}</small>
-            </span>
-            <input
-              type="text"
-              value={dnsName}
-              placeholder="host"
-              onChange={(event) => setDnsName(event.target.value)}
-            />
-          </label>
-        )}
+        <p className="muted small">{t.settings.nameMovedHint}</p>
 
         <label className="field">
           <span>

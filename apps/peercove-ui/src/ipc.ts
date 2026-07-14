@@ -309,6 +309,13 @@ export const api = {
     invoke<void>("set_my_dns_name", { configPath, dnsName }),
   setHostDnsName: (configPath: string, dnsName: string) =>
     invoke<string>("set_host_dns_name", { configPath, dnsName }),
+  // 表示名（ADR-0027、M3-19）。ホストは自分の分を直接、メンバー本人は
+  // デーモン経由（接続中のみ・ホストが検証）で変更する。ホストから見た他
+  // メンバーの表示名変更は renameMember(peercove-ops)を使う
+  setMyDisplayName: (configPath: string, displayName: string) =>
+    invoke<void>("set_my_display_name", { configPath, displayName }),
+  setHostDisplayName: (configPath: string, displayName: string) =>
+    invoke<string>("set_host_display_name", { configPath, displayName }),
   setMemberSubnets: (configPath: string, publicKey: string, subnets: string[]) =>
     invoke<void>("set_member_subnets", { configPath, publicKey, subnets }),
   // ACL: メンバー間通信の遮断組（M3-10、ADR-0018。ホスト設定のみ）

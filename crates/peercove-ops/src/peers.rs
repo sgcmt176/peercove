@@ -496,6 +496,34 @@ pub fn set_peer_dns_name_by_ip(
     set_peer_dns_name(config_path, &Selector::Ip(member_ip), input)
 }
 
+/// コントロールチャネル経由(本人の仮想 IP で特定)で表示名を変更する入り口
+/// (ADR-0027、M3-19)。表示名は host.toml `[[peer]].name` が正本(ADR-0021)なので、
+/// 本人からの変更も [`rename_peer`] で適用する。戻り値は確定した表示名(ログ用)。
+pub fn set_peer_display_name_by_ip(
+    config_path: &Path,
+    member_ip: Ipv4Addr,
+    input: &str,
+) -> anyhow::Result<String> {
+    let name = input.trim();
+    rename_peer(config_path, &Selector::Ip(member_ip), name)?;
+    Ok(name.to_string())
+}
+
+/// ホスト自身の表示名を設定する(ADR-0027)。戻り値は確定した表示名。
+/// 空文字は許さない(表示名は必須)。`[interface].display_name` を書く。
+pub fn set_host_display_name(config_path: &Path, input: &str) -> anyhow::Result<String> {
+    let name = input.trim();
+    crate::invite::validate_name(name)?;
+    let mut doc = load_doc(config_path)?;
+    let interface = doc
+        .get_mut("interface")
+        .and_then(|item| item.as_table_mut())
+        .context("[interface] が見つかりません")?;
+    interface.insert("display_name", toml_edit::value(name));
+    write_validated(config_path, &doc.to_string())?;
+    Ok(name.to_string())
+}
+
 /// ホスト自身の DNS 名を設定する(ADR-0021)。戻り値は確定したラベル。
 pub fn set_host_dns_name(config_path: &Path, input: &str) -> anyhow::Result<String> {
     let label = peercove_core::names::normalize_dns_name(input, true)?;
@@ -609,6 +637,45 @@ mod tests {
         assert!(rename_peer(&config, &Selector::Name("アリス"), "bob").is_err());
         // 不正な名前は拒否
         assert!(rename_peer(&config, &Selector::Name("アリス"), "").is_err());
+    }
+
+    /// メンバー本人の表示名変更(ADR-0027): 仮想 IP で特定して `[[peer]].name` を書く。
+    #[test]
+    fn set_peer_display_name_by_ip_updates_name() {
+        let config = setup("peer-display");
+        add(&config, "alice", "10.100.42.2");
+        add(&config, "bob", "10.100.42.3");
+
+        let ip = "10.100.42.2".parse().unwrap();
+        let applied = set_peer_display_name_by_ip(&config, ip, "  アリスのPC ").unwrap();
+        assert_eq!(applied, "アリスのPC", "trim される");
+        let parsed = Config::load(&config).unwrap();
+        assert_eq!(parsed.peers[0].name.as_deref(), Some("アリスのPC"));
+        assert_eq!(parsed.peers[1].name.as_deref(), Some("bob"), "他は不変");
+
+        // 他メンバーと同名にはできない / 空は拒否
+        assert!(set_peer_display_name_by_ip(&config, ip, "bob").is_err());
+        assert!(set_peer_display_name_by_ip(&config, ip, "  ").is_err());
+    }
+
+    /// ホスト自身の表示名変更(ADR-0027): `[interface].display_name` を書く。
+    #[test]
+    fn set_host_display_name_writes_interface() {
+        let config = setup("host-display");
+        add(&config, "alice", "10.100.42.2");
+
+        let applied = set_host_display_name(&config, "  うちのサーバ ").unwrap();
+        assert_eq!(applied, "うちのサーバ");
+        assert_eq!(
+            Config::load(&config)
+                .unwrap()
+                .interface
+                .display_name
+                .as_deref(),
+            Some("うちのサーバ")
+        );
+        // 空は拒否
+        assert!(set_host_display_name(&config, "   ").is_err());
     }
 
     #[test]

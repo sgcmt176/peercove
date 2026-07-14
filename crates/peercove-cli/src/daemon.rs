@@ -196,6 +196,37 @@ impl DaemonShared {
                     ),
                 }
             }
+            IpcRequest::SetDisplayName { config, name } => {
+                // (member)表示名の変更依頼(ADR-0027)。DNS 名変更と同じ経路で
+                // ホストへ送り、検証・適用の結果を待つ。ロックは送信前に手放す
+                let (link, network) = {
+                    let active = self.active.lock().await;
+                    let active = active.get(&Self::key_for(&config)).with_context(|| {
+                        format!("この設定のトンネルは動いていません({})", config.display())
+                    })?;
+                    if active.role != Role::Member {
+                        bail!(
+                            "この操作はメンバーとして参加しているネットワーク用です\
+                            (ホスト自身の表示名はメンバー一覧の自分の行から変更できます)"
+                        );
+                    }
+                    (Arc::clone(&active.member_link), active.network.clone())
+                };
+                let reply = link
+                    .request_display_name(name)
+                    .context("ホストに接続していません(接続が確立してからやり直してください)")?;
+                match tokio::time::timeout(std::time::Duration::from_secs(10), reply).await {
+                    Ok(Ok((true, message))) => {
+                        tracing::info!("表示名を変更しました(network={network}): {message}");
+                        Ok(IpcResponse::Done)
+                    }
+                    Ok(Ok((false, message))) => bail!("{message}"),
+                    Ok(Err(_)) => bail!("ホストとの接続が切れました。やり直してください"),
+                    Err(_) => bail!(
+                        "ホストから応答がありません(ホストのバージョンが古い可能性があります)"
+                    ),
+                }
+            }
         }
     }
 

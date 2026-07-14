@@ -144,6 +144,8 @@ struct MemberLinkState {
     /// 読みタスクが応答を流し込む。切断(attach)で捨てられると受け口側は
     /// Err になる(= 接続が切れた)。
     dns_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
+    /// 表示名変更(ADR-0027)の応答待ち。dns_reply と同じ仕組み。
+    display_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
 }
 
 impl MemberLink {
@@ -184,18 +186,39 @@ impl MemberLink {
         Some(rx)
     }
 
+    /// 自分の表示名の変更をホストへ依頼し、応答の受け口を返す(ADR-0027)。
+    /// 切断中なら `None`。仕組みは [`Self::request_dns_name`] と同じ。
+    pub fn request_display_name(
+        &self,
+        name: String,
+    ) -> Option<tokio::sync::oneshot::Receiver<(bool, String)>> {
+        let mut state = self.inner.lock().unwrap();
+        let outbox = state.outbox.as_ref()?;
+        if outbox
+            .send(ControlMessage::SetDisplayName { name })
+            .is_err()
+        {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.display_reply = Some(tx);
+        Some(rx)
+    }
+
     fn attach(&self, outbox: Outbox) {
         let mut state = self.inner.lock().unwrap();
         state.session += 1;
         state.outbox = Some(outbox);
         state.rotate_result = None;
         state.dns_reply = None; // 応答待ちの受け口は Err(切断)になる
+        state.display_reply = None;
     }
 
     fn detach(&self) {
         let mut state = self.inner.lock().unwrap();
         state.outbox = None;
         state.dns_reply = None;
+        state.display_reply = None;
     }
 
     fn put_rotate_result(&self, accepted: bool, message: String) {
@@ -204,6 +227,12 @@ impl MemberLink {
 
     fn put_dns_result(&self, accepted: bool, message: String) {
         if let Some(reply) = self.inner.lock().unwrap().dns_reply.take() {
+            let _ = reply.send((accepted, message));
+        }
+    }
+
+    fn put_display_result(&self, accepted: bool, message: String) {
+        if let Some(reply) = self.inner.lock().unwrap().display_reply.take() {
             let _ = reply.send((accepted, message));
         }
     }
@@ -309,6 +338,34 @@ impl HostRequests {
             }
             Err(e) => {
                 tracing::warn!("DNS 名変更の適用タスクが失敗しました: {e}");
+                (false, "ホスト側の内部エラーです".to_string())
+            }
+        }
+    }
+
+    /// 表示名の変更依頼(ADR-0027)を適用し、(accepted, メッセージ) を返す。
+    /// 表示名は host.toml `[[peer]].name` が正本なので rename_peer と同型で書く。
+    async fn apply_display_name(&self, member_ip: Ipv4Addr, name: String) -> (bool, String) {
+        let _guard = self.lock.lock().await;
+        let path = self.config_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            peercove_ops::peers::set_peer_display_name_by_ip(&path, member_ip, &name)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(name)) => {
+                tracing::info!("メンバー {member_ip} の表示名を「{name}」に変更しました");
+                (
+                    true,
+                    format!("表示名を「{name}」に変更しました(数秒で全員に反映されます)"),
+                )
+            }
+            Ok(Err(e)) => {
+                tracing::info!("メンバー {member_ip} の表示名変更を受け付けませんでした: {e:#}");
+                (false, format!("{e:#}"))
+            }
+            Err(e) => {
+                tracing::warn!("表示名変更の適用タスクが失敗しました: {e}");
                 (false, "ホスト側の内部エラーです".to_string())
             }
         }
@@ -616,6 +673,12 @@ async fn host_reader(
                 let (accepted, message) = requests.apply_dns_name(member_ip, name).await;
                 let _ = out.send(ControlMessage::SetDnsNameResult { accepted, message });
             }
+            Ok(ControlMessage::SetDisplayName { name }) => {
+                // 表示名の変更依頼(ADR-0027)。DNS 名と同じく永続化のみで、
+                // 台帳への反映は supervisor の次回再読込(≤5 秒)が行う
+                let (accepted, message) = requests.apply_display_name(member_ip, name).await;
+                let _ = out.send(ControlMessage::SetDisplayNameResult { accepted, message });
+            }
             Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
         }
@@ -805,6 +868,10 @@ async fn member_reader(
             Ok(ControlMessage::SetDnsNameResult { accepted, message }) => {
                 // DNS 名変更の応答(ADR-0021)。IPC ハンドラが待つ受け口へ渡す
                 link.put_dns_result(accepted, message);
+            }
+            Ok(ControlMessage::SetDisplayNameResult { accepted, message }) => {
+                // 表示名変更の応答(ADR-0027)。IPC ハンドラが待つ受け口へ渡す
+                link.put_display_result(accepted, message);
             }
             Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
