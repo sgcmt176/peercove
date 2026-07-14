@@ -321,16 +321,16 @@ export default function App() {
                 />
               )}
               <SidebarItem
-                icon="⚙"
-                label={t.sidebar.settings}
-                active={view === "net-settings"}
-                onClick={() => setView("net-settings")}
-              />
-              <SidebarItem
                 icon="🧾"
                 label={t.sidebar.logs}
                 active={view === "logs"}
                 onClick={() => setView("logs")}
+              />
+              <SidebarItem
+                icon="⚙"
+                label={t.sidebar.settings}
+                active={view === "net-settings"}
+                onClick={() => setView("net-settings")}
               />
             </>
           ) : (
@@ -394,7 +394,7 @@ export default function App() {
           </section>
         )}
 
-        {detail && view !== "logs" && (
+        {detail && (
           <DetailHeader
             name={detailName}
             isHost={detailHost}
@@ -404,7 +404,7 @@ export default function App() {
             onDisconnect={() => void disconnect()}
           />
         )}
-        {detail && view !== "logs" && openTunnel?.removed && (
+        {detail && openTunnel?.removed && (
           <section className="card card--error">
             <h2>{t.tunnel.removedTitle}</h2>
             <p>{t.tunnel.removedBody}</p>
