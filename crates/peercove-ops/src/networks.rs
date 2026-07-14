@@ -94,6 +94,11 @@ pub fn list(base: &Path) -> Vec<NetworkEntry> {
         let Some(slug) = dir.file_name().and_then(|n| n.to_str()).map(String::from) else {
             continue;
         };
+        // 復元処理のステージング/退避ディレクトリなど、内部用の名前を
+        // ネットワークとして公開しない。設定が入っていても削除 UI の対象外にする。
+        if !names::is_dns_label(&slug) {
+            continue;
+        }
         let (config_path, role) = match (dir.join(HOST_FILE), dir.join(MEMBER_FILE)) {
             (host, _) if host.exists() => (host, Role::Host),
             (_, member) if member.exists() => (member, Role::Member),
@@ -258,6 +263,9 @@ mod tests {
         let broken = networks_dir(&base).join("broken");
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join(HOST_FILE), "not toml [").unwrap();
+        // 復元中または後始末待ちの内部ディレクトリも一覧へ出さない。
+        let internal = networks_dir(&base).join(".replace-old-1-2");
+        crate::init::init_host(&internal, "game-lan", 51821, false).unwrap();
         assert_eq!(list(&base).len(), 1);
     }
 

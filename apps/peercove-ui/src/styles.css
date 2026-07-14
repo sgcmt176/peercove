@@ -1072,6 +1072,7 @@ select {
 .quality__chart--loss { min-height: 110px; }
 .quality__grid { stroke: var(--border); stroke-width: 1; }
 .quality__rtt-line { fill: none; stroke: var(--primary); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.quality__rtt-point { fill: var(--primary); stroke: var(--card); stroke-width: 2; }
 .quality__loss-bar { fill: #d97706; }
 .quality__axis { fill: var(--muted); font-size: 11px; }
 .quality__no-data { min-height: 110px; display: grid; place-items: center; }

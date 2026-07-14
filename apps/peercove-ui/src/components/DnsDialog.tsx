@@ -278,13 +278,15 @@ export function DnsView({
                 {record.url !== null && copyButton(record.url, t.dns.copyUrl)}
                 {isHost && (
                   <>
-                    <button
-                      type="button"
-                      className="button--link small"
-                      onClick={() => setHealthEditing(record)}
-                    >
-                      {t.dns.health.settings}
-                    </button>
+                    {record.port !== null && record.healthSettings !== null && (
+                      <button
+                        type="button"
+                        className="button--link small"
+                        onClick={() => setHealthEditing(record)}
+                      >
+                        {t.dns.health.settings}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="button--link button--link-danger small"

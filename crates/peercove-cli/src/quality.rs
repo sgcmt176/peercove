@@ -116,6 +116,8 @@ impl Aggregate {
 
 pub struct QualityStore {
     directory: PathBuf,
+    #[cfg(unix)]
+    owner: Option<(u32, u32)>,
     entries: Vec<QualitySample>,
     current_window: Option<u64>,
     current: HashMap<String, Aggregate>,
@@ -129,6 +131,8 @@ impl QualityStore {
         let directory = config_path.with_extension("quality");
         let mut store = Self {
             directory,
+            #[cfg(unix)]
+            owner: config_owner(config_path),
             entries: Vec::new(),
             current_window: None,
             current: HashMap::new(),
@@ -136,6 +140,7 @@ impl QualityStore {
             previous_routes: HashMap::new(),
             skipped_corrupt_lines: 0,
         };
+        store.repair_ownership();
         store.read_history(now_unix_ms());
         Arc::new(Mutex::new(store))
     }
@@ -272,6 +277,7 @@ impl QualityStore {
 
     fn append(&self, sample: &QualitySample) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.directory)?;
+        self.apply_owner(&self.directory);
         let path = self
             .directory
             .join(format!("{}.jsonl", utc_date(sample.window_start_unix_ms)));
@@ -280,9 +286,30 @@ impl QualityStore {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?;
         file.write_all(line.as_bytes())?;
+        self.apply_owner(&path);
         Ok(())
+    }
+
+    /// Linux のサービス(root)が作った履歴を、設定ファイルの所有者へ戻す。
+    /// これを行わないと一般ユーザーの UI からネットワークを削除できない。
+    fn repair_ownership(&self) {
+        self.apply_owner(&self.directory);
+        if let Ok(entries) = std::fs::read_dir(&self.directory) {
+            for entry in entries.flatten() {
+                self.apply_owner(&entry.path());
+            }
+        }
+    }
+
+    fn apply_owner(&self, path: &Path) {
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.owner {
+            let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     fn read_history(&mut self, now_unix_ms: u64) {
@@ -349,6 +376,14 @@ impl QualityStore {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn config_owner(config_path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(config_path)
+        .ok()
+        .map(|metadata| (metadata.uid(), metadata.gid()))
 }
 
 pub fn now_unix_ms() -> u64 {

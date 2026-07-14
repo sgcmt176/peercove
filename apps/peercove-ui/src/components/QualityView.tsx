@@ -197,17 +197,22 @@ function RttChart({ samples }: { samples: QualityPoint[] }) {
   if (values.length === 0) return <p className="muted quality__no-data">{t.quality.noRtt}</p>;
   const max = Math.max(1, ...values) * 1.1;
   const width = 720, height = 170, pad = 24;
-  const points = shown.map((sample, index) => sample.rttAvgMs === null ? null : `${xAt(index, shown.length, width, pad)},${height - pad - sample.rttAvgMs / max * (height - pad * 2)}`);
-  const segments: string[] = [];
-  let current: string[] = [];
+  const points = shown.map((sample, index) => sample.rttAvgMs === null ? null : ({
+    x: xAt(index, shown.length, width, pad),
+    y: height - pad - sample.rttAvgMs / max * (height - pad * 2),
+  }));
+  const segments: Array<Array<{ x: number; y: number }>> = [];
+  let current: Array<{ x: number; y: number }> = [];
   for (const point of points) {
     if (point) current.push(point);
-    else if (current.length) { segments.push(current.join(" ")); current = []; }
+    else if (current.length) { segments.push(current); current = []; }
   }
-  if (current.length) segments.push(current.join(" "));
+  if (current.length) segments.push(current);
   return <svg className="quality__chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t.quality.rttAria}>
     {[0, .5, 1].map((ratio) => <line key={ratio} x1={pad} x2={width-pad} y1={pad + ratio*(height-pad*2)} y2={pad + ratio*(height-pad*2)} className="quality__grid" />)}
-    {segments.map((points, index) => <polyline key={index} points={points} className="quality__rtt-line" />)}
+    {segments.map((segment, index) => segment.length === 1
+      ? <circle key={index} cx={segment[0].x} cy={segment[0].y} r="4" className="quality__rtt-point" />
+      : <polyline key={index} points={segment.map((point) => `${point.x},${point.y}`).join(" ")} className="quality__rtt-line" />)}
     <text x={pad} y={15} className="quality__axis">{max.toFixed(0)} ms</text><text x={pad} y={height-5} className="quality__axis">0 ms</text>
   </svg>;
 }
@@ -219,7 +224,12 @@ function LossChart({ samples }: { samples: QualityPoint[] }) {
   const bar = (width - pad * 2) / Math.max(shown.length, 1);
   return <svg className="quality__chart quality__chart--loss" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t.quality.lossAria}>
     <line x1={pad} x2={width-pad} y1={height-pad} y2={height-pad} className="quality__grid" />
-    {shown.map((sample, index) => sample.lossPercent === null ? null : <rect key={sample.windowStartUnixMs} x={pad+index*bar} y={height-pad-sample.lossPercent/100*(height-pad*2)} width={Math.max(1,bar-1)} height={sample.lossPercent/100*(height-pad*2)} className="quality__loss-bar" />)}
+    {shown.map((sample, index) => {
+      if (sample.lossPercent === null) return null;
+      // 0% も「測定済み」と分かるよう、基線上に最小 2px の棒を描く。
+      const barHeight = Math.max(2, sample.lossPercent / 100 * (height - pad * 2));
+      return <rect key={sample.windowStartUnixMs} x={pad+index*bar} y={height-pad-barHeight} width={Math.max(1,bar-1)} height={barHeight} className="quality__loss-bar" />;
+    })}
     <text x={pad} y={15} className="quality__axis">100%</text><text x={pad} y={height-5} className="quality__axis">0%</text>
   </svg>;
 }
