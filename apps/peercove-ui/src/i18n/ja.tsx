@@ -86,11 +86,14 @@ export const ja = {
     lead: "設定と現在の状態を変更せずに確認します。外部の診断サーバーへは送信しません。",
     rerun: "再診断",
     running: "診断しています…",
-    export: "診断結果を保存",
-    saved: (path: string) => `診断結果を保存しました: ${path}（同じ場所に TXT も保存）`,
     noIssues: "確認できた範囲に問題はありません。",
     passed: (count: number) => `正常な項目（${count}）`,
     unknownAction: "詳細な判定に必要な情報がありません。",
+    passAction: "問題は見つかりませんでした。",
+    evidence: {
+      peercoveAclManaged: "PeerCove管理（現在のユーザー＋SYSTEM）",
+      modeBitsVerified: "Unix権限を確認済み",
+    },
     overall: {
       healthy: "正常",
       attention: "確認が必要",
@@ -102,12 +105,6 @@ export const ja = {
       fail: "失敗",
       unknown: "判定不能",
     },
-    exportConfirmTitle: "診断結果を保存しますか？",
-    exportConfirmBody:
-      "JSON と人が読める TXT をローカルに保存します。自動アップロードは行いません。",
-    exportConfirmDetail:
-      "秘密鍵・PSK・招待トークンは除外します。設定パス、仮想 IP、公開鍵、接続先、直近ログは含まれる場合があります。",
-    exportConfirm: "内容を確認して保存",
     check: {
       "app.ipc_compatible": {
         summary: "UI とデーモンの IPC は互換です",

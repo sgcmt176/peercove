@@ -163,58 +163,6 @@ async fn diagnose_network(config_path: String) -> Result<DiagnosticReport, Strin
     }
 }
 
-/// 診断結果を JSON と同名の TXT のペアでローカルへ保存する。自動送信はしない。
-#[tauri::command]
-async fn save_diagnostic_report(
-    app: tauri::AppHandle,
-    report: DiagnosticReport,
-) -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::DialogExt;
-
-    let json = serde_json::to_string_pretty(&report)
-        .map_err(|error| format!("診断 JSON を作成できません: {error}"))?;
-    let text = report.to_text();
-    if export_contains_secret(&json) || export_contains_secret(&text) {
-        return Err("診断結果に秘密情報らしい内容があるため保存を中止しました".to_string());
-    }
-    let picked = tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
-            .file()
-            .set_file_name("peercove-diagnostic.json")
-            .blocking_save_file()
-            .map(|path| path.to_string())
-    })
-    .await
-    .map_err(|error| format!("ダイアログの表示に失敗しました: {error}"))?;
-    let Some(path) = picked else {
-        return Ok(None);
-    };
-    let mut json_path = PathBuf::from(&path);
-    json_path.set_extension("json");
-    let mut text_path = json_path.clone();
-    text_path.set_extension("txt");
-    std::fs::write(&json_path, json)
-        .map_err(|error| format!("JSON の保存に失敗しました: {error}"))?;
-    if let Err(error) = std::fs::write(&text_path, text) {
-        let _ = std::fs::remove_file(&json_path);
-        return Err(format!("TXT の保存に失敗しました: {error}"));
-    }
-    Ok(Some(json_path.display().to_string()))
-}
-
-fn export_contains_secret(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    [
-        "private_key =",
-        "private_key\"",
-        "preshared_key",
-        "peercove://join?token=",
-        "invite token",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 // ---- ファイル送信・受信ボックス(ADR-0015、M3-9b) ----
 
 /// 送るファイルを選ぶ(OS のファイルダイアログ)。キャンセルで None。
@@ -1119,7 +1067,6 @@ pub fn run() {
             check_update,
             daemon_logs,
             diagnose_network,
-            save_diagnostic_report,
             start_host,
             start_member,
             stop_tunnel,
@@ -1162,19 +1109,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Tauri アプリの起動に失敗しました");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn diagnostic_export_deny_list_blocks_secret_shapes() {
-        assert!(export_contains_secret("private_key = 'abc'"));
-        assert!(export_contains_secret("peercove://join?token=abc"));
-        assert!(export_contains_secret("PRESHARED_KEY_FILE"));
-        assert!(!export_contains_secret(
-            "public_key: visible\naddress: 10.0.0.1"
-        ));
-    }
 }

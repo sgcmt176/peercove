@@ -1360,14 +1360,11 @@ mod tests {
         let connections: control::Connections = Default::default();
         // alice の制御接続を模擬(誤って削除通知が送られたら検出できるように)
         let (tx, mut member_inbox) = tokio::sync::mpsc::unbounded_channel();
-        connections.lock().unwrap().insert(
-            "10.100.42.2".parse().unwrap(),
-            control::ConnectionInfo {
-                outbox: tx,
-                app_version: None,
-                capabilities: vec![],
-            },
-        );
+        let (connection, _close_rx) = control::ConnectionInfo::new(tx, None, vec![]);
+        connections
+            .lock()
+            .unwrap()
+            .insert("10.100.42.2".parse().unwrap(), connection);
 
         let config = host_config(&peer_toml(&old_key));
         sync_peers(

@@ -12,8 +12,6 @@ export function DiagnosticsView({ configPath }: { configPath: string }) {
   const [report, setReport] = useState<DiagnosticReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [saveConfirm, setSaveConfirm] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
 
   const run = useCallback(async () => {
     setBusy(true);
@@ -40,22 +38,6 @@ export function DiagnosticsView({ configPath }: { configPath: string }) {
     [report],
   );
 
-  const save = async () => {
-    if (!report) return;
-    setBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const path = await api.saveDiagnosticReport(report);
-      if (path) setNotice(t.diagnostics.saved(path));
-      setSaveConfirm(false);
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <section className="diagnostics">
       <header className="page-head diagnostics__head">
@@ -63,23 +45,12 @@ export function DiagnosticsView({ configPath }: { configPath: string }) {
           <h2>{t.diagnostics.title}</h2>
           <p className="muted">{t.diagnostics.lead}</p>
         </div>
-        <div className="diagnostics__actions">
-          <button type="button" onClick={() => void run()} disabled={busy}>
-            {busy ? t.common.running : t.diagnostics.rerun}
-          </button>
-          <button
-            type="button"
-            className="button--ghost"
-            onClick={() => setSaveConfirm(true)}
-            disabled={!report || busy}
-          >
-            {t.diagnostics.export}
-          </button>
-        </div>
+        <button type="button" onClick={() => void run()} disabled={busy}>
+          {busy ? t.common.running : t.diagnostics.rerun}
+        </button>
       </header>
 
       {error && <p className="error" role="alert">{error}</p>}
-      {notice && <p className="notice" role="status">{notice}</p>}
       {!report && !error && <p className="muted">{t.diagnostics.running}</p>}
 
       {report && (
@@ -109,22 +80,6 @@ export function DiagnosticsView({ configPath }: { configPath: string }) {
           )}
         </>
       )}
-
-      {saveConfirm && report && (
-        <div className="card diagnostics__confirm" role="alertdialog" aria-modal="true">
-          <h3>{t.diagnostics.exportConfirmTitle}</h3>
-          <p>{t.diagnostics.exportConfirmBody}</p>
-          <p className="muted small">{t.diagnostics.exportConfirmDetail}</p>
-          <div className="row-actions">
-            <button type="button" onClick={() => setSaveConfirm(false)} disabled={busy}>
-              {t.common.cancel}
-            </button>
-            <button type="button" onClick={() => void save()} disabled={busy}>
-              {busy ? t.common.saving : t.diagnostics.exportConfirm}
-            </button>
-          </div>
-        </div>
-      )}
     </section>
   );
 }
@@ -141,13 +96,15 @@ function CheckCard({ check }: { check: DiagnosticCheck }) {
       </span>
       <div>
         <strong>{copy.summary}</strong>
-        <p className="muted small">{copy.action}</p>
+        <p className="muted small">
+          {check.status === "pass" ? t.diagnostics.passAction : copy.action}
+        </p>
         {Object.keys(check.evidence).length > 0 && (
           <dl className="diagnostics__evidence">
             {Object.entries(check.evidence).map(([key, value]) => (
               <div key={key}>
                 <dt>{key}</dt>
-                <dd className="mono">{value}</dd>
+                <dd className="mono">{evidenceValue(value)}</dd>
               </div>
             ))}
           </dl>
@@ -155,6 +112,16 @@ function CheckCard({ check }: { check: DiagnosticCheck }) {
       </div>
     </article>
   );
+}
+
+function evidenceValue(value: string) {
+  if (value === "peercove_acl_managed") {
+    return t.diagnostics.evidence.peercoveAclManaged;
+  }
+  if (value === "mode_bits_verified") {
+    return t.diagnostics.evidence.modeBitsVerified;
+  }
+  return value;
 }
 
 function statusIcon(status: DiagnosticStatus) {

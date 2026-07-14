@@ -437,8 +437,6 @@ export const api = {
   daemonLogs: (afterSeq: number) => invoke<Logs>("daemon_logs", { afterSeq }),
   diagnoseNetwork: (configPath: string) =>
     invoke<DiagnosticReport>("diagnose_network", { configPath }),
-  saveDiagnosticReport: (report: DiagnosticReport) =>
-    invoke<string | null>("save_diagnostic_report", { report }),
   listDnsRecords: (configPath: string) =>
     invoke<DnsRecord[]>("list_dns_records", { configPath }),
   // ターゲットは ip（固定）か member（メンバー参照 = IP 自動追随）のどちらか。

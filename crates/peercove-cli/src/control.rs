@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,16 +32,37 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// RTT 計測 ping の間隔(M2-G5)。supervisor の周期と同じにして、
 /// UI の表示が 1 周期ごとに 1 回は更新されるようにする。
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 接続中メンバーの送信口と、Hello で広告された製品情報(M3-12)。
 #[derive(Clone)]
 pub struct ConnectionInfo {
     pub(crate) outbox: mpsc::UnboundedSender<ControlMessage>,
+    connection_id: u64,
+    close: mpsc::UnboundedSender<()>,
     pub app_version: Option<String>,
     pub capabilities: Vec<String>,
 }
 
 impl ConnectionInfo {
+    pub(crate) fn new(
+        outbox: mpsc::UnboundedSender<ControlMessage>,
+        app_version: Option<String>,
+        capabilities: Vec<String>,
+    ) -> (Self, mpsc::UnboundedReceiver<()>) {
+        let (close, close_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                outbox,
+                connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+                close,
+                app_version,
+                capabilities,
+            },
+            close_rx,
+        )
+    }
+
     pub fn send(&self, message: ControlMessage) -> bool {
         self.outbox.send(message).is_ok()
     }
@@ -49,6 +70,32 @@ impl ConnectionInfo {
 
 /// 接続中メンバー(仮想 IP → 接続情報)。削除通知と台帳の製品情報に使う。
 pub type Connections = Arc<Mutex<HashMap<Ipv4Addr, ConnectionInfo>>>;
+
+fn register_connection(connections: &Connections, member_ip: Ipv4Addr, connection: ConnectionInfo) {
+    let previous = connections.lock().unwrap().insert(member_ip, connection);
+    if let Some(previous) = previous {
+        // 鍵更新直後など、旧 TCP が半開きのまま新しい認証済み
+        // セッションが先に到着することがある。新しい方を正本にする。
+        let _ = previous.close.send(());
+    }
+}
+
+fn unregister_connection(
+    connections: &Connections,
+    member_ip: Ipv4Addr,
+    connection_id: u64,
+) -> bool {
+    let mut connections = connections.lock().unwrap();
+    if connections
+        .get(&member_ip)
+        .is_some_and(|current| current.connection_id == connection_id)
+    {
+        connections.remove(&member_ip);
+        true
+    } else {
+        false
+    }
+}
 
 /// ホストが配布する内容一式(台帳 + カスタム DNS レコード — M3-1)。
 /// watch チャネルでまとめて流し、どれかが変わったら再配布される。
@@ -642,20 +689,9 @@ async fn handle_member(
 
     // 送信キューを登録(台帳変更・削除通知・Pong の配送口)
     let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
-    {
-        let mut connections = connections.lock().unwrap();
-        if connections.contains_key(&member_ip) {
-            anyhow::bail!("同じ招待を使った接続が既に存在します");
-        }
-        connections.insert(
-            member_ip,
-            ConnectionInfo {
-                outbox: tx.clone(),
-                app_version,
-                capabilities,
-            },
-        );
-    }
+    let (connection, mut close_rx) = ConnectionInfo::new(tx.clone(), app_version, capabilities);
+    let connection_id = connection.connection_id;
+    register_connection(connections, member_ip, connection);
 
     // 現在の台帳を即送信。borrow_and_update で「見た」ことにして、
     // 直後の changed() が同じ内容をもう一度送るのを防ぐ
@@ -688,13 +724,20 @@ async fn handle_member(
     // (読み側が先に終わると tx が落ちて書き側も即 ready になり、順序が非決定になる)
     let result = tokio::select! {
         biased;
+        _ = close_rx.recv() => {
+            writer.abort();
+            read_task.abort();
+            Ok(Ok(()))
+        }
         joined = &mut writer => { read_task.abort(); joined }
         joined = &mut read_task => { writer.abort(); joined }
     };
     let result =
         result.unwrap_or_else(|e| Err(anyhow::anyhow!("制御タスクが異常終了しました: {e}")));
-    connections.lock().unwrap().remove(&member_ip);
-    rtt.lock().unwrap().remove(&member_ip);
+    let removed_current = unregister_connection(connections, member_ip, connection_id);
+    if removed_current {
+        rtt.lock().unwrap().remove(&member_ip);
+    }
     result
 }
 
@@ -1051,6 +1094,30 @@ mod tests {
         )
         .unwrap();
         Arc::new(HostRequests::new(path, PrivateKey::generate().public_key()))
+    }
+
+    #[test]
+    fn authenticated_reconnect_replaces_stale_session_safely() {
+        let connections: Connections = Default::default();
+        let member_ip = "10.100.42.2".parse().unwrap();
+        let (first_outbox, _first_inbox) = mpsc::unbounded_channel();
+        let (first, mut first_close) = ConnectionInfo::new(first_outbox, None, vec![]);
+        let first_id = first.connection_id;
+        register_connection(&connections, member_ip, first);
+
+        let (second_outbox, _second_inbox) = mpsc::unbounded_channel();
+        let (second, _second_close) = ConnectionInfo::new(second_outbox, None, vec![]);
+        let second_id = second.connection_id;
+        register_connection(&connections, member_ip, second);
+
+        assert_eq!(first_close.try_recv(), Ok(()), "旧セッションを終了させる");
+        assert!(
+            !unregister_connection(&connections, member_ip, first_id),
+            "旧セッションの終了で新セッションを削除しない"
+        );
+        assert_eq!(connections.lock().unwrap().len(), 1);
+        assert!(unregister_connection(&connections, member_ip, second_id));
+        assert!(connections.lock().unwrap().is_empty());
     }
 
     /// 受信ログの INFO/debug 判定(ADR-0019): エンドポイントとその観測経過

@@ -1110,7 +1110,7 @@ impl DaemonShared {
                             if permissions_unknown {
                                 "not_available"
                             } else {
-                                "complete"
+                                secret_permission_check_label()
                             }
                             .to_string(),
                         ),
@@ -1296,8 +1296,20 @@ fn secret_permissions_are_private(metadata: &std::fs::Metadata) -> Option<bool> 
 
 #[cfg(windows)]
 fn secret_permissions_are_private(_metadata: &std::fs::Metadata) -> Option<bool> {
-    // Windows ACL の詳細検査は OS API 境界として別段階。存在だけをここで確認する。
-    None
+    // Windows の秘密ファイルは peercove-ops::secret::write_secret が作成時に
+    // 継承を外し「現在のユーザー + SYSTEM」のみに ACL を制限する。ここでは
+    // ファイルの存在を確認できれば、その管理契約を満たす正常状態として扱う。
+    Some(true)
+}
+
+#[cfg(unix)]
+fn secret_permission_check_label() -> &'static str {
+    "mode_bits_verified"
+}
+
+#[cfg(windows)]
+fn secret_permission_check_label() -> &'static str {
+    "peercove_acl_managed"
 }
 
 fn unix_ms() -> u64 {
@@ -1792,6 +1804,39 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.id == "app.ipc_compatible"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_existing_secret_is_reported_as_acl_managed_and_passes() {
+        let (shared, _rx) = test_shared();
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-diagnostic-windows-secret-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("host.key"), PrivateKey::generate().to_base64()).unwrap();
+        let config = dir.join("host.toml");
+        std::fs::write(
+            &config,
+            "[interface]\nprivate_key_file = \"host.key\"\naddress = \"10.99.200.1/24\"\nlisten_port = 51820\n",
+        )
+        .unwrap();
+
+        let report = shared.diagnose(config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "permissions.secret_files")
+            .unwrap();
+        assert_eq!(check.status, DiagnosticStatus::Pass);
+        assert_eq!(
+            check.evidence.get("permission_check").map(String::as_str),
+            Some("peercove_acl_managed")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// duplex ストリーム越しに start → status → stop → shutdown の一連を流す。

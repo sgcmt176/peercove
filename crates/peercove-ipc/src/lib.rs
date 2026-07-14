@@ -61,9 +61,29 @@ pub async fn connect() -> anyhow::Result<IpcStream> {
 #[cfg(windows)]
 async fn connect_impl() -> anyhow::Result<IpcStream> {
     use tokio::net::windows::named_pipe::ClientOptions;
-    ClientOptions::new()
-        .open(peercove_core::ipc::PIPE_NAME)
-        .context("デーモンに接続できません(`peercove daemon run` が起動していますか?)")
+    // サーバーが accept 後に次のパイプインスタンスを作るまでの短い間、
+    // UI の status ポーリングと診断が重なると ERROR_PIPE_BUSY (231) になる。
+    // デーモン未起動などの本来のエラーはそのまま返し、busy だけを短時間再試行する。
+    let mut attempts = 0;
+    loop {
+        match ClientOptions::new().open(peercove_core::ipc::PIPE_NAME) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if is_pipe_busy(&error) && attempts < 50 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "デーモンに接続できません(`peercove daemon run` が起動していますか?)",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_pipe_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(231)
 }
 
 #[cfg(unix)]
@@ -193,5 +213,17 @@ mod tests {
         assert_eq!(socket_candidates(), vec![override_path.clone()]);
         assert_eq!(socket_path(), override_path);
         std::env::remove_var(SOCKET_ENV);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn only_error_pipe_busy_is_retryable() {
+        assert!(is_pipe_busy(&std::io::Error::from_raw_os_error(231)));
+        assert!(!is_pipe_busy(&std::io::Error::from_raw_os_error(2)));
+        assert!(!is_pipe_busy(&std::io::Error::from_raw_os_error(5)));
     }
 }
