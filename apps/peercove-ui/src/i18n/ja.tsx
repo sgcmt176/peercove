@@ -551,6 +551,8 @@ export const ja = {
     savedRestart: "保存しました。切断して接続し直すと反映されます。",
     savedLive: "保存しました。数秒でトンネルに反映されます。",
     interface: "インターフェース",
+    // 既定名が衝突したとき自動採番される(ADR-0028、M3-20)
+    interfaceRenamed: "（設定は peercove0。名前の衝突を避けて自動採番）",
     // 表示名・DNS 名の変更はメンバー一覧へ一元化した(ADR-0027、M3-19)
     nameMovedHint:
       "表示名・DNS 名は「メンバー」一覧の自分の行にある ✎ から変更できます。",

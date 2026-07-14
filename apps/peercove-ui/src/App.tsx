@@ -442,7 +442,10 @@ export default function App() {
               />
             )
           ) : view === "net-settings" ? (
-            <NetworkSettingsView configPath={openConfig!} />
+            <NetworkSettingsView
+              configPath={openConfig!}
+              liveInterfaceName={openTunnel?.interfaceName ?? null}
+            />
           ) : openTunnel !== null ? (
             <TunnelView
               tunnel={openTunnel}

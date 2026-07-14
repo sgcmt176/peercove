@@ -246,6 +246,10 @@ pub struct Tunnel {
     /// "hosting" | "joined"
     pub role: &'static str,
     pub address: String,
+    /// 実行時のインターフェース名(ADR-0012 の自動採番後）。設定ファイルの
+    /// `interface.name` とは異なりうる。設定画面が接続中はこれを表示する
+    /// (ADR-0028、M3-20)。旧デーモンでは空文字。
+    pub interface_name: String,
     pub members: Vec<Member>,
     pub peers: Vec<Peer>,
     /// ホストからネットワーク削除された(M2-G6)。UI が明示して切断を促す。
@@ -282,6 +286,7 @@ impl From<&TunnelInfo> for Tunnel {
             network: info.network.clone(),
             role: role_str(info.role),
             address: info.address.to_string(),
+            interface_name: info.interface_name.clone(),
             members: info
                 .ledger
                 .iter()
@@ -664,6 +669,7 @@ mod tests {
             network: "home".to_string(),
             role: TunnelRole::Host,
             address: "10.100.42.1".parse().unwrap(),
+            interface_name: "peercove0".to_string(),
             ledger: vec![LedgerEntry {
                 name: Some("alice".to_string()),
                 dns_name: None,
@@ -704,6 +710,10 @@ mod tests {
         assert_eq!(json["daemonOutdated"], false);
         assert_eq!(json["state"], "hosting");
         assert_eq!(json["tunnel"]["address"], "10.100.42.1");
+        assert_eq!(
+            json["tunnel"]["interfaceName"], "peercove0",
+            "実行時のインターフェース名が status に載る(M3-20)"
+        );
         assert_eq!(json["tunnel"]["network"], "home");
         assert_eq!(json["tunnel"]["role"], "hosting");
         assert_eq!(json["tunnel"]["members"][0]["name"], "alice");
@@ -779,6 +789,7 @@ mod tests {
             network: "home".to_string(),
             role: TunnelRole::Member,
             address: "10.100.42.2".parse().unwrap(), // 自分
+            interface_name: "peercove0".to_string(),
             ledger: vec![
                 entry("host", "10.100.42.1", true),
                 entry("me", "10.100.42.2", false),

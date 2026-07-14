@@ -154,6 +154,8 @@ export interface Tunnel {
   /** このトンネルでの役割。 */
   role: "hosting" | "joined";
   address: string;
+  /** 実行時のインターフェース名（自動採番後。設定値と異なりうる — M3-20）。 */
+  interfaceName: string;
   members: Member[];
   peers: Peer[];
   /** ホストからネットワーク削除された（M2-G6）。UI が明示して切断を促す。 */

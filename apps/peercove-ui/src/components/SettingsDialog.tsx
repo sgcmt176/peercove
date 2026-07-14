@@ -16,7 +16,14 @@ import { t } from "../i18n";
  * MTU・待受ポート・ホストのエンドポイントは、インターフェース生成時に決まる
  * ので**再接続するまで反映されない**。保存後にその旨を出す。
  */
-export function NetworkSettingsView({ configPath }: { configPath: string }) {
+export function NetworkSettingsView({
+  configPath,
+  liveInterfaceName,
+}: {
+  configPath: string;
+  /** 接続中の実アダプタ名(自動採番後）。未接続なら null で設定値を出す。 */
+  liveInterfaceName: string | null;
+}) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,7 +38,11 @@ export function NetworkSettingsView({ configPath }: { configPath: string }) {
     <section className="card">
       <h2 className="card-title">{t.settings.title}</h2>
       {settings ? (
-        <SettingsForm configPath={configPath} settings={settings} />
+        <SettingsForm
+          configPath={configPath}
+          settings={settings}
+          liveInterfaceName={liveInterfaceName}
+        />
       ) : (
         <div className="page-body">
           {error ? (
@@ -48,10 +59,15 @@ export function NetworkSettingsView({ configPath }: { configPath: string }) {
 function SettingsForm({
   configPath,
   settings,
+  liveInterfaceName,
 }: {
   configPath: string;
   settings: Settings;
+  liveInterfaceName: string | null;
 }) {
+  // 接続中は実際に使われているアダプタ名を出す(既定名が衝突すると自動採番で
+  // peercove1 等になるため、設定ファイルの値と食い違いうる — ADR-0028、M3-20)
+  const interfaceName = liveInterfaceName ?? settings.interfaceName;
   const [listenPort, setListenPort] = useState(
     settings.listenPort === null ? "" : String(settings.listenPort),
   );
@@ -129,7 +145,13 @@ function SettingsForm({
       <div className="page-body">
         <dl className="facts">
           <dt>{t.settings.interface}</dt>
-          <dd className="mono">{settings.interfaceName}</dd>
+          <dd className="mono">
+            {interfaceName}
+            {liveInterfaceName &&
+              liveInterfaceName !== settings.interfaceName && (
+                <small className="muted"> {t.settings.interfaceRenamed}</small>
+              )}
+          </dd>
           <dt>{t.common.virtualIp}</dt>
           <dd className="mono">{settings.address}</dd>
           <dt>{t.common.configFile}</dt>

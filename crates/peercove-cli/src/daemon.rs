@@ -1061,6 +1061,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
             Role::Member => TunnelRole::Member,
         },
         address: active.address,
+        interface_name: active.if_name.clone(),
         peers: peers
             .iter()
             .map(|p| PeerSummary {

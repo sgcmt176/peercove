@@ -283,6 +283,11 @@ pub struct TunnelInfo {
     pub role: TunnelRole,
     /// 自分の仮想 IP。
     pub address: Ipv4Addr,
+    /// 実行時のインターフェース名(ADR-0012 の自動採番後。既定名が使用中だと
+    /// `peercove1`, `peercove2`, … へ避ける)。設定ファイルの `interface.name`
+    /// とは異なりうる。旧デーモンの応答には無い(空文字 → UI は設定値を出す)。
+    #[serde(default)]
+    pub interface_name: String,
     /// 台帳スナップショット(host: 自前構築 / member: 受信したもの)。
     #[serde(default)]
     pub ledger: Vec<LedgerEntry>,
