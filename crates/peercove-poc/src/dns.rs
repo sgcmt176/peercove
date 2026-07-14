@@ -224,6 +224,7 @@ pub fn respond(query: &[u8], zone: &Zone) -> Option<Vec<u8>> {
         .cloned()
         .or_else(|| wildcard_lookup(&zone.cname, &name).cloned());
     if let Some(target) = cname {
+        tracing::debug!("DNS CNAME {name} → {target}");
         let rdata = (qclass == CLASS_IN).then(|| encode_name(&target));
         let mut out = header(RCODE_NOERROR, u16::from(rdata.is_some()), true);
         out.extend_from_slice(question);
@@ -239,6 +240,7 @@ pub fn respond(query: &[u8], zone: &Zone) -> Option<Vec<u8>> {
     }
 
     // A も CNAME も無い → NXDOMAIN
+    tracing::debug!("DNS NXDOMAIN {name}(qtype={qtype})");
     let mut out = header(RCODE_NXDOMAIN, 0, true);
     out.extend_from_slice(question);
     Some(out)

@@ -15,7 +15,7 @@ import { clearHistory, recordStatus } from "./history";
 import { Theme, applyTheme, loadTheme, nextTheme } from "./theme";
 import { NetworksView } from "./components/NetworksView";
 import { TunnelView } from "./components/TunnelView";
-import { LogsDialog } from "./components/LogsDialog";
+import { LogsView } from "./components/LogsDialog";
 import { NetworkSettingsView } from "./components/SettingsDialog";
 import { AppSettingsView } from "./components/PrefsDialog";
 
@@ -23,6 +23,7 @@ import { AppSettingsView } from "./components/PrefsDialog";
 type View =
   | "networks"
   | "app-settings"
+  | "logs"
   | "members"
   | "chat"
   | "stats"
@@ -59,8 +60,6 @@ export default function App() {
   });
   /** 設定済みネットワークの一覧(M3-0c)。 */
   const [networks, setNetworks] = useState<NetworkInfo[]>([]);
-  /** デーモンのログ(モーダルのまま。診断用)。 */
-  const [logsOpen, setLogsOpen] = useState(false);
   /** 詳細/設定を開いているネットワーク(configPath)。null なら一覧側。 */
   const [openConfig, setOpenConfig] = useState<string | null>(null);
   /** サイドバーで選んでいる表示(M3-16)。 */
@@ -337,6 +336,15 @@ export default function App() {
                 onClick={backToList}
               />
               <SidebarItem
+                icon="🧾"
+                label={t.sidebar.logs}
+                active={view === "logs"}
+                onClick={() => {
+                  setOpenConfig(null);
+                  setView("logs");
+                }}
+              />
+              <SidebarItem
                 icon="⚙"
                 label={t.sidebar.settings}
                 active={view === "app-settings"}
@@ -364,15 +372,6 @@ export default function App() {
                 onClick={() => setTheme(nextTheme(theme))}
               >
                 {theme === "light" ? "☀" : "☾"}
-              </button>
-              <button
-                type="button"
-                className="button--icon"
-                title={t.sidebar.logs}
-                disabled={connection.kind === "unreachable"}
-                onClick={() => setLogsOpen(true)}
-              >
-                ☰
               </button>
             </span>
           </div>
@@ -423,6 +422,8 @@ export default function App() {
           ) : !detail ? (
             view === "app-settings" ? (
               <AppSettingsView />
+            ) : view === "logs" ? (
+              <LogsView />
             ) : (
               <NetworksView
                 networks={networks}
@@ -461,8 +462,6 @@ export default function App() {
           )}
         </div>
       </main>
-
-      {logsOpen && <LogsDialog onClose={() => setLogsOpen(false)} />}
     </div>
   );
 }

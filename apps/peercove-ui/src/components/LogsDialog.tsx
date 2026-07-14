@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { LogEntry, api, errorMessage, formatLogTime } from "../ipc";
-import { Modal } from "./Modal";
 import { t } from "../i18n";
 
 /** ログの取りに行く間隔。開いている間だけポーリングする。 */
@@ -12,7 +11,7 @@ const LEVELS = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] as const;
 type Level = (typeof LEVELS)[number];
 
 /**
- * デーモンのログビュー(M2-G5)。
+ * デーモンのログページ(M2-G5 → M3-18 でページ化)。
  *
  * デーモンは別プロセス・別権限なので標準エラー出力は読めない。IPC で
  * リングバッファの差分を取りに行く(`after_seq` 方式)。
@@ -20,7 +19,7 @@ type Level = (typeof LEVELS)[number];
  * 表示できるのはデーモンが**記録している**レベルまで。`--log-level warn` で
  * 起動していれば debug 行はそもそも溜まっていない。
  */
-export function LogsDialog({ onClose }: { onClose: () => void }) {
+export function LogsView() {
   const [lines, setLines] = useState<LogEntry[]>([]);
   const [dropped, setDropped] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -61,8 +60,9 @@ export function LogsDialog({ onClose }: { onClose: () => void }) {
   }, [visible.length, follow]);
 
   return (
-    <Modal title={t.logs.title} onClose={onClose} wide>
-      <div className="modal__body">
+    <section className="card">
+      <h2 className="card-title">{t.logs.title}</h2>
+      <div className="page-body">
         <div className="row logs__controls">
           <label className="logs__level">
             <span className="muted">{t.logs.level}</span>
@@ -105,7 +105,9 @@ export function LogsDialog({ onClose }: { onClose: () => void }) {
           ) : (
             visible.map((line) => (
               <div key={line.seq} className="logs__line">
-                <span className="muted logs__time">{formatLogTime(line.unixMs)}</span>
+                <span className="muted logs__time">
+                  {formatLogTime(line.unixMs)}
+                </span>
                 <span className={`logs__level-${line.level.toLowerCase()}`}>
                   {line.level}
                 </span>
@@ -118,11 +120,6 @@ export function LogsDialog({ onClose }: { onClose: () => void }) {
 
         <p className="muted small">{t.logs.footer}</p>
       </div>
-      <div className="modal__actions">
-        <button type="button" className="button--ghost" onClick={onClose}>
-          {t.common.close}
-        </button>
-      </div>
-    </Modal>
+    </section>
   );
 }

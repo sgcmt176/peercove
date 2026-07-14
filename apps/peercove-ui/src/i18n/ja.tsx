@@ -76,7 +76,7 @@ export const ja = {
       theme === "light"
         ? "外観: ライト（クリックでダーク）"
         : "外観: ダーク（クリックでライト）",
-    logs: "デーモンのログ",
+    logs: "ログ",
     version: (v: string) => `v${v}`,
   },
 
