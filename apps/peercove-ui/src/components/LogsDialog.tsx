@@ -60,7 +60,7 @@ export function LogsView() {
   }, [visible.length, follow]);
 
   return (
-    <section className="card">
+    <section className="card logs-page">
       <h2 className="card-title">{t.logs.title}</h2>
       <div className="page-body">
         <div className="row logs__controls">

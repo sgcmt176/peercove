@@ -599,6 +599,28 @@ select {
   gap: 6px;
 }
 
+/* ログを 1 ページで表示するとき、カードを画面下部いっぱいまで広げる(M3-18) */
+.logs-page {
+  flex: 1;
+  min-height: 0;
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-page .page-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-page .logs {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+
 .logs {
   /* 行が増えても縦に伸びず、中でスクロールする。長いメッセージは折り返す */
   max-height: 45vh;

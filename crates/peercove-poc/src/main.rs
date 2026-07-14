@@ -265,7 +265,7 @@ enum DaemonAction {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_level.as_deref());
-    run(cli.command)
+    run(cli.command, cli.log_level)
 }
 
 /// ログの詳細度: `--log-level` > `RUST_LOG` > 既定(info)。
@@ -290,7 +290,7 @@ fn init_tracing(log_level: Option<&str>) {
         .init();
 }
 
-fn run(command: Command) -> anyhow::Result<()> {
+fn run(command: Command, log_level: Option<String>) -> anyhow::Result<()> {
     match command {
         Command::Keygen { out, psk, force } => commands::keygen::run(&out, psk, force),
         Command::Host { config, upnp } => {
@@ -397,11 +397,11 @@ fn run(command: Command) -> anyhow::Result<()> {
         Command::UdpPing { target, count } => commands::udp::run_ping(target, count),
         Command::Status { config } => commands::status::run(&config),
         Command::Down { config } => commands::tunnel::run_down(&config),
-        Command::Daemon { action } => run_daemon_action(action),
+        Command::Daemon { action } => run_daemon_action(action, log_level),
     }
 }
 
-fn run_daemon_action(action: DaemonAction) -> anyhow::Result<()> {
+fn run_daemon_action(action: DaemonAction, log_level: Option<String>) -> anyhow::Result<()> {
     use peercove_core::ipc::{IpcRequest, IpcResponse};
     // デーモンとクライアントで作業ディレクトリが違うため、パスは絶対にして送る
     let canon = |path: PathBuf| -> anyhow::Result<PathBuf> {
@@ -424,7 +424,7 @@ fn run_daemon_action(action: DaemonAction) -> anyhow::Result<()> {
                 )
             }
         }
-        DaemonAction::ServiceInstall => service::install(),
+        DaemonAction::ServiceInstall => service::install(log_level.as_deref()),
         DaemonAction::ServiceUninstall => service::uninstall(),
         DaemonAction::Status => {
             if let IpcResponse::Status(status) = daemon::request(IpcRequest::Status)? {

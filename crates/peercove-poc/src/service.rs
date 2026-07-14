@@ -135,8 +135,10 @@ mod windows_impl {
         result
     }
 
-    /// サービスを SCM に登録して起動する(要管理者)。
-    pub fn install() -> anyhow::Result<()> {
+    /// サービスを SCM に登録して起動する(要管理者)。`log_level` を渡すと、
+    /// 登録されるサービスの起動引数にも `--log-level` を載せる(UI のログビューの
+    /// 詳細度はサービスの起動レベルで決まるため — M3-18)。
+    pub fn install(log_level: Option<&str>) -> anyhow::Result<()> {
         let manager = ServiceManager::local_computer(
             None::<&str>,
             ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -144,6 +146,11 @@ mod windows_impl {
         .map_err(|e| access_denied_hint(e, "サービスの登録"))?;
 
         let exe = std::env::current_exe().context("実行ファイルのパスを特定できません")?;
+        let mut launch_arguments: Vec<std::ffi::OsString> = vec!["daemon".into(), "service".into()];
+        if let Some(level) = log_level {
+            launch_arguments.push("--log-level".into());
+            launch_arguments.push(level.into());
+        }
         let info = ServiceInfo {
             name: SERVICE_NAME.into(),
             display_name: DISPLAY_NAME.into(),
@@ -151,7 +158,7 @@ mod windows_impl {
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
             executable_path: exe.clone(),
-            launch_arguments: vec!["daemon".into(), "service".into()],
+            launch_arguments,
             dependencies: vec![],
             account_name: None, // LocalSystem
             account_password: None,
@@ -343,12 +350,21 @@ mod unix_impl {
         Ok(())
     }
 
-    /// systemd ユニットを設置して有効化・起動する(要 root)。
-    pub fn install() -> anyhow::Result<()> {
+    /// systemd ユニットを設置して有効化・起動する(要 root)。`log_level` を渡すと
+    /// ExecStart の `daemon run` に `--log-level` を足す(M3-18)。
+    pub fn install(log_level: Option<&str>) -> anyhow::Result<()> {
         require_root("サービスの登録")?;
         let exe = std::env::current_exe().context("実行ファイルのパスを特定できません")?;
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-        let unit = UNIT_TEMPLATE.replace(TEMPLATE_EXEC, &exe.display().to_string());
+        // ExecStart(`<TEMPLATE_EXEC> daemon run`)にだけ --log-level を挿し込む
+        let template = match log_level {
+            Some(level) => UNIT_TEMPLATE.replace(
+                &format!("{TEMPLATE_EXEC} daemon run"),
+                &format!("{TEMPLATE_EXEC} daemon run --log-level {level}"),
+            ),
+            None => UNIT_TEMPLATE.to_string(),
+        };
+        let unit = template.replace(TEMPLATE_EXEC, &exe.display().to_string());
         let path = unit_path();
         std::fs::write(&path, unit)
             .with_context(|| format!("{} の書き込みに失敗しました", path.display()))?;

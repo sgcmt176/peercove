@@ -226,7 +226,7 @@ export default function App() {
   useEffect(() => {
     if (connection.kind !== "ok" || openConfig === null) return;
     const running = tunnels.some((tun) => tun.config === openConfig);
-    if (running || view === "net-settings") return;
+    if (running || view === "net-settings" || view === "logs") return;
     if (networks.some((n) => n.configPath === openConfig)) {
       setView("net-settings");
     } else {
@@ -326,6 +326,12 @@ export default function App() {
                 active={view === "net-settings"}
                 onClick={() => setView("net-settings")}
               />
+              <SidebarItem
+                icon="🧾"
+                label={t.sidebar.logs}
+                active={view === "logs"}
+                onClick={() => setView("logs")}
+              />
             </>
           ) : (
             <>
@@ -388,7 +394,7 @@ export default function App() {
           </section>
         )}
 
-        {detail && (
+        {detail && view !== "logs" && (
           <DetailHeader
             name={detailName}
             isHost={detailHost}
@@ -398,7 +404,7 @@ export default function App() {
             onDisconnect={() => void disconnect()}
           />
         )}
-        {detail && openTunnel?.removed && (
+        {detail && view !== "logs" && openTunnel?.removed && (
           <section className="card card--error">
             <h2>{t.tunnel.removedTitle}</h2>
             <p>{t.tunnel.removedBody}</p>
@@ -407,7 +413,7 @@ export default function App() {
 
         <div
           className={
-            detail && view === "chat"
+            view === "logs" || (detail && view === "chat")
               ? "app__content app__content--flush"
               : "app__content"
           }
@@ -419,11 +425,11 @@ export default function App() {
             />
           ) : connection.kind === "connecting" ? (
             <p className="muted">{t.state.connectingDaemon}</p>
+          ) : view === "logs" ? (
+            <LogsView />
           ) : !detail ? (
             view === "app-settings" ? (
               <AppSettingsView />
-            ) : view === "logs" ? (
-              <LogsView />
             ) : (
               <NetworksView
                 networks={networks}
