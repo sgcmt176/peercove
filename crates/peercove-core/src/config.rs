@@ -87,6 +87,9 @@ pub struct DnsRecordConfig {
     /// ターゲット B: メンバー参照(IP 自動追随)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<MemberRef>,
+    /// ターゲット C: CNAME(別ドメインの別名。外部ドメイン可 — ADR-0025)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cname: Option<String>,
     /// 親メンバー(端末配下サブドメイン)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub under: Option<MemberRef>,
@@ -406,20 +409,34 @@ impl Config {
             if !seen_records.insert((record.name.as_str(), record.under)) {
                 return invalid(format!("dns_record \"{}\" が重複しています", record.name));
             }
-            match (&record.ip, &record.member) {
-                (Some(_), Some(_)) => {
+            // ターゲットは ip / member / cname のちょうど 1 つ(ADR-0025)
+            let targets = [
+                record.ip.is_some(),
+                record.member.is_some(),
+                record.cname.is_some(),
+            ]
+            .iter()
+            .filter(|&&set| set)
+            .count();
+            if targets == 0 {
+                return invalid(format!(
+                    "dns_record \"{}\" に ip / member / cname のいずれかを指定してください",
+                    record.name
+                ));
+            }
+            if targets > 1 {
+                return invalid(format!(
+                    "dns_record \"{}\" は ip / member / cname のどれか 1 つだけ指定できます",
+                    record.name
+                ));
+            }
+            if let Some(cname) = &record.cname {
+                if crate::names::normalize_cname_target(cname).as_deref() != Some(cname.as_str()) {
                     return invalid(format!(
-                        "dns_record \"{}\" に ip と member の両方は指定できません",
-                        record.name
+                        "dns_record \"{}\" の cname \"{}\" が不正です(ドメイン名を指定してください)",
+                        record.name, cname
                     ));
                 }
-                (None, None) => {
-                    return invalid(format!(
-                        "dns_record \"{}\" に ip か member のどちらかを指定してください",
-                        record.name
-                    ));
-                }
-                _ => {}
             }
             for reference in [&record.member, &record.under].into_iter().flatten() {
                 if !member_exists(reference) {
@@ -709,6 +726,7 @@ under = "{peer_key}"
             name: "web".to_string(),
             ip: None,
             member: Some(MemberRef::Key(peer_key)),
+            cname: None,
             under: Some(MemberRef::Key(peer_key)),
             scheme: None,
             port: None,

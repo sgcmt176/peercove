@@ -35,9 +35,10 @@ export function DnsView({
   const [prefix, setPrefix] = useState("");
   const [baseKind, setBaseKind] = useState("free");
   const [baseFree, setBaseFree] = useState("");
-  // 転送先: "ip" = IP 直指定 / それ以外 = メンバー参照("host" or 公開鍵)
+  // 転送先: "ip" = IP 直指定 / "cname" = ドメイン別名 / それ以外 = メンバー参照
   const [target, setTarget] = useState("ip");
   const [ip, setIp] = useState("");
+  const [cnameInput, setCnameInput] = useState("");
   const [scheme, setScheme] = useState("");
   const [port, setPort] = useState("");
   const [busy, setBusy] = useState(false);
@@ -109,15 +110,24 @@ export function DnsView({
 
   // base がマシンなら転送先はそのマシンに固定(サブドメインは通常そのマシンを指す)。
   // 自由入力のときだけ転送先を選べる
-  const effectiveTarget = machineBase
-    ? { member: baseKind }
-    : target === "ip"
-      ? { ip }
-      : { member: target };
+  const effectiveTarget: { ip?: string; member?: string; cname?: string } =
+    machineBase
+      ? { member: baseKind }
+      : target === "ip"
+        ? { ip }
+        : target === "cname"
+          ? { cname: cnameInput.trim() }
+          : { member: target };
 
+  const targetOk =
+    target === "ip"
+      ? ip.trim() !== ""
+      : target === "cname"
+        ? cnameInput.trim() !== ""
+        : true;
   const canAdd = machineBase
     ? prefix.trim() !== ""
-    : baseFree.trim() !== "" && (target !== "ip" || ip.trim() !== "");
+    : baseFree.trim() !== "" && targetOk;
 
   const add = async () => {
     setBusy(true);
@@ -134,6 +144,7 @@ export function DnsView({
       setPrefix("");
       setBaseFree("");
       setIp("");
+      setCnameInput("");
       setScheme("");
       setPort("");
       reload();
@@ -218,12 +229,16 @@ export function DnsView({
                     </span>
                   ) : null}
                 </span>
-                {record.member !== null && (
+                {record.member !== null ? (
                   <span className="muted small ellipsis">
                     {t.dns.targetOf(memberName(record.member))}
                   </span>
-                )}
-                <span className="mono muted">{record.ip ?? t.dns.brokenRef}</span>
+                ) : record.cname !== null ? (
+                  <span className="muted small ellipsis">{t.dns.cnameTag}</span>
+                ) : null}
+                <span className="mono muted">
+                  {record.cname ?? record.ip ?? t.dns.brokenRef}
+                </span>
                 {copyButton(record.fqdn)}
                 {record.url !== null && copyButton(record.url, t.dns.copyUrl)}
                 {isHost && (
@@ -297,6 +312,7 @@ export function DnsView({
                   onChange={(event) => setTarget(event.target.value)}
                 >
                   <option value="ip">{t.dns.forwardIp}</option>
+                  <option value="cname">{t.dns.forwardCname}</option>
                   {members.map((member) => (
                     <option
                       key={member.publicKey}
@@ -317,7 +333,20 @@ export function DnsView({
                   />
                 </label>
               )}
+              {!machineBase && target === "cname" && (
+                <label className="field">
+                  <input
+                    value={cnameInput}
+                    placeholder={t.dns.cnamePlaceholder}
+                    className="mono"
+                    onChange={(event) => setCnameInput(event.target.value)}
+                  />
+                </label>
+              )}
             </div>
+            {!machineBase && target === "cname" && (
+              <p className="muted small">{t.dns.cnameHint}</p>
+            )}
             {machineBase && (
               <p className="muted small">{t.dns.forwardLocked}</p>
             )}

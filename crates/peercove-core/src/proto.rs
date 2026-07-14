@@ -35,6 +35,10 @@ pub enum ControlMessage {
         members: Vec<LedgerEntry>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         dns_records: Vec<crate::dns::DnsRecord>,
+        /// カスタム CNAME レコード(ADR-0025、M3-17)。dns_records と同じ互換規則
+        /// (旧バージョンとは互いに無視し合う)。[`PROTO_VERSION`] は上げない。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cname_records: Vec<crate::dns::CnameRecord>,
     },
     /// host → member: あなたは削除された(以後トンネルは通らない)。
     Removed { message: String },
@@ -159,6 +163,12 @@ mod tests {
                     scheme: None,
                     port: None,
                 }],
+                cname_records: vec![crate::dns::CnameRecord {
+                    name: "docs".to_string(),
+                    target: "example.com".to_string(),
+                    scheme: None,
+                    port: None,
+                }],
             },
             ControlMessage::Removed {
                 message: "ホストにより削除されました".to_string(),
@@ -198,10 +208,11 @@ mod tests {
         .unwrap();
         assert_eq!(json, r#"{"type":"hello","version":1}"#);
 
-        // dns_records が空なら旧バージョンとワイヤ表現が一致する(互換維持)
+        // dns_records / cname_records が空なら旧バージョンとワイヤ表現が一致する(互換維持)
         let json = serde_json::to_string(&ControlMessage::Ledger {
             members: vec![],
             dns_records: vec![],
+            cname_records: vec![],
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"ledger","members":[]}"#);
@@ -224,6 +235,7 @@ mod tests {
             ControlMessage::Ledger {
                 members: vec![],
                 dns_records: vec![],
+                cname_records: vec![],
             }
         );
 

@@ -35,6 +35,8 @@ export interface DnsRecord {
   fqdn: string;
   /** ターゲットのメンバー参照（"host" または公開鍵）。固定 IP レコードは null。 */
   member: string | null;
+  /** CNAME の転送先ドメイン（A / メンバー参照レコードは null — ADR-0025）。 */
+  cname: string | null;
   /** 親メンバー（"host" または公開鍵）。最上位レコードは null。 */
   under: string | null;
   /** URL コピー用のサービス情報（M3-14c、ADR-0023）。 */
@@ -363,7 +365,7 @@ export const api = {
   addDnsRecord: (
     configPath: string,
     name: string,
-    target: { ip?: string; member?: string },
+    target: { ip?: string; member?: string; cname?: string },
     under?: string,
     scheme?: string,
     port?: number,
@@ -373,6 +375,7 @@ export const api = {
       name,
       ip: target.ip ?? null,
       member: target.member ?? null,
+      cname: target.cname ?? null,
       under: under ?? null,
       scheme: scheme ?? null,
       port: port ?? null,

@@ -868,24 +868,36 @@ fn list_dns_records(config_path: String) -> Result<Vec<DnsRecordDto>, String> {
 /// ターゲットは ip(固定 IP)/ member(メンバー参照 = IP 自動追随)の
 /// どちらか。under で親メンバー配下のサブドメインになる。実行中のホストは
 /// 5 秒の再読込で拾い、解決してから台帳と一緒に全メンバーへ配布される。
+// tauri コマンドは名前付き引数(フロントから個別に渡る)なので構造体化しない
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn add_dns_record(
     config_path: String,
     name: String,
     ip: Option<String>,
     member: Option<String>,
+    cname: Option<String>,
     under: Option<String>,
     scheme: Option<String>,
     port: Option<u16>,
 ) -> Result<(), String> {
-    let target = match (ip.as_deref().filter(|s| !s.trim().is_empty()), &member) {
-        (Some(ip), None) => peercove_ops::dns::RecordTarget::Ip(
-            ip.trim()
-                .parse()
+    let ip = ip.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let cname = cname.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let target = match (ip, &member, cname) {
+        (Some(ip), None, None) => peercove_ops::dns::RecordTarget::Ip(
+            ip.parse()
                 .map_err(|_| format!("\"{ip}\" は IPv4 アドレスとして解釈できません"))?,
         ),
-        (None, Some(member)) => peercove_ops::dns::RecordTarget::Member(parse_member_ref(member)?),
-        _ => return Err("ターゲットには IP かメンバーのどちらかを指定してください".to_string()),
+        (None, Some(member), None) => {
+            peercove_ops::dns::RecordTarget::Member(parse_member_ref(member)?)
+        }
+        (None, None, Some(cname)) => peercove_ops::dns::RecordTarget::Cname(cname.to_string()),
+        _ => {
+            return Err(
+                "転送先には IP / メンバー / ドメイン(CNAME)のいずれか 1 つを指定してください"
+                    .to_string(),
+            )
+        }
     };
     let under = under
         .as_deref()

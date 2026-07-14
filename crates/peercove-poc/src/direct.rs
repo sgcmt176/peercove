@@ -381,6 +381,7 @@ mod tests {
             distribution: Distribution {
                 members,
                 dns_records: vec![],
+                cname_records: vec![],
                 deny: vec![],
             },
             received_at: at,

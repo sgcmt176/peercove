@@ -65,6 +65,17 @@ pub fn is_custom_dns_name(input: &str) -> bool {
     (first == "*" || is_dns_label(first)) && labels.all(is_dns_label)
 }
 
+/// CNAME の転送先ドメインを正規化する(ADR-0025)。小文字化し末尾ドットを落とし、
+/// 各ラベルが DNS ラベルとして正規形かを確認する。外部ドメイン(example.com 等)も
+/// 対象なので相対名検証([`is_dns_name`])を流用する。空・253 文字超・不正は `None`。
+pub fn normalize_cname_target(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_end_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed.len() > 253 || !is_dns_name(&trimmed) {
+        return None;
+    }
+    Some(trimmed)
+}
+
 /// 自由入力の相対名を正規化する(ADR-0024)。各ラベルを [`dns_label`] で
 /// 正規化し(小文字化・空白/記号 → ハイフン)、先頭の `*` はそのまま残す。
 /// どれかのラベルが空になる(記号だけ・連続ドット・末尾ドット等)場合は `None`。

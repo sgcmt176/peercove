@@ -283,6 +283,9 @@ pub struct TunnelInfo {
     /// レコード一覧を表示するために載せる。旧デーモンの応答には無い(空)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_records: Vec<crate::dns::DnsRecord>,
+    /// 配信されたカスタム CNAME レコード(ADR-0025、M3-17)。member の一覧表示用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cname_records: Vec<crate::dns::CnameRecord>,
     /// ピア統計の要約(公開鍵 base64 → (最終ハンドシェイク経過秒, rx, tx))。
     #[serde(default)]
     pub peers: Vec<PeerSummary>,

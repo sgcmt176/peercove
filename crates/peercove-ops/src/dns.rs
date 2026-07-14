@@ -15,13 +15,15 @@ use peercove_core::names;
 
 use crate::peers::{load_doc, write_validated};
 
-/// レコードのターゲット(ADR-0022)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// レコードのターゲット(ADR-0022 / ADR-0025)。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordTarget {
     /// 固定 IP(従来型・LAN 機器)
     Ip(Ipv4Addr),
     /// メンバー参照(配布時にその時点の仮想 IP へ解決)
     Member(MemberRef),
+    /// CNAME(別ドメインの別名。外部ドメイン可 — ADR-0025)
+    Cname(String),
 }
 
 /// 追加するカスタム DNS レコード(ADR-0022 / ADR-0023)。
@@ -95,11 +97,12 @@ pub fn list_records(config_path: &Path) -> anyhow::Result<Vec<RecordDetail>> {
                     None => record.name.clone(), // 参照切れ(remove_peer が掃除するので一瞬)
                 },
             };
-            let (target, resolved_ip) = match (record.ip, &record.member) {
-                (Some(ip), _) => (RecordTarget::Ip(ip), Some(ip)),
-                (None, Some(member)) => (RecordTarget::Member(*member), ip_of(&config, member)),
+            let (target, resolved_ip) = match (record.ip, &record.member, &record.cname) {
+                (Some(ip), _, _) => (RecordTarget::Ip(ip), Some(ip)),
+                (None, Some(member), _) => (RecordTarget::Member(*member), ip_of(&config, member)),
+                (None, None, Some(cname)) => (RecordTarget::Cname(cname.clone()), None),
                 // validate が通っているので来ないが、保守的に IP 0.0.0.0 扱いにしない
-                (None, None) => (RecordTarget::Ip(Ipv4Addr::UNSPECIFIED), None),
+                (None, None, None) => (RecordTarget::Ip(Ipv4Addr::UNSPECIFIED), None),
             };
             let fqdn = format!("{relative}.{network}.{DNS_SUFFIX}");
             let url = service_url(&fqdn, record.scheme.as_deref(), record.port);
@@ -185,12 +188,18 @@ pub fn add_record(config_path: &Path, record: &NewRecord<'_>) -> anyhow::Result<
         .context("dns_record が配列テーブルではありません(手編集の可能性)")?;
     let mut table = toml_edit::Table::new();
     table.insert("name", toml_edit::value(name.as_str()));
-    match record.target {
+    match &record.target {
         RecordTarget::Ip(ip) => {
             table.insert("ip", toml_edit::value(ip.to_string()));
         }
         RecordTarget::Member(member) => {
             table.insert("member", toml_edit::value(member.to_config_string()));
+        }
+        RecordTarget::Cname(domain) => {
+            let Some(target) = names::normalize_cname_target(domain) else {
+                bail!("転送先ドメイン \"{domain}\" が不正です(例: docs.example.com)");
+            };
+            table.insert("cname", toml_edit::value(target));
         }
     }
     if let Some(under) = record.under {

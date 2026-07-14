@@ -759,8 +759,18 @@ select {
   gap: 2px;
 }
 
-.dns-list__names > .ellipsis {
+/* 名前・URL 行は省略せず折り返す(ポートつき URL が「…」で切れない — M3-16 FB) */
+.dns-list__names > .ellipsis,
+.dns-list__names .mono {
   display: block;
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+/* 折り返しても行の右側(IP・操作)は上寄せで揃える */
+.dns-list__row {
+  align-items: flex-start;
 }
 
 /* ---- UI デザインパス(M3-6) ---- */

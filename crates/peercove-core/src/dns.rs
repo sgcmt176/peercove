@@ -65,6 +65,22 @@ pub struct DnsRecord {
     pub port: Option<u16>,
 }
 
+/// カスタム CNAME レコード(ADR-0025、M3-17)。`name` を別ドメイン `target` の
+/// 別名にする。ホストが解決して台帳と一緒に配布し、内蔵リゾルバが CNAME 応答を
+/// 返す。A レコードとは別枠で配る(旧メンバー互換のため)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CnameRecord {
+    /// 相対名(正規化済み。`docs`, `*.app` など)
+    pub name: String,
+    /// 別名の指す先(小文字・末尾ドットなしの絶対ドメイン。外部可)
+    pub target: String,
+    /// UI の URL コピー用メタ情報(ADR-0023 と同じ)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
 /// ゾーンの 1 エントリ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneEntry {
@@ -220,6 +236,52 @@ pub fn resolve_records(
     resolved
 }
 
+/// カスタム CNAME レコード(ADR-0025)を配布用へ解決する。`under`(親メンバー)は
+/// その時点の DNS ラベルへ解決する(A レコードと同じ規則)。参照先が台帳に無い
+/// レコードは黙って外す。ターゲットは解決不要(絶対ドメインをそのまま配る)。
+pub fn resolve_cnames(
+    records: &[crate::config::DnsRecordConfig],
+    ledger: &[LedgerEntry],
+) -> Vec<CnameRecord> {
+    use crate::config::MemberRef;
+
+    let mut taken = HashSet::new();
+    let mut members: Vec<&LedgerEntry> = ledger.iter().collect();
+    members.sort_by_key(|entry| entry.ip);
+    let labels = assign_labels(&members, &mut taken);
+    let label_of = |reference: &MemberRef| {
+        members
+            .iter()
+            .zip(labels.iter())
+            .find(|(member, _)| match reference {
+                MemberRef::Host => member.is_host,
+                MemberRef::Key(key) => member.public_key == *key,
+            })
+            .map(|(_, label)| label.clone())
+    };
+
+    let mut resolved = Vec::new();
+    for record in records {
+        let Some(target) = &record.cname else {
+            continue;
+        };
+        let name = match &record.under {
+            None => record.name.clone(),
+            Some(under) => match label_of(under) {
+                Some(label) => format!("{}.{label}", record.name),
+                None => continue,
+            },
+        };
+        resolved.push(CnameRecord {
+            name,
+            target: target.clone(),
+            scheme: record.scheme.clone(),
+            port: record.port,
+        });
+    }
+    resolved
+}
+
 /// `base` が取られていたら `-<oct>`、それも駄目なら `-<oct>-2`, … で一意化。
 fn uniquify(base: &str, oct: u8, taken: &HashSet<String>) -> String {
     if !taken.contains(base) {
@@ -351,6 +413,7 @@ mod tests {
                 name: "gamehost".to_string(),
                 ip: None,
                 member: Some(MemberRef::Key(alice_key)),
+                cname: None,
                 under: None,
                 scheme: Some("http".to_string()),
                 port: Some(8080),
@@ -360,6 +423,7 @@ mod tests {
                 name: "web".to_string(),
                 ip: None,
                 member: Some(MemberRef::Host),
+                cname: None,
                 under: Some(MemberRef::Host),
                 scheme: None,
                 port: None,
@@ -369,6 +433,7 @@ mod tests {
                 name: "printer".to_string(),
                 ip: Some("192.168.10.50".parse().unwrap()),
                 member: None,
+                cname: None,
                 under: Some(MemberRef::Key(alice_key)),
                 scheme: None,
                 port: Some(9100),
@@ -378,12 +443,28 @@ mod tests {
                 name: "ghost".to_string(),
                 ip: None,
                 member: Some(MemberRef::Key(PrivateKey::generate().public_key())),
+                cname: None,
+                under: None,
+                scheme: None,
+                port: None,
+            },
+            DnsRecordConfig {
+                // CNAME(ADR-0025): 外部ドメインの別名
+                name: "docs".to_string(),
+                ip: None,
+                member: None,
+                cname: Some("example.com".to_string()),
                 under: None,
                 scheme: None,
                 port: None,
             },
         ];
         let resolved = resolve_records(&records, &ledger);
+        // CNAME レコードは A 解決に混ざらない(別枠)
+        let cnames = resolve_cnames(&records, &ledger);
+        assert_eq!(cnames.len(), 1);
+        assert_eq!(cnames[0].name, "docs");
+        assert_eq!(cnames[0].target, "example.com");
         let names: Vec<(&str, String)> = resolved
             .iter()
             .map(|r| (r.name.as_str(), r.ip.to_string()))

@@ -466,9 +466,14 @@ export const ja = {
     // 転送先(ADR-0024)
     forwardLabel: "転送先（このドメインが指す先）",
     forwardIp: "IP アドレスを指定",
+    forwardCname: "ドメイン（CNAME）を指定",
     forwardMember: (name: string) => `マシン: ${name}`,
     forwardLocked:
       "ドメインの「この左側」にマシンを選んだので、転送先はそのマシンに固定されます。",
+    cnamePlaceholder: "docs.example.com",
+    cnameHint:
+      "別のドメインの別名（CNAME）にします。外部ドメイン（example.com など）も指定できます。閲覧側はこのドメインを引くと、指定先へたどり直します。",
+    cnameTag: "→ 別ドメイン",
     ipPlaceholder: "10.68.1.50",
     schemeLabel: "スキーム（任意）",
     schemePlaceholder: "http",

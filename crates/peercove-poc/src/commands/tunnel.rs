@@ -301,6 +301,8 @@ pub struct Snapshot {
     pub ledger: Option<Vec<LedgerEntry>>,
     /// カスタム DNS レコード(M3-1)。host は自分の設定、member は受信したもの。
     pub dns_records: Vec<peercove_core::dns::DnsRecord>,
+    /// カスタム CNAME レコード(ADR-0025、M3-17)。host は解決済み、member は受信。
+    pub cname_records: Vec<peercove_core::dns::CnameRecord>,
     /// 相手の仮想 IP → コントロールチャネルで測った RTT(ミリ秒、M2-G5)。
     pub rtt_ms: HashMap<std::net::Ipv4Addr, f64>,
     /// (member のみ)ホストからネットワーク削除された(M2-G6)。UI が明示する。
@@ -494,6 +496,10 @@ pub async fn supervise(
                                     &config.dns_records,
                                     &members,
                                 ),
+                                cname_records: peercove_core::dns::resolve_cnames(
+                                    &config.dns_records,
+                                    &members,
+                                ),
                                 deny: config.acl.normalized_deny(),
                                 members,
                             };
@@ -632,12 +638,14 @@ pub async fn supervise(
                         tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
                     }
                     if let Some(snapshot) = &snapshot {
+                        let (dns_records, cname_records) = distribution
+                            .map(|dist| (dist.dns_records, dist.cname_records))
+                            .unwrap_or_default();
                         *snapshot.lock().unwrap() = Some(Snapshot {
                             peers: stats,
                             ledger,
-                            dns_records: distribution
-                                .map(|dist| dist.dns_records)
-                                .unwrap_or_default(),
+                            dns_records,
+                            cname_records,
                             rtt_ms: rtt.lock().unwrap().clone(),
                             removed: removed.load(std::sync::atomic::Ordering::Relaxed),
                             direct: direct_routes,

@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context};
-use peercove_core::dns::DnsRecord;
 use peercove_core::ipc::{
     ChatMessageInfo, DaemonStatus, IpcEnvelope, IpcReply, IpcRequest, IpcResponse, IpcResult,
     PeerSummary, TunnelInfo, TunnelRole, IPC_VERSION,
@@ -892,11 +891,7 @@ impl DaemonShared {
 
     /// 全ネットワーク合算の DNS ゾーンを最新の台帳から作り直す(5 秒周期)。
     async fn refresh_zones(&self) {
-        let data: Vec<(
-            String,
-            Vec<peercove_core::proto::LedgerEntry>,
-            Vec<DnsRecord>,
-        )> = {
+        let data: Vec<crate::dns::NetworkZoneData> = {
             let active = self.active.lock().await;
             active
                 .values()
@@ -907,8 +902,9 @@ impl DaemonShared {
                             a.network.clone(),
                             s.ledger.clone().unwrap_or_default(),
                             s.dns_records.clone(),
+                            s.cname_records.clone(),
                         ),
-                        None => (a.network.clone(), Vec::new(), Vec::new()),
+                        None => (a.network.clone(), Vec::new(), Vec::new(), Vec::new()),
                     }
                 })
                 .collect()
@@ -996,13 +992,14 @@ impl DaemonShared {
 
 /// 1 トンネル分の status 応答を組み立てる。
 fn tunnel_info(active: &Active) -> TunnelInfo {
-    let (peers, ledger, dns_records, rtt_ms, removed, direct) = {
+    let (peers, ledger, dns_records, cname_records, rtt_ms, removed, direct) = {
         let snapshot = active.snapshot.lock().unwrap();
         match snapshot.as_ref() {
             Some(snapshot) => (
                 snapshot.peers.clone(),
                 snapshot.ledger.clone(),
                 snapshot.dns_records.clone(),
+                snapshot.cname_records.clone(),
                 snapshot.rtt_ms.clone(),
                 snapshot.removed,
                 snapshot.direct.clone(),
@@ -1010,6 +1007,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
             None => (
                 Vec::new(),
                 None,
+                Vec::new(),
                 Vec::new(),
                 HashMap::new(),
                 false,
@@ -1051,6 +1049,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
             .collect(),
         ledger,
         dns_records,
+        cname_records,
         removed,
         direct,
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)

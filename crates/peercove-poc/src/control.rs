@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use peercove_core::dns::DnsRecord;
+use peercove_core::dns::{CnameRecord, DnsRecord};
 use peercove_core::proto::{ControlMessage, LedgerEntry, CONTROL_PORT, PROTO_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -41,6 +41,8 @@ pub type Connections = Arc<Mutex<HashMap<Ipv4Addr, mpsc::UnboundedSender<Control
 pub struct Distribution {
     pub members: Vec<LedgerEntry>,
     pub dns_records: Vec<DnsRecord>,
+    /// カスタム CNAME レコード(ADR-0025、M3-17)。
+    pub cname_records: Vec<CnameRecord>,
     /// ACL の遮断組(ADR-0018、M3-10。仮想 IP の正規化済みペア)。
     /// ワイヤには載せず、送信時にメンバーごとのフィルタ
     /// ([`ledger_message_for`])の材料にする。
@@ -65,6 +67,7 @@ fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMes
     ControlMessage::Ledger {
         members: dist.members,
         dns_records: dist.dns_records,
+        cname_records: dist.cname_records,
     }
 }
 
@@ -91,9 +94,14 @@ type LedgerDigest = (
         Vec<ipnet::Ipv4Net>,            // subnets(ADR-0014)
     )>,
     Vec<DnsRecord>,
+    Vec<CnameRecord>,
 );
 
-fn ledger_digest(members: &[LedgerEntry], dns_records: &[DnsRecord]) -> LedgerDigest {
+fn ledger_digest(
+    members: &[LedgerEntry],
+    dns_records: &[DnsRecord],
+    cname_records: &[CnameRecord],
+) -> LedgerDigest {
     (
         members
             .iter()
@@ -111,6 +119,7 @@ fn ledger_digest(members: &[LedgerEntry], dns_records: &[DnsRecord]) -> LedgerDi
             })
             .collect(),
         dns_records.to_vec(),
+        cname_records.to_vec(),
     )
 }
 
@@ -755,15 +764,17 @@ async fn member_reader(
             Ok(ControlMessage::Ledger {
                 members,
                 dns_records,
+                cname_records,
             }) => {
                 // 意味のある変化があったときだけ INFO(エンドポイント鮮度の
                 // 定期更新による再配布は debug に落とす — ADR-0019)
-                let digest = ledger_digest(&members, &dns_records);
+                let digest = ledger_digest(&members, &dns_records, &cname_records);
                 if last_digest.as_ref() != Some(&digest) {
                     tracing::info!(
-                        "台帳を受信しました({} 名、DNS レコード {} 件)",
+                        "台帳を受信しました({} 名、DNS レコード {} 件、CNAME {} 件)",
                         members.len(),
-                        dns_records.len()
+                        dns_records.len(),
+                        cname_records.len()
                     );
                     last_digest = Some(digest);
                 } else {
@@ -773,6 +784,7 @@ async fn member_reader(
                     distribution: Distribution {
                         members,
                         dns_records,
+                        cname_records,
                         deny: vec![], // deny はワイヤに載らない(blocked で受ける)
                     },
                     received_at: Instant::now(),
@@ -838,21 +850,30 @@ mod tests {
         fresher[0].endpoint = Some("203.0.113.9:51820".parse().unwrap());
         fresher[0].endpoint_age_secs = Some(60);
         assert_eq!(
-            ledger_digest(&base, &[]),
-            ledger_digest(&fresher, &[]),
+            ledger_digest(&base, &[], &[]),
+            ledger_digest(&fresher, &[], &[]),
             "エンドポイント鮮度だけの変化は意味のある変化ではない"
         );
 
         let mut offline = base.clone();
         offline[0].online = false;
-        assert_ne!(ledger_digest(&base, &[]), ledger_digest(&offline, &[]));
+        assert_ne!(
+            ledger_digest(&base, &[], &[]),
+            ledger_digest(&offline, &[], &[])
+        );
 
         let mut blocked = base.clone();
         blocked[0].blocked = true;
-        assert_ne!(ledger_digest(&base, &[]), ledger_digest(&blocked, &[]));
+        assert_ne!(
+            ledger_digest(&base, &[], &[]),
+            ledger_digest(&blocked, &[], &[])
+        );
 
         let more = vec![base[0].clone(), entry("bob", "100.100.42.3", true)];
-        assert_ne!(ledger_digest(&base, &[]), ledger_digest(&more, &[]));
+        assert_ne!(
+            ledger_digest(&base, &[], &[]),
+            ledger_digest(&more, &[], &[])
+        );
     }
 
     /// host サーバー ↔ member クライアントを localhost で対向させ、
@@ -866,6 +887,7 @@ mod tests {
         let (ledger_tx, ledger_rx) = watch::channel(Distribution {
             members: vec![entry("alice", "100.100.42.2", true)],
             dns_records: vec![],
+            cname_records: vec![],
             deny: vec![],
         });
         let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
@@ -927,6 +949,12 @@ mod tests {
                     scheme: Some("https".to_string()),
                     port: Some(8443),
                 }],
+                cname_records: vec![CnameRecord {
+                    name: "docs".to_string(),
+                    target: "example.com".to_string(),
+                    scheme: None,
+                    port: None,
+                }],
                 deny: vec![],
             })
             .unwrap();
@@ -945,6 +973,8 @@ mod tests {
             assert_eq!(dist.dns_records[0].name, "nas");
             assert_eq!(dist.dns_records[0].scheme.as_deref(), Some("https"));
             assert_eq!(dist.dns_records[0].port, Some(8443));
+            assert_eq!(dist.cname_records.len(), 1, "CNAME も一緒に届く");
+            assert_eq!(dist.cname_records[0].target, "example.com");
         }
 
         // 接続レジストリに登録されている(削除通知の配送口)
@@ -975,6 +1005,7 @@ mod tests {
         let dist = Distribution {
             members: vec![blocked_peer, open_peer],
             dns_records: vec![],
+            cname_records: vec![],
             deny: vec![("100.100.42.2".parse().unwrap(), member_ip)],
         };
 

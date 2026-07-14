@@ -309,34 +309,57 @@ impl From<&TunnelInfo> for Tunnel {
             transfers: info.transfers.iter().map(Transfer::from).collect(),
             chat_seq: info.chat_seq,
             groups: info.groups.iter().map(Group::from).collect(),
+            // 配布形式は解決済み(A は {name, ip}、CNAME は {name, target})。
+            // どちらもメンバー一覧に出す(参照情報は持たない)
             dns_records: info
                 .dns_records
                 .iter()
-                .map(|record| DnsRecordDto {
-                    name: record.name.clone(),
-                    ip: Some(record.ip.to_string()),
-                    fqdn: format!(
+                .map(|record| {
+                    let fqdn = format!(
                         "{}.{}.{}",
                         record.name,
                         info.network,
                         peercove_core::dns::DNS_SUFFIX
-                    ),
-                    // 配布形式は解決済みの {name, ip} のみ(参照情報は持たない)
-                    member: None,
-                    under: None,
-                    scheme: record.scheme.clone(),
-                    port: record.port,
-                    url: peercove_core::dns::service_url(
-                        &format!(
-                            "{}.{}.{}",
-                            record.name,
-                            info.network,
-                            peercove_core::dns::DNS_SUFFIX
+                    );
+                    DnsRecordDto {
+                        name: record.name.clone(),
+                        ip: Some(record.ip.to_string()),
+                        cname: None,
+                        url: peercove_core::dns::service_url(
+                            &fqdn,
+                            record.scheme.as_deref(),
+                            record.port,
                         ),
-                        record.scheme.as_deref(),
-                        record.port,
-                    ),
+                        fqdn,
+                        member: None,
+                        under: None,
+                        scheme: record.scheme.clone(),
+                        port: record.port,
+                    }
                 })
+                .chain(info.cname_records.iter().map(|record| {
+                    let fqdn = format!(
+                        "{}.{}.{}",
+                        record.name,
+                        info.network,
+                        peercove_core::dns::DNS_SUFFIX
+                    );
+                    DnsRecordDto {
+                        name: record.name.clone(),
+                        ip: None,
+                        cname: Some(record.target.clone()),
+                        url: peercove_core::dns::service_url(
+                            &fqdn,
+                            record.scheme.as_deref(),
+                            record.port,
+                        ),
+                        fqdn,
+                        member: None,
+                        under: None,
+                        scheme: record.scheme.clone(),
+                        port: record.port,
+                    }
+                }))
                 .collect(),
         }
     }
@@ -447,10 +470,12 @@ impl From<&peercove_ops::networks::NetworkEntry> for NetworkDto {
 #[serde(rename_all = "camelCase")]
 pub struct DnsRecordDto {
     pub name: String,
-    /// 解決済みの現在の IP(メンバー参照が切れている場合のみ None)
+    /// 解決済みの現在の IP(メンバー参照が切れている場合・CNAME は None)
     pub ip: Option<String>,
+    /// CNAME の転送先ドメイン(A / メンバー参照レコードは None — ADR-0025)
+    pub cname: Option<String>,
     pub fqdn: String,
-    /// ターゲットのメンバー参照(固定 IP レコードは None)
+    /// ターゲットのメンバー参照(固定 IP / CNAME レコードは None)
     pub member: Option<String>,
     /// 親メンバー(最上位レコードは None)
     pub under: Option<String>,
@@ -461,14 +486,19 @@ pub struct DnsRecordDto {
 
 impl From<peercove_ops::dns::RecordDetail> for DnsRecordDto {
     fn from(detail: peercove_ops::dns::RecordDetail) -> Self {
+        let (member, cname) = match &detail.target {
+            peercove_ops::dns::RecordTarget::Ip(_) => (None, None),
+            peercove_ops::dns::RecordTarget::Member(member) => {
+                (Some(member.to_config_string()), None)
+            }
+            peercove_ops::dns::RecordTarget::Cname(domain) => (None, Some(domain.clone())),
+        };
         Self {
             name: detail.name,
             ip: detail.resolved_ip.map(|ip| ip.to_string()),
+            cname,
             fqdn: detail.fqdn,
-            member: match detail.target {
-                peercove_ops::dns::RecordTarget::Ip(_) => None,
-                peercove_ops::dns::RecordTarget::Member(member) => Some(member.to_config_string()),
-            },
+            member,
             under: detail.under.map(|under| under.to_config_string()),
             scheme: detail.scheme,
             port: detail.port,
@@ -658,6 +688,12 @@ mod tests {
                 scheme: Some("http".to_string()),
                 port: Some(8080),
             }],
+            cname_records: vec![peercove_core::dns::CnameRecord {
+                name: "docs".to_string(),
+                target: "example.com".to_string(),
+                scheme: None,
+                port: None,
+            }],
         };
         let json = serde_json::to_value(Status::from(DaemonStatus {
             version: peercove_core::ipc::IPC_VERSION,
@@ -756,6 +792,7 @@ mod tests {
             chat_seq: 0,
             groups: vec![],
             dns_records: vec![],
+            cname_records: vec![],
         };
         let tunnel = Tunnel::from(&info);
         let routes: Vec<Option<&str>> = tunnel.members.iter().map(|m| m.route).collect();
