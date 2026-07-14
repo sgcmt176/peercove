@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use boringtun::noise::{errors::WireGuardError, handshake, Packet, Tunn, TunnResult};
@@ -118,6 +118,9 @@ pub struct Device {
     /// ACL の遮断組(ADR-0018)。仮想 IP の正規化済みペア(小さい方が先)。
     /// リレー時に「来たピア × 出るピア」の組で判定して破棄する。
     acl_policy: RwLock<peercove_core::acl::AclPolicy>,
+    /// 許可された新規セッションの応答方向。Linux conntrack と同じく、
+    /// 片方向 deny が逆方向から開始した通信の応答まで壊さないために使う。
+    acl_sessions: Mutex<peercove_core::acl::AclSessionTracker>,
     /// 承認待ち端末の仮想 IP。ホストのコントロール TCP 以外を破棄する。
     isolated: RwLock<std::collections::HashSet<Ipv4Addr>>,
     isolation_host: RwLock<Option<Ipv4Addr>>,
@@ -154,6 +157,7 @@ impl Device {
                 default: peercove_core::acl::AclAction::Allow,
                 rules: vec![],
             }),
+            acl_sessions: Mutex::new(peercove_core::acl::AclSessionTracker::default()),
             isolated: RwLock::new(std::collections::HashSet::new()),
             isolation_host: RwLock::new(None),
             shutdown: AtomicBool::new(false),
@@ -328,10 +332,22 @@ impl Device {
                         tracing::trace!("承認待ち端末宛のリレーパケットを破棄しました");
                         return;
                     }
-                    // ACL(ADR-0018): 遮断組のリレーは破棄(TUN にも渡さない)
+                    // ACL(ADR-0018/0035): 新規セッションの開始方向を判定し、
+                    // 許可された逆方向セッションの応答だけは deny 方向でも通す。
                     let policy = self.acl_policy.read().unwrap();
                     let decision = policy.evaluate_ipv4_packet(packet);
-                    if decision.action == peercove_core::acl::AclAction::Deny {
+                    let mut sessions = self.acl_sessions.lock().unwrap();
+                    let now = Instant::now();
+                    let established_reply = decision.action == peercove_core::acl::AclAction::Deny
+                        && sessions.allows_reply(packet, now);
+                    if decision.action == peercove_core::acl::AclAction::Allow {
+                        sessions.observe_allowed(packet, now);
+                    } else if established_reply {
+                        tracing::trace!(
+                            "ACL で許可済みセッションの応答をリレーします(rule={:?})",
+                            decision.rule_id
+                        );
+                    } else {
                         tracing::trace!(
                             "ACL によりリレーを破棄しました(rule={:?})",
                             decision.rule_id
@@ -617,10 +633,22 @@ mod tests {
     }
 
     fn tcp_packet(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+        tcp_packet_with_flags(src, dst, src_port, dst_port, 0)
+    }
+
+    fn tcp_packet_with_flags(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        flags: u8,
+    ) -> Vec<u8> {
         let mut packet = ipv4_packet(src, dst, &[0; 20]);
         packet[9] = 6;
         packet[20..22].copy_from_slice(&src_port.to_be_bytes());
         packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet[32] = 5 << 4;
+        packet[33] = flags;
         packet
     }
 
@@ -988,6 +1016,16 @@ mod tests {
             host.tun.os_in_rx.try_recv().is_err(),
             "遮断したパケットが host の TUN に漏れた"
         );
+
+        // 逆方向 B -> A から開始したセッションは、A -> B が deny でも
+        // 応答パケットだけ通る。これにより方向付き ACL が接続開始方向として機能する。
+        let b_syn = tcp_packet_with_flags(b_ip, a_ip, 50_000, 443, 0x02);
+        let received = expect_via_tunnel(&b, &a, b_syn.clone(), "許可方向 B->A の SYN");
+        assert_eq!(received, b_syn);
+        let a_syn_ack = tcp_packet_with_flags(a_ip, b_ip, 443, 50_000, 0x12);
+        let received =
+            expect_via_tunnel(&a, &b, a_syn_ack.clone(), "deny 方向 A->B の確立済み応答");
+        assert_eq!(received, a_syn_ack);
 
         // ホスト宛の通信は影響を受けない
         let a2h = ipv4_packet(a_ip, host_ip, b"a to host");

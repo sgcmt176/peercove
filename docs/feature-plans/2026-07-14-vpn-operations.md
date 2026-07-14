@@ -536,8 +536,8 @@ DiagnosticCheck {
 - 推奨初期セマンティクス:
   - 上から最初に一致したルール
   - default allow（既存互換）
-  - 方向あり
-  - established connection の特別扱いはせず、パケット単位で同一評価
+  - 方向あり（新規通信の開始方向）
+  - 許可方向から開始したTCP/UDP/ICMPの応答はstatefulに許可
 
 #### M3-25c: DNS サービス参照
 

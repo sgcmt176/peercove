@@ -20,7 +20,7 @@ pub struct LinuxBackend {
     api: WGApi<Kernel>,
     /// ルーター役(ADR-0014)として適用中の状態。down で対解除する。
     router: RouterState,
-    /// ACL(ADR-0018)で適用中の DROP ルールの (src, dst)。down で対解除する。
+    /// ACL(ADR-0018/0035)で適用中のルール。down で対解除する。
     acl_rules: Vec<Vec<String>>,
     acl_policy: Option<AclPolicy>,
     acl_generation: u64,
@@ -55,6 +55,16 @@ mod acl_tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--dport", "25565:25570"]));
+        assert!(args.windows(2).any(|pair| pair == ["-j", "ACCEPT"]));
+    }
+
+    #[test]
+    fn acl_reply_rule_accepts_only_conntrack_reply_direction() {
+        let args = acl_reply_rule_args("-I", "pcv0", "test");
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--ctstate", "ESTABLISHED,RELATED"]));
+        assert!(args.windows(2).any(|pair| pair == ["--ctdir", "REPLY"]));
         assert!(args.windows(2).any(|pair| pair == ["-j", "ACCEPT"]));
     }
 }
@@ -180,6 +190,34 @@ fn acl_rule_args(
         comment.into(),
     ]);
     args
+}
+
+/// 許可された逆方向セッションの応答だけを、通常の方向 ACL より先に通す。
+/// `--ctdir REPLY` を付けるため、元の開始方向は引き続き通常ルールで評価される。
+fn acl_reply_rule_args(op: &str, wg_if: &str, comment: &str) -> Vec<String> {
+    [
+        op,
+        "FORWARD",
+        "-i",
+        wg_if,
+        "-o",
+        wg_if,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "ESTABLISHED,RELATED",
+        "--ctdir",
+        "REPLY",
+        "-j",
+        "ACCEPT",
+        "-m",
+        "comment",
+        "--comment",
+        comment,
+    ]
+    .iter()
+    .map(|value| value.to_string())
+    .collect()
 }
 
 fn isolation_rule_args(op: &str, wg_if: &str, ip: std::net::Ipv4Addr) -> Vec<Vec<String>> {
@@ -480,6 +518,18 @@ impl WgBackend for LinuxBackend {
         self.acl_generation = self.acl_generation.wrapping_add(1);
         let generation = self.acl_generation;
         let mut desired = Vec::new();
+        if policy.default == AclAction::Deny
+            || policy
+                .rules
+                .iter()
+                .any(|rule| rule.action == AclAction::Deny)
+        {
+            desired.push(acl_reply_rule_args(
+                "-I",
+                &self.if_name,
+                &format!("peercove-acl-v2-{generation}-established-reply"),
+            ));
+        }
         for rule in &policy.rules {
             let sources: Vec<String> = if rule.source.is_empty() {
                 vec!["0.0.0.0/0".into()]

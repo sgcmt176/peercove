@@ -28,6 +28,7 @@ import { LogsView } from "./components/LogsDialog";
 import { NetworkSettingsView } from "./components/SettingsDialog";
 import { AppSettingsView } from "./components/PrefsDialog";
 import { DiagnosticsView } from "./components/DiagnosticsView";
+import { AclView } from "./components/AclDialog";
 import { loadPrefs } from "./prefs";
 import { checkForUpdate } from "./update";
 
@@ -42,6 +43,7 @@ type View =
   | "inbox"
   | "dns"
   | "subnets"
+  | "acl"
   | "diagnostics"
   | "net-settings";
 
@@ -336,13 +338,22 @@ export default function App() {
                 onClick={() => setView("dns")}
               />
               {detailHost && (
-                <SidebarItem
-                  icon="🖧"
-                  label={t.sidebar.subnets}
-                  active={view === "subnets"}
-                  disabled={openTunnel === null}
-                  onClick={() => setView("subnets")}
-                />
+                <>
+                  <SidebarItem
+                    icon="🖧"
+                    label={t.sidebar.subnets}
+                    active={view === "subnets"}
+                    disabled={openTunnel === null}
+                    onClick={() => setView("subnets")}
+                  />
+                  <SidebarItem
+                    icon="⛨"
+                    label={t.sidebar.acl}
+                    active={view === "acl"}
+                    disabled={openTunnel === null}
+                    onClick={() => setView("acl")}
+                  />
+                </>
               )}
               <SidebarItem
                 icon="✓"
@@ -509,6 +520,8 @@ export default function App() {
             />
           ) : view === "diagnostics" ? (
             <DiagnosticsView configPath={openConfig!} />
+          ) : view === "acl" && detailHost && openTunnel !== null ? (
+            <AclView configPath={openTunnel.config} members={openTunnel.members} />
           ) : openTunnel !== null ? (
             <TunnelView
               tunnel={openTunnel}

@@ -2426,8 +2426,9 @@ ADR-0022 でカスタム DNS レコードはエイリアス・サービス名・
    `[[acl.rule]]`を置く。対象は`"any"`または`member`（公開鍵）、`group`（安定ID）、
    `subnet`、宛先のみ`service`（DNSレコード安定ID）とする。表示名やDNS名をIDに使わない。
 2. **評価**: 上から最初に一致した有効ルールを採用し、不一致時はdefault actionを使う。
-   方向を区別し、protocolはany/TCP/UDP/ICMP、TCP/UDPは単一宛先ポートと閉区間を扱う。
-   established connectionを特別扱いせず、各IPv4パケットを同じ純粋評価器で判定する。
+   方向は「新規通信を開始する方向」として区別する。protocolはany/TCP/UDP/ICMP、
+   TCP/UDPは単一宛先ポートと閉区間を扱う。通常ルールで許可された方向から開始した
+   TCP/UDP/ICMP echoの応答は、逆方向がdenyでも許可する。新規開始でない任意パケットは許可しない。
 3. **旧設定**: `deny = [[A,B]]`は、評価器内で最優先のA→B/B→A deny-anyへ変換する。
    ACL画面を初めて保存した時は同等のv2ルールへ移行し、旧設定の遮断結果を維持する。
 4. **DNSサービス**: 新規レコードへ`id = "svc-..."`を付け、旧レコードはホストが一覧を
@@ -2436,9 +2437,12 @@ ADR-0022 でカスタム DNS レコードはエイリアス・サービス名・
 5. **直接通信**: v2ルールの送信元／宛先に関係するメンバー組は、ルールのallow/denyを問わず
    `force_relay`として受信者別台帳へ載せ、endpointを除外する。確立済み直接ピアも次回同期で削除する。
    UIは「ACLにより中継」と先頭の関連ルールIDを表示する。旧deny pairは従来のblocked表示を使う。
-6. **Windows**: 復号したリレーパケットをOS非依存`AclPolicy`で判定し、denyならTUNへも
-   宛先ピアへも渡さない。ポリシーは`RwLock`内で一括差し替えし、再読込中の空状態を作らない。
-7. **Linux**: 同じresolved policyからiptables FORWARD規則を展開する。規則順は共通評価器と揃え、
+6. **Windows**: 復号したリレーパケットをOS非依存`AclPolicy`で判定する。TCPはSYN、UDPは
+   最初のdatagram、ICMPはecho requestを許可した時だけ応答フローを登録する。フロー表は有効期限と
+   16,384件の上限を持ち、未登録のdenyパケットはTUNへも宛先ピアへも渡さない。
+7. **Linux**: 同じresolved policyからiptables FORWARD規則を展開する。conntrackの
+   `ESTABLISHED,RELATED --ctdir REPLY` を方向ACLより先に許可し、元の開始方向は通常どおりルール評価する。
+   規則順は共通評価器と揃え、
    新世代をすべて旧世代より上へ追加してから旧世代を削除する。途中失敗時は新世代だけを戻すため、
    再読込中に一時的な全許可状態を作らない。`down`は適用中の全規則を対で削除する。
 8. **制御/UI**: TCP control portが両方向ともdenyとなる組は`blocked`としてチャット・ファイルUIも
@@ -2453,7 +2457,7 @@ ADR-0022 でカスタム DNS レコードはエイリアス・サービス名・
 
 ### 対象外
 
-- IPv6、接続追跡ベースのstateful firewall、時間帯ルール、外部CNAME、端末側分散ポリシー評価。
+- IPv6、時間帯ルール、外部CNAME、端末側分散ポリシー評価。
 
 ## メモ: 仮想 IP レンジと Tailscale の衝突(M1 で要検討)
 

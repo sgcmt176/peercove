@@ -721,6 +721,8 @@ select {
   border-color: var(--danger, #d33);
 }
 
+.acl-page { display: grid; gap: 16px; }
+.acl-page__head p { margin: 6px 0 0; }
 .acl-v2 { display: grid; gap: 20px; }
 .acl-v2 h3 { margin: 0 0 10px; font-size: 1rem; }
 .acl-v2__default { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
@@ -1047,10 +1049,10 @@ select {
 .quality__periods button:hover { color: var(--text); }
 .quality__periods button.active {
   background: var(--surface, #fff);
-  color: var(--primary);
+  color: var(--accent);
   box-shadow: 0 1px 4px rgba(0, 0, 0, .12);
 }
-.quality__periods button:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.quality__periods button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .quality__summary {
   display: grid;
@@ -1066,13 +1068,13 @@ select {
 .quality > .card > h3 { margin: 0 0 12px; font-size: 1rem; }
 .quality__chart-title h3 { margin: 0; }
 .quality__legend { display: inline-flex; align-items: center; gap: 7px; font-size: .82rem; }
-.quality__legend-line { width: 22px; border-top: 3px solid var(--primary); }
+.quality__legend-line { width: 22px; border-top: 3px solid var(--accent); }
 
 .quality__chart { width: 100%; min-height: 150px; overflow: visible; }
 .quality__chart--loss { min-height: 110px; }
 .quality__grid { stroke: var(--border); stroke-width: 1; }
-.quality__rtt-line { fill: none; stroke: var(--primary); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-.quality__rtt-point { fill: var(--primary); stroke: var(--card); stroke-width: 2; }
+.quality__rtt-line { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.quality__rtt-point { fill: var(--accent); stroke: var(--card); stroke-width: 2; }
 .quality__loss-bar { fill: #d97706; }
 .quality__axis { fill: var(--muted); font-size: 11px; }
 .quality__no-data { min-height: 110px; display: grid; place-items: center; }

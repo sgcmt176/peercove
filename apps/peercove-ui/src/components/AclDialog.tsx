@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { AclPolicySettings, AclProtocol, AclRule, AclTarget, DnsRecord, Member, api, errorMessage } from "../ipc";
-import { Modal } from "./Modal";
 import { t } from "../i18n";
 
 type TargetKind = "any" | "member" | "group" | "subnet" | "service";
 
-export function AclDialog({ configPath, members, onClose }: { configPath: string; members: Member[]; onClose: () => void; }) {
+export function AclView({ configPath, members }: { configPath: string; members: Member[]; }) {
   const [policy, setPolicy] = useState<AclPolicySettings | null>(null);
   const [services, setServices] = useState<DnsRecord[]>([]);
   const [busy, setBusy] = useState(false);
@@ -23,9 +22,31 @@ export function AclDialog({ configPath, members, onClose }: { configPath: string
   const peers = members.filter((member) => !member.isHost);
   const usableServices = services.filter((record) => record.id && !record.cname && record.port);
   useEffect(() => {
+    let alive = true;
+    setPolicy(null);
+    setServices([]);
+    setError(null);
     Promise.all([api.readAclPolicy(configPath), api.listDnsRecords(configPath)])
-      .then(([loaded, dns]) => { setPolicy(loaded); setServices(dns); setDestinationValue(peers[0]?.publicKey ?? ""); })
-      .catch((cause) => setError(errorMessage(cause)));
+      .then(([loaded, dns]) => {
+        if (!alive) return;
+        // 初期のACL v2実装は既定値のports/enabledをJSONから省略した。
+        // 旧UIバックエンドからの応答でもページ全体を落とさないよう補完する。
+        setPolicy({
+          ...loaded,
+          groups: loaded.groups ?? [],
+          rules: (loaded.rules ?? []).map((rule) => ({
+            ...rule,
+            ports: rule.ports ?? [],
+            enabled: rule.enabled ?? true,
+          })),
+        });
+        setServices(dns);
+        setDestinationValue(peers[0]?.publicKey ?? "");
+      })
+      .catch((cause) => {
+        if (alive) setError(errorMessage(cause));
+      });
+    return () => { alive = false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [configPath]);
 
@@ -75,10 +96,13 @@ export function AclDialog({ configPath, members, onClose }: { configPath: string
     setGroupName(""); setGroupMembers(new Set());
   };
 
-  return <Modal title={t.acl.title} onClose={onClose} wide>
-    <div className="modal__body acl-v2">
+  return <div className="acl-page">
+    <section className="card acl-page__head">
+      <h2 className="card-title">{t.acl.title}</h2>
       <p className="muted small">{t.acl.introV2}</p>
-      {!policy ? <p className="muted">{t.common.loading}</p> : <>
+    </section>
+    <section className="card acl-v2">
+      {!policy ? !error && <p className="muted">{t.common.loading}</p> : <>
         <div className="acl-v2__default"><span>{t.acl.defaultAction}</span><select value={policy.default} disabled={busy} onChange={(event) => void save({ ...policy, default: event.target.value as "allow" | "deny" })}><option value="allow">{t.acl.allow}</option><option value="deny">{t.acl.deny}</option></select></div>
         <section><h3>{t.acl.rules}</h3>
           {policy.rules.length === 0 ? <p className="muted small">{t.acl.noRules}</p> : <div className="acl-v2__table-wrap"><table className="acl-v2__table"><thead><tr><th>{t.acl.order}</th><th>{t.acl.action}</th><th>{t.acl.source}</th><th>{t.acl.destination}</th><th>{t.acl.protocol}</th><th>{t.acl.ports}</th><th>{t.acl.state}</th><th>{t.acl.actions}</th></tr></thead><tbody>{policy.rules.map((rule, index) => <tr key={rule.id}><td>{index + 1}</td><td><span className={`tag ${rule.action === "deny" ? "tag--blocked" : ""}`}>{rule.action === "allow" ? t.acl.allow : t.acl.deny}</span></td><td>{labelTarget(rule.source)}</td><td>{labelTarget(rule.destination)}</td><td>{rule.protocol.toUpperCase()}</td><td>{rule.ports.join(", ") || t.acl.allPorts}</td><td><label className="chat__pick-row"><input type="checkbox" checked={rule.enabled} disabled={busy} onChange={(event) => updateRule(index, { enabled: event.target.checked })}/><span>{rule.enabled ? t.acl.enabled : t.acl.disabled}</span></label></td><td><div className="row"><button type="button" className="button--icon" aria-label={t.acl.moveUp} disabled={busy || index === 0} onClick={() => move(index, -1)}>↑</button><button type="button" className="button--icon" aria-label={t.acl.moveDown} disabled={busy || index === policy.rules.length - 1} onClick={() => move(index, 1)}>↓</button><button type="button" className="button--icon" aria-label={t.common.delete} disabled={busy} onClick={() => void save({ ...policy, rules: policy.rules.filter((_, i) => i !== index) })}>×</button></div></td></tr>)}</tbody></table></div>}
@@ -93,8 +117,8 @@ export function AclDialog({ configPath, members, onClose }: { configPath: string
         <section className="acl-v2__groups"><h3>{t.acl.groups}</h3>{policy.groups.map((group) => <div className="row" key={group.id}><strong>{group.id}</strong><span className="muted small">{group.members.length}{t.acl.people}</span><button type="button" className="button--ghost" onClick={() => void save({ ...policy, groups: policy.groups.filter((g) => g.id !== group.id), rules: policy.rules.filter((r) => !(typeof r.source !== 'string' && 'group' in r.source && r.source.group === group.id) && !(typeof r.destination !== 'string' && 'group' in r.destination && r.destination.group === group.id)) })}>{t.common.delete}</button></div>)}<label>{t.acl.groupName}<input value={groupName} onChange={(e) => setGroupName(e.target.value)}/></label><div className="acl-v2__member-checks">{peers.map((member) => <label className="chat__pick-row" key={member.publicKey}><input type="checkbox" checked={groupMembers.has(member.publicKey)} onChange={(e) => { const next = new Set(groupMembers); e.target.checked ? next.add(member.publicKey) : next.delete(member.publicKey); setGroupMembers(next); }}/><span>{member.name ?? member.ip}</span></label>)}</div><button type="button" className="button--ghost" disabled={!groupId || groupMembers.size === 0 || busy} onClick={addGroup}>{t.acl.addGroup}</button></section>
       </>}
       {error && <p role="alert" className="error-text small">{error}</p>}
-    </div><div className="modal__actions"><button type="button" onClick={onClose}>{t.common.close}</button></div>
-  </Modal>;
+    </section>
+  </div>;
 }
 
 function TargetInput({ label, kind, value, setKind, setValue, members, groups, services, allowService }: { label: string; kind: TargetKind; value: string; setKind: (kind: TargetKind) => void; setValue: (value: string) => void; members: Member[]; groups: string[]; services: DnsRecord[]; allowService: boolean; }) {

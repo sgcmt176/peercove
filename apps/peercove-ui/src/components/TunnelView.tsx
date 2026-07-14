@@ -18,7 +18,6 @@ import { ConfirmModal, Modal } from "./Modal";
 import { InviteDialog } from "./InviteDialog";
 import { DnsView } from "./DnsDialog";
 import { SubnetView } from "./SubnetDialog";
-import { AclDialog } from "./AclDialog";
 import { Avatar } from "./Avatar";
 import { ChatPanel } from "./ChatPanel";
 import { Sparkline } from "./Sparkline";
@@ -57,8 +56,6 @@ export function TunnelView({
   const [removing, setRemoving] = useState<Member | null>(null);
   /** ファイル送信ダイアログ(M3-13e: 宛先をチェックボックスで選ぶ)。 */
   const [sendingFile, setSendingFile] = useState(false);
-  /** 通信制御ダイアログ(M3-10、ADR-0018。ホストのみ)。 */
-  const [showAcl, setShowAcl] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -209,16 +206,6 @@ export function TunnelView({
                     {t.transfer.sendButton}
                   </button>
                 )}
-                {isHost &&
-                  tunnel.members.filter((m) => !m.isHost).length >= 2 && (
-                    <button
-                      type="button"
-                      className="button--ghost small"
-                      onClick={() => setShowAcl(true)}
-                    >
-                      {t.acl.button}
-                    </button>
-                  )}
                 {isHost && (
                   <button type="button" onClick={() => setInviting(true)}>
                     {t.tunnel.invite}
@@ -305,17 +292,6 @@ export function TunnelView({
           configPath={tunnel.config}
           onClose={() => {
             setInviting(false);
-            onChanged();
-          }}
-        />
-      )}
-
-      {showAcl && (
-        <AclDialog
-          configPath={tunnel.config}
-          members={tunnel.members}
-          onClose={() => {
-            setShowAcl(false);
             onChanged();
           }}
         />

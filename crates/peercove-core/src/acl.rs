@@ -1,6 +1,8 @@
 //! ACL v2 の設定型と OS 非依存のパケット評価器 (ADR-0035)。
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
@@ -60,9 +62,11 @@ pub struct AclRule {
     #[serde(default)]
     pub protocol: AclProtocol,
     /// `80` または `8000-8100`。空は全ポート。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // UI は再読込時に常に配列として扱うため、空でも JSON から省略しない。
+    #[serde(default)]
     pub ports: Vec<String>,
-    #[serde(default = "enabled", skip_serializing_if = "std::ops::Not::not")]
+    // UI のチェックボックスへ明示的に返すため、既定の true も省略しない。
+    #[serde(default = "enabled")]
     pub enabled: bool,
 }
 
@@ -90,6 +94,124 @@ pub struct ResolvedRule {
 pub struct AclDecision<'a> {
     pub action: AclAction,
     pub rule_id: Option<&'a str>,
+}
+
+/// Windows ユーザー空間リレーで、許可された新規通信の応答方向だけを通すための
+/// 有効期限付きフロー表。Linux の conntrack `ESTABLISHED --ctdir REPLY` と同じ境界を持つ。
+#[derive(Debug, Default)]
+pub struct AclSessionTracker {
+    replies: HashMap<ReplyKey, Session>,
+    next_prune: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReplyKey {
+    Transport {
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        protocol: u8,
+        src_port: u16,
+        dst_port: u16,
+    },
+    IcmpEcho {
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        kind: u8,
+        identifier: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Session {
+    expires_at: Instant,
+    lifetime: Duration,
+}
+
+const TCP_SESSION_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const UDP_SESSION_LIFETIME: Duration = Duration::from_secs(30);
+const ICMP_SESSION_LIFETIME: Duration = Duration::from_secs(10);
+const MAX_ACL_SESSIONS: usize = 16_384;
+
+impl AclSessionTracker {
+    /// ポリシーで許可されたパケットを観測し、応答方向のピンホールを作成・延長する。
+    pub fn observe_allowed(&mut self, packet: &[u8], now: Instant) {
+        self.remove_expired(now);
+        let Some(candidate) = session_candidate(packet) else {
+            return;
+        };
+        match candidate {
+            SessionCandidate::Transport {
+                reply,
+                protocol,
+                opens_session,
+            } => {
+                let lifetime = if protocol == 6 {
+                    TCP_SESSION_LIFETIME
+                } else {
+                    UDP_SESSION_LIFETIME
+                };
+                if opens_session || self.replies.contains_key(&reply) {
+                    self.insert(reply, lifetime, now);
+                }
+            }
+            SessionCandidate::IcmpEchoRequest { reply } => {
+                self.insert(reply, ICMP_SESSION_LIFETIME, now);
+            }
+            SessionCandidate::Other => {}
+        }
+    }
+
+    /// ACL で deny となったパケットが、許可済みセッションの応答かを判定する。
+    pub fn allows_reply(&mut self, packet: &[u8], now: Instant) -> bool {
+        self.remove_expired(now);
+        let Some(key) = packet_reply_key(packet) else {
+            return false;
+        };
+        let Some(session) = self.replies.get_mut(&key) else {
+            return false;
+        };
+        session.expires_at = now + session.lifetime;
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.replies.clear();
+        self.next_prune = None;
+    }
+
+    fn insert(&mut self, key: ReplyKey, lifetime: Duration, now: Instant) {
+        if self.replies.len() >= MAX_ACL_SESSIONS && !self.replies.contains_key(&key) {
+            // 上限後のユニークUDPフローで毎回全表を走査するDoSを避ける。
+            return;
+        }
+        self.replies.insert(
+            key,
+            Session {
+                expires_at: now + lifetime,
+                lifetime,
+            },
+        );
+    }
+
+    fn remove_expired(&mut self, now: Instant) {
+        if self.next_prune.is_some_and(|next| now < next) {
+            return;
+        }
+        self.replies.retain(|_, session| session.expires_at > now);
+        self.next_prune = Some(now + Duration::from_secs(1));
+    }
+}
+
+enum SessionCandidate {
+    Transport {
+        reply: ReplyKey,
+        protocol: u8,
+        opens_session: bool,
+    },
+    IcmpEchoRequest {
+        reply: ReplyKey,
+    },
+    Other,
 }
 
 impl AclPolicy {
@@ -301,16 +423,7 @@ fn protocol_matches(expected: AclProtocol, actual: u8) -> bool {
 }
 
 fn packet_fields(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, Option<u16>)> {
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return None;
-    }
-    let header_len = usize::from(packet[0] & 0x0f) * 4;
-    if header_len < 20 || packet.len() < header_len {
-        return None;
-    }
-    let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let protocol = packet[9];
+    let (src, dst, protocol, header_len) = ipv4_fields(packet)?;
     let port = if matches!(protocol, 6 | 17) && packet.len() >= header_len + 4 {
         Some(u16::from_be_bytes([
             packet[header_len + 2],
@@ -320,6 +433,95 @@ fn packet_fields(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, Option<u16>)>
         None
     };
     Some((src, dst, protocol, port))
+}
+
+fn ipv4_fields(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, u8, usize)> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if header_len < 20 || packet.len() < header_len {
+        return None;
+    }
+    Some((
+        Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+        Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+        packet[9],
+        header_len,
+    ))
+}
+
+fn session_candidate(packet: &[u8]) -> Option<SessionCandidate> {
+    if !is_initial_fragment(packet) {
+        return None;
+    }
+    let (src, dst, protocol, header_len) = ipv4_fields(packet)?;
+    match protocol {
+        6 | 17 if packet.len() >= header_len + 4 => {
+            let src_port = u16::from_be_bytes([packet[header_len], packet[header_len + 1]]);
+            let dst_port = u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
+            let opens_session = if protocol == 17 {
+                true
+            } else if packet.len() >= header_len + 14 {
+                let flags = packet[header_len + 13];
+                flags & 0x02 != 0 && flags & 0x10 == 0 // SYN && !ACK
+            } else {
+                false
+            };
+            Some(SessionCandidate::Transport {
+                reply: ReplyKey::Transport {
+                    src: dst,
+                    dst: src,
+                    protocol,
+                    src_port: dst_port,
+                    dst_port: src_port,
+                },
+                protocol,
+                opens_session,
+            })
+        }
+        1 if packet.len() >= header_len + 8 && packet[header_len] == 8 => {
+            let identifier = u16::from_be_bytes([packet[header_len + 4], packet[header_len + 5]]);
+            Some(SessionCandidate::IcmpEchoRequest {
+                reply: ReplyKey::IcmpEcho {
+                    src: dst,
+                    dst: src,
+                    kind: 0,
+                    identifier,
+                },
+            })
+        }
+        _ => Some(SessionCandidate::Other),
+    }
+}
+
+fn packet_reply_key(packet: &[u8]) -> Option<ReplyKey> {
+    if !is_initial_fragment(packet) {
+        return None;
+    }
+    let (src, dst, protocol, header_len) = ipv4_fields(packet)?;
+    match protocol {
+        6 | 17 if packet.len() >= header_len + 4 => Some(ReplyKey::Transport {
+            src,
+            dst,
+            protocol,
+            src_port: u16::from_be_bytes([packet[header_len], packet[header_len + 1]]),
+            dst_port: u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]),
+        }),
+        1 if packet.len() >= header_len + 8 && matches!(packet[header_len], 0 | 8) => {
+            Some(ReplyKey::IcmpEcho {
+                src,
+                dst,
+                kind: packet[header_len],
+                identifier: u16::from_be_bytes([packet[header_len + 4], packet[header_len + 5]]),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_initial_fragment(packet: &[u8]) -> bool {
+    packet.len() >= 8 && u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff == 0
 }
 
 #[cfg(test)]
@@ -414,5 +616,100 @@ mod tests {
         );
         assert!(parse_ports(&["0".into()]).is_err());
         assert!(parse_ports(&["10-2".into()]).is_err());
+    }
+
+    #[test]
+    fn rule_json_keeps_ui_defaults() {
+        let rule = AclRule {
+            id: "default-fields".into(),
+            action: AclAction::Deny,
+            source: AclTarget::Any("any".into()),
+            destination: AclTarget::Any("any".into()),
+            protocol: AclProtocol::Any,
+            ports: vec![],
+            enabled: true,
+        };
+        let json = serde_json::to_value(rule).unwrap();
+        assert_eq!(json["ports"], serde_json::json!([]));
+        assert_eq!(json["enabled"], serde_json::json!(true));
+    }
+
+    fn transport_packet(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        protocol: u8,
+        src_port: u16,
+        dst_port: u16,
+        tcp_flags: u8,
+    ) -> Vec<u8> {
+        let transport_len = if protocol == 6 { 20 } else { 8 };
+        let mut packet = vec![0u8; 20 + transport_len];
+        packet[0] = 0x45;
+        packet[9] = protocol;
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        if protocol == 6 {
+            packet[33] = tcp_flags;
+        }
+        packet
+    }
+
+    fn icmp_echo_packet(src: Ipv4Addr, dst: Ipv4Addr, kind: u8, identifier: u16) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 1;
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet[20] = kind;
+        packet[24..26].copy_from_slice(&identifier.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn stateful_tracker_allows_only_tcp_reply_direction() {
+        let a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let now = Instant::now();
+        let mut tracker = AclSessionTracker::default();
+
+        let b_syn = transport_packet(b, a, 6, 50_000, 443, 0x02);
+        let a_syn_ack = transport_packet(a, b, 6, 443, 50_000, 0x12);
+        let unrelated_a_syn = transport_packet(a, b, 6, 443, 50_001, 0x02);
+        tracker.observe_allowed(&b_syn, now);
+        assert!(tracker.allows_reply(&a_syn_ack, now));
+        assert!(!tracker.allows_reply(&unrelated_a_syn, now));
+
+        assert!(!tracker.allows_reply(
+            &a_syn_ack,
+            now + TCP_SESSION_LIFETIME + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn stateful_tracker_matches_udp_ports_and_icmp_identifier() {
+        let a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let now = Instant::now();
+        let mut tracker = AclSessionTracker::default();
+
+        tracker.observe_allowed(&transport_packet(b, a, 17, 50_000, 53, 0), now);
+        assert!(tracker.allows_reply(&transport_packet(a, b, 17, 53, 50_000, 0), now));
+        assert!(!tracker.allows_reply(&transport_packet(a, b, 17, 53, 50_001, 0), now));
+
+        tracker.observe_allowed(&icmp_echo_packet(b, a, 8, 42), now);
+        assert!(tracker.allows_reply(&icmp_echo_packet(a, b, 0, 42), now));
+        assert!(!tracker.allows_reply(&icmp_echo_packet(a, b, 0, 43), now));
+    }
+
+    #[test]
+    fn stateful_tracker_does_not_open_tcp_session_without_initial_syn() {
+        let a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let now = Instant::now();
+        let mut tracker = AclSessionTracker::default();
+        tracker.observe_allowed(&transport_packet(b, a, 6, 50_000, 443, 0x10), now);
+        assert!(!tracker.allows_reply(&transport_packet(a, b, 6, 443, 50_000, 0x10), now));
     }
 }
