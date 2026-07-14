@@ -467,6 +467,8 @@ export const ja = {
     forwardLabel: "転送先（このドメインが指す先）",
     forwardIp: "IP アドレスを指定",
     forwardMember: (name: string) => `マシン: ${name}`,
+    forwardLocked:
+      "ドメインの「この左側」にマシンを選んだので、転送先はそのマシンに固定されます。",
     ipPlaceholder: "10.68.1.50",
     schemeLabel: "スキーム（任意）",
     schemePlaceholder: "http",

@@ -60,6 +60,10 @@ export function DnsView({
     return member ? labelOf(member) : "";
   };
 
+  /** リスト表示用のマシンの表示名(表示名 → DNS ラベル → IP)。 */
+  const displayName = (member: Member): string =>
+    member.name ?? member.dnsName?.split(".")[0] ?? member.ip;
+
   // ホスト = 設定ファイルから(編集用の参照情報つき)。
   // メンバー = 配信された status から(設定ファイルには載っていない)
   const reload = useCallback(() => {
@@ -103,9 +107,17 @@ export function DnsView({
     : baseTrim;
   const previewFqdn = leftShown ? `${leftShown}.${suffix}` : suffix;
 
-  const canAdd =
-    (machineBase ? prefix.trim() !== "" : baseFree.trim() !== "") &&
-    (target !== "ip" || ip.trim() !== "");
+  // base がマシンなら転送先はそのマシンに固定(サブドメインは通常そのマシンを指す)。
+  // 自由入力のときだけ転送先を選べる
+  const effectiveTarget = machineBase
+    ? { member: baseKind }
+    : target === "ip"
+      ? { ip }
+      : { member: target };
+
+  const canAdd = machineBase
+    ? prefix.trim() !== ""
+    : baseFree.trim() !== "" && (target !== "ip" || ip.trim() !== "");
 
   const add = async () => {
     setBusy(true);
@@ -114,7 +126,7 @@ export function DnsView({
       await api.addDnsRecord(
         configPath,
         relative,
-        target === "ip" ? { ip } : { member: target },
+        effectiveTarget,
         machineRef,
         scheme.trim() === "" ? undefined : scheme.trim(),
         port.trim() === "" ? undefined : Number(port),
@@ -253,7 +265,7 @@ export function DnsView({
                     key={member.publicKey}
                     value={member.isHost ? "host" : member.publicKey}
                   >
-                    {labelOf(member)}
+                    {displayName(member)}
                   </option>
                 ))}
               </select>
@@ -280,7 +292,8 @@ export function DnsView({
             <div className="row">
               <label className="field">
                 <select
-                  value={target}
+                  value={machineBase ? baseKind : target}
+                  disabled={machineBase}
                   onChange={(event) => setTarget(event.target.value)}
                 >
                   <option value="ip">{t.dns.forwardIp}</option>
@@ -289,16 +302,12 @@ export function DnsView({
                       key={member.publicKey}
                       value={member.isHost ? "host" : member.publicKey}
                     >
-                      {t.dns.forwardMember(
-                        member.name ??
-                          member.dnsName?.split(".")[0] ??
-                          member.ip,
-                      )}
+                      {t.dns.forwardMember(displayName(member))}
                     </option>
                   ))}
                 </select>
               </label>
-              {target === "ip" && (
+              {!machineBase && target === "ip" && (
                 <label className="field">
                   <input
                     value={ip}
@@ -309,6 +318,9 @@ export function DnsView({
                 </label>
               )}
             </div>
+            {machineBase && (
+              <p className="muted small">{t.dns.forwardLocked}</p>
+            )}
 
             {/* サービス情報(任意): スキーム・ポート → URL 表示 */}
             <div className="row">
