@@ -176,6 +176,7 @@ function NetworkCard({
   const [error, setError] = useState<string | null>(null);
   const [upnp, setUpnp] = useState(true);
   const running = tunnel !== null;
+  const connected = running && !tunnel.connectionError && !tunnel.removed;
   const isHost = network.role === "hosting";
   const onlineCount =
     tunnel?.members.filter((member) => member.online).length ?? 0;
@@ -211,12 +212,18 @@ function NetworkCard({
   };
 
   return (
-    <section className={running ? "card network network--on" : "card network"}>
+    <section className={connected ? "card network network--on" : "card network"}>
       <div className="card__head">
         <h2 className="network__title">
           <span
-            className={running ? "dot dot--online" : "dot dot--offline"}
-            aria-label={running ? t.networks.running : t.networks.stopped}
+            className={connected ? "dot dot--online" : "dot dot--offline"}
+            aria-label={
+              tunnel?.connectionError
+                ? t.tunnel.rejectedBadge
+                : running
+                  ? t.networks.running
+                  : t.networks.stopped
+            }
           />
           {network.name}
           <span className="tag">
@@ -224,6 +231,9 @@ function NetworkCard({
           </span>
           {tunnel?.removed && (
             <span className="tag tag--danger">{t.networks.removedBadge}</span>
+          )}
+          {tunnel?.connectionError && (
+            <span className="tag tag--danger">{t.tunnel.rejectedBadge}</span>
           )}
         </h2>
         <div className="row">
@@ -256,7 +266,13 @@ function NetworkCard({
       <dl className="facts">
         <dt>{t.common.virtualIp}</dt>
         <dd className="mono">{running ? tunnel.address : network.address}</dd>
-        <dt>{running ? t.networks.running : t.networks.stopped}</dt>
+        <dt>
+          {tunnel?.connectionError
+            ? t.tunnel.rejectedBadge
+            : running
+              ? t.networks.running
+              : t.networks.stopped}
+        </dt>
         <dd>
           {running
             ? t.networks.membersOnline(onlineCount)
@@ -276,6 +292,11 @@ function NetworkCard({
       )}
 
       {error && <p className="error-text">{error}</p>}
+      {tunnel?.connectionError && (
+        <p className="error-text" role="alert">
+          {tunnel.connectionError} {t.tunnel.rejectedAction}
+        </p>
+      )}
 
       <div className="row network__foot">
         <button

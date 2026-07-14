@@ -173,6 +173,8 @@ export interface Tunnel {
   peers: Peer[];
   /** ホストからネットワーク削除された（M2-G6）。UI が明示して切断を促す。 */
   removed: boolean;
+  /** ホストが参加を拒否し、自動再接続を停止した理由。 */
+  connectionError?: string | null;
   /** ファイル転送の進捗（実行中 + 直近の完了/失敗分）。 */
   transfers: Transfer[];
   /** チャット履歴の最新 seq（ADR-0016）。進んだら差分フェッチする。 */

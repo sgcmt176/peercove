@@ -1321,7 +1321,7 @@ fn unix_ms() -> u64 {
 
 /// 1 トンネル分の status 応答を組み立てる。
 fn tunnel_info(active: &Active) -> TunnelInfo {
-    let (peers, ledger, dns_records, cname_records, rtt_ms, removed, direct) = {
+    let (peers, ledger, dns_records, cname_records, rtt_ms, removed, connection_error, direct) = {
         let snapshot = active.snapshot.lock().unwrap();
         match snapshot.as_ref() {
             Some(snapshot) => (
@@ -1331,6 +1331,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
                 snapshot.cname_records.clone(),
                 snapshot.rtt_ms.clone(),
                 snapshot.removed,
+                snapshot.connection_error.clone(),
                 snapshot.direct.clone(),
             ),
             None => (
@@ -1340,6 +1341,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
                 Vec::new(),
                 HashMap::new(),
                 false,
+                None,
                 HashMap::new(),
             ),
         }
@@ -1381,6 +1383,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         dns_records,
         cname_records,
         removed,
+        connection_error,
         direct,
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)
         transfers: active.transfers.lock().unwrap().clone(),

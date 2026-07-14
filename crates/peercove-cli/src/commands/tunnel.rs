@@ -352,6 +352,8 @@ pub struct Snapshot {
     pub rtt_ms: HashMap<std::net::Ipv4Addr, f64>,
     /// (member のみ)ホストからネットワーク削除された(M2-G6)。UI が明示する。
     pub removed: bool,
+    /// (member のみ)使用済み招待など、ホストが参加を拒否した理由。
+    pub connection_error: Option<String>,
     /// (member のみ)相手の仮想 IP → 直接経路の状態(ADR-0013、M3-4)。
     pub direct: HashMap<std::net::Ipv4Addr, peercove_core::ipc::DirectStatus>,
 }
@@ -738,6 +740,7 @@ pub async fn supervise(
                             cname_records,
                             rtt_ms: rtt.lock().unwrap().clone(),
                             removed: removed.load(std::sync::atomic::Ordering::Relaxed),
+                            connection_error: member_link.connection_error(),
                             direct: direct_routes,
                         });
                     }

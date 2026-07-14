@@ -71,6 +71,11 @@ pub enum ControlMessage {
     },
     /// host → member: あなたは削除された(以後トンネルは通らない)。
     Removed { message: String },
+    /// host → member: Hello の招待認証を拒否した。
+    ///
+    /// 使用済み招待の別端末利用や期限切れなど、同じ設定での自動再試行では
+    /// 回復しない理由を返す。受信側は再接続を停止し、利用者に表示する。
+    JoinRejected { message: String },
     /// 双方向: RTT 計測(M2-G5)。受け取った側は同じ nonce で [`ControlMessage::Pong`] を返す。
     ///
     /// 追加メッセージなので [`PROTO_VERSION`] は上げない。ping を知らない旧実装は
@@ -231,6 +236,9 @@ mod tests {
             },
             ControlMessage::Removed {
                 message: "ホストにより削除されました".to_string(),
+            },
+            ControlMessage::JoinRejected {
+                message: "この招待は使用済みです".to_string(),
             },
             ControlMessage::Ping { nonce: 7 },
             ControlMessage::Pong { nonce: 7 },

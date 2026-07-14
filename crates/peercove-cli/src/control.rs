@@ -233,6 +233,8 @@ struct MemberLinkState {
     dns_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
     /// 表示名変更(ADR-0027)の応答待ち。dns_reply と同じ仕組み。
     display_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
+    /// 自動再試行では回復しない、ホストからの参加拒否理由。
+    connection_error: Option<String>,
 }
 
 impl MemberLink {
@@ -254,6 +256,11 @@ impl MemberLink {
     /// 届いた rotate_key_result を取り出す(1 回限り)。
     pub fn take_rotate_result(&self) -> Option<(bool, String)> {
         self.inner.lock().unwrap().rotate_result.take()
+    }
+
+    /// ホストが参加を拒否した場合の、UI に表示する理由。
+    pub fn connection_error(&self) -> Option<String> {
+        self.inner.lock().unwrap().connection_error.clone()
     }
 
     /// 自分の DNS 名の変更をホストへ依頼し、応答の受け口を返す(ADR-0021)。
@@ -299,6 +306,7 @@ impl MemberLink {
         state.rotate_result = None;
         state.dns_reply = None; // 応答待ちの受け口は Err(切断)になる
         state.display_reply = None;
+        state.connection_error = None;
     }
 
     fn detach(&self) {
@@ -322,6 +330,10 @@ impl MemberLink {
         if let Some(reply) = self.inner.lock().unwrap().display_reply.take() {
             let _ = reply.send((accepted, message));
         }
+    }
+
+    fn reject(&self, message: String) {
+        self.inner.lock().unwrap().connection_error = Some(message);
     }
 }
 
@@ -644,7 +656,7 @@ async fn handle_member(
     rtt: &RttMap,
     requests: Arc<HostRequests>,
 ) -> anyhow::Result<()> {
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, mut write_half) = stream.into_split();
     let mut reader = line_reader(read_half);
 
     // 最初のメッセージは Hello(名乗り)
@@ -655,37 +667,46 @@ async fn handle_member(
     if hello.is_none() {
         anyhow::bail!("Hello の前に切断されました");
     }
-    let (app_version, capabilities, device_id) = match serde_json::from_str::<ControlMessage>(&line)
-    {
-        Ok(ControlMessage::Hello {
-            version,
-            name,
-            app_version,
-            capabilities,
-            device_id,
-        }) => {
-            if version != PROTO_VERSION {
-                tracing::warn!(
-                    "メンバー {member_ip} のプロトコルバージョン {version} は未対応です\
+    let (name, app_version, capabilities, device_id) =
+        match serde_json::from_str::<ControlMessage>(&line) {
+            Ok(ControlMessage::Hello {
+                version,
+                name,
+                app_version,
+                capabilities,
+                device_id,
+            }) => {
+                if version != PROTO_VERSION {
+                    tracing::warn!(
+                        "メンバー {member_ip} のプロトコルバージョン {version} は未対応です\
                     (こちらは {PROTO_VERSION})"
-                );
+                    );
+                }
+                (name, app_version, capabilities, device_id)
             }
-            tracing::info!(
-                "メンバー {member_ip}({})が接続しました(version={})",
-                name.as_deref().unwrap_or("名前なし"),
-                app_version.as_deref().unwrap_or("不明")
-            );
+            Ok(other) => anyhow::bail!("Hello 以外のメッセージが届きました: {other:?}"),
+            Err(e) => anyhow::bail!("Hello の解析に失敗しました: {e}"),
+        };
 
-            (app_version, capabilities, device_id)
+    let isolated = match requests.accept_invite(member_ip, device_id).await {
+        Ok(isolated) => isolated,
+        Err(error) => {
+            let reason = format!("{error:#}");
+            let message = format!("{reason}。ホストから新しい招待トークンを受け取ってください。");
+            write_half
+                .write_all(encode_line(&ControlMessage::JoinRejected { message }).as_bytes())
+                .await
+                .context("参加拒否理由をメンバーへ送信できません")?;
+            write_half.flush().await?;
+            tracing::warn!("メンバー {member_ip} の参加を拒否しました: {reason}");
+            anyhow::bail!("メンバー {member_ip} の招待を受け付けられません: {reason}");
         }
-        Ok(other) => anyhow::bail!("Hello 以外のメッセージが届きました: {other:?}"),
-        Err(e) => anyhow::bail!("Hello の解析に失敗しました: {e}"),
     };
-
-    let isolated = requests
-        .accept_invite(member_ip, device_id)
-        .await
-        .with_context(|| format!("メンバー {member_ip} の招待を受け付けられません"))?;
+    tracing::info!(
+        "メンバー {member_ip}({})が接続しました(version={})",
+        name.as_deref().unwrap_or("名前なし"),
+        app_version.as_deref().unwrap_or("不明")
+    );
 
     // 送信キューを登録(台帳変更・削除通知・Pong の配送口)
     let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
@@ -889,7 +910,13 @@ pub async fn run_member_client(
                     &link,
                 );
                 let result = session.await;
+                let connection_error = link.connection_error();
                 link.detach();
+                if let Some(message) = connection_error {
+                    tracing::warn!("ホストが参加を拒否したため再接続を停止します: {message}");
+                    rtt.lock().unwrap().remove(&host_ip);
+                    return;
+                }
                 if let Err(e) = result {
                     tracing::debug!("制御接続が終了しました(再接続します): {e:#}");
                 }
@@ -1037,6 +1064,12 @@ async fn member_reader(
                 *latest_ledger.lock().unwrap() = None;
                 removed.store(true, Ordering::Relaxed);
                 anyhow::bail!("削除通知を受信");
+            }
+            Ok(ControlMessage::JoinRejected { message }) => {
+                tracing::warn!("ホストが参加を拒否しました: {message}");
+                *latest_ledger.lock().unwrap() = None;
+                link.reject(message);
+                anyhow::bail!("参加拒否通知を受信");
             }
             Ok(ControlMessage::RotateKeyResult { accepted, message }) => {
                 // 鍵ローテーションの応答(ADR-0020)。ファイル操作と再起動は
@@ -1408,6 +1441,71 @@ mod tests {
             "削除フラグが立つこと(UI に「削除された」と出す信号)"
         );
         assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn reused_v3_invite_returns_reason_and_stops_retry_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-reused-invite-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let peer_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"alice\"\ninvite_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\ninvite_issued_at = 1\ninvite_accepted_at = 2\ninvite_device_id = \"11111111111111111111111111111111\"\npublic_key = \"{peer_key}\"\nallowed_ips = [\"127.0.0.1/32\"]\n"
+            ),
+        )
+        .unwrap();
+        let requests = Arc::new(HostRequests::new(
+            config_path,
+            PrivateKey::generate().public_key(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_ledger_tx, ledger_rx) = watch::channel(Distribution::default());
+        let connections: Connections = Default::default();
+        let server_connections = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let IpAddr::V4(ip) = peer.ip() else {
+                unreachable!()
+            };
+            handle_member(
+                stream,
+                ip,
+                ledger_rx,
+                &server_connections,
+                &Default::default(),
+                requests,
+            )
+            .await
+        });
+
+        let link = Arc::new(MemberLink::default());
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let result = member_session(
+            stream,
+            &Some("alice".to_string()),
+            &Some("22222222222222222222222222222222".to_string()),
+            &Arc::new(Mutex::new(None)),
+            "127.0.0.1".parse().unwrap(),
+            &Default::default(),
+            &Arc::new(AtomicBool::new(false)),
+            &link,
+        )
+        .await;
+
+        assert!(result.is_err(), "参加拒否でセッションを終了する");
+        let message = link.connection_error().expect("拒否理由が残る");
+        assert!(message.contains("別の端末で既に使用"), "{message}");
+        assert!(message.contains("新しい招待トークン"), "{message}");
+        assert!(server.await.unwrap().is_err());
+        assert!(connections.lock().unwrap().is_empty());
     }
 
     async fn wait_for<T>(value: &Arc<Mutex<Option<T>>>, predicate: impl Fn(&Option<T>) -> bool) {

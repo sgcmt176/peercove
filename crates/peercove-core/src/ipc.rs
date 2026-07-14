@@ -314,6 +314,9 @@ pub struct TunnelInfo {
     /// トンネルはまだ張ったままだが通信は落ちている。UI が明示して切断を促す。
     #[serde(default)]
     pub removed: bool,
+    /// (member のみ)ホストが参加を拒否し、自動再接続を停止した理由。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_error: Option<String>,
     /// (member のみ)相手の仮想 IP → 直接経路の状態(ADR-0013、M3-4)。
     /// 載っていない相手はホスト経由(中継)。旧デーモンの応答には無い(空)。
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]

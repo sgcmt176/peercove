@@ -439,6 +439,7 @@ export default function App() {
             name={detailName}
             isHost={detailHost}
             running={openTunnel !== null}
+            rejected={Boolean(openTunnel?.connectionError)}
             disconnecting={disconnecting}
             onBack={backToList}
             onDisconnect={() => void disconnect()}
@@ -448,6 +449,13 @@ export default function App() {
           <section className="card card--error">
             <h2>{t.tunnel.removedTitle}</h2>
             <p>{t.tunnel.removedBody}</p>
+          </section>
+        )}
+        {detail && openTunnel?.connectionError && (
+          <section className="card card--error" role="alert">
+            <h2>{t.tunnel.rejectedTitle}</h2>
+            <p>{openTunnel.connectionError}</p>
+            <p>{t.tunnel.rejectedAction}</p>
           </section>
         )}
 
@@ -531,6 +539,7 @@ function DetailHeader({
   name,
   isHost,
   running,
+  rejected,
   disconnecting,
   onBack,
   onDisconnect,
@@ -538,6 +547,7 @@ function DetailHeader({
   name: string;
   isHost: boolean;
   running: boolean;
+  rejected: boolean;
   disconnecting: boolean;
   onBack: () => void;
   onDisconnect: () => void;
@@ -553,8 +563,12 @@ function DetailHeader({
         ←
       </button>
       <h2 className="detail__title">{name}</h2>
-      <span className={running ? "badge badge--on" : "badge"}>
-        {running ? t.tunnel.connected : t.networks.stopped}
+      <span className={running && !rejected ? "badge badge--on" : "badge"}>
+        {rejected
+          ? t.tunnel.rejectedBadge
+          : running
+            ? t.tunnel.connected
+            : t.networks.stopped}
       </span>
       <span className="tag">
         {isHost ? t.networks.roleHost : t.networks.roleMember}

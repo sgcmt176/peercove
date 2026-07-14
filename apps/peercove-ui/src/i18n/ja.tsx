@@ -313,6 +313,10 @@ export const ja = {
     removedTitle: "ホストから削除されました",
     removedBody:
       "このネットワークからあなたは削除されました。通信はすでに遮断されています。「切断」してから、必要なら新しい招待トークンで参加し直してください。",
+    rejectedTitle: "接続が拒否されました",
+    rejectedBadge: "参加拒否",
+    rejectedAction:
+      "この参加設定では再接続できません。「切断」してから、ホストが発行した新しい招待トークンで参加し直してください。",
     disconnectConfirm: "切断する",
     disconnect: "切断",
     back: "一覧へ戻る",

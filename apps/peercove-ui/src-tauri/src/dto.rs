@@ -262,6 +262,8 @@ pub struct Tunnel {
     pub peers: Vec<Peer>,
     /// ホストからネットワーク削除された(M2-G6)。UI が明示して切断を促す。
     pub removed: bool,
+    /// ホストが参加を拒否し、自動再接続を停止した理由。
+    pub connection_error: Option<String>,
     /// ファイル転送の進捗(ADR-0015、M3-9)。実行中 + 直近の完了/失敗分。
     pub transfers: Vec<Transfer>,
     /// チャット履歴の最新 seq(ADR-0016、M3-13b)。これが進んだら差分フェッチする。
@@ -319,6 +321,7 @@ impl From<&TunnelInfo> for Tunnel {
                 .collect(),
             peers: info.peers.iter().map(Peer::from).collect(),
             removed: info.removed,
+            connection_error: info.connection_error.clone(),
             transfers: info.transfers.iter().map(Transfer::from).collect(),
             chat_seq: info.chat_seq,
             groups: info.groups.iter().map(Group::from).collect(),
@@ -707,6 +710,7 @@ mod tests {
             }],
             peers: vec![],
             removed: false,
+            connection_error: None,
             direct: Default::default(),
             transfers: vec![],
             chat_seq: 0,
@@ -829,6 +833,7 @@ mod tests {
             ],
             peers: vec![],
             removed: false,
+            connection_error: Some("この招待は別の端末で使用済みです".to_string()),
             direct,
             transfers: vec![],
             chat_seq: 0,
@@ -837,6 +842,10 @@ mod tests {
             cname_records: vec![],
         };
         let tunnel = Tunnel::from(&info);
+        assert_eq!(
+            tunnel.connection_error.as_deref(),
+            Some("この招待は別の端末で使用済みです")
+        );
         let routes: Vec<Option<&str>> = tunnel.members.iter().map(|m| m.route).collect();
         assert_eq!(
             routes,
