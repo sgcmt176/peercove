@@ -658,8 +658,6 @@ export const ja = {
     forwardIp: "IP アドレスを指定",
     forwardCname: "ドメイン（CNAME）を指定",
     forwardMember: (name: string) => `マシン: ${name}`,
-    forwardLocked:
-      "ドメインの「この左側」にマシンを選んだので、転送先はそのマシンに固定されます。",
     cnamePlaceholder: "docs.example.com",
     cnameHint:
       "別のドメインの別名（CNAME）にします。外部ドメイン（example.com など）も指定できます。閲覧側はこのドメインを引くと、指定先へたどり直します。",

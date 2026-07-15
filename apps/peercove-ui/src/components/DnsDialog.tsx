@@ -128,16 +128,14 @@ export function DnsView({
     : baseTrim;
   const previewFqdn = leftShown ? `${leftShown}.${suffix}` : suffix;
 
-  // base がマシンなら転送先はそのマシンに固定(サブドメインは通常そのマシンを指す)。
-  // 自由入力のときだけ転送先を選べる
+  // 転送先は常に選択値(target/ip/cname)に従う。base がマシンのときは初期値として
+  // そのマシンを入れるが(baseKind の onChange で設定)、プルダウンから変更できる。
   const effectiveTarget: { ip?: string; member?: string; cname?: string } =
-    machineBase
-      ? { member: baseKind }
-      : target === "ip"
-        ? { ip }
-        : target === "cname"
-          ? { cname: cnameInput.trim() }
-          : { member: target };
+    target === "ip"
+      ? { ip }
+      : target === "cname"
+        ? { cname: cnameInput.trim() }
+        : { member: target };
 
   const targetOk =
     target === "ip"
@@ -145,9 +143,8 @@ export function DnsView({
       : target === "cname"
         ? cnameInput.trim() !== ""
         : true;
-  const canAdd = machineBase
-    ? prefix.trim() !== ""
-    : baseFree.trim() !== "" && targetOk;
+  const canAdd =
+    (machineBase ? prefix.trim() !== "" : baseFree.trim() !== "") && targetOk;
 
   const add = async () => {
     setBusy(true);
@@ -318,7 +315,12 @@ export function DnsView({
               <select
                 className="dns-domain__basekind"
                 value={baseKind}
-                onChange={(event) => setBaseKind(event.target.value)}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setBaseKind(value);
+                  // マシンを選んだら転送先の初期値を同マシンにする(変更可)。
+                  if (value !== "free") setTarget(value);
+                }}
               >
                 <option value="free">{t.dns.baseFree}</option>
                 {members.map((member) => (
@@ -353,8 +355,7 @@ export function DnsView({
             <div className="row">
               <label className="field">
                 <select
-                  value={machineBase ? baseKind : target}
-                  disabled={machineBase}
+                  value={target}
                   onChange={(event) => setTarget(event.target.value)}
                 >
                   <option value="ip">{t.dns.forwardIp}</option>
@@ -369,7 +370,7 @@ export function DnsView({
                   ))}
                 </select>
               </label>
-              {!machineBase && target === "ip" && (
+              {target === "ip" && (
                 <label className="field">
                   <input
                     value={ip}
@@ -379,7 +380,7 @@ export function DnsView({
                   />
                 </label>
               )}
-              {!machineBase && target === "cname" && (
+              {target === "cname" && (
                 <label className="field">
                   <input
                     value={cnameInput}
@@ -390,11 +391,8 @@ export function DnsView({
                 </label>
               )}
             </div>
-            {!machineBase && target === "cname" && (
+            {target === "cname" && (
               <p className="muted small">{t.dns.cnameHint}</p>
-            )}
-            {machineBase && (
-              <p className="muted small">{t.dns.forwardLocked}</p>
             )}
 
             {/* サービス情報(任意): スキーム・ポート → URL 表示 */}
