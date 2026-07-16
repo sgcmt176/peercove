@@ -1203,7 +1203,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-service",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "wintun",
 ]
 

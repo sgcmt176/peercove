@@ -35,7 +35,7 @@ wintun = "0.5"
 boringtun = "0.7"
 # デーモンの Windows サービス化(M2-G7、ADR-0010)。Mullvad 製・同用途で実績あり
 windows-service = "0.8"
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
