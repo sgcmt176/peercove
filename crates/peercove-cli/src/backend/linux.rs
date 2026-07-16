@@ -288,6 +288,33 @@ impl LinuxBackend {
         }
     }
 
+    /// FORWARD を `-I`(先頭挿入)で触る `sync_acl` / `sync_subnet_router` の直後に
+    /// 呼ぶ。ACL やサブネットルーターの ACCEPT ルールを先頭に入れると、承認待ち
+    /// 端末の隔離 DROP より上位に来て隔離が破れる(承認前に許可済みサービス・
+    /// LAN へ到達できてしまう)。隔離は常に最優先でなければならないため、隔離
+    /// ルールを削除して入れ直し、必ず FORWARD の最上位へ戻す。Windows は
+    /// `deliver_inbound` で隔離判定を ACL より前に行うのでこの問題は無い。
+    fn reassert_isolation_top(&mut self) {
+        if self.isolated_ips.is_empty() {
+            return;
+        }
+        let ips = self.isolated_ips.clone();
+        // まず全 IP の隔離ルールを外し、正規の順(DROP → 制御 ACCEPT)で入れ直す。
+        // 個別に消してから入れ直すことで、ACCEPT を最後に -I して最上位に保つ。
+        for ip in &ips {
+            for args in isolation_rule_args("-D", &self.if_name, *ip) {
+                let _ = iptables(&args);
+            }
+        }
+        for ip in &ips {
+            for args in isolation_rule_args("-I", &self.if_name, *ip) {
+                if let Err(e) = iptables(&args) {
+                    tracing::warn!("隔離ルールの再挿入に失敗しました({ip}): {e:#}");
+                }
+            }
+        }
+    }
+
     /// サブネットへの経路が向く LAN 側 IF を特定する(`ip route get`)。
     fn lan_interface_for(&self, subnet: &ipnet::Ipv4Net) -> anyhow::Result<String> {
         let probe = subnet
@@ -599,6 +626,8 @@ impl WgBackend for LinuxBackend {
         }
         self.acl_rules = desired;
         self.acl_policy = Some(policy.clone());
+        // ACL を FORWARD 先頭に入れ直したので、隔離を最上位へ戻す。
+        self.reassert_isolation_top();
         Ok(())
     }
 
@@ -650,6 +679,7 @@ impl WgBackend for LinuxBackend {
 
         // 新しく広告されたサブネットの適用
         let wg_if = self.if_name.clone();
+        let mut inserted_forward = false;
         for subnet in subnets {
             if self.router.subnets.iter().any(|(s, _)| s == subnet) {
                 continue;
@@ -666,6 +696,7 @@ impl WgBackend for LinuxBackend {
                         "FORWARD 許可ルールの設定に失敗しました。iptables が必要です \
                          (sudo apt install iptables)",
                     )?;
+                    inserted_forward = true;
                 }
             }
             if snat {
@@ -685,6 +716,11 @@ impl WgBackend for LinuxBackend {
             }
             self.router.subnets.push((*subnet, snat));
             tracing::info!("サブネットルーターを有効化しました({subnet} → {lan_if}、SNAT={snat})");
+        }
+        // 仮想 /24 全体を許可する FORWARD ルールを先頭に入れたので、承認待ち隔離を
+        // 最上位へ戻す(承認待ち端末が LAN サブネットへ到達しないように)。
+        if inserted_forward {
+            self.reassert_isolation_top();
         }
         Ok(())
     }

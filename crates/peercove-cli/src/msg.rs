@@ -351,6 +351,11 @@ async fn handle_incoming(
             let revision = group.revision;
             let applied = {
                 let mut store = groups.lock().unwrap();
+                // 認可: 送信元がそのグループのメンバーでなければ取り込まない
+                // (非メンバーによる改名・追放・自分の勝手な追加を防ぐ)。
+                if !store.accepts_update(&group, peer_ip) {
+                    bail!("権限のないグループ更新を拒否しました({peer_ip})");
+                }
                 // 送信者はこの revision を持っている → こちらから送り返さない
                 store.mark_acked(&id, peer_ip, revision);
                 store.apply(group.clone())
@@ -1486,10 +1491,12 @@ mod tests {
         let groups = test_groups();
         {
             let mut store = groups.lock().unwrap();
+            // 送信元(loopback = 127.0.0.1)を現メンバーに含める。既知グループの
+            // 更新は現メンバーからのみ受理するため(accepts_update)。
             store.apply(GroupInfo {
                 id: "g1".to_string(),
                 name: "旧名".to_string(),
-                members: vec!["10.0.0.1".parse().unwrap()],
+                members: vec!["127.0.0.1".parse().unwrap(), "10.0.0.1".parse().unwrap()],
                 revision: 1,
                 updated_by: "10.0.0.1".parse().unwrap(),
             });
@@ -1521,10 +1528,13 @@ mod tests {
             anyhow::Ok(())
         });
 
+        // 送信元(このテストは loopback から接続するので peer_ip = 127.0.0.1)を
+        // メンバーに含める。認可(accepts_update)は送信元がメンバーであることを
+        // 要求するため、実運用でも更新を配るのはそのグループのメンバーになる。
         let newer = GroupInfo {
             id: "g1".to_string(),
             name: "新名".to_string(),
-            members: vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
+            members: vec!["127.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
             revision: 2,
             updated_by: "10.0.0.2".parse().unwrap(),
         };

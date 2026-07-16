@@ -165,13 +165,27 @@ pub fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        // 保存先が既にシンボリックリンクなら拒否する。root デーモンが攻撃者の
+        // 仕込んだリンク先へ秘密を書くのを防ぐ(best-effort の事前チェック)。
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(io_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "秘密ファイルの保存先がシンボリックリンクです",
+                )));
+            }
+        }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)
+            .map_err(io_err)?;
+        // `.mode(0o600)` は新規作成時のみ効く。既存ファイルを上書きした場合に
+        // 緩い権限が残らないよう、開いた fd に 0600 を明示的に再適用する。
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(io_err)?;
         file.write_all(contents.as_bytes()).map_err(io_err)?;
         Ok(())

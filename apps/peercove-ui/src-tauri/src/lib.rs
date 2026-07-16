@@ -602,10 +602,50 @@ const PREVIEW_HTML_LIMIT: usize = 512 * 1024;
 /// プレビュー画像の上限。超えるものは画像なしで返す。
 const PREVIEW_IMAGE_LIMIT: usize = 2 * 1024 * 1024;
 
+/// 取得先として禁止する IPv4 か(ループバック・プライベート・CGNAT 等)。
+fn ipv4_forbidden(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.octets()[0] == 0
+        // CGNAT(100.64.0.0/10)。PeerCove の既定レンジもここ
+        || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+}
+
+/// 取得先として禁止する IPv6 か。ループバック・未指定・マルチキャストに加え、
+/// ULA(fc00::/7)・リンクローカル(fe80::/10)・IPv4-mapped(中の v4 で判定)を弾く。
+fn ipv6_forbidden(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return true;
+    }
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_forbidden(v4);
+    }
+    let seg0 = ip.segments()[0];
+    (seg0 & 0xfe00) == 0xfc00 // ULA fc00::/7
+        || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+}
+
+fn ip_forbidden(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_forbidden(v4),
+        std::net::IpAddr::V6(v6) => ipv6_forbidden(v6),
+    }
+}
+
 /// 自動取得してよい URL か(ADR-0017)。チャットに URL を書くだけで相手の
-/// 端末が取得しに行くため、ループバック・プライベート等の IP リテラルと
+/// 端末が取得しに行くため、ループバック・プライベート等の内部アドレスと
 /// 内部向けドメインは拒否する(トンネル内サービスへの意図しないアクセス防止)。
+///
+/// IP リテラルだけでなく、**ホスト名は解決先 IP も検査**する(内部 IP へ解決する
+/// ドメインを使った回避を塞ぐ)。なお、ここで解決した IP と reqwest が接続時に
+/// 再解決する IP がずれる DNS リバインディングの残余リスクはある(結果は表示者に
+/// しか返らないブラインド SSRF なので、主要な内部到達経路を塞ぐことを主眼とする)。
 fn previewable(url: &reqwest::Url) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err("http/https 以外は取得しません".to_string());
     }
@@ -614,24 +654,37 @@ fn previewable(url: &reqwest::Url) -> Result<(), String> {
     };
     let host = host.trim_matches(['[', ']']);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        if ip.is_private()
-            || ip.is_loopback()
-            || ip.is_link_local()
-            || ip.is_unspecified()
-            // CGNAT(100.64.0.0/10)。PeerCove の既定レンジもここ
-            || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
-        {
-            return Err("プライベートな IP は取得しません".to_string());
-        }
-    } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
-        if ip.is_loopback() || ip.is_unspecified() {
-            return Err("プライベートな IP は取得しません".to_string());
-        }
-    } else if host.eq_ignore_ascii_case("localhost")
-        || host.to_ascii_lowercase().ends_with(".internal")
-        || host.to_ascii_lowercase().ends_with(".local")
-    {
+        return if ipv4_forbidden(ip) {
+            Err("内部アドレスは取得しません".to_string())
+        } else {
+            Ok(())
+        };
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        return if ipv6_forbidden(ip) {
+            Err("内部アドレスは取得しません".to_string())
+        } else {
+            Ok(())
+        };
+    }
+    // ホスト名: 内部向けの名前を弾いたうえで、解決先 IP を全て検査する。
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".internal") || lower.ends_with(".local") {
         return Err("内部向けの名前は取得しません".to_string());
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let mut resolved = 0usize;
+    for addr in (host, port)
+        .to_socket_addrs()
+        .map_err(|_| "名前を解決できません".to_string())?
+    {
+        resolved += 1;
+        if ip_forbidden(addr.ip()) {
+            return Err("内部アドレスへ解決される URL は取得しません".to_string());
+        }
+    }
+    if resolved == 0 {
+        return Err("名前を解決できません".to_string());
     }
     Ok(())
 }
@@ -1279,4 +1332,44 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Tauri アプリの起動に失敗しました");
+}
+
+#[cfg(test)]
+mod preview_ssrf_tests {
+    use super::previewable;
+
+    fn ok(url: &str) -> bool {
+        previewable(&reqwest::Url::parse(url).unwrap()).is_ok()
+    }
+
+    #[test]
+    fn rejects_internal_ip_literals() {
+        // IPv4 の内部レンジ
+        assert!(!ok("http://127.0.0.1/"));
+        assert!(!ok("http://10.1.2.3/"));
+        assert!(!ok("http://192.168.0.1/"));
+        assert!(!ok("http://169.254.1.1/"));
+        assert!(!ok("http://100.100.42.1/")); // CGNAT(PeerCove 既定)
+                                              // IPv6 の内部レンジ(以前は loopback/unspecified しか弾いていなかった)
+        assert!(!ok("http://[::1]/"));
+        assert!(!ok("http://[fd00::1]/")); // ULA
+        assert!(!ok("http://[fe80::1]/")); // link-local
+        assert!(!ok("http://[::ffff:127.0.0.1]/")); // IPv4-mapped loopback
+        assert!(!ok("http://[::ffff:10.0.0.1]/")); // IPv4-mapped private
+    }
+
+    #[test]
+    fn rejects_internal_names_and_schemes() {
+        assert!(!ok("http://localhost/"));
+        assert!(!ok("http://foo.internal/"));
+        assert!(!ok("http://printer.local/"));
+        assert!(!ok("ftp://example.com/")); // http/https 以外
+        assert!(!ok("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn allows_public_ip_literals() {
+        assert!(ok("http://1.1.1.1/"));
+        assert!(ok("https://[2606:4700:4700::1111]/")); // 公開 IPv6(Cloudflare)
+    }
 }

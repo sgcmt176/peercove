@@ -72,6 +72,26 @@ impl GroupStore {
         }))
     }
 
+    /// ネットワークから受信した `group_update` を取り込んでよいか(認可)。
+    ///
+    /// グループ情報は署名を持たず P2P で配り合うため、`apply` の revision 勝負だけ
+    /// だと**招待済みの悪意あるメンバーが、自分が属さないグループを改名・追放・
+    /// 自分を勝手に追加**できてしまう(`updated_by` も詐称可能)。そこで受信時に
+    /// 「送信元がそのグループのメンバーか」を検査する:
+    /// - 既知グループの変更 → 送信元が**現在の**メンバーであること
+    ///   (中継はメンバーが行うため gossip を壊さない。非メンバーの改竄を弾く)
+    /// - 未知グループ(新規)→ 送信元が**その**グループのメンバーであること
+    ///   (見ず知らずの第三者が勝手なグループを作って見せるのを弾く)
+    ///
+    /// 送信元 IP は WG のトンネル内送信元(AllowedIPs /32)なので詐称できない。
+    /// 自分で作った更新(ローカル操作)はこの検査を通さず直接 `apply` する。
+    pub fn accepts_update(&self, group: &GroupInfo, sender: Ipv4Addr) -> bool {
+        match self.groups.get(&group.id) {
+            Some(current) => current.members.contains(&sender),
+            None => group.members.contains(&sender),
+        }
+    }
+
     /// 受信した(または自分で作った)グループ全量を取り込む。
     /// **最新リビジョン勝ち**: 手元より revision が大きければ置換、同値は
     /// updated_by の IP が大きい方が勝つ(決定的にどちらかへ収束させる)。
@@ -320,6 +340,41 @@ mod tests {
             .apply(group("g1", 3, "10.0.0.2", &["10.0.0.2"]))
             .is_some());
         assert_eq!(store.get("g1").unwrap().revision, 3);
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    /// 認可(accepts_update): 受信更新は送信元がメンバーの場合のみ受理する。
+    #[test]
+    fn accepts_update_requires_membership() {
+        let config = temp_config("authz");
+        let store = GroupStore::load(&config);
+        let mut store = store.lock().unwrap();
+        let g = group("g1", 1, "10.0.0.1", &["10.0.0.1", "10.0.0.2"]);
+
+        // 新規グループ: 送信元がそのグループのメンバーなら受理、非メンバーは拒否。
+        assert!(
+            store.accepts_update(&g, "10.0.0.2".parse().unwrap()),
+            "新規でも送信元がメンバーなら受理"
+        );
+        assert!(
+            !store.accepts_update(&g, "10.0.0.9".parse().unwrap()),
+            "新規で送信元が非メンバーなら拒否(第三者の勝手なグループを弾く)"
+        );
+
+        store.apply(g).unwrap();
+
+        // 既知グループの変更: 現メンバーからのみ受理。非メンバーが自分を
+        // 追加しようとする更新(members に自分を入れる)も拒否する。
+        let renamed = group("g1", 2, "10.0.0.1", &["10.0.0.1", "10.0.0.2"]);
+        assert!(
+            store.accepts_update(&renamed, "10.0.0.1".parse().unwrap()),
+            "現メンバーからの変更は受理"
+        );
+        let self_add = group("g1", 2, "10.0.0.9", &["10.0.0.1", "10.0.0.2", "10.0.0.9"]);
+        assert!(
+            !store.accepts_update(&self_add, "10.0.0.9".parse().unwrap()),
+            "非メンバーが自分を追加する更新は拒否(現メンバーで判定するため)"
+        );
         let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 
