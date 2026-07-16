@@ -115,4 +115,8 @@ CLI だけでも一通りの操作ができます([docs/user-guide.md](docs/user
 
 ## ライセンス
 
-MIT OR Apache-2.0(予定)
+[MIT ライセンス](LICENSE-MIT) または [Apache License 2.0](LICENSE-APACHE) の
+デュアルライセンスです。利用者はどちらかを選べます。
+
+このリポジトリへのコントリビューションは、Apache-2.0 の §5 に従い、明示的に
+別段の定めをしない限り同じデュアルライセンスで提供されたものとみなします。

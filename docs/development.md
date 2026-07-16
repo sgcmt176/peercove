@@ -166,3 +166,27 @@ cargo-zigbuild clippy --workspace --all-targets --target x86_64-unknown-linux-gn
 UI(`apps/peercove-ui`)はルートのワークスペースから独立しています。UI を変更したら
 `apps/peercove-ui/src-tauri` で `cargo fmt --check` / `cargo clippy` / `cargo test` と、
 `apps/peercove-ui` で `npm run build` を別途通してください。
+
+## 依存ライセンスの確認
+
+PeerCove 本体は MIT OR Apache-2.0(デュアル)です。依存 crate に強いコピーレフト
+(GPL / AGPL 等)が混ざっていないかは [cargo-license](https://crates.io/crates/cargo-license)
+で確認できます:
+
+```bash
+cargo install cargo-license   # 初回のみ
+
+# ルート(CLI/デーモン/コア)の依存ライセンスを種別ごとに一覧
+cargo license
+cargo license | awk -F'(' '{print $1}' | sort -u   # 種別だけ重複排除で見る
+
+# UI(Tauri)側は独立ワークスペースなので個別に
+cd apps/peercove-ui/src-tauri && cargo license
+```
+
+現状、単独のコピーレフトは **MPL-2.0(弱い・ファイル単位)** のみで、GPL/AGPL は
+ありません。方針と配布時の第三者謝辞の扱いは
+[packaging/licenses/README.md](../packaging/licenses/README.md) を参照。
+
+CI で継続的に弾きたい場合は [cargo-deny](https://crates.io/crates/cargo-deny) の
+`licenses` チェックを `deny.toml` に定義して追加できます(現状は未導入)。
