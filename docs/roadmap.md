@@ -28,7 +28,7 @@ PeerCove は**事業者サーバーを持たない** P2P 型 VPN デスクトッ
 | 対象外(当面) | macOS、モバイル、IPv6(構造上は妨げない) | — |
 
 M0 の仕様正本は [peercove-m0-handoff.md](peercove-m0-handoff.md)。M0 の実測値と
-検証記録は [m0-report-template.md](m0-report-template.md) と README の検証手順。
+検証記録は [m0-report-template.md](m0-report-template.md) と [verification.md](verification.md) の検証手順。
 **M1 の正式な handoff 資料は依頼者から受領予定**(handoff §8 が予告)。
 
 ## 3. アーキテクチャ現状(M0 完了時点)
@@ -105,7 +105,7 @@ crates/
 
 ## 4. M0 で得た運用知見(検証でハマった点)
 
-新しく作業する人は必ず目を通すこと。README のトラブルシューティングにも記載あり。
+新しく作業する人は必ず目を通すこと。[verification.md](verification.md)(G-2 の失敗時の確認ポイント)にも記載あり。
 
 1. **Tailscale 併用機は 100.64.0.0/10 宛先を DROP** する(ts-input)。検証時は
    `sudo tailscale down`。症状: handshake・transfer 正常なのに ping 不通
@@ -252,7 +252,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 
 ## 7. 開発ワークフロー(全員共通)
 
-1. **1 ゴール(タスク)ずつ**実装 → 動作確認手順を README に追記 → コミット
+1. **1 ゴール(タスク)ずつ**実装 → 動作確認手順を [verification.md](verification.md) に追記 → コミット
 2. ネットワーク実疎通の確認は**依頼者が実機で行う**。「検証依頼」として手順を
    提示し、結果報告を待ってから次へ進む(自動テスト化はしなくてよい)
 3. コミット前に必ず:
