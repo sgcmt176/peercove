@@ -52,6 +52,14 @@ Copy-Item $wintun "$stage\wintun.dll"
 Copy-Item $license "$stage\wintun-LICENSE.txt"
 Copy-Item $portableReadme "$stage\README.md"
 
+# 第三者ライセンス謝辞(packaging\make-notices.sh で生成)。配布物には必須。
+$notices = "$root\packaging\dist\THIRD-PARTY-NOTICES.txt"
+if (Test-Path $notices) {
+    Copy-Item $notices "$stage\THIRD-PARTY-NOTICES.txt"
+} else {
+    Write-Warning "THIRD-PARTY-NOTICES.txt がありません。配布前に 'sh packaging/make-notices.sh'(Git Bash)を実行してください"
+}
+
 if (Test-Path $out) { Remove-Item -Force $out }
 Compress-Archive -Path "$stage\*" -DestinationPath $out
 Remove-Item -Recurse -Force $stage

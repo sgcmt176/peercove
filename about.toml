@@ -1,0 +1,30 @@
+# cargo-about 設定 — 第三者 crate のライセンス謝辞(THIRD-PARTY-NOTICES)生成用。
+#
+# 使い方は packaging/make-notices.sh(docs/development.md 参照)。
+# ここに載っていないライセンスの crate が現れると生成が失敗するので、
+# deny.toml の allow と同じ方針で追記する。
+
+# 全ターゲット(Windows / Linux)の依存を対象に集める。
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]

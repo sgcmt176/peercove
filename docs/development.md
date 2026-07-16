@@ -152,6 +152,110 @@ powershell -ExecutionPolicy Bypass -File packaging\make-zip.ps1
 sh packaging/make-tar.sh
 ```
 
+#### 第三者ライセンス謝辞(THIRD-PARTY-NOTICES.txt)
+
+配布物には依存(Rust + npm)のライセンス表示を集約したファイルを同梱します
+(方針は [packaging/licenses/README.md](../packaging/licenses/README.md))。
+UI の依存を入れた状態(`npm ci` 済み)で:
+
+```bash
+cargo install cargo-about --features cli   # 初回のみ(cli フィーチャ必須)
+sh packaging/make-notices.sh
+#   → packaging/dist/THIRD-PARTY-NOTICES.txt
+```
+
+ポータブル版の組み立て(`make-zip.ps1` / `make-tar.sh`)は、この生成物があれば
+自動で同梱します(無ければ警告して続行)。MSI / deb への同梱は現状は手動で、
+生成した `THIRD-PARTY-NOTICES.txt` をインストール先の `licenses\`(Windows)/
+`/usr/share/doc/peercove/`(deb)へ含める運用です(自動化は今後の課題)。
+
+## リリース手順(タグ + バイナリ添付)
+
+初回リリースは手動です(コード署名・リリース自動化 CI は未整備。§下記の注意)。
+Windows 機と Linux 機の両方でビルドする必要があります(MSI は Windows、deb は
+Linux でしか作れないため)。
+
+### 1. バージョンを上げる
+
+`0.1.0` を新バージョンに揃えます(4 か所。ずれるとインストーラのファイル名と
+UI 表示が食い違います):
+
+```
+Cargo.toml                              … [workspace.package] version
+apps/peercove-ui/package.json           … "version"
+apps/peercove-ui/src-tauri/tauri.conf.json … "version"
+apps/peercove-ui/src-tauri/Cargo.toml   … [package] version
+```
+
+ゲート(`cargo fmt --check` / `clippy` / `test`、UI の `npm run build`)を通し、
+コミットしておきます。
+
+### 2. 成果物をビルドする
+
+**Windows 機**(MSI + ポータブル ZIP):
+
+```powershell
+# 事前準備で wintun.dll / wintun-LICENSE.txt を配置(上の「事前準備」参照)
+cargo build --release -p peercove-cli
+cd apps\peercove-ui; npm ci; npm run tauri build       # → MSI
+cd ..\..
+sh packaging/make-notices.sh                            # → THIRD-PARTY-NOTICES.txt
+powershell -ExecutionPolicy Bypass -File packaging\make-zip.ps1   # → ZIP
+```
+
+**Linux 機**(deb + ポータブル tar.gz):
+
+```bash
+sudo apt install libayatana-appindicator3-dev   # 初回のみ(トレイのビルド)
+cargo build --release -p peercove-cli
+cd apps/peercove-ui && npm ci && npm run tauri build   # → deb
+cd ../..
+sh packaging/make-notices.sh                           # → THIRD-PARTY-NOTICES.txt
+sh packaging/make-tar.sh                                # → tar.gz
+```
+
+集まる成果物(合計 5 点):
+
+- `PeerCove_<版>_x64_ja-JP.msi`(Windows インストーラ)
+- `PeerCove_<版>_amd64.deb`(Ubuntu インストーラ)
+- `PeerCove-portable-windows-x64.zip`
+- `PeerCove-portable-linux-x64.tar.gz`
+- `THIRD-PARTY-NOTICES.txt`
+
+### 3. タグを打って push する
+
+```bash
+git tag -a v<版> -m "PeerCove v<版>"
+git push origin v<版>
+```
+
+### 4. GitHub Release を作成して添付する
+
+[gh CLI](https://cli.github.com/) を使う場合(推奨):
+
+```bash
+gh release create v<版> \
+  --title "PeerCove v<版>" \
+  --notes "変更点をここに" \
+  PeerCove_<版>_x64_ja-JP.msi \
+  PeerCove_<版>_amd64.deb \
+  PeerCove-portable-windows-x64.zip \
+  PeerCove-portable-linux-x64.tar.gz \
+  THIRD-PARTY-NOTICES.txt
+```
+
+gh を使わない場合は GitHub の «Releases» → «Draft a new release» でタグ `v<版>` を
+選び、上記ファイルをドラッグして公開します。README のインストール節は Releases
+からの入手を前提にしているので、初回リリース後はリンクが有効になります。
+
+> **注意(未整備・既知の割り切り)**:
+> - **コード署名なし**。Windows は SmartScreen の警告、Ubuntu は未署名 deb の
+>   警告が出ます(利用者に案内が必要)。署名は将来対応(ADR-0010 で言及)。
+> - **リリースビルドの自動化 CI は無し**。上記はすべて手元での手動ビルドです。
+>   タグ push で MSI/deb を自動ビルドして添付する GitHub Actions ワークフローは
+>   今後の課題(Tauri のクロスビルド + 署名の設計が必要)。
+> - **バージョンの一斉更新スクリプトは無し**。上の 4 ファイルを手で揃えます。
+
 ## コミット前チェック(ゲート)
 
 ```bash

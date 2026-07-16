@@ -1,0 +1,42 @@
+# cargo-deny 設定 — 依存ライセンスの継続チェック(リリース準備)
+#
+# 目的: PeerCove 本体は MIT OR Apache-2.0(デュアル)。将来 GPL / AGPL などの
+# 強いコピーレフト依存が紛れ込んだら CI で気づけるようにする。
+#
+# 実行(ルートと UI の 2 ワークスペースを個別に。手順は docs/development.md):
+#   cargo deny check licenses
+#   cargo deny --manifest-path apps/peercove-ui/src-tauri/Cargo.toml check licenses
+#
+# 許可リスト方式: ここに載っていないライセンスの crate が現れたら失敗する。
+# 正当な許容ライセンスが増えたら allow に追記する(それが GPL 等でないことを確認して)。
+
+[licenses]
+# SPDX 式で「いずれかを満たせば OK」と評価される(例: "Apache-2.0 OR MIT" は
+# 下記のどちらかが allow にあれば通る)。この一覧は 2026-07 時点の実依存を監査して作成。
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    # MPL-2.0: 弱い(ファイル単位)コピーレフト。無改変で利用しており、
+    # デュアルライセンスでの配布と両立する(該当ファイルのソース入手性のみ義務)。
+    # 該当 crate: attohttpc, uniffi 系 / cssparser, selectors 系(いずれも透過的依存)。
+    "MPL-2.0",
+]
+# ライセンス表記の一致信頼度のしきい値(既定 0.8)。
+confidence-threshold = 0.8
+
+# ワークスペース内の自作 crate はライセンス判定の対象外にする。
+[licenses.private]
+ignore = true

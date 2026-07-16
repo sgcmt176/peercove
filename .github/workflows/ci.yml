@@ -53,6 +53,26 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  licenses:
+    name: licenses (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # 依存ライセンスの継続チェック(deny.toml)。GPL / AGPL などの強い
+      # コピーレフトが紛れ込んだら失敗する。ルートと UI の 2 ワークスペースを個別に。
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          manifest-path: Cargo.toml
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --config deny.toml
+          manifest-path: apps/peercove-ui/src-tauri/Cargo.toml
+
   ui:
     name: ui (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

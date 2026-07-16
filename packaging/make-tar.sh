@@ -51,6 +51,14 @@ cp "$ui" "$stage/PeerCove/PeerCove"
 cp "$root/packaging/README-portable.md" "$stage/PeerCove/README.md"
 chmod +x "$stage/PeerCove/peercove" "$stage/PeerCove/PeerCove"
 
+# 第三者ライセンス謝辞(packaging/make-notices.sh で生成)。配布物には必須。
+notices="$root/packaging/dist/THIRD-PARTY-NOTICES.txt"
+if [ -f "$notices" ]; then
+    cp "$notices" "$stage/PeerCove/THIRD-PARTY-NOTICES.txt"
+else
+    echo "!! THIRD-PARTY-NOTICES.txt がありません。配布前に 'sh packaging/make-notices.sh' を実行してください" >&2
+fi
+
 mkdir -p "$root/packaging/dist"
 rm -f "$out"
 tar -czf "$out" -C "$stage" PeerCove

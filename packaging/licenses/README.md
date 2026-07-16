@@ -39,6 +39,10 @@ PeerCove 本体は MIT OR Apache-2.0(デュアル)ですが、依存 crate・npm
   ライセンスでの配布と両立します。MPL-2.0 は該当ファイルのソース入手性を保つ
   義務があるだけで、成果物全体のライセンスには影響しません。
 - **配布時の対応**: リリースの `.msi` / `.deb` / ZIP には、依存(Rust + npm)の
-  ライセンス表示を集約した `THIRD-PARTY-NOTICES.txt` を同梱するのが望ましい。
-  生成は `cargo about`(Rust)+ `license-checker`(npm)などで自動化できる
-  (未整備。初回リリースまでに用意する)。
+  ライセンス表示を集約した `THIRD-PARTY-NOTICES.txt` を同梱します。生成は
+  `packaging/make-notices.sh`(Rust は `cargo about` = `about.toml` / `about.hbs`、
+  npm は `packaging/collect-npm-licenses.mjs` が `node_modules` を走査)。
+  ポータブル ZIP / tar は生成物があれば自動同梱します。MSI / deb への埋め込みは
+  現状手動(生成した `THIRD-PARTY-NOTICES.txt` をインストール先の `licenses\` /
+  `/usr/share/doc/peercove/` へ含める)。手順は
+  [development.md](../../docs/development.md) の「第三者ライセンス謝辞」を参照。
