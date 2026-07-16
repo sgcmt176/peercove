@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 ipnet = { version = "2", features = ["serde"] }
 base64 = "0.22"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util"] }
 clap = { version = "4", features = ["derive"] }
