@@ -1,0 +1,48 @@
+# Dependabot — 依存の脆弱性通知と更新 PR の自動作成
+#
+# 役割分担:
+#   - CI の cargo-deny(advisories)/ npm audit … 既知脆弱性が「今の依存」に
+#     あることを検知して落とす(受け身の防波堤)
+#   - Dependabot … 新しい修正版が出たら更新 PR を作る(能動的な追従)
+#
+# 更新 PR はまとまった単位でよいので週 1 回・件数を絞る。セキュリティ更新は
+# この設定とは別枠で、GitHub が脆弱性を検知し次第すぐ PR が作られる。
+
+version: 2
+updates:
+  # ルートワークスペース(CLI / デーモン / コア)
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  # UI(Tauri)ワークスペース
+  - package-ecosystem: cargo
+    directory: /apps/peercove-ui/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  # UI フロントエンド(npm)
+  - package-ecosystem: npm
+    directory: /apps/peercove-ui
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # GitHub Actions 自体の更新
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

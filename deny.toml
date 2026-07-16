@@ -40,3 +40,44 @@ confidence-threshold = 0.8
 # ワークスペース内の自作 crate はライセンス判定の対象外にする。
 [licenses.private]
 ignore = true
+
+# ---------------------------------------------------------------------------
+# 脆弱性チェック(RustSec advisory DB)。実行: cargo deny check advisories
+# 新しい advisory が出たら CI が失敗する。ignore へ入れるのは「実行時リスクが
+# 無い/上流の修正待ちで対処不能」と判断したものだけで、必ず理由を書くこと。
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+ignore = [
+    # --- unmaintained(メンテ終了の告知。脆弱性ではない) ---
+    # paste: defguard_wireguard_rs → netlink 系(Linux)の透過的依存。
+    # 上流が pastey 等へ移行するのを待つ(代替なしの unmaintained 告知)。
+    { id = "RUSTSEC-2024-0436", reason = "paste は netlink 系の透過的依存。上流の移行待ち" },
+    # proc-macro-error: Tauri 系の透過的依存(ビルド時マクロ)。上流の移行待ち。
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error はビルド時マクロの透過的依存。上流の移行待ち" },
+    # gtk-rs GTK3 バインディング一式: Tauri v2 が Linux で GTK3 を使うため必須。
+    # Tauri 本体の GTK4 移行(tauri#9662)を待つ。10 crate ぶんの一括告知。
+    { id = "RUSTSEC-2024-0411", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0412", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0413", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0414", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0415", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0416", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0417", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0418", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0419", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    { id = "RUSTSEC-2024-0420", reason = "GTK3 バインディング。Tauri v2 の GTK4 移行待ち" },
+    # unic-*: askama(WiX テンプレート生成)経由のビルド時依存。上流の移行待ち。
+    { id = "RUSTSEC-2025-0075", reason = "unic-* はビルド時依存。上流の移行待ち" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-* はビルド時依存。上流の移行待ち" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-* はビルド時依存。上流の移行待ち" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-* はビルド時依存。上流の移行待ち" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-* はビルド時依存。上流の移行待ち" },
+
+    # --- vulnerability だが実行時リスク無しと判断したもの ---
+    # quick-xml 0.39.4 の DoS 2 件: wayland-scanner(proc-macro)がビルド時に
+    # crate 同梱の Wayland プロトコル XML を解析する経路のみ。攻撃者制御の入力は
+    # 通らない。wayland-scanner が 0.40+ へ上げたら ignore を外す。
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml はビルド時の wayland-scanner のみ。信頼済み入力" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml はビルド時の wayland-scanner のみ。信頼済み入力" },
+]

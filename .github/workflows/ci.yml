@@ -53,23 +53,25 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-  licenses:
-    name: licenses (cargo-deny)
+  deny:
+    name: deny (licenses + advisories)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      # 依存ライセンスの継続チェック(deny.toml)。GPL / AGPL などの強い
-      # コピーレフトが紛れ込んだら失敗する。ルートと UI の 2 ワークスペースを個別に。
+      # 依存の継続チェック(deny.toml)。ルートと UI の 2 ワークスペースを個別に。
+      #   licenses  … GPL / AGPL などの強いコピーレフトが紛れ込んだら失敗
+      #   advisories … RustSec DB の既知脆弱性・メンテ終了告知が出たら失敗
+      #               (実行時リスク無しと判断したものは deny.toml の ignore に理由つきで記録)
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses
+          command: check licenses advisories
           manifest-path: Cargo.toml
 
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses
+          command: check licenses advisories
           arguments: --config deny.toml
           manifest-path: apps/peercove-ui/src-tauri/Cargo.toml
 
@@ -112,6 +114,12 @@ jobs:
 
       - name: npm ci
         run: npm ci
+
+      # npm 依存の既知脆弱性チェック(High 以上で失敗。moderate 以下は
+      # Dependabot の更新 PR に任せる)
+      - name: npm audit
+        if: runner.os == 'Linux'
+        run: npm audit --audit-level=high
 
       # tsc の型チェック + vite ビルド(CLAUDE.md の UI 変更時ゲート)
       - name: npm run build

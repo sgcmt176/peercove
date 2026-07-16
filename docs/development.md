@@ -292,5 +292,27 @@ cd apps/peercove-ui/src-tauri && cargo license
 ありません。方針と配布時の第三者謝辞の扱いは
 [packaging/licenses/README.md](../packaging/licenses/README.md) を参照。
 
-CI で継続的に弾きたい場合は [cargo-deny](https://crates.io/crates/cargo-deny) の
-`licenses` チェックを `deny.toml` に定義して追加できます(現状は未導入)。
+CI では [cargo-deny](https://crates.io/crates/cargo-deny) の `licenses` チェックが
+毎 push 走ります(`deny.toml`。GPL / AGPL 等が混ざると失敗)。
+
+## 依存の脆弱性チェック
+
+3 層で守っています:
+
+1. **cargo-deny の advisories チェック(CI・毎 push)** — RustSec advisory DB の
+   既知脆弱性・メンテ終了告知を照合します。実行時リスクが無い/上流待ちと判断した
+   ものは `deny.toml` の `[advisories].ignore` に**理由つき**で記録してあります
+   (新しい advisory が出ると CI が落ちるので、その都度判断して修正か ignore を選ぶ)。
+   ローカル実行:
+
+   ```bash
+   cargo deny check advisories
+   cargo deny --manifest-path apps/peercove-ui/src-tauri/Cargo.toml --config deny.toml check advisories
+   ```
+
+2. **npm audit(CI・毎 push)** — フロントエンド依存の既知脆弱性。High 以上で失敗。
+
+3. **Dependabot(`.github/dependabot.yml`)** — 修正版が出たら週次で更新 PR を作成
+   (セキュリティ修正は検知し次第すぐ)。対象は cargo(ルート + UI)・npm・
+   GitHub Actions。リポジトリ設定で Dependabot alerts が有効になっている必要が
+   あります(Settings → Security → Dependabot)。
