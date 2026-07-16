@@ -43,5 +43,5 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-defguard_wireguard_rs = "0.10"
+defguard_wireguard_rs = "0.11"
 libc = "0.2"
