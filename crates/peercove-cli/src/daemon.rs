@@ -1574,14 +1574,43 @@ mod winsec {
 
     const SDDL_REVISION_1: u32 = 1;
 
-    /// パイプの DACL:
+    /// 操作を許可するユーザーの SID(`PEERCOVE_OWNER_SID`、インストーラが付与)を
+    /// 返す。未設定や不正な形式なら `None`(呼び出し側で従来動作へフォールバック)。
+    /// 文字列を SDDL に埋めるため、SID 形式(`S-1-` + 数字とハイフンのみ)を厳格に
+    /// 検証してインジェクションを防ぐ(ADR-0038)。
+    pub fn owner_sid_from_env() -> Option<String> {
+        let raw = std::env::var("PEERCOVE_OWNER_SID").ok()?;
+        let sid = raw.trim();
+        if is_valid_sid(sid) {
+            Some(sid.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// SID 文字列の厳格な検証。`S-1-` で始まり、以降は数字とハイフンのみ。
+    pub fn is_valid_sid(sid: &str) -> bool {
+        sid.len() >= 5
+            && sid.len() <= 187 // SID 文字列の理論上限に十分な余裕
+            && sid.starts_with("S-1-")
+            && sid[4..].bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    }
+
+    /// パイプの DACL を作る(ADR-0038):
     /// - SYSTEM(SY)と Administrators(BA)にフルアクセス
-    /// - 認証済みユーザー(AU)に FILE_GENERIC_READ | FILE_GENERIC_WRITE
+    /// - 所有者に FILE_GENERIC_READ | FILE_GENERIC_WRITE
     ///   (FW は FILE_APPEND_DATA を含み、= FILE_CREATE_PIPE_INSTANCE)
     ///
-    /// ACE に総称権(GA/GR/GW)を書くとオブジェクト固有権へマップされず
-    /// アクセス拒否になるため、必ず FR/FW/FA を使うこと。
-    const PIPE_SDDL: &str = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;AU)\0";
+    /// `owner` に検証済み SID を渡すとそのユーザーのみに絞る。`None` なら従来どおり
+    /// 認証済みユーザー(AU)へ開く(後方互換)。ACE に総称権(GA/GR/GW)を書くと
+    /// オブジェクト固有権へマップされずアクセス拒否になるため、必ず FR/FW/FA を使う。
+    pub fn pipe_sddl(owner: Option<&str>) -> String {
+        let principal = match owner {
+            Some(sid) if is_valid_sid(sid) => sid,
+            _ => "AU",
+        };
+        format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;{principal})")
+    }
 
     /// 上記 DACL を持つセキュリティ記述子。
     pub struct PipeSecurity {
@@ -1593,8 +1622,10 @@ mod winsec {
     unsafe impl Sync for PipeSecurity {}
 
     impl PipeSecurity {
-        pub fn authenticated_users() -> anyhow::Result<Self> {
-            let sddl: Vec<u16> = PIPE_SDDL.encode_utf16().collect();
+        /// 所有者 SID が分かればそのユーザーのみ、分からなければ認証済みユーザーへ
+        /// 開くセキュリティ記述子を作る。
+        pub fn for_owner(owner: Option<&str>) -> anyhow::Result<Self> {
+            let sddl: Vec<u16> = format!("{}\0", pipe_sddl(owner)).encode_utf16().collect();
             let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: FFI 境界。sddl は null 終端の UTF-16。descriptor は関数側が
             // LocalAlloc で確保し、Drop で LocalFree する
@@ -1637,7 +1668,17 @@ mod winsec {
 async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
-    let security = winsec::PipeSecurity::authenticated_users()?;
+    // 操作を許可するユーザーの SID(インストーラが PEERCOVE_OWNER_SID で渡す)が
+    // 分かればそのユーザーのみに、分からなければ従来どおり全認証済みユーザーに
+    // パイプを開く(ADR-0038)。
+    let owner = winsec::owner_sid_from_env();
+    if owner.is_none() {
+        tracing::warn!(
+            "IPC パイプの所有者(PEERCOVE_OWNER_SID)が未設定のため、全認証済みユーザーに \
+             開放します。共用 PC ではインストーラ経由(所有者 SID の設定)を推奨します(ADR-0038)"
+        );
+    }
+    let security = winsec::PipeSecurity::for_owner(owner.as_deref())?;
     let make = |first: bool| -> anyhow::Result<NamedPipeServer> {
         let mut attrs = security.attributes();
         // SAFETY: attrs は本呼び出し中のみ参照される。指す記述子は security が保持
@@ -1899,6 +1940,35 @@ mod auth_tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod winsec_tests {
+    use super::winsec::{is_valid_sid, pipe_sddl};
+
+    #[test]
+    fn valid_sid_restricts_and_invalid_falls_back() {
+        // 所有者不明: 従来どおり認証済みユーザー(AU)。
+        assert_eq!(pipe_sddl(None), "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;AU)");
+        // 正当な SID: そのユーザーのみに絞る。
+        let sid = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let sddl = pipe_sddl(Some(sid));
+        assert!(sddl.contains(sid));
+        assert!(!sddl.contains(";AU)"));
+        // 不正な値(SDDL インジェクション狙い)は SID として弾き AU へフォールバック。
+        assert_eq!(pipe_sddl(Some("AU)(A;;FA;;;WD")), pipe_sddl(None));
+        assert_eq!(pipe_sddl(Some("../etc")), pipe_sddl(None));
+    }
+
+    #[test]
+    fn sid_validation() {
+        assert!(is_valid_sid("S-1-5-18"));
+        assert!(is_valid_sid("S-1-5-21-1-2-3-1001"));
+        assert!(!is_valid_sid("S-1-5-x")); // 数字以外
+        assert!(!is_valid_sid("D:(A;;FA;;;WD)")); // SDDL 断片
+        assert!(!is_valid_sid("")); // 空
+        assert!(!is_valid_sid("S-1-")); // 短すぎ
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2148,7 +2218,7 @@ mod tests {
         use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
         let name = format!(r"\\.\pipe\peercove-sdtest-{}", std::process::id());
-        let security = winsec::PipeSecurity::authenticated_users().expect("記述子の作成");
+        let security = winsec::PipeSecurity::for_owner(None).expect("記述子の作成");
         let mut attrs = security.attributes();
         // SAFETY: attrs は本呼び出し中のみ参照される
         let server = unsafe {
