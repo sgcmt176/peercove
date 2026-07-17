@@ -35,7 +35,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 依存の継続チェック(deny.toml)。ルートと UI の 2 ワークスペースを個別に。
       #   licenses  … GPL / AGPL などの強いコピーレフトが紛れ込んだら失敗
@@ -87,7 +87,7 @@ jobs:
       run:
         working-directory: apps/peercove-ui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Tauri v2 のコンパイルに必要な Linux システム依存
       # (deb が出荷ターゲットなので Ubuntu でもビルド可能なことを保証する)
