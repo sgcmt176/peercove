@@ -1,6 +1,6 @@
 # M0 計測レポート(G-7)
 
-計測手順は [verification.md](verification.md) の「検証手順(G-7: 計測レポート)」を参照。
+計測手順は [verification.md](../verification.md) の「検証手順(G-7: 計測レポート)」を参照。
 
 ## 1. 計測環境
 

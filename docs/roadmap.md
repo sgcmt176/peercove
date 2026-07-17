@@ -28,12 +28,12 @@ PeerCove は**事業者サーバーを持たない** P2P 型 VPN デスクトッ
 |---|---|---|
 | **M0** | 技術検証 PoC(トンネル・ハブ&スポーク・TCP/UDP 疎通・UPnP・計測) | ✅ **完了(2026-07-08、実機検証済み)** |
 | **M1** | 招待トークン(pcv1)・コントロールチャネル・台帳配布・メンバー削除・init | ✅ **完了(2026-07-08、実機検証済み)** |
-| **M2** | daemon 分離 + Tauri/React フル UI + インストーラ(仕様: `peercove-m2-handoff.md` v1.0 確定) | ⬅️ **ほぼ完了。G1〜G6 + G7a(サービス化)実機検証済み。G7b(MSI/deb/ZIP)実装済み・インストーラの実機検証待ち** |
+| **M2** | daemon 分離 + Tauri/React フル UI + インストーラ(仕様: `history/peercove-m2-handoff.md` v1.0 確定) | ⬅️ **ほぼ完了。G1〜G6 + G7a(サービス化)実機検証済み。G7b(MSI/deb/ZIP)実装済み・インストーラの実機検証待ち** |
 | Phase 2 | UDP ホールパンチングによるメンバー間直接通信 | 未着手(§6 参照) |
 | 対象外(当面) | macOS、モバイル、IPv6(構造上は妨げない) | — |
 
-M0 の仕様正本は [peercove-m0-handoff.md](peercove-m0-handoff.md)。M0 の実測値と
-検証記録は [m0-report-template.md](m0-report-template.md) と [verification.md](verification.md) の検証手順。
+M0 の仕様正本は [peercove-m0-handoff.md](history/peercove-m0-handoff.md)。M0 の実測値と
+検証記録は [m0-report-template.md](history/m0-report-template.md) と [verification.md](verification.md) の検証手順。
 **M1 の正式な handoff 資料は依頼者から受領予定**(handoff §8 が予告)。
 
 ## 3. アーキテクチャ現状(M0 完了時点)
@@ -186,7 +186,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 
 | # | タスク | 概要 | 難易度 | 担当目安 |
 |---|---|---|---|---|
-| A-1 | M2 要件の確定 | ✅ 完了。`peercove-m2-handoff.md` v1.0(§9 で Q1〜Q6 確定) | — | **依頼者**(+相談) |
+| A-1 | M2 要件の確定 | ✅ 完了。`history/peercove-m2-handoff.md` v1.0(§9 で Q1〜Q6 確定) | — | **依頼者**(+相談) |
 | A-2 | daemon 分離 | ✅ 完了(M2-G1、ADR-0007) | ★★★★ | Fable |
 | A-3 | Tauri + React UI | ✅ 完了(M2-G2〜G6)。状態表示・接続/参加・招待/管理・設定/ログ/RTT・トレイ/通知 | ★★★ | Fable |
 | A-4 | インストーラ・自動起動 | **M2-G7 として残り**。Windows MSI / Linux deb、wintun.dll 同梱(Q5 で可)、サービス化(Windows サービス / systemd) | ★★★★ | Fable(サービス化)+ Opus(バンドル) |
@@ -249,7 +249,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 2. ~~A-1(M2 要件確認)~~ → 完了。A-2 / A-3 も完了
 3. **A-4 = M2-G7 は前後半とも実装済み**。前半(G7a: サービス化、ADR-0010)は
    Session 0 PoC まで実機検証済み。後半(G7b: MSI / deb / ZIP)は実装済みで
-   **インストーラの実機検証待ち**(指示書 `docs/peercove-g7-packaging-handoff.md`、
+   **インストーラの実機検証待ち**(指示書 `docs/history/peercove-g7-packaging-handoff.md`、
    MSI 方式変更は ADR-0010)。
    残る M2 の仕上げはコード署名(M3)を除けば実機検証のみ
 4. **B(直接通信)は M2-G7 と並行可**。daemon 分離(A-2)が前提だったので、
@@ -279,7 +279,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 ## 8. 既知の技術的負債・メモ
 
 - **スループット**: VM + Windows ユーザー空間実装で TCP ~30 Mbps
-  (m0-report-template.md)。ボトルネック候補: 暗号処理のシングルスレッド、
+  (history/m0-report-template.md)。ボトルネック候補: 暗号処理のシングルスレッド、
   wintun リング往復、2KB バッファのコピー(→ トラック C-2/C-3)
 - **メンバー側の設定変更**: member.toml の変更は再起動が必要(host 側のみ動的反映)
 - **udp-ping の統計未取得**(m0 レポート §5)。次回の実機検証時についでに埋める
