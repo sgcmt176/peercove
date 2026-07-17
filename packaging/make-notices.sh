@@ -6,7 +6,7 @@
 # 同梱する(配布時の第三者表示義務のため。方針は packaging/licenses/README.md)。
 #
 # 前提ツール:
-#   cargo install cargo-about        # Rust 依存の集約
+#   cargo install cargo-about --features cli   # Rust 依存の集約(cli 必須)
 #   node(npm 依存の集約。apps/peercove-ui/node_modules が入っていること = npm ci 済み)
 #
 # 使い方(リポジトリのどこからでも。Windows は Git Bash で):
@@ -22,7 +22,8 @@ out="$out_dir/THIRD-PARTY-NOTICES.txt"
 mkdir -p "$out_dir"
 
 if ! command -v cargo-about >/dev/null 2>&1 && ! cargo about --version >/dev/null 2>&1; then
-    echo "cargo-about が必要です: cargo install cargo-about" >&2
+    echo "cargo-about が必要です: cargo install cargo-about --features cli" >&2
+    echo "  (--features cli を付けないとバイナリが入りません)" >&2
     exit 1
 fi
 
