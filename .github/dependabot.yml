@@ -5,8 +5,9 @@
 #     あることを検知して落とす(受け身の防波堤)
 #   - Dependabot … 新しい修正版が出たら更新 PR を作る(能動的な追従)
 #
-# 更新 PR はまとまった単位でよいので週 1 回・件数を絞る。セキュリティ更新は
-# この設定とは別枠で、GitHub が脆弱性を検知し次第すぐ PR が作られる。
+# ノイズを抑えるため、通常の更新は月 1 回・minor/patch のみにする。メジャー更新
+# (破壊的変更を含みうる)は自動 PR を作らない(取り込むときは手動で判断)。
+# なお、既知の脆弱性に対する**セキュリティ更新**は ignore に関係なく作られる。
 
 version: 2
 updates:
@@ -14,35 +15,44 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # UI(Tauri)ワークスペース
   - package-ecosystem: cargo
     directory: /apps/peercove-ui/src-tauri
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # UI フロントエンド(npm)
   - package-ecosystem: npm
     directory: /apps/peercove-ui
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
-  # GitHub Actions 自体の更新
+  # GitHub Actions 自体の更新(メジャーも安全・低頻度なので受ける)
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 3
