@@ -8,6 +8,16 @@
 set -e
 
 if [ "$1" = "configure" ]; then
+    # IPC を操作してよいユーザー(所有者)の uid を決めて、サービスへ渡す
+    # (ADR-0038)。sudo apt install なら SUDO_UID、無ければ最初の一般ユーザー。
+    owner_uid="${SUDO_UID:-}"
+    if [ -z "$owner_uid" ]; then
+        owner_uid=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 { print $3; exit }')
+    fi
+    if [ -n "$owner_uid" ] && [ "$owner_uid" != "0" ]; then
+        mkdir -p /etc/default
+        printf 'PEERCOVE_OWNER_UID=%s\n' "$owner_uid" > /etc/default/peercove-daemon
+    fi
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
         systemctl enable peercove-daemon.service >/dev/null 2>&1 || true
