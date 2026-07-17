@@ -8,7 +8,7 @@
 
 | タスク | 状態 |
 |---|---|
-| 1. Windows MSI | ✅ 実装済み・**実機検証待ち**。MSI は WiX ネイティブ ServiceInstall ではなく**カスタムアクションで `daemon service-install/uninstall` を呼ぶ方式に変更**(ADR-0010 改訂、理由と Fable 確認事項は `docs/peercove-g7b-msi-review-for-fable.md`)。ファイアウォールも CLI 内で処理 |
+| 1. Windows MSI | ✅ 実装済み・**実機検証待ち**。MSI は WiX ネイティブ ServiceInstall ではなく**カスタムアクションで `daemon service-install/uninstall` を呼ぶ方式に変更**(ADR-0010 改訂)。ファイアウォールも CLI 内で処理 |
 | 2. Ubuntu deb | ✅ 実装済み・**実機検証待ち**。Tauri の `files` + maintainer script(`packaging/deb/*.sh`)で systemd unit 同梱・自動起動。dpkg 再組みは不要だった |
 | 3. wintun 同梱 + ライセンス | ✅ 実装済み。`packaging/licenses/`(本文は zip 由来・gitignore)、MSI が同梱、アプリにも謝辞フッター |
 | 4. ZIP / tar(上級者向け) | ✅ 実装済み。`packaging/make-zip.ps1` / `make-tar.sh` |

@@ -644,7 +644,7 @@ sudo ./target/release/peercove daemon service-install
 
 > **未検証の設計です**(Opus 実装 / Fable 確認待ち)。MSI は WiX の
 > カスタムアクションで `daemon service-install` / `service-uninstall` を呼ぶ方式
-> です(ADR-0010、`docs/peercove-g7b-msi-review-for-fable.md`)。失敗する場合は
+> です(ADR-0010)。失敗する場合は
 > インストールログ(`msiexec /i PeerCove_*.msi /l*v install.log`)を取得して
 > ください。
 
