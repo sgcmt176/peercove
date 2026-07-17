@@ -1,4 +1,4 @@
-# PeerCove ポータブル版(Windows ZIP)を組み立てる(M2-G7b、上級者向け配布)。
+﻿# PeerCove ポータブル版(Windows ZIP)を組み立てる(M2-G7b、上級者向け配布)。
 #
 # 前提(先に済ませておく):
 #   cargo build --release -p peercove-cli
@@ -46,8 +46,11 @@ $out = "$root\packaging\dist\PeerCove-portable-windows-x64.zip"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
+# デーモンと UI は名前で区別する。Windows はファイル名の大文字小文字を区別しない
+# ため、UI を "PeerCove.exe" にすると "peercove.exe"(デーモン)と衝突して片方が
+# 消える。MSI と同じく UI は peercove-ui.exe とする(ADR-0010 / 検証フィードバック)。
 Copy-Item $daemon "$stage\peercove.exe"
-Copy-Item $ui "$stage\PeerCove.exe"
+Copy-Item $ui "$stage\peercove-ui.exe"
 Copy-Item $wintun "$stage\wintun.dll"
 Copy-Item $license "$stage\wintun-LICENSE.txt"
 Copy-Item $portableReadme "$stage\README.md"
@@ -65,4 +68,4 @@ Compress-Archive -Path "$stage\*" -DestinationPath $out
 Remove-Item -Recurse -Force $stage
 
 Write-Host "作成しました: $out"
-Write-Host "内容: peercove.exe / PeerCove.exe / wintun.dll / wintun-LICENSE.txt / README.md"
+Write-Host "内容: peercove.exe(CLI/デーモン)/ peercove-ui.exe(UI)/ wintun.dll / wintun-LICENSE.txt / THIRD-PARTY-NOTICES.txt / README.md"

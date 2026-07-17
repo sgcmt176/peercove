@@ -47,9 +47,10 @@ rm -rf "$stage"
 mkdir -p "$stage/PeerCove"
 
 cp "$daemon" "$stage/PeerCove/peercove"
-cp "$ui" "$stage/PeerCove/PeerCove"
+# UI は MSI / Windows ポータブルと同じく peercove-ui にする(命名を揃える)。
+cp "$ui" "$stage/PeerCove/peercove-ui"
 cp "$root/packaging/README-portable.md" "$stage/PeerCove/README.md"
-chmod +x "$stage/PeerCove/peercove" "$stage/PeerCove/PeerCove"
+chmod +x "$stage/PeerCove/peercove" "$stage/PeerCove/peercove-ui"
 
 # 第三者ライセンス謝辞(packaging/make-notices.sh で生成)。配布物には必須。
 notices="$root/packaging/dist/THIRD-PARTY-NOTICES.txt"
@@ -65,4 +66,4 @@ tar -czf "$out" -C "$stage" PeerCove
 rm -rf "$stage"
 
 echo "作成しました: $out"
-echo "内容: PeerCove/{peercove, PeerCove, README.md}"
+echo "内容: PeerCove/{peercove, peercove-ui, README.md, THIRD-PARTY-NOTICES.txt}"
