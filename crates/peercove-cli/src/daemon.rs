@@ -1574,43 +1574,14 @@ mod winsec {
 
     const SDDL_REVISION_1: u32 = 1;
 
-    /// 操作を許可するユーザーの SID(`PEERCOVE_OWNER_SID`、インストーラが付与)を
-    /// 返す。未設定や不正な形式なら `None`(呼び出し側で従来動作へフォールバック)。
-    /// 文字列を SDDL に埋めるため、SID 形式(`S-1-` + 数字とハイフンのみ)を厳格に
-    /// 検証してインジェクションを防ぐ(ADR-0038)。
-    pub fn owner_sid_from_env() -> Option<String> {
-        let raw = std::env::var("PEERCOVE_OWNER_SID").ok()?;
-        let sid = raw.trim();
-        if is_valid_sid(sid) {
-            Some(sid.to_string())
-        } else {
-            None
-        }
-    }
-
-    /// SID 文字列の厳格な検証。`S-1-` で始まり、以降は数字とハイフンのみ。
-    pub fn is_valid_sid(sid: &str) -> bool {
-        sid.len() >= 5
-            && sid.len() <= 187 // SID 文字列の理論上限に十分な余裕
-            && sid.starts_with("S-1-")
-            && sid[4..].bytes().all(|b| b.is_ascii_digit() || b == b'-')
-    }
-
-    /// パイプの DACL を作る(ADR-0038):
+    /// パイプの DACL:
     /// - SYSTEM(SY)と Administrators(BA)にフルアクセス
-    /// - 所有者に FILE_GENERIC_READ | FILE_GENERIC_WRITE
+    /// - 認証済みユーザー(AU)に FILE_GENERIC_READ | FILE_GENERIC_WRITE
     ///   (FW は FILE_APPEND_DATA を含み、= FILE_CREATE_PIPE_INSTANCE)
     ///
-    /// `owner` に検証済み SID を渡すとそのユーザーのみに絞る。`None` なら従来どおり
-    /// 認証済みユーザー(AU)へ開く(後方互換)。ACE に総称権(GA/GR/GW)を書くと
-    /// オブジェクト固有権へマップされずアクセス拒否になるため、必ず FR/FW/FA を使う。
-    pub fn pipe_sddl(owner: Option<&str>) -> String {
-        let principal = match owner {
-            Some(sid) if is_valid_sid(sid) => sid,
-            _ => "AU",
-        };
-        format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;{principal})")
-    }
+    /// ACE に総称権(GA/GR/GW)を書くとオブジェクト固有権へマップされず
+    /// アクセス拒否になるため、必ず FR/FW/FA を使うこと。
+    const PIPE_SDDL: &str = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;AU)\0";
 
     /// 上記 DACL を持つセキュリティ記述子。
     pub struct PipeSecurity {
@@ -1622,10 +1593,8 @@ mod winsec {
     unsafe impl Sync for PipeSecurity {}
 
     impl PipeSecurity {
-        /// 所有者 SID が分かればそのユーザーのみ、分からなければ認証済みユーザーへ
-        /// 開くセキュリティ記述子を作る。
-        pub fn for_owner(owner: Option<&str>) -> anyhow::Result<Self> {
-            let sddl: Vec<u16> = format!("{}\0", pipe_sddl(owner)).encode_utf16().collect();
+        pub fn authenticated_users() -> anyhow::Result<Self> {
+            let sddl: Vec<u16> = PIPE_SDDL.encode_utf16().collect();
             let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: FFI 境界。sddl は null 終端の UTF-16。descriptor は関数側が
             // LocalAlloc で確保し、Drop で LocalFree する
@@ -1668,17 +1637,7 @@ mod winsec {
 async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
-    // 操作を許可するユーザーの SID(インストーラが PEERCOVE_OWNER_SID で渡す)が
-    // 分かればそのユーザーのみに、分からなければ従来どおり全認証済みユーザーに
-    // パイプを開く(ADR-0038)。
-    let owner = winsec::owner_sid_from_env();
-    if owner.is_none() {
-        tracing::warn!(
-            "IPC パイプの所有者(PEERCOVE_OWNER_SID)が未設定のため、全認証済みユーザーに \
-             開放します。共用 PC ではインストーラ経由(所有者 SID の設定)を推奨します(ADR-0038)"
-        );
-    }
-    let security = winsec::PipeSecurity::for_owner(owner.as_deref())?;
+    let security = winsec::PipeSecurity::authenticated_users()?;
     let make = |first: bool| -> anyhow::Result<NamedPipeServer> {
         let mut attrs = security.attributes();
         // SAFETY: attrs は本呼び出し中のみ参照される。指す記述子は security が保持
@@ -1721,61 +1680,19 @@ async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
     }
 }
 
-/// Unix: このデーモンを操作してよい「所有者 uid」を決める(ADR-0038)。
-///
-/// - `PEERCOVE_OWNER_UID`(systemd ユニット / インストーラが設定)を最優先。
-/// - なければ `SUDO_UID`(`sudo peercove daemon run` で自動的に入る)。
-///
-/// どちらも無い場合は `None`。所有者不明 = 後方互換で全 uid を許可しつつ警告する
-/// (ソース版の素の root 実行など。共用機では非推奨)。
-#[cfg(unix)]
-fn authorized_owner_uid() -> Option<u32> {
-    for key in ["PEERCOVE_OWNER_UID", "SUDO_UID"] {
-        if let Ok(value) = std::env::var(key) {
-            if let Ok(uid) = value.trim().parse::<u32>() {
-                if uid != 0 {
-                    return Some(uid);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Unix: 接続元 uid を認可してよいか(ADR-0038)。root(uid 0)は常に許可。
-/// 所有者が判明していればその uid のみ、判明していなければ後方互換で全て許可する
-/// (呼び出し側が警告を出す)。
-#[cfg(unix)]
-fn authorize_peer(owner: Option<u32>, peer_uid: u32) -> bool {
-    peer_uid == 0 || owner.is_none_or(|o| peer_uid == o)
-}
-
 #[cfg(unix)]
 async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let path = peercove_ipc::socket_path();
     let _ = std::fs::remove_file(&path); // 前回異常終了の残骸
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("{} の bind に失敗しました", path.display()))?;
-    // root で起動したデーモンのソケットへ、非特権の UI/CLI が接続できるようにする。
-    // 所有者(PEERCOVE_OWNER_UID / SUDO_UID)が分かればそのユーザー専用に絞り、
-    // 分からなければ後方互換で全ユーザーへ開く(ADR-0038)。いずれの場合も
-    // accept 時に接続元 uid を検証する。
-    let owner = authorized_owner_uid();
-    if let Some(uid) = owner {
-        // 所有者所有・0600 にして、OS レベルでも所有者(と root)のみ接続可にする。
-        if let Err(e) = std::os::unix::fs::chown(&path, Some(uid), None) {
-            tracing::warn!("ソケットの所有者設定に失敗しました(uid={uid}): {e}");
-        }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("{} のパーミッション設定に失敗しました", path.display()))?;
-    } else {
+    // root で起動したデーモンのソケットへ、非特権の UI/CLI が接続できるようにする
+    // (Windows 側で認証済みユーザーに許可するのと同じ方針。単一ユーザー PC 前提で、
+    //  複数ユーザーの権限分離は将来課題 — ADR-0007)
+    {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
             .with_context(|| format!("{} のパーミッション設定に失敗しました", path.display()))?;
-        tracing::warn!(
-            "IPC ソケットの所有者を特定できないため全ユーザーに開放します。共用 PC では \
-             PEERCOVE_OWNER_UID(操作を許可するユーザーの uid)を設定してください(ADR-0038)"
-        );
     }
     println!(
         "peercove デーモンを開始しました({} で待受け中。Ctrl+C か shutdown 要求で終了)",
@@ -1786,21 +1703,6 @@ async fn accept_loop(shared: Arc<DaemonShared>) -> anyhow::Result<()> {
             .accept()
             .await
             .context("UDS の accept に失敗しました")?;
-        // 接続元 uid を検証(SO_PEERCRED)。所有者以外(root を除く)は拒否する。
-        match stream.peer_cred() {
-            Ok(cred) if authorize_peer(owner, cred.uid()) => {}
-            Ok(cred) => {
-                tracing::warn!(
-                    "認可されていないユーザー(uid={})からの IPC 接続を拒否しました",
-                    cred.uid()
-                );
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!("接続元の資格情報を取得できないため拒否しました: {e}");
-                continue;
-            }
-        }
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, shared).await {
@@ -1895,78 +1797,6 @@ fn format_log_line(line: &peercove_core::ipc::LogLine) -> String {
         line.target,
         line.message
     )
-}
-
-#[cfg(all(test, unix))]
-mod auth_tests {
-    use super::{authorize_peer, authorized_owner_uid};
-
-    #[test]
-    fn authorize_peer_respects_owner() {
-        // 所有者が判明: root と所有者のみ許可、他ユーザーは拒否。
-        assert!(authorize_peer(Some(1000), 0), "root は常に許可");
-        assert!(authorize_peer(Some(1000), 1000), "所有者は許可");
-        assert!(!authorize_peer(Some(1000), 1001), "別ユーザーは拒否");
-        // 所有者不明: 後方互換で全て許可(呼び出し側が警告)。
-        assert!(authorize_peer(None, 0));
-        assert!(authorize_peer(None, 1234));
-    }
-
-    #[test]
-    fn owner_uid_prefers_env_and_ignores_root() {
-        // 環境変数はプロセス共有なので 1 テストにまとめ、必ず後始末する。
-        for key in ["PEERCOVE_OWNER_UID", "SUDO_UID"] {
-            std::env::remove_var(key);
-        }
-        assert_eq!(authorized_owner_uid(), None, "どちらも無ければ None");
-
-        std::env::set_var("SUDO_UID", "1000");
-        assert_eq!(authorized_owner_uid(), Some(1000), "SUDO_UID を採用");
-
-        std::env::set_var("PEERCOVE_OWNER_UID", "1005");
-        assert_eq!(
-            authorized_owner_uid(),
-            Some(1005),
-            "PEERCOVE_OWNER_UID を優先"
-        );
-
-        std::env::set_var("PEERCOVE_OWNER_UID", "0");
-        std::env::set_var("SUDO_UID", "0");
-        assert_eq!(authorized_owner_uid(), None, "uid 0 は所有者にしない");
-
-        for key in ["PEERCOVE_OWNER_UID", "SUDO_UID"] {
-            std::env::remove_var(key);
-        }
-    }
-}
-
-#[cfg(all(test, windows))]
-mod winsec_tests {
-    use super::winsec::{is_valid_sid, pipe_sddl};
-
-    #[test]
-    fn valid_sid_restricts_and_invalid_falls_back() {
-        // 所有者不明: 従来どおり認証済みユーザー(AU)。
-        assert_eq!(pipe_sddl(None), "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;AU)");
-        // 正当な SID: そのユーザーのみに絞る。
-        let sid = "S-1-5-21-1111111111-2222222222-3333333333-1001";
-        let sddl = pipe_sddl(Some(sid));
-        assert!(sddl.contains(sid));
-        assert!(!sddl.contains(";AU)"));
-        // 不正な値(SDDL インジェクション狙い)は SID として弾き AU へフォールバック。
-        assert_eq!(pipe_sddl(Some("AU)(A;;FA;;;WD")), pipe_sddl(None));
-        assert_eq!(pipe_sddl(Some("../etc")), pipe_sddl(None));
-    }
-
-    #[test]
-    fn sid_validation() {
-        assert!(is_valid_sid("S-1-5-18"));
-        assert!(is_valid_sid("S-1-5-21-1-2-3-1001"));
-        assert!(!is_valid_sid("S-1-5-x")); // 数字以外
-        assert!(!is_valid_sid("D:(A;;FA;;;WD)")); // SDDL 断片
-        assert!(!is_valid_sid("")); // 空
-        assert!(!is_valid_sid("S-1-")); // 短すぎ
-    }
 }
 
 #[cfg(test)]
@@ -2218,7 +2048,7 @@ mod tests {
         use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
         let name = format!(r"\\.\pipe\peercove-sdtest-{}", std::process::id());
-        let security = winsec::PipeSecurity::for_owner(None).expect("記述子の作成");
+        let security = winsec::PipeSecurity::authenticated_users().expect("記述子の作成");
         let mut attrs = security.attributes();
         // SAFETY: attrs は本呼び出し中のみ参照される
         let server = unsafe {

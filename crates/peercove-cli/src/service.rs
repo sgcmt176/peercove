@@ -324,9 +324,6 @@ mod unix_impl {
     /// テンプレート内のバイナリパス(deb の配置先)。CLI インストール時は
     /// 実行中の exe のパスへ置換する。
     const TEMPLATE_EXEC: &str = "/usr/bin/peercove";
-    /// IPC を操作してよいユーザーの uid を渡す環境ファイル(ADR-0038)。
-    /// ユニットの `EnvironmentFile=-` が読む。deb の postinst と共通。
-    const OWNER_ENV_FILE: &str = "/etc/default/peercove-daemon";
 
     fn unit_path() -> std::path::PathBuf {
         // /etc は管理者の設置場所(deb は /usr/lib/systemd/system を使い、
@@ -371,28 +368,6 @@ mod unix_impl {
         let path = unit_path();
         std::fs::write(&path, unit)
             .with_context(|| format!("{} の書き込みに失敗しました", path.display()))?;
-        // IPC を操作してよいユーザーの uid をサービスへ渡す(ADR-0038)。
-        // sudo 実行なら SUDO_UID が入る。ユニットの EnvironmentFile が読む。
-        if let Some(uid) = std::env::var("SUDO_UID")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|&u| u != 0)
-        {
-            let env_path = std::path::Path::new(OWNER_ENV_FILE);
-            if let Some(parent) = env_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(env_path, format!("PEERCOVE_OWNER_UID={uid}\n")) {
-                tracing::warn!(
-                    "{OWNER_ENV_FILE} の書き込みに失敗しました(全ユーザーに開放されます): {e}"
-                );
-            }
-        } else {
-            println!(
-                "  注意: 操作を許可するユーザーを特定できませんでした。共用 PC では \
-                 {OWNER_ENV_FILE} に PEERCOVE_OWNER_UID=<uid> を書いて再起動してください"
-            );
-        }
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", SERVICE_NAME])?;
         println!("サービス {SERVICE_NAME} を登録して起動しました(自動起動: 有効)");
@@ -420,7 +395,6 @@ mod unix_impl {
         }
         std::fs::remove_file(&path)
             .with_context(|| format!("{} の削除に失敗しました", path.display()))?;
-        let _ = std::fs::remove_file(OWNER_ENV_FILE); // 所有者 uid の設定を後始末(ADR-0038)
         systemctl(&["daemon-reload"])?;
         println!("サービス {SERVICE_NAME} を登録解除しました");
         Ok(())

@@ -22,10 +22,6 @@ Restart=on-failure
 RestartSec=5
 # トンネル操作(TUN 作成・ルーティング)に root が必要
 User=root
-# IPC を操作してよいユーザーの uid(ADR-0038)。deb の postinst が
-# PEERCOVE_OWNER_UID=<uid> を書き込む。無ければデーモンは全ユーザーへ開く
-# (後方互換)ので、`-` で存在しなくてもエラーにしない。
-EnvironmentFile=-/etc/default/peercove-daemon
 
 [Install]
 WantedBy=multi-user.target

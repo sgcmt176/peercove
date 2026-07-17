@@ -1327,27 +1327,3 @@ UI は次ゴール(M3-13b)なので CLI で確認する。
    メンバー追加が反映されないこと。A・B 間のグループ操作は従来どおり動くこと。
 9. グループの作成・改名・メンバー追加・退出が、メンバー間で従来どおり伝搬すること
    (認可により正規のメンバー発の更新は影響を受けない)。
-
-## 検証手順(IPC 接続元認可 — Unix、ADR-0038)
-
-Linux で、別ユーザーが特権デーモンを操作できないことを確認する。デーモンは
-新版へ入れ替える(deb は再インストール、または `service-install` し直す)。
-
-1. deb 再インストール後、`cat /etc/default/peercove-daemon` に
-   `PEERCOVE_OWNER_UID=<あなたの uid>` が書かれていること(`id -u` と一致)。
-   `service-install` 経由でも同ファイルができること。
-2. 所有者(あなた)の UI/CLI から `peercove daemon status` が通ること(従来どおり)。
-3. `ls -l /run/peercove.sock` が所有者所有・`0600` 相当であること(所有者判明時)。
-4. **別の一般ユーザーを作って試す**(例 `sudo useradd -m tester`):
-   `sudo -u tester peercove daemon status` が**失敗**すること(接続拒否)。
-   デーモンのログ(`journalctl -u peercove-daemon`)に「認可されていないユーザー
-   (uid=…)からの IPC 接続を拒否しました」が出ること。
-5. `sudo peercove daemon status`(root)は通ること(root は常に許可)。
-6. 後方互換: `PEERCOVE_OWNER_UID` を消し `sudo` でなく素の root で
-   `peercove daemon run` を起動すると、「所有者を特定できないため全ユーザーに
-   開放します」の警告が出て従来どおり動くこと。
-7. 退行なし: 所有者本人からの接続・切断・招待・チャット・ファイル送信が従来どおり
-   動くこと。
-
-> **Windows は本 ADR ではまだ従来どおり**(全認証済みユーザーに開放)。名前付き
-> パイプの DACL 絞り込みは次の増分。
