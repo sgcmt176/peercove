@@ -1234,6 +1234,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "peercove-mobile"
+version = "0.1.0"
+dependencies = [
+ "peercove-core",
+ "uniffi",
+]
+
+[[package]]
 name = "peercove-ops"
 version = "0.1.0"
 dependencies = [

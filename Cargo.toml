@@ -5,6 +5,7 @@ members = [
     "crates/peercove-ipc",
     "crates/peercove-ops",
     "crates/peercove-cli",
+    "crates/peercove-mobile",
 ]
 # UI(Tauri)は独自ワークスペース。ここに含めると cargo test/clippy が
 # WebView・フロントエンドのビルドに巻き込まれ、開発ループが重くなるため

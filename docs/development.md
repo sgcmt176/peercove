@@ -168,6 +168,45 @@ sh packaging/make-notices.sh
 生成した `THIRD-PARTY-NOTICES.txt` をインストール先の `licenses\`(Windows)/
 `/usr/share/doc/peercove/`(deb)へ含める運用です(自動化は今後の課題)。
 
+## Android 版のビルド(M4、ADR-0039)
+
+Android アプリは `apps/peercove-android`(Kotlin + Compose)。頭脳は Rust
+(`crates/peercove-mobile`)で、Gradle が cargo-ndk → uniffi-bindgen → APK を
+一気通貫でビルドする(`.so` と生成 Kotlin はコミットしない)。
+
+### 必要環境(Windows 開発機)
+
+- **Android Studio**(`C:\Program Files\Android\Android Studio`)。同梱 JDK
+  (`…\Android Studio\jbr`)を Gradle 実行に使う
+- **Android SDK / NDK**(`%LOCALAPPDATA%\Android\Sdk`)。cmdline-tools の
+  `sdkmanager` で導入する:
+  ```
+  sdkmanager --licenses
+  sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
+  ```
+- **Rust 側**: `rustup target add aarch64-linux-android x86_64-linux-android` と
+  `cargo install cargo-ndk --locked`
+- `apps/peercove-android/local.properties` に SDK の場所を書く(コミットしない):
+  `sdk.dir=C\:\\Users\\<user>\\AppData\\Local\\Android\\Sdk`
+
+### ビルド
+
+```powershell
+# デバッグ APK(Rust ビルド込み)。JAVA_HOME は Android Studio の jbr を指す
+$env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+cd apps\peercove-android
+.\gradlew.bat assembleDebug
+#   → app\build\outputs\apk\debug\app-debug.apk
+
+# 実機インストール(USB デバッグを有効にした端末を接続して)
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+- リポジトリパスに非 ASCII を含むため `android.overridePathCheck=true` を
+  `gradle.properties` に設定済み(NDK ビルドは Gradle 外の cargo-ndk で行うので実害なし)
+- Rust だけ検証したい場合: `cargo ndk -t arm64-v8a build -p peercove-mobile`
+  (`ANDROID_HOME` か `ANDROID_NDK_HOME` を設定して実行)
+
 ## リリース手順(タグ + バイナリ添付)
 
 初回リリースは手動です(コード署名・リリース自動化 CI は未整備。§下記の注意)。

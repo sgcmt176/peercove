@@ -1,0 +1,23 @@
+# PeerCove モバイル用コア(M4、ADR-0039)。
+# Android アプリ(apps/peercove-android)へ UniFFI で公開する。
+# cdylib は Android 向け .so のため。ホストでは通常の lib としてテストする。
+
+[package]
+name = "peercove-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+# Kotlin バインディング生成用(uniffi のライブラリモード)。
+# 使い方: cargo run -p peercove-mobile --bin uniffi-bindgen -- generate --library <so> --language kotlin --out-dir <dir>
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+peercove-core = { workspace = true }
+uniffi = { version = "0.31", features = ["cli"] }

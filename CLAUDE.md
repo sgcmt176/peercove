@@ -25,7 +25,9 @@
 - `crates/peercove-ipc` … デーモン制御 IPC のクライアント(UI と CLI が共用)
 - `crates/peercove-ops` … 設定ファイル操作(init / invite / join / メンバー管理)。表示を持たず構造体を返す。UI と CLI が共用
 - `crates/peercove-cli` … CLI + デーモン。OS 依存層(TUN/WG/ルーティング/フォワーディング)は trait で抽象化し、`#[cfg(target_os)]` で実装を分ける
+- `crates/peercove-mobile` … M4 モバイル用 Rust コア。UniFFI で Kotlin へ公開(頭脳は Rust、OS 連携は Kotlin = ADR-0039)
 - `apps/peercove-ui` … M2 デスクトップ UI(Tauri + React)。**ルートのワークスペースから独立**しているので、`cargo test --workspace` には含まれない。UI を変更したら `apps/peercove-ui/src-tauri` で `cargo test` と `npm run build` を別途通すこと
+- `apps/peercove-android` … M4 Android アプリ(Kotlin + Compose)。ワークスペース外。ビルドは `gradlew assembleDebug`(cargo-ndk → uniffi-bindgen → APK を一気通貫。`docs/development.md` 参照)
 
 ## コーディング規約
 

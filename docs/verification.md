@@ -1327,3 +1327,19 @@ UI は次ゴール(M3-13b)なので CLI で確認する。
    メンバー追加が反映されないこと。A・B 間のグループ操作は従来どおり動くこと。
 9. グループの作成・改名・メンバー追加・退出が、メンバー間で従来どおり伝搬すること
    (認可により正規のメンバー発の更新は影響を受けない)。
+
+## 検証手順(M4 E-A: Android 土台)
+
+Android アプリの土台(Rust コア ↔ Kotlin の疎通)の確認。ビルド手順は
+[development.md](development.md) の「Android 版のビルド」。
+
+1. Android 端末で **開発者向けオプション → USB デバッグ** を有効にする
+   (設定 → デバイス情報 → ビルド番号を 7 回タップ → 開発者向けオプション)。
+2. 端末を USB で開発機につなぎ、端末側で「この PC を許可」する。
+3. `adb devices` で端末が `device` と表示されること(`unauthorized` なら手順 2 をやり直す)。
+4. `adb install -r app\build\outputs\apk\debug\app-debug.apk` が成功すること。
+5. 端末で「PeerCove」アプリを起動し、以下が表示されること:
+   - `PeerCove` の見出しと `mobile core v0.1.0`(Rust 側のバージョン)
+   - `core ok / pubkey <44 文字の base64>` — peercove-core の X25519 鍵生成が
+     **端末上の Rust で**実行された証拠。起動のたびに値が変わる(毎回新規生成)
+6. 表示が出ればゴール達成(トンネルはまだ張らない。E-B から)。

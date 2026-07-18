@@ -1,0 +1,10 @@
+# Gradle / Android Studio の生成物
+.gradle/
+build/
+.kotlin/
+local.properties
+.idea/
+*.iml
+
+# Rust から生成される成果物(cargo-ndk が置く .so と UniFFI 生成 Kotlin)
+app/src/main/jniLibs/
