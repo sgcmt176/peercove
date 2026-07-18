@@ -50,8 +50,8 @@ import uniffi.peercove_mobile.removeNetwork
 import uniffi.peercove_mobile.tunnelStatus
 
 /**
- * M4 E-B の画面: 招待トークンで参加(貼り付け / QR 読み取り)、
- * ネットワークごとの接続・切断・状態表示。
+ * M4 E-C の画面: 参加(貼り付け / QR)、接続・切断、ネットワーク詳細
+ * (トーク / メンバー / DNS)への遷移。
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,6 +63,11 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
+
+private sealed class Route {
+    data object Home : Route()
+    data class Net(val slug: String, val name: String) : Route()
 }
 
 private fun startVpnService(context: Context, slug: String) {
@@ -81,19 +86,47 @@ private fun stopVpnService(context: Context) {
 @Composable
 private fun App() {
     val context = LocalContext.current
+    var route by remember { mutableStateOf<Route>(Route.Home) }
+    var notice by remember { mutableStateOf<String?>(null) }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        notice?.let {
+            Text(
+                it,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        when (val r = route) {
+            is Route.Home -> HomeScreen(
+                onNotice = { notice = it },
+                onOpen = { slug, name -> route = Route.Net(slug, name) },
+            )
+            is Route.Net -> NetworkScreen(
+                slug = r.slug,
+                networkName = r.name,
+                onBack = { route = Route.Home },
+                onNotice = { notice = it },
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> Unit) {
+    val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
 
     var networks by remember { mutableStateOf(listNetworks(baseDir)) }
     var statuses by remember { mutableStateOf(mapOf<String, TunnelStatus?>()) }
     var tokenInput by remember { mutableStateOf("") }
-    var message by remember { mutableStateOf<String?>(null) }
     var pendingSlug by remember { mutableStateOf<String?>(null) }
 
     fun refresh() {
         networks = listNetworks(baseDir)
     }
 
-    // 2 秒ごとに稼働状態を更新(正本は Rust 側のトンネル登録簿)
     LaunchedEffect(Unit) {
         while (true) {
             statuses = networks.associate { it.slug to tunnelStatus(it.slug) }
@@ -101,7 +134,6 @@ private fun App() {
         }
     }
 
-    // VPN 権限ダイアログ(初回のみ OS が表示)
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
@@ -110,7 +142,7 @@ private fun App() {
         if (result.resultCode == Activity.RESULT_OK && slug != null) {
             startVpnService(context, slug)
         } else {
-            message = "VPN の使用が許可されませんでした"
+            onNotice("VPN の使用が許可されませんでした")
         }
     }
 
@@ -124,7 +156,6 @@ private fun App() {
         }
     }
 
-    // 招待 QR の読み取り(zxing)。トークン文字列 or ディープリンクが入っている
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.let { tokenInput = it }
     }
@@ -136,11 +167,6 @@ private fun App() {
             style = MaterialTheme.typography.bodySmall,
         )
         Spacer(modifier = Modifier.padding(4.dp))
-
-        message?.let {
-            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-            Spacer(modifier = Modifier.padding(4.dp))
-        }
 
         JoinCard(
             token = tokenInput,
@@ -157,16 +183,16 @@ private fun App() {
             onJoin = joinAction@{
                 val token = tokenInput.trim()
                 if (token.isEmpty()) {
-                    message = "招待コードを入力するか QR を読み取ってください"
+                    onNotice("招待コードを入力するか QR を読み取ってください")
                     return@joinAction
                 }
                 try {
                     val info = joinNetwork(baseDir, token)
-                    message = "「${info.name}」に参加しました"
+                    onNotice("「${info.name}」に参加しました")
                     tokenInput = ""
                     refresh()
                 } catch (e: MobileException) {
-                    message = e.message
+                    onNotice(e.message ?: "参加に失敗しました")
                 }
             },
         )
@@ -180,12 +206,13 @@ private fun App() {
                     status = statuses[network.slug],
                     onConnect = { connect(network.slug) },
                     onDisconnect = { stopVpnService(context) },
+                    onOpen = { onOpen(network.slug, network.name) },
                     onRemove = {
                         try {
                             removeNetwork(baseDir, network.slug)
                             refresh()
                         } catch (e: MobileException) {
-                            message = e.message
+                            onNotice(e.message ?: "削除に失敗しました")
                         }
                     },
                 )
@@ -228,6 +255,7 @@ private fun NetworkCard(
     status: TunnelStatus?,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onOpen: () -> Unit,
     onRemove: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -255,7 +283,9 @@ private fun NetworkCard(
                     Spacer(modifier = Modifier.width(8.dp))
                     TextButton(onClick = onRemove) { Text("削除") }
                 } else {
-                    Button(onClick = onDisconnect) { Text("切断") }
+                    Button(onClick = onOpen) { Text("開く") }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedButton(onClick = onDisconnect) { Text("切断") }
                 }
             }
         }
@@ -265,14 +295,5 @@ private fun NetworkCard(
 private fun statusLine(status: TunnelStatus?): String {
     if (status == null) return "未接続"
     val age = status.handshakeAgeSecs ?: return "接続試行中…(ハンドシェイク待ち)"
-    return "接続中(ハンドシェイク ${age} 秒前 / ↑${formatBytes(status.txBytes)} ↓${formatBytes(status.rxBytes)})"
-}
-
-private fun formatBytes(bytes: ULong): String {
-    val b = bytes.toLong()
-    return when {
-        b >= 1_048_576 -> "%.1f MB".format(b / 1_048_576.0)
-        b >= 1_024 -> "%.1f KB".format(b / 1_024.0)
-        else -> "$b B"
-    }
+    return "接続中(ハンドシェイク ${age} 秒前 / ↑${formatBytesLong(status.txBytes)} ↓${formatBytesLong(status.rxBytes)})"
 }

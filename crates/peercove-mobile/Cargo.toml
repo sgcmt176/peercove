@@ -30,6 +30,10 @@ ipnet = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 # デスクトップの Windows デバイス(ADR-0001)と同じ WG プロトコル実装
 boringtun = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# ファイル転送の SHA-256 検証(ADR-0015、デスクトップと同じ)
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
