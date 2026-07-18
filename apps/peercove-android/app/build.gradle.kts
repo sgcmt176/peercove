@@ -107,4 +107,7 @@ dependencies {
     // UniFFI 生成コードの実行時依存(JNA は Android では aar 版を使う)
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    // 招待 QR コードの読み取り(M4 E-B)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }

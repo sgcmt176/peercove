@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- WG トンネルの UDP 通信 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 招待 QR コードの読み取り(zxing)。カメラ無し端末でも動くようにする -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
     <application
         android:label="@string/app_name"
         android:icon="@android:mipmap/sym_def_app_icon"
@@ -15,6 +21,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- VPN サービス。BIND_VPN_SERVICE はシステムだけが持つ権限なので、
+             exported でも第三者アプリからは bind できない -->
+        <service
+            android:name=".PeercoveVpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>
