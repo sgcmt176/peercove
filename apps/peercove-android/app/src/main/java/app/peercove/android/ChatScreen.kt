@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -162,13 +163,15 @@ fun ConversationScreen(
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    // imePadding: キーボード表示時に入力バーを持ち上げる
+    Column(modifier = Modifier.fillMaxSize().imePadding()) {
         LazyColumn(
             state = listState,
             modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            items(convMessages, key = { it.seq }) { message ->
+            // key は Bundle 保存可能な型が必須(ULong のままだと実行時クラッシュ)
+            items(convMessages, key = { it.seq.toLong() }) { message ->
                 when {
                     message.system -> SystemLine(message.text)
                     message.outgoing -> OutgoingBubble(message, context, onNotice)

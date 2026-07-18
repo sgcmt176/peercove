@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -89,7 +90,9 @@ private fun App() {
     var route by remember { mutableStateOf<Route>(Route.Home) }
     var notice by remember { mutableStateOf<String?>(null) }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    // safeDrawingPadding: エッジツーエッジ(targetSdk 35+ で強制)でステータス
+    // バー・ナビゲーションバー・カメラ切欠きと重ならないようにする
+    Column(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
         notice?.let {
             Text(
                 it,
@@ -177,7 +180,9 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
                         .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
                         .setPrompt("招待 QR コードを読み取ってください")
                         .setBeepEnabled(false)
-                        .setOrientationLocked(false),
+                        // 既定の CaptureActivity は横向きなので縦固定版を使う
+                        .setCaptureActivity(PortraitCaptureActivity::class.java)
+                        .setOrientationLocked(true),
                 )
             },
             onJoin = joinAction@{
