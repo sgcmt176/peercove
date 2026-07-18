@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,10 +14,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -90,9 +96,20 @@ private fun App() {
     var route by remember { mutableStateOf<Route>(Route.Home) }
     var notice by remember { mutableStateOf<String?>(null) }
 
-    // safeDrawingPadding: エッジツーエッジ(targetSdk 35+ で強制)でステータス
-    // バー・ナビゲーションバー・カメラ切欠きと重ならないようにする
-    Column(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
+    // システムの戻る操作でひとつ前の画面へ(アプリを閉じない)
+    BackHandler(enabled = route is Route.Net) { route = Route.Home }
+
+    // エッジツーエッジ(targetSdk 35+ で強制)対策。上と左右はここで確保し、
+    // 下は navigationBarsPadding だけにする(safeDrawing 全部に ime を含めると
+    // チャットの imePadding と二重になりキーボード上の余白が大きくなりすぎる)
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
+            )
+            .navigationBarsPadding(),
+    ) {
         notice?.let {
             Text(
                 it,

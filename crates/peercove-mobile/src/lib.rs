@@ -660,6 +660,64 @@ pub fn send_file_to(slug: String, to_ip: String, src_path: String) -> Result<Str
         .map_err(Into::into)
 }
 
+/// 表示名の変更(ホストへ依頼 → 承認されたらローカル設定にも保存)。
+/// ブロッキング(応答待ち最大 10 秒)なので Kotlin 側は IO ディスパッチャで呼ぶ。
+#[uniffi::export]
+pub fn set_display_name(
+    base_dir: String,
+    slug: String,
+    name: String,
+) -> Result<String, MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(MobileError::Failure {
+            msg: "表示名が空です".to_string(),
+        });
+    }
+    let reply = s.set_display_name(&name)?;
+    // ローカル member.toml にも保存(次回接続の hello で同じ名前を名乗る)
+    let config_path = networks::networks_dir(Path::new(&base_dir))
+        .join(&slug)
+        .join(networks::MEMBER_FILE);
+    match peercove_ops::settings::read(&config_path) {
+        Ok(current) => {
+            let update = peercove_ops::settings::Update {
+                display_name: Some(name),
+                dns_name: current.dns_name.clone(),
+                listen_port: current.listen_port,
+                mtu: current.mtu,
+                host_endpoint: current.host_endpoint.clone(),
+                direct: current.direct,
+                max_recv_file_mb: current.max_recv_file_mb,
+                require_invite_approval: current.require_invite_approval,
+            };
+            if let Err(e) = peercove_ops::settings::update(&config_path, &update) {
+                tracing::warn!("表示名のローカル保存に失敗しました: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("設定の読み込みに失敗しました: {e:#}"),
+    }
+    Ok(reply)
+}
+
+/// 自分の DNS 名の変更(ホストへ依頼。正本は host.toml)。
+#[uniffi::export]
+pub fn set_dns_name(slug: String, name: String) -> Result<String, MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(MobileError::Failure {
+            msg: "DNS 名が空です".to_string(),
+        });
+    }
+    s.set_dns_name(&name).map_err(Into::into)
+}
+
 /// ファイル転送の進捗一覧。
 #[uniffi::export]
 pub fn transfers(slug: String) -> Vec<TransferStatus> {

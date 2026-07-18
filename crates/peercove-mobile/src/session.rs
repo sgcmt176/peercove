@@ -99,6 +99,11 @@ pub struct SessionShared {
     pub transfers: Mutex<Vec<TransferInfo>>,
     /// listener が実際に bind したアドレス(テストが接続先を知るため)
     pub bound_listen: Mutex<Option<SocketAddr>>,
+    /// コントロールチャネルへ差し込む送信キュー(表示名・DNS 名の変更依頼)
+    outbox: Mutex<Vec<ControlMessage>>,
+    /// SetDnsName / SetDisplayName の応答受け口((accepted, message))
+    dns_result: Mutex<Option<(bool, String)>>,
+    display_result: Mutex<Option<(bool, String)>>,
     stop: AtomicBool,
 }
 
@@ -119,6 +124,9 @@ impl NetSession {
             rtt_ms: Mutex::new(None),
             transfers: Mutex::new(Vec::new()),
             bound_listen: Mutex::new(None),
+            outbox: Mutex::new(Vec::new()),
+            dns_result: Mutex::new(None),
+            display_result: Mutex::new(None),
             stop: AtomicBool::new(false),
             cfg,
         });
@@ -471,10 +479,21 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
                         *shared.rejected.lock().unwrap() = Some(message);
                         bail!("参加拒否通知を受信");
                     }
+                    Ok(ControlMessage::SetDnsNameResult { accepted, message }) => {
+                        *shared.dns_result.lock().unwrap() = Some((accepted, message));
+                    }
+                    Ok(ControlMessage::SetDisplayNameResult { accepted, message }) => {
+                        *shared.display_result.lock().unwrap() = Some((accepted, message));
+                    }
                     Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
                     Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
                 }
             }
+        }
+        // 変更依頼(表示名・DNS 名)の差し込み送信
+        let queued: Vec<ControlMessage> = shared.outbox.lock().unwrap().drain(..).collect();
+        for message in queued {
+            send_json(&mut writer, &message)?;
         }
         if last_ping.elapsed() >= PING_INTERVAL {
             last_ping = Instant::now();
@@ -808,6 +827,55 @@ fn receive_file(
         }
     }
     result
+}
+
+// ---- コントロールチャネル経由の変更依頼 --------------------------------------
+
+impl SessionShared {
+    /// 依頼を送って応答を待つ(SetDisplayName / SetDnsName 共通)。
+    /// 拒否・タイムアウト(旧ホスト未対応)はエラー。成功はホストのメッセージ。
+    fn control_request(
+        &self,
+        message: ControlMessage,
+        slot: &Mutex<Option<(bool, String)>>,
+    ) -> anyhow::Result<String> {
+        if !self.control_connected.load(Ordering::Relaxed) {
+            bail!("ホストと同期していません(接続直後は数秒待ってから再試行してください)");
+        }
+        *slot.lock().unwrap() = None;
+        self.outbox.lock().unwrap().push(message);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !self.stopped() {
+            if let Some((accepted, reply)) = slot.lock().unwrap().take() {
+                if accepted {
+                    return Ok(reply);
+                }
+                bail!("{reply}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        bail!("ホストから応答がありません(ホストが旧バージョンの可能性)");
+    }
+
+    /// 自分の表示名の変更依頼(ADR-0027)。正本は host.toml でホストが適用する。
+    pub fn set_display_name(&self, name: &str) -> anyhow::Result<String> {
+        self.control_request(
+            ControlMessage::SetDisplayName {
+                name: name.to_string(),
+            },
+            &self.display_result,
+        )
+    }
+
+    /// 自分の DNS 名の変更依頼(ADR-0021)。正本は host.toml。
+    pub fn set_dns_name(&self, name: &str) -> anyhow::Result<String> {
+        self.control_request(
+            ControlMessage::SetDnsName {
+                name: name.to_string(),
+            },
+            &self.dns_result,
+        )
+    }
 }
 
 // ---- 送信(チャット・ファイル)----------------------------------------------
@@ -1275,6 +1343,32 @@ mod tests {
             // セッション発の ping は無視してよい
         }
         assert!(got_pong, "pong が返らない");
+
+        // 表示名の変更依頼: 依頼行が届き、応答が呼び出し元へ返る
+        let session_for_req = Arc::clone(&session.shared);
+        let request = std::thread::spawn(move || session_for_req.set_display_name("新しい名前"));
+        let mut got_request = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            if line.contains(r#""type":"set_display_name""#) {
+                assert!(line.contains("新しい名前"), "{line}");
+                got_request = true;
+                break;
+            }
+        }
+        assert!(got_request, "変更依頼が届かない");
+        let result = ControlMessage::SetDisplayNameResult {
+            accepted: true,
+            message: "更新しました".to_string(),
+        };
+        writer
+            .write_all((serde_json::to_string(&result).unwrap() + "\n").as_bytes())
+            .unwrap();
+        assert_eq!(request.join().unwrap().unwrap(), "更新しました");
 
         // removed で再接続をやめる
         let removed = ControlMessage::Removed {
