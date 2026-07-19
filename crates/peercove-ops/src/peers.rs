@@ -127,8 +127,20 @@ impl ConfigLock {
             .open(&lock_path)
             .with_context(|| format!("{} を開けません", lock_path.display()))?;
         // ブロッキング排他ロック(std::fs::File::lock、Rust 1.89+)。ファイルを閉じると解放。
-        file.lock()
-            .with_context(|| format!("{} のロックに失敗しました", lock_path.display()))?;
+        match file.lock() {
+            Ok(()) => {}
+            // Android など std のファイルロック未対応のプラットフォームでは素通し
+            // (モバイルはアプリ 1 プロセスで設定を書くため、プロセス間の直列化が
+            // そもそも不要 = ADR-0007 のデスクトップ前提が当てはまらない)。
+            // M4 E-C 検証フィードバック 2026-07-19
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                tracing::debug!("ファイルロック未対応のためスキップします: {e}");
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("{} のロックに失敗しました", lock_path.display()));
+            }
+        }
         Ok(Self { _file: file })
     }
 }

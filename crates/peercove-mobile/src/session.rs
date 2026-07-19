@@ -191,14 +191,10 @@ impl SessionShared {
             .unwrap_or_else(|| ip.to_string())
     }
 
-    /// 受信ファイルサイズ上限(バイト、0 = 無制限)。member.toml の
-    /// `max_recv_file_mb`(デスクトップと同じ設定)を申し出ごとに読む
+    /// 受信ファイルサイズ上限(バイト、0 = 無制限)。申し出ごとに読む
     /// (設定変更を再起動なしで反映)。
     fn recv_limit_bytes(&self) -> u64 {
-        let mb = peercove_core::config::Config::load(&self.cfg.config_path)
-            .map(|c| c.interface.max_recv_file_mb)
-            .unwrap_or(MOBILE_DEFAULT_MAX_RECV_FILE_MB);
-        mb.saturating_mul(1024 * 1024)
+        recv_limit_mb_for(&self.cfg.config_path).saturating_mul(1024 * 1024)
     }
 
     fn inbox_dir(&self) -> PathBuf {
@@ -257,6 +253,21 @@ impl SessionShared {
             t.state = state.to_string();
         }
     }
+}
+
+/// member.toml の受信上限(MB)。**フィールドが書かれていない**設定(この機能より
+/// 前の join で作ったもの)はモバイル既定の 10 にする — Config のデフォルト
+/// (デスクトップの 100)へ落とさない(2026-07-19 依頼者指定)。
+pub fn recv_limit_mb_for(config_path: &Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return MOBILE_DEFAULT_MAX_RECV_FILE_MB;
+    };
+    if !text.contains("max_recv_file_mb") {
+        return MOBILE_DEFAULT_MAX_RECV_FILE_MB;
+    }
+    peercove_core::config::Config::load(config_path)
+        .map(|c| c.interface.max_recv_file_mb)
+        .unwrap_or(MOBILE_DEFAULT_MAX_RECV_FILE_MB)
 }
 
 // ---- 行フレーミング(JSON Lines)---------------------------------------------

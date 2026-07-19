@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -163,8 +162,8 @@ fun ConversationScreen(
         }
     }
 
-    // imePadding: キーボード表示時に入力バーを持ち上げる
-    Column(modifier = Modifier.fillMaxSize().imePadding()) {
+    // キーボードの持ち上げはルートの safeDrawingPadding が担う(MainActivity)
+    Column(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             state = listState,
             modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp),

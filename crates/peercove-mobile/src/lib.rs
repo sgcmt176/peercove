@@ -86,6 +86,8 @@ pub struct TunnelStatus {
     pub handshake_age_secs: Option<u64>,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
+    /// いま使っている接続先(LAN → 外部 IP のフォールバック確認用)
+    pub endpoint: String,
 }
 
 /// Android の VpnService.protect() を Rust から呼ぶためのコールバック。
@@ -227,7 +229,8 @@ fn network_info(entry: &NetworkEntry) -> Option<NetworkInfo> {
             .unwrap_or_default(),
         endpoint: peer.endpoint.map(|ep| ep.to_string()).unwrap_or_default(),
         mtu: config.interface.mtu,
-        max_recv_file_mb: config.interface.max_recv_file_mb,
+        // 明示されていない古い設定はモバイル既定の 10 MB として扱う
+        max_recv_file_mb: session::recv_limit_mb_for(&entry.config_path),
     })
 }
 
@@ -409,6 +412,10 @@ pub fn tunnel_status(slug: String) -> Option<TunnelStatus> {
             handshake_age_secs: s.handshake_age_secs,
             tx_bytes: s.tx_bytes,
             rx_bytes: s.rx_bytes,
+            endpoint: s
+                .current_endpoint
+                .map(|e| e.to_string())
+                .unwrap_or_default(),
         }
     })
 }

@@ -13,8 +13,12 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false">
 
+        <!-- adjustNothing: キーボードでウィンドウを縮めない(端末により
+             enableEdgeToEdge だけでは縮む)。持ち上げは Compose のインセット
+             (safeDrawingPadding = ime を含む union)が一手に担う -->
         <activity
             android:name=".MainActivity"
+            android:windowSoftInputMode="adjustNothing"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

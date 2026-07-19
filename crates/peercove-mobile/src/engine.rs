@@ -59,6 +59,8 @@ pub struct EngineStats {
     pub handshake_age_secs: Option<u64>,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
+    /// いま使っているエンドポイント(フォールバック切替の確認用)
+    pub current_endpoint: Option<SocketAddr>,
 }
 
 struct Shared {
@@ -130,7 +132,9 @@ impl Engine {
     }
 
     pub fn stats(&self) -> EngineStats {
-        self.shared.stats.lock().unwrap().clone()
+        let mut stats = self.shared.stats.lock().unwrap().clone();
+        stats.current_endpoint = Some(*self.shared.current_peer.lock().unwrap());
+        stats
     }
 
     /// トンネルを停止してスレッドを回収する。TUN(fd)は Arc の解放で閉じる。
