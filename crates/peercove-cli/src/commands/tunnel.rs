@@ -49,6 +49,9 @@ pub struct ActiveTunnel {
     pub if_name: String,
     /// ネットワーク名(設定の network_name、旧設定は既定名)。
     pub network: String,
+    /// (host)UPnP で観測した外部エンドポイント(M4 E-C)。
+    /// 招待の自動候補として IPC status に載せる。UPnP 無効・失敗時は None
+    pub external_endpoint: Option<std::net::SocketAddrV4>,
     upnp_lease: Option<crate::upnp::UpnpLease>,
 }
 
@@ -114,6 +117,7 @@ pub fn bring_up(
     // UPnP はトンネル作成前に試行する(TUN のマルチキャスト経路が SSDP 探索を
     // 妨げないように)。失敗してもトンネルは起動する(手動ポートフォワードで代替可能)
     let listen_port = spec.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
+    let mut external_endpoint = None;
     let upnp_lease = if upnp && role == Role::Host {
         match crate::upnp::setup(listen_port) {
             Ok(report) => {
@@ -123,6 +127,10 @@ pub fn bring_up(
                     report.external_ip, report.external_port
                 );
                 println!("→ 別 NAT のメンバーは endpoint にこれを指定してください");
+                // 招待の自動候補として保持する(M4 E-C。IPC status で公開)
+                if let std::net::IpAddr::V4(v4) = report.external_ip {
+                    external_endpoint = Some(std::net::SocketAddrV4::new(v4, report.external_port));
+                }
                 Some(report.lease)
             }
             Err(e) => {
@@ -156,6 +164,7 @@ pub fn bring_up(
         role,
         if_name,
         network: config.network_name().to_string(),
+        external_endpoint,
         upnp_lease,
     })
 }
@@ -229,6 +238,7 @@ impl ActiveTunnel {
             role,
             if_name: "peercove-test".to_string(),
             network: "test".to_string(),
+            external_endpoint: None,
             upnp_lease: None,
         }
     }

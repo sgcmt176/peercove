@@ -32,11 +32,21 @@ pub fn run(options: &CliOptions) -> anyhow::Result<()> {
         );
     }
 
+    // 稼働中デーモンが UPnP で外部エンドポイントを知っていれば自動で候補に足す
+    // (M4 E-C)。デーモン停止・UPnP 無効なら黙って何もしない(手動指定で代替可)
+    let mut extra: Vec<SocketAddrV4> = options.extra_endpoints.to_vec();
+    if let Some(external) = daemon_external_endpoint(options.config_path) {
+        if !extra.contains(&external) {
+            println!("デーモンが観測した外部エンドポイント {external} を候補に追加します");
+            extra.push(external);
+        }
+    }
+
     let result = invite(&InviteOptions {
         config_path: options.config_path,
         name: options.name,
         ip: options.ip,
-        extra_endpoints: options.extra_endpoints,
+        extra_endpoints: &extra,
         psk: options.psk,
         expires_in_secs: options.expires_in_secs,
     })?;
@@ -81,4 +91,22 @@ pub fn run(options: &CliOptions) -> anyhow::Result<()> {
         println!("{}", qr.to_str());
     }
     Ok(())
+}
+
+/// 稼働中デーモンからこのネットワークの外部エンドポイントを取り出す(ベストエフォート)。
+fn daemon_external_endpoint(config_path: &Path) -> Option<SocketAddrV4> {
+    let canonical = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    match peercove_ipc::request(peercove_core::ipc::IpcRequest::Status) {
+        Ok(peercove_core::ipc::IpcResponse::Status(status)) => status
+            .tunnels
+            .iter()
+            .find(|t| {
+                t.config == canonical
+                    || t.config.canonicalize().ok().as_deref() == Some(canonical.as_path())
+            })
+            .and_then(|t| t.external_endpoint),
+        _ => None,
+    }
 }

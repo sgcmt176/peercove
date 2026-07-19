@@ -55,6 +55,8 @@ struct Active {
     /// 衝突検査(StartLimits)用
     subnet: ipnet::Ipv4Net,
     if_name: String,
+    /// (host)UPnP で観測した外部エンドポイント(M4 E-C。status で公開)
+    external_endpoint: Option<std::net::SocketAddrV4>,
     stop_tx: watch::Sender<bool>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
     /// 内蔵 DNS サーバ(トンネル IP の :53、M3-1)。停止時に abort する
@@ -821,6 +823,7 @@ impl DaemonShared {
         let subnet = tunnel.spec.address.trunc();
         let network = tunnel.network.clone();
         let if_name = tunnel.if_name.clone();
+        let external_endpoint = tunnel.external_endpoint;
         // 内蔵 DNS(M3-1): トンネル IP の :53 で待受け(準備でき次第 bind)
         let dns_task = tokio::spawn(crate::dns::run_for_tunnel(address, Arc::clone(&self.zones)));
         // Linux のスプリット DNS は per-link 設定(リンク消滅で自動解除)
@@ -926,6 +929,7 @@ impl DaemonShared {
                 address,
                 subnet,
                 if_name,
+                external_endpoint,
                 stop_tx,
                 task,
                 dns_task,
@@ -1416,6 +1420,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         },
         address: active.address,
         interface_name: active.if_name.clone(),
+        external_endpoint: active.external_endpoint,
         peers: peers
             .iter()
             .map(|p| PeerSummary {

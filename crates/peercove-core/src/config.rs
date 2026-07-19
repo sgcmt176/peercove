@@ -291,6 +291,13 @@ pub struct PeerConfig {
     pub public_key: PublicKey,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<SocketAddr>,
+    /// 予備のエンドポイント候補(招待トークンの複数候補、M4 E-C)。メンバー設定で
+    /// join が書き、`endpoint` への接続が確立しないときのフォールバックに使う
+    /// (現在はモバイルが利用。デスクトップのデーモンは先頭 endpoint のみ使用)。
+    /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
+    /// 読めない(明示エラーになる)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_fallbacks: Vec<SocketAddr>,
     pub allowed_ips: Vec<Ipv4Net>,
     /// このメンバーが広告する背後 LAN のサブネット(ADR-0014、M3-7)。
     /// ホスト設定が正本で、台帳経由で全メンバーへ配布される。

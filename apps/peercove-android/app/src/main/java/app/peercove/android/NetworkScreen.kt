@@ -63,7 +63,7 @@ import uniffi.peercove_mobile.members
 import uniffi.peercove_mobile.sessionState
 import uniffi.peercove_mobile.setDisplayName
 import uniffi.peercove_mobile.setDnsName
-import uniffi.peercove_mobile.setRecvLimitMb
+import uniffi.peercove_mobile.updateNetworkSettings
 
 /**
  * ネットワーク詳細(接続中のトーク / メンバー / DNS)。
@@ -366,12 +366,15 @@ private fun DnsRow(fqdn: String, value: String, url: String?, onCopy: (String) -
     HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
 }
 
-/** 設定タブ: 受信サイズ上限(端末ローカル)と表示名・DNS 名(ホストへ依頼)。 */
+/** 設定タブ: デスクトップのメンバー設定と同等(接続先・MTU・受信上限 +
+ *  表示名・DNS 名はホストへ依頼)。 */
 @Composable
 private fun SettingsTab(slug: String, onNotice: (String) -> Unit) {
     val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
     val scope = rememberCoroutineScope()
+    var endpointText by remember { mutableStateOf("") }
+    var mtuText by remember { mutableStateOf("") }
     var limitText by remember { mutableStateOf("") }
     var displayName by remember { mutableStateOf("") }
     var dnsName by remember { mutableStateOf("") }
@@ -382,6 +385,8 @@ private fun SettingsTab(slug: String, onNotice: (String) -> Unit) {
             listNetworks(baseDir).firstOrNull { it.slug == slug }
         }
         if (info != null) {
+            endpointText = info.endpoint
+            mtuText = info.mtu.toString()
             limitText = info.maxRecvFileMb.toString()
             displayName = info.displayName
         }
@@ -407,7 +412,22 @@ private fun SettingsTab(slug: String, onNotice: (String) -> Unit) {
             .verticalScroll(rememberScrollState())
             .padding(12.dp),
     ) {
-        Text("ファイル受信", style = MaterialTheme.typography.titleMedium)
+        Text("接続", style = MaterialTheme.typography.titleMedium)
+        OutlinedTextField(
+            value = endpointText,
+            onValueChange = { endpointText = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("接続先エンドポイント(IP:ポート)") },
+            singleLine = true,
+        )
+        OutlinedTextField(
+            value = mtuText,
+            onValueChange = { mtuText = it.filter { c -> c.isDigit() } },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("MTU(既定 1420)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            singleLine = true,
+        )
         OutlinedTextField(
             value = limitText,
             onValueChange = { limitText = it.filter { c -> c.isDigit() } },
@@ -418,11 +438,18 @@ private fun SettingsTab(slug: String, onNotice: (String) -> Unit) {
         )
         Spacer(modifier = Modifier.padding(2.dp))
         Button(
-            enabled = !busy && limitText.isNotEmpty(),
+            enabled = !busy && endpointText.isNotBlank() && mtuText.isNotEmpty() && limitText.isNotEmpty(),
             onClick = {
                 run {
-                    setRecvLimitMb(baseDir, slug, limitText.toULongOrNull() ?: 10uL)
-                    "受信サイズ上限を保存しました(${limitText} MB)"
+                    val restart = updateNetworkSettings(
+                        baseDir,
+                        slug,
+                        endpointText,
+                        mtuText.toUShortOrNull() ?: 1420u,
+                        limitText.toULongOrNull() ?: 10uL,
+                    )
+                    if (restart) "保存しました(切断 → 接続のし直しで反映されます)"
+                    else "保存しました"
                 }
             },
         ) { Text("保存") }

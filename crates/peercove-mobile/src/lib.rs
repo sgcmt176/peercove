@@ -177,11 +177,12 @@ pub fn join_network(base_dir: String, token: String) -> Result<NetworkInfo, Mobi
         .unwrap_or_else(|| peercove_core::names::DEFAULT_NETWORK_NAME.to_string());
     let (slug, dir) = networks::join_dir(base, &network_name)?;
     peercove_ops::join::join(&token_text, &dir, false)?;
-    // スマホの受信上限の既定(10 MB)をローカル設定として書いておく
-    if let Err(e) =
-        session::write_mobile_recv_limit_mb(&dir, session::MOBILE_DEFAULT_MAX_RECV_FILE_MB)
-    {
-        tracing::warn!("モバイル設定の書き込みに失敗しました: {e:#}");
+    // スマホの受信上限の既定は 10 MB(デスクトップの既定 100 MB より小さく。
+    // 2026-07-19 依頼者指定)。member.toml の max_recv_file_mb に書く
+    if let Err(e) = update_settings_with(&dir.join(networks::MEMBER_FILE), |_, update| {
+        update.max_recv_file_mb = session::MOBILE_DEFAULT_MAX_RECV_FILE_MB;
+    }) {
+        tracing::warn!("受信上限の初期設定に失敗しました: {e:#}");
     }
     tracing::info!("ネットワーク {network_name} に参加しました(slug={slug})");
     list_networks(base_dir)
@@ -226,17 +227,59 @@ fn network_info(entry: &NetworkEntry) -> Option<NetworkInfo> {
             .unwrap_or_default(),
         endpoint: peer.endpoint.map(|ep| ep.to_string()).unwrap_or_default(),
         mtu: config.interface.mtu,
-        max_recv_file_mb: session::read_mobile_recv_limit_mb(&entry.dir),
+        max_recv_file_mb: config.interface.max_recv_file_mb,
     })
 }
 
-/// 受信ファイルサイズ上限を変更する(MB、0 = 無制限)。即時反映
-/// (セッションは申し出ごとに mobile.toml を読む)。
+/// 設定を「現在値を全部読んでから一部だけ変えて書き戻す」共通処理。
+/// 戻り値 true = トンネルの入れ直しが必要な変更(エンドポイント・MTU 等)。
+fn update_settings_with(
+    config_path: &Path,
+    apply: impl FnOnce(&peercove_ops::settings::Settings, &mut peercove_ops::settings::Update),
+) -> anyhow::Result<bool> {
+    let current = peercove_ops::settings::read(config_path)?;
+    let mut update = peercove_ops::settings::Update {
+        display_name: current.display_name.clone(),
+        dns_name: current.dns_name.clone(),
+        listen_port: current.listen_port,
+        mtu: current.mtu,
+        host_endpoint: current.host_endpoint.clone(),
+        direct: current.direct,
+        max_recv_file_mb: current.max_recv_file_mb,
+        require_invite_approval: current.require_invite_approval,
+    };
+    apply(&current, &mut update);
+    let restart = current.restart_required(&update);
+    peercove_ops::settings::update(config_path, &update)?;
+    Ok(restart)
+}
+
+/// メンバー設定の変更(デスクトップの設定画面と同等: 接続先・MTU・受信上限)。
+/// 戻り値 true = 反映にはトンネルの接続し直しが必要(接続先・MTU の変更時)。
 #[uniffi::export]
-pub fn set_recv_limit_mb(base_dir: String, slug: String, mb: u64) -> Result<(), MobileError> {
-    let dir = networks::networks_dir(Path::new(&base_dir)).join(&slug);
-    session::write_mobile_recv_limit_mb(&dir, mb)?;
-    Ok(())
+pub fn update_network_settings(
+    base_dir: String,
+    slug: String,
+    host_endpoint: String,
+    mtu: u16,
+    max_recv_file_mb: u64,
+) -> Result<bool, MobileError> {
+    let endpoint: std::net::SocketAddr =
+        host_endpoint
+            .trim()
+            .parse()
+            .map_err(|_| MobileError::Failure {
+                msg: "接続先は IP:ポート 形式で指定してください".to_string(),
+            })?;
+    let config_path = networks::networks_dir(Path::new(&base_dir))
+        .join(&slug)
+        .join(networks::MEMBER_FILE);
+    let restart = update_settings_with(&config_path, |_, update| {
+        update.host_endpoint = Some(endpoint.to_string());
+        update.mtu = mtu;
+        update.max_recv_file_mb = max_recv_file_mb;
+    })?;
+    Ok(restart)
 }
 
 /// VpnService の TUN fd で WG トンネルを開始する。
@@ -289,11 +332,15 @@ fn start_tunnel_impl(
         None => None,
     };
 
+    // エンドポイント候補: 先頭(通常 LAN)→ 予備(外部 IP など。M4 E-C)
+    let mut endpoints = vec![peer.endpoint.expect("上で確認済み")];
+    endpoints.extend(peer.endpoint_fallbacks.iter().copied());
     let spec = engine::EngineSpec {
         private_key: *private.as_bytes(),
         peer_public_key: *peer.public_key.as_bytes(),
         preshared_key: psk.map(|k| *k.as_bytes()),
-        endpoint: peer.endpoint.expect("上で確認済み"),
+        endpoints,
+        rotate_after: std::time::Duration::from_secs(10),
         allowed_ips: peer.allowed_ips.clone(),
         persistent_keepalive: peer.persistent_keepalive,
     };
@@ -682,23 +729,10 @@ pub fn set_display_name(
     let config_path = networks::networks_dir(Path::new(&base_dir))
         .join(&slug)
         .join(networks::MEMBER_FILE);
-    match peercove_ops::settings::read(&config_path) {
-        Ok(current) => {
-            let update = peercove_ops::settings::Update {
-                display_name: Some(name),
-                dns_name: current.dns_name.clone(),
-                listen_port: current.listen_port,
-                mtu: current.mtu,
-                host_endpoint: current.host_endpoint.clone(),
-                direct: current.direct,
-                max_recv_file_mb: current.max_recv_file_mb,
-                require_invite_approval: current.require_invite_approval,
-            };
-            if let Err(e) = peercove_ops::settings::update(&config_path, &update) {
-                tracing::warn!("表示名のローカル保存に失敗しました: {e:#}");
-            }
-        }
-        Err(e) => tracing::warn!("設定の読み込みに失敗しました: {e:#}"),
+    if let Err(e) = update_settings_with(&config_path, |_, update| {
+        update.display_name = Some(name);
+    }) {
+        tracing::warn!("表示名のローカル保存に失敗しました: {e:#}");
     }
     Ok(reply)
 }
@@ -808,6 +842,7 @@ mod tests {
         assert_eq!(info.host_ip, "10.77.0.1");
         assert_eq!(info.endpoint, "192.168.10.2:51820");
         assert_eq!(info.display_name, "sumaho");
+        assert_eq!(info.max_recv_file_mb, 10, "スマホの既定受信上限は 10 MB");
 
         let listed = list_networks(base_str.clone());
         assert_eq!(listed.len(), 1);

@@ -191,11 +191,14 @@ impl SessionShared {
             .unwrap_or_else(|| ip.to_string())
     }
 
-    /// 受信ファイルサイズ上限(バイト、0 = 無制限)。networks/<slug>/mobile.toml の
-    /// `max_recv_file_mb` を毎回読む(設定変更を再起動なしで反映)。
+    /// 受信ファイルサイズ上限(バイト、0 = 無制限)。member.toml の
+    /// `max_recv_file_mb`(デスクトップと同じ設定)を申し出ごとに読む
+    /// (設定変更を再起動なしで反映)。
     fn recv_limit_bytes(&self) -> u64 {
-        let dir = self.cfg.config_path.parent().unwrap_or(Path::new("."));
-        read_mobile_recv_limit_mb(dir).saturating_mul(1024 * 1024)
+        let mb = peercove_core::config::Config::load(&self.cfg.config_path)
+            .map(|c| c.interface.max_recv_file_mb)
+            .unwrap_or(MOBILE_DEFAULT_MAX_RECV_FILE_MB);
+        mb.saturating_mul(1024 * 1024)
     }
 
     fn inbox_dir(&self) -> PathBuf {
@@ -254,36 +257,6 @@ impl SessionShared {
             t.state = state.to_string();
         }
     }
-}
-
-/// networks/<slug>/mobile.toml を読む(無ければ既定 10 MB)。
-pub fn read_mobile_recv_limit_mb(network_dir: &Path) -> u64 {
-    let path = network_dir.join("mobile.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return MOBILE_DEFAULT_MAX_RECV_FILE_MB;
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("max_recv_file_mb") {
-            if let Some(value) = rest.trim_start().strip_prefix('=') {
-                if let Ok(mb) = value.trim().parse::<u64>() {
-                    return mb;
-                }
-            }
-        }
-    }
-    MOBILE_DEFAULT_MAX_RECV_FILE_MB
-}
-
-/// networks/<slug>/mobile.toml を書く(join 時と設定変更時)。
-pub fn write_mobile_recv_limit_mb(network_dir: &Path, mb: u64) -> anyhow::Result<()> {
-    let path = network_dir.join("mobile.toml");
-    let content = format!(
-        "# PeerCove モバイル固有の設定(このファイルは端末ローカル)\n\
-         # 受信ファイルサイズの上限(MB)。0 は無制限\n\
-         max_recv_file_mb = {mb}\n"
-    );
-    std::fs::write(&path, content).with_context(|| format!("{} へ書けません", path.display()))
 }
 
 // ---- 行フレーミング(JSON Lines)---------------------------------------------
@@ -1232,8 +1205,26 @@ mod tests {
     }
 
     /// テスト用セッション。listen は 127.0.0.1 のエフェメラルポート。
+    /// member.toml は本物(ops::join で生成)なので、設定読み出し(受信上限
+    /// など)も実物の経路で動く。
     fn test_session(label: &str, control_addr: SocketAddr, peer_msg_port: u16) -> NetSession {
         let dir = temp_dir(label);
+        let token = peercove_core::token::InviteToken {
+            member_private_key: PrivateKey::generate(),
+            host_public_key: PrivateKey::generate().public_key(),
+            preshared_key: None,
+            member_address: "10.77.0.5/24".parse().unwrap(),
+            host_virtual_ip: "10.77.0.1".parse().unwrap(),
+            endpoints: vec!["192.0.2.1:51820".parse().unwrap()],
+            name: format!("test-{label}"),
+            network: Some("testnet".to_string()),
+            invite_id: None,
+            issued_at: None,
+            expires_at: None,
+        }
+        .encode()
+        .unwrap();
+        peercove_ops::join::join(&token, &dir, true).unwrap();
         NetSession::start(SessionConfig {
             slug: label.to_string(),
             config_path: dir.join("member.toml"),
@@ -1500,10 +1491,23 @@ mod tests {
         seed_ledger(&a, both.clone());
         seed_ledger(&b, both);
 
-        // A の上限を 1 MB に設定
-        let a_dir = a.shared.cfg.config_path.parent().unwrap().to_path_buf();
-        write_mobile_recv_limit_mb(&a_dir, 1).unwrap();
-        assert_eq!(read_mobile_recv_limit_mb(&a_dir), 1);
+        // A の上限を 1 MB に設定(デスクトップと同じ member.toml の設定を使う)
+        let config_path = a.shared.cfg.config_path.clone();
+        let current = peercove_ops::settings::read(&config_path).unwrap();
+        peercove_ops::settings::update(
+            &config_path,
+            &peercove_ops::settings::Update {
+                display_name: current.display_name.clone(),
+                dns_name: current.dns_name.clone(),
+                listen_port: current.listen_port,
+                mtu: current.mtu,
+                host_endpoint: current.host_endpoint.clone(),
+                direct: current.direct,
+                max_recv_file_mb: 1,
+                require_invite_approval: current.require_invite_approval,
+            },
+        )
+        .unwrap();
 
         // 2 MB のファイルは拒否される(理由に上限が入る)
         let src = temp_dir("limit-src").join("big.bin");

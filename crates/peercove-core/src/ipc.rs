@@ -308,6 +308,10 @@ pub struct TunnelInfo {
     /// とは異なりうる。旧デーモンの応答には無い(空文字 → UI は設定値を出す)。
     #[serde(default)]
     pub interface_name: String,
+    /// (host)UPnP で観測した外部エンドポイント(M4 E-C)。招待の自動候補に
+    /// 使う。UPnP 無効・失敗・member では None。旧デーモンの応答には無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_endpoint: Option<std::net::SocketAddrV4>,
     /// 台帳スナップショット(host: 自前構築 / member: 受信したもの)。
     #[serde(default)]
     pub ledger: Vec<LedgerEntry>,

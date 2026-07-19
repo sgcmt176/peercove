@@ -853,14 +853,14 @@ fn init_host(app: tauri::AppHandle, name: String, force: bool) -> Result<InitRes
 
 /// 招待トークンを発行する。**戻り値の token は秘密情報**(発行直後のみ表示する)。
 #[tauri::command]
-fn create_invite(
+async fn create_invite(
     config_path: String,
     name: Option<String>,
     psk: bool,
     endpoints: Vec<String>,
     expires_in_secs: Option<u64>,
 ) -> Result<InviteResult, String> {
-    let extra: Vec<SocketAddrV4> = endpoints
+    let mut extra: Vec<SocketAddrV4> = endpoints
         .iter()
         .map(|e| {
             e.trim()
@@ -868,6 +868,27 @@ fn create_invite(
                 .map_err(|_| format!("エンドポイント {e} は IP:ポート形式で指定してください"))
         })
         .collect::<Result<_, _>>()?;
+
+    // 稼働中デーモンが UPnP で観測した外部エンドポイントを自動で候補に足す
+    // (M4 E-C)。デーモン停止・UPnP 無効なら黙って何もしない(手動指定で代替可)
+    if let Ok(IpcResponse::Status(status)) = peercove_ipc::request_async(IpcRequest::Status).await {
+        let canonical = Path::new(&config_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&config_path));
+        let external = status
+            .tunnels
+            .iter()
+            .find(|t| {
+                t.config == canonical
+                    || t.config.canonicalize().ok().as_deref() == Some(canonical.as_path())
+            })
+            .and_then(|t| t.external_endpoint);
+        if let Some(external) = external {
+            if !extra.contains(&external) {
+                extra.push(external);
+            }
+        }
+    }
 
     let result = peercove_ops::invite::invite(&peercove_ops::invite::InviteOptions {
         config_path: Path::new(&config_path),

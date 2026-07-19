@@ -106,8 +106,16 @@ fn render_member_config(token: &InviteToken, device_id: Option<&str>) -> String 
     out.push_str(&format!("control_host = \"{}\"\n", token.host_virtual_ip));
     out.push_str(&format!("public_key = \"{}\"\n", token.host_public_key));
     out.push_str(&format!("endpoint = \"{}\"\n", token.endpoints[0]));
-    for other in &token.endpoints[1..] {
-        out.push_str(&format!("# endpoint = \"{other}\"  # 別の候補\n"));
+    if token.endpoints.len() > 1 {
+        // 接続失敗時に順に試す予備の到達先(例: LAN → 外部 IP。M4 E-C)
+        let fallbacks: Vec<String> = token.endpoints[1..]
+            .iter()
+            .map(|e| format!("\"{e}\""))
+            .collect();
+        out.push_str(&format!(
+            "endpoint_fallbacks = [{}]\n",
+            fallbacks.join(", ")
+        ));
     }
     out.push_str(&format!(
         "allowed_ips = [\"{}\"]\n",
@@ -169,6 +177,11 @@ mod tests {
         assert_eq!(peer.public_key, token.host_public_key);
         assert_eq!(peer.control_host, Some(token.host_virtual_ip));
         assert_eq!(peer.persistent_keepalive, Some(25));
+        assert_eq!(
+            peer.endpoint_fallbacks,
+            vec!["203.0.113.5:51820".parse::<std::net::SocketAddr>().unwrap()],
+            "2 番目以降の候補は endpoint_fallbacks に載る(M4 E-C)"
+        );
 
         let key = peercove_core::keys::read_private_key_file(&result.key_path).unwrap();
         assert_eq!(key.as_bytes(), token.member_private_key.as_bytes());

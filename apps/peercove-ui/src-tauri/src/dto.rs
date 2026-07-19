@@ -843,6 +843,7 @@ mod tests {
             role: TunnelRole::Host,
             address: "10.100.42.1".parse().unwrap(),
             interface_name: "peercove0".to_string(),
+            external_endpoint: None,
             ledger: vec![LedgerEntry {
                 name: Some("alice".to_string()),
                 dns_name: None,
@@ -981,6 +982,7 @@ mod tests {
             role: TunnelRole::Member,
             address: "10.100.42.2".parse().unwrap(), // 自分
             interface_name: "peercove0".to_string(),
+            external_endpoint: None,
             ledger: vec![
                 entry("host", "10.100.42.1", true),
                 entry("me", "10.100.42.2", false),

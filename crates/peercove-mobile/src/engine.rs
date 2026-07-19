@@ -17,7 +17,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::{Tunn, TunnResult};
@@ -34,8 +34,11 @@ pub struct EngineSpec {
     pub private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
     pub preshared_key: Option<[u8; 32]>,
-    /// ホストのエンドポイント(member.toml の endpoint。数値アドレス)
-    pub endpoint: SocketAddr,
+    /// ホストのエンドポイント候補(先頭から順に試す。M4 E-C: LAN → 外部 IP の
+    /// フォールバック。member.toml の endpoint + endpoint_fallbacks)
+    pub endpoints: Vec<SocketAddr>,
+    /// ハンドシェイクが確立しないとき次の候補へ切り替えるまでの時間
+    pub rotate_after: Duration,
     /// ホスト側 AllowedIPs(通常はネットワークのサブネット全体)
     pub allowed_ips: Vec<Ipv4Net>,
     pub persistent_keepalive: Option<u16>,
@@ -63,6 +66,10 @@ struct Shared {
     udp: UdpSocket,
     tun: Arc<dyn TunIo>,
     allowed_ips: Vec<Ipv4Net>,
+    /// エンドポイント候補と現在使用中の候補(タイマーがローテートする)
+    endpoints: Vec<SocketAddr>,
+    current_peer: Mutex<SocketAddr>,
+    rotate_after: Duration,
     stats: Mutex<EngineStats>,
     stop: AtomicBool,
 }
@@ -76,7 +83,11 @@ impl Engine {
     /// トンネルを開始する。`udp` は bind 済み(かつ Android では protect 済み)の
     /// ソケットを受け取る(テストで自由にポートを選べるように)。
     pub fn start(spec: EngineSpec, tun: Arc<dyn TunIo>, udp: UdpSocket) -> anyhow::Result<Engine> {
-        udp.connect(spec.endpoint)?;
+        let first = *spec
+            .endpoints
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("エンドポイント候補がありません"))?;
+        udp.connect(first)?;
         udp.set_read_timeout(Some(TICK))?;
 
         let tunn = Tunn::new(
@@ -92,6 +103,9 @@ impl Engine {
             udp,
             tun,
             allowed_ips: spec.allowed_ips,
+            endpoints: spec.endpoints,
+            current_peer: Mutex::new(first),
+            rotate_after: spec.rotate_after,
             stats: Mutex::new(EngineStats::default()),
             stop: AtomicBool::new(false),
         });
@@ -169,11 +183,9 @@ fn tun_loop(shared: &Shared) {
 fn udp_loop(shared: &Shared) {
     let mut datagram = [0u8; BUF_SIZE];
     let mut work = [0u8; BUF_SIZE];
-    let peer_ip = match shared.udp.peer_addr() {
-        Ok(addr) => addr.ip(),
-        Err(_) => return,
-    };
     while !shared.stop.load(Ordering::Relaxed) {
+        // フォールバックのローテートで変わりうるので毎回読む
+        let peer_ip = shared.current_peer.lock().unwrap().ip();
         let n = match shared.udp.recv(&mut datagram) {
             Ok(n) => n,
             Err(e)
@@ -217,9 +229,11 @@ fn udp_loop(shared: &Shared) {
     }
 }
 
-/// 250ms ごとの再送・keepalive・鍵更新 + 統計の更新
+/// 250ms ごとの再送・keepalive・鍵更新 + 統計の更新 + フォールバック切替
 fn timer_loop(shared: &Shared) {
     let mut work = [0u8; BUF_SIZE];
+    let mut endpoint_index = 0usize;
+    let mut last_rotate = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) {
         std::thread::sleep(TICK);
         let mut tunn = shared.tunn.lock().unwrap();
@@ -232,11 +246,34 @@ fn timer_loop(shared: &Shared) {
             _ => {}
         }
         let (since, tx, rx, _loss, _rtt) = tunn.stats();
-        drop(tunn);
-        let mut stats = shared.stats.lock().unwrap();
-        stats.handshake_age_secs = since.map(|d| d.as_secs());
-        stats.tx_bytes = tx as u64;
-        stats.rx_bytes = rx as u64;
+        {
+            let mut stats = shared.stats.lock().unwrap();
+            stats.handshake_age_secs = since.map(|d| d.as_secs());
+            stats.tx_bytes = tx as u64;
+            stats.rx_bytes = rx as u64;
+        }
+
+        // エンドポイントのフォールバック(M4 E-C): ハンドシェイクが一度も
+        // 確立しない、または途絶(180 秒 = WG の REJECT_AFTER_TIME)したら
+        // 次の候補へ切り替えて再ハンドシェイクする。候補 1 つなら何もしない
+        let dead = match since {
+            None => true,
+            Some(age) => age > Duration::from_secs(180),
+        };
+        if shared.endpoints.len() > 1 && dead && last_rotate.elapsed() >= shared.rotate_after {
+            endpoint_index = (endpoint_index + 1) % shared.endpoints.len();
+            let next = shared.endpoints[endpoint_index];
+            last_rotate = Instant::now();
+            if shared.udp.connect(next).is_ok() {
+                *shared.current_peer.lock().unwrap() = next;
+                tracing::info!("エンドポイントを切り替えます: {next}");
+                if let TunnResult::WriteToNetwork(data) =
+                    tunn.format_handshake_initiation(&mut work, true)
+                {
+                    let _ = shared.udp.send(data);
+                }
+            }
+        }
     }
 }
 
@@ -299,7 +336,8 @@ mod tests {
             private_key: private.to_bytes(),
             peer_public_key: peer_public.to_bytes(),
             preshared_key: None,
-            endpoint,
+            endpoints: vec![endpoint],
+            rotate_after: Duration::from_secs(10),
             allowed_ips: vec![allowed.parse().unwrap()],
             persistent_keepalive: Some(5),
         };
@@ -348,6 +386,62 @@ mod tests {
             false
         });
         assert!(established, "ハンドシェイクが統計に反映されない");
+
+        a.stop();
+        b.stop();
+    }
+
+    /// 先頭エンドポイントが死んでいるとき、次の候補へフォールバックして
+    /// ハンドシェイクが確立する(M4 E-C: LAN → 外部 IP の自動切替に相当)。
+    #[test]
+    fn engine_falls_back_to_second_endpoint() {
+        let a_key = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let b_key = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let a_pub = x25519::PublicKey::from(&a_key);
+        let b_pub = x25519::PublicKey::from(&b_key);
+
+        // 何も応答しないダミー(死んでいる先頭候補)
+        let dead = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+
+        let a_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a_addr = a_udp.local_addr().unwrap();
+        let b_addr = b_udp.local_addr().unwrap();
+
+        // A: [死んでいる候補, B] の順。500ms で切り替え
+        let (a_in, a_rx) = mpsc::channel::<Vec<u8>>();
+        let (a_out_tx, _a_out) = mpsc::channel();
+        let _ = a_in; // TUN 入力は使わない
+        let tun = Arc::new(ChanTun {
+            rx: Mutex::new(a_rx),
+            tx: a_out_tx,
+        });
+        let a = Engine::start(
+            EngineSpec {
+                private_key: a_key.to_bytes(),
+                peer_public_key: b_pub.to_bytes(),
+                preshared_key: None,
+                endpoints: vec![dead_addr, b_addr],
+                rotate_after: Duration::from_millis(500),
+                allowed_ips: vec!["10.99.0.2/32".parse().unwrap()],
+                persistent_keepalive: Some(5),
+            },
+            tun,
+            a_udp,
+        )
+        .unwrap();
+        // B は通常どおり A を向く
+        let (b, _b_in, _b_out) = make_engine(&b_key, a_pub, a_addr, b_udp, "10.99.0.1/32");
+
+        let established = (0..100).any(|_| {
+            if a.stats().handshake_age_secs.is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            false
+        });
+        assert!(established, "フォールバック先でハンドシェイクが確立しない");
 
         a.stop();
         b.stop();
