@@ -739,9 +739,11 @@ export const ja = {
     formTitle: "メンバーを招待",
     nameLabel: "名前（省略すると自動で付きます）",
     namePlaceholder: "alice",
-    externalLabel: "外部の接続先（別ネットワークの人を招く場合）",
-    externalHint: "LAN 内の接続先は自動で入ります。省略しても構いません。",
-    externalPlaceholder: "203.0.113.5:51820",
+    externalLabel: "外部の接続先（LAN 外・スマホのモバイル回線から招く場合）",
+    externalHint:
+      "LAN 内の接続先は自動で入ります。UPnP が有効なら外部 IP も自動で追加されます。" +
+      "UPnP が使えないときは「グローバルIP:待受ポート」を入力し、ルーターでその UDP ポートをこの PC へ転送してください。",
+    externalPlaceholder: "203.0.113.5:51822",
     pskLabel: "事前共有鍵（PSK）も発行する",
     expiryLabel: "招待の有効期限",
     expiryHour: "1 時間",

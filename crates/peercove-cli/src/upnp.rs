@@ -11,7 +11,11 @@ use igd_next::{AddPortError, Gateway, PortMappingProtocol, SearchOptions};
 
 /// 異常終了で残ってもリース切れで消えるよう 24 時間にする(ADR-0004)。
 const LEASE_SECS: u32 = 86_400;
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// SSDP 探索のタイムアウト。応答の遅いルーターや、Windows サービス
+/// (Session 0)からのマルチキャストで取りこぼす例があったため長めにする。
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// 探索の試行回数(1 回目で取りこぼしても粘る)。
+const SEARCH_ATTEMPTS: usize = 3;
 const MAPPING_DESCRIPTION: &str = "PeerCove";
 
 /// 開放済みポートのハンドル。`release` で対で削除する。
@@ -55,16 +59,33 @@ pub fn setup(listen_port: u16) -> anyhow::Result<UpnpReport> {
         .map(|ip| SocketAddr::new(ip, 0))
         .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
     tracing::debug!("SSDP 探索を {bind_addr} から送信します");
-    let options = SearchOptions {
-        bind_addr,
-        timeout: Some(SEARCH_TIMEOUT),
-        ..Default::default()
-    };
-    let gateway = igd_next::search_gateway(options).map_err(|e| {
+    // 何回か試す(1 回目で応答を取りこぼしても粘る)。最後のエラーを保持する
+    let mut last_error = None;
+    let mut found = None;
+    for attempt in 1..=SEARCH_ATTEMPTS {
+        let options = SearchOptions {
+            bind_addr,
+            timeout: Some(SEARCH_TIMEOUT),
+            ..Default::default()
+        };
+        match igd_next::search_gateway(options) {
+            Ok(gateway) => {
+                found = Some(gateway);
+                break;
+            }
+            Err(e) => {
+                tracing::debug!("UPnP 探索 {attempt}/{SEARCH_ATTEMPTS} 回目が失敗: {e}");
+                last_error = Some(e);
+            }
+        }
+    }
+    let gateway = found.ok_or_else(|| {
+        let e = last_error.expect("失敗時は必ずエラーがある");
         anyhow::anyhow!(
             "UPnP 対応ルーターが見つかりませんでした({e})。\
              次を確認してください: (1) ルーターの設定画面で UPnP が有効か \
-             (2) 無効な場合は手動でポートフォワード(UDP {listen_port} → この PC)を設定 \
+             (2) 無効な場合は手動でポートフォワード(UDP {listen_port} → この PC)を設定し、\
+             招待発行時に「外部の接続先」へ グローバルIP:{listen_port} を入力 \
              (3) それでも外部から届かない場合は回線が CGNAT の可能性(ISP に \
              グローバル IP の提供を確認)"
         )
