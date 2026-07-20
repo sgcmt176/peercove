@@ -353,6 +353,7 @@ mod tests {
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             app_version: None,
+            platform: None,
             capabilities: vec![],
             invite_status: None,
             invite_expires_at: None,

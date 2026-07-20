@@ -578,6 +578,7 @@ pub async fn supervise(
                                     if let Some(info) = connected.get(&entry.ip) {
                                         entry.app_version = info.app_version.clone();
                                         entry.capabilities = info.capabilities.clone();
+                                        entry.platform = info.platform.clone();
                                     }
                                 }
                                 crate::health::schedule(&health, config, &members);
@@ -832,6 +833,7 @@ fn build_ledger(
         ip: config.interface.address.addr(),
         public_key: *host_public_key,
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        platform: Some(std::env::consts::OS.to_string()),
         capabilities: peercove_core::proto::current_capabilities(),
         invite_status: None,
         invite_expires_at: None,
@@ -877,6 +879,7 @@ fn build_ledger(
                 .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
             public_key: peer.public_key,
             app_version: None,
+            platform: None,
             capabilities: vec![],
             invite_status: Some(invite_status.to_string()),
             invite_expires_at: peer.invite_expires_at,
@@ -1417,7 +1420,7 @@ mod tests {
         let connections: control::Connections = Default::default();
         // alice の制御接続を模擬(誤って削除通知が送られたら検出できるように)
         let (tx, mut member_inbox) = tokio::sync::mpsc::unbounded_channel();
-        let (connection, _close_rx) = control::ConnectionInfo::new(tx, None, vec![]);
+        let (connection, _close_rx) = control::ConnectionInfo::new(tx, None, vec![], None);
         connections
             .lock()
             .unwrap()

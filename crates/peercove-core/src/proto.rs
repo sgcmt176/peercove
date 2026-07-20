@@ -56,6 +56,11 @@ pub enum ControlMessage {
         /// 招待 v3 の join 先端末で生成した ID。旧招待は None。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
+        /// 端末の OS("windows" / "linux" / "android" 等)。ホスト UI の
+        /// 端末バッジ表示に使う(E-E 11)。旧メンバーは送らないので None。
+        /// 追加フィールドなので [`PROTO_VERSION`] は上げない。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform: Option<String>,
     },
     /// host → member: 台帳スナップショット(接続時と変更時に送る)。
     ///
@@ -136,6 +141,10 @@ pub struct LedgerEntry {
     /// この端末が名乗った製品バージョン。ホスト自身はローカル版を載せる。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    /// この端末の OS("windows" / "linux" / "android")。Hello 由来
+    /// (E-E 11)。旧メンバー・オフライン中は None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
     /// この端末が Hello で広告した追加機能。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
@@ -191,6 +200,7 @@ mod tests {
             ip: "100.100.42.2".parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             app_version: None,
+            platform: None,
             capabilities: vec![],
             invite_status: None,
             invite_expires_at: None,
@@ -226,6 +236,7 @@ mod tests {
                 app_version: Some("0.1.0".to_string()),
                 capabilities: vec!["chat".to_string()],
                 device_id: None,
+                platform: Some("windows".to_string()),
             },
             ControlMessage::Ledger {
                 members: vec![entry()],
@@ -292,6 +303,7 @@ mod tests {
             app_version: None,
             capabilities: vec![],
             device_id: None,
+            platform: None,
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"hello","version":1}"#);
@@ -306,6 +318,7 @@ mod tests {
                 app_version: None,
                 capabilities: vec![],
                 device_id: None,
+                platform: None,
             }
         );
 

@@ -618,6 +618,22 @@ function TransferRow({
   );
 }
 
+/** OS 種別の表示名（E-E 11 の端末バッジ）。未知の値はそのまま出す。 */
+function platformLabel(platform: string): string {
+  switch (platform) {
+    case "windows":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    case "android":
+      return "Android";
+    case "macos":
+      return "macOS";
+    default:
+      return platform;
+  }
+}
+
 function MemberRow({
   config,
   member,
@@ -710,6 +726,14 @@ function MemberRow({
             >
               {member.appVersion ? `v${member.appVersion}` : "v?"}
             </span>
+            {member.platform && (
+              <span
+                className="tag member__platform"
+                title={t.update.memberPlatformTitle}
+              >
+                {platformLabel(member.platform)}
+              </span>
+            )}
             {member.route && (
               <span
                 className={`tag tag--route-${member.route}`}

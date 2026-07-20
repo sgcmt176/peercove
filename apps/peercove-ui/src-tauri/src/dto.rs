@@ -94,6 +94,9 @@ pub struct Member {
     pub ip: String,
     pub public_key: String,
     pub app_version: Option<String>,
+    /// この端末の OS("windows" / "linux" / "android"。E-E 11)。
+    /// 旧バージョンのメンバー・オフライン中は null。
+    pub platform: Option<String>,
     pub capabilities: Vec<String>,
     pub invite_status: Option<String>,
     pub invite_expires_at: Option<u64>,
@@ -128,6 +131,7 @@ impl Member {
             ip: entry.ip.to_string(),
             public_key: entry.public_key.to_base64(),
             app_version: entry.app_version.clone(),
+            platform: entry.platform.clone(),
             capabilities: entry.capabilities.clone(),
             invite_status: entry.invite_status.clone(),
             invite_expires_at: entry.invite_expires_at,
@@ -853,6 +857,7 @@ mod tests {
                 ip: "10.100.42.2".parse().unwrap(),
                 public_key: PrivateKey::generate().public_key(),
                 app_version: Some("0.1.0".to_string()),
+                platform: Some("android".to_string()),
                 capabilities: peercove_core::proto::current_capabilities(),
                 invite_status: Some("joined".to_string()),
                 invite_expires_at: Some(1_700_086_400),
@@ -959,6 +964,7 @@ mod tests {
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             app_version: None,
+            platform: None,
             capabilities: vec![],
             invite_status: None,
             invite_expires_at: None,

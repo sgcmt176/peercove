@@ -566,6 +566,9 @@ pub struct MemberInfo {
     pub is_self: bool,
     pub blocked: bool,
     pub app_version: Option<String>,
+    /// この端末の OS("windows" / "linux" / "android"。E-E 11)。
+    /// 旧バージョン・オフライン中は None。
+    pub platform: Option<String>,
 }
 
 /// チャット 1 通(UI 表示用)。
@@ -672,6 +675,7 @@ pub fn members(slug: String) -> Vec<MemberInfo> {
                 is_self: m.ip == own_ip,
                 blocked: m.blocked,
                 app_version: m.app_version.clone(),
+                platform: m.platform.clone(),
             }
         })
         .collect()

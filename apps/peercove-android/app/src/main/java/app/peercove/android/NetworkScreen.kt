@@ -1082,6 +1082,15 @@ private fun CopySheet(
     }
 }
 
+/** OS 種別の表示名(E-E 11 の端末バッジ)。未知の値はそのまま出す。 */
+private fun platformLabel(platform: String): String = when (platform) {
+    "windows" -> "Windows"
+    "linux" -> "Linux"
+    "android" -> "Android"
+    "macos" -> "macOS"
+    else -> platform
+}
+
 @Composable
 private fun MemberList(memberList: List<MemberInfo>, onCopy: (String) -> Unit) {
     var sheetFor by remember { mutableStateOf<MemberInfo?>(null) }
@@ -1130,6 +1139,8 @@ private fun MemberList(memberList: List<MemberInfo>, onCopy: (String) -> Unit) {
                             Badge(stringResource(R.string.badge_blocked))
                         }
                         member.appVersion?.let { Badge("v$it") }
+                        // 端末バッジ(E-E 11): 相手の OS
+                        member.platform?.let { Badge(platformLabel(it)) }
                     }
                     Text(
                         member.ip + if (member.fqdn.isNotEmpty()) " ・${member.fqdn}" else "",

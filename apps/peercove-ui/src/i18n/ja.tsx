@@ -238,6 +238,7 @@ export const ja = {
     sidebar: (version: string) => `v${version} · 更新あり`,
     memberVersion: (version: string) => `PeerCove v${version}`,
     memberVersionUnknown: "PeerCove バージョン不明",
+    memberPlatformTitle: "この端末の OS（接続時に申告）",
   },
 
   daemonOutdated: {

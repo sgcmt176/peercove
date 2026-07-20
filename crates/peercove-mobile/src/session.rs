@@ -477,6 +477,7 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
             app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             capabilities: MOBILE_CAPABILITIES.iter().map(|c| c.to_string()).collect(),
             device_id: shared.cfg.device_id.clone(),
+            platform: Some("android".to_string()),
         },
     )?;
 
@@ -1758,6 +1759,7 @@ mod tests {
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             app_version: None,
+            platform: None,
             capabilities: vec![],
             invite_status: None,
             invite_expires_at: None,

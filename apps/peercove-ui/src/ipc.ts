@@ -12,6 +12,8 @@ export interface Member {
   publicKey: string;
   /** 相手が Hello で広告した製品バージョン。旧版は null。 */
   appVersion: string | null;
+  /** 相手の OS（"windows" / "linux" / "android"）。旧版・オフライン中は null。 */
+  platform: string | null;
   /** 相手が広告した追加機能 ID。旧版は空。 */
   capabilities: string[];
   inviteStatus:

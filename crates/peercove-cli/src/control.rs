@@ -42,6 +42,8 @@ pub struct ConnectionInfo {
     close: mpsc::UnboundedSender<()>,
     pub app_version: Option<String>,
     pub capabilities: Vec<String>,
+    /// Hello で名乗った OS(E-E 11。台帳の端末バッジに使う)
+    pub platform: Option<String>,
 }
 
 impl ConnectionInfo {
@@ -49,6 +51,7 @@ impl ConnectionInfo {
         outbox: mpsc::UnboundedSender<ControlMessage>,
         app_version: Option<String>,
         capabilities: Vec<String>,
+        platform: Option<String>,
     ) -> (Self, mpsc::UnboundedReceiver<()>) {
         let (close, close_rx) = mpsc::unbounded_channel();
         (
@@ -58,6 +61,7 @@ impl ConnectionInfo {
                 close,
                 app_version,
                 capabilities,
+                platform,
             },
             close_rx,
         )
@@ -746,7 +750,7 @@ async fn handle_member(
     if hello.is_none() {
         anyhow::bail!("Hello の前に切断されました");
     }
-    let (name, app_version, capabilities, device_id) =
+    let (name, app_version, capabilities, device_id, platform) =
         match serde_json::from_str::<ControlMessage>(&line) {
             Ok(ControlMessage::Hello {
                 version,
@@ -754,6 +758,7 @@ async fn handle_member(
                 app_version,
                 capabilities,
                 device_id,
+                platform,
             }) => {
                 if version != PROTO_VERSION {
                     tracing::warn!(
@@ -761,7 +766,7 @@ async fn handle_member(
                     (こちらは {PROTO_VERSION})"
                     );
                 }
-                (name, app_version, capabilities, device_id)
+                (name, app_version, capabilities, device_id, platform)
             }
             Ok(other) => anyhow::bail!("Hello 以外のメッセージが届きました: {other:?}"),
             Err(e) => anyhow::bail!("Hello の解析に失敗しました: {e}"),
@@ -789,7 +794,8 @@ async fn handle_member(
 
     // 送信キューを登録(台帳変更・削除通知・Pong の配送口)
     let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
-    let (connection, mut close_rx) = ConnectionInfo::new(tx.clone(), app_version, capabilities);
+    let (connection, mut close_rx) =
+        ConnectionInfo::new(tx.clone(), app_version, capabilities, platform);
     let connection_id = connection.connection_id;
     register_connection(connections, member_ip, connection);
     rtt.lock().unwrap().connected(member_ip);
@@ -1042,6 +1048,7 @@ async fn member_session(
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         capabilities: peercove_core::proto::current_capabilities(),
         device_id: device_id.clone(),
+        platform: Some(std::env::consts::OS.to_string()),
     })
     .expect("受信側はこの後 spawn する");
     // supervisor が鍵ローテーション依頼を差し込めるようにする(ADR-0020)
@@ -1197,6 +1204,7 @@ mod tests {
             ip: ip.parse().unwrap(),
             public_key: PrivateKey::generate().public_key(),
             app_version: None,
+            platform: None,
             capabilities: vec![],
             invite_status: None,
             invite_expires_at: None,
@@ -1231,12 +1239,12 @@ mod tests {
         let connections: Connections = Default::default();
         let member_ip = "10.100.42.2".parse().unwrap();
         let (first_outbox, _first_inbox) = mpsc::unbounded_channel();
-        let (first, mut first_close) = ConnectionInfo::new(first_outbox, None, vec![]);
+        let (first, mut first_close) = ConnectionInfo::new(first_outbox, None, vec![], None);
         let first_id = first.connection_id;
         register_connection(&connections, member_ip, first);
 
         let (second_outbox, _second_inbox) = mpsc::unbounded_channel();
-        let (second, _second_close) = ConnectionInfo::new(second_outbox, None, vec![]);
+        let (second, _second_close) = ConnectionInfo::new(second_outbox, None, vec![], None);
         let second_id = second.connection_id;
         register_connection(&connections, member_ip, second);
 
