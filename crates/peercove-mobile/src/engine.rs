@@ -77,6 +77,10 @@ struct Shared {
     /// 最後に rebind(回線切替)した時刻。それ以降にハンドシェイクが
     /// 成立するまで、途絶判定(180 秒)を待たずにローテーションを回す
     rebound_at: Mutex<Option<Instant>>,
+    /// 最後にローテーション(または rebind)した時刻。rebind 直後は
+    /// 強制再ハンドシェイクに rotate_after ぶんの猶予を与える(与えないと
+    /// 一時的な「未確立」を見て即座に別候補へ切り替え、自分で接続を壊す)
+    last_rotate: Mutex<Instant>,
     stats: Mutex<EngineStats>,
     stop: AtomicBool,
 }
@@ -120,6 +124,7 @@ impl Engine {
             current_peer: Mutex::new(first),
             rotate_after: spec.rotate_after,
             rebound_at: Mutex::new(None),
+            last_rotate: Mutex::new(Instant::now()),
             stats: Mutex::new(EngineStats::default()),
             stop: AtomicBool::new(false),
         });
@@ -161,6 +166,8 @@ impl Engine {
         let udp = Arc::new(udp);
         *self.shared.udp.write().unwrap() = Arc::clone(&udp);
         *self.shared.rebound_at.lock().unwrap() = Some(Instant::now());
+        // 強制再ハンドシェイクへ rotate_after ぶんの猶予を与える
+        *self.shared.last_rotate.lock().unwrap() = Instant::now();
         let mut buf = [0u8; BUF_SIZE];
         let mut tunn = self.shared.tunn.lock().unwrap();
         if let TunnResult::WriteToNetwork(data) = tunn.format_handshake_initiation(&mut buf, true) {
@@ -275,7 +282,6 @@ fn udp_loop(shared: &Shared) {
 fn timer_loop(shared: &Shared) {
     let mut work = [0u8; BUF_SIZE];
     let mut endpoint_index = 0usize;
-    let mut last_rotate = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) {
         std::thread::sleep(TICK);
         let mut tunn = shared.tunn.lock().unwrap();
@@ -315,8 +321,9 @@ fn timer_loop(shared: &Shared) {
                 }
             }
         }
-        if dead && last_rotate.elapsed() >= shared.rotate_after {
-            last_rotate = Instant::now();
+        // rebind 直後の猶予も含めて Shared の last_rotate で管理する
+        if dead && shared.last_rotate.lock().unwrap().elapsed() >= shared.rotate_after {
+            *shared.last_rotate.lock().unwrap() = Instant::now();
             if shared.endpoints.len() > 1 {
                 endpoint_index = (endpoint_index + 1) % shared.endpoints.len();
             }

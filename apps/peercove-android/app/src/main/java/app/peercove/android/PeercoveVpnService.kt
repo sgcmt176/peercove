@@ -182,25 +182,25 @@ class PeercoveVpnService : VpnService() {
             val base = filesDir.absolutePath
             var lastHandshakeAt = System.currentTimeMillis()
             var rotateAttempted = false
-            var lastRxBytes = -1L
-            var lastRxChangeAt = System.currentTimeMillis()
+            var deadSince = System.currentTimeMillis()
             var lastPokeAt = 0L
             while (gen == watchGeneration && currentSlug == slug) {
                 Thread.sleep(5000)
                 if (gen != watchGeneration || currentSlug != slug) break
                 val status = tunnelStatus(slug) ?: continue
                 val now = System.currentTimeMillis()
-                // 保険の自己回復: 受信が 60 秒止まっていたら(健全なら keepalive で
-                // 30 秒程度ごとに必ず受信がある)、NetworkCallback に頼らず
-                // 30 秒間隔で UDP を張り直す。古い回線に固定されたソケットは
-                // 張り直さない限り復帰できない(実機で観測)
-                val rx = status.rxBytes.toLong()
-                if (rx != lastRxBytes) {
-                    lastRxBytes = rx
-                    lastRxChangeAt = now
-                } else if (now - lastRxChangeAt > 60_000 && now - lastPokeAt > 30_000) {
+                // 保険の自己回復: NetworkCallback が来ない機種・状況向け。
+                // 健全なら keepalive によりハンドシェイクは 2〜3 分ごとに
+                // 更新されるので、「未確立 or 150 秒超」が 30 秒続いたら
+                // 30 秒間隔で UDP を張り直す。
+                // ※受信バイト数は keepalive(ペイロード 0)で増えないため
+                //   判定に使わない(誤検知して健全な接続を揺らした実機報告)
+                val age = status.handshakeAgeSecs?.toLong()
+                if (age != null && age <= 150) {
+                    deadSince = now
+                } else if (now - deadSince > 30_000 && now - lastPokeAt > 30_000) {
                     lastPokeAt = now
-                    Log.i(TAG, "受信が止まっているため UDP を張り直します")
+                    Log.i(TAG, "疎通が途絶えているため UDP を張り直します")
                     pokeTunnel(slug)
                 }
                 if (status.handshakeAgeSecs != null) {
@@ -257,16 +257,25 @@ class PeercoveVpnService : VpnService() {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                Log.i(TAG, "実ネットワークが利用可能になりました($network)→ 再バインド")
+            // Wi-Fi とモバイルが同時に居る端末ではイベントが連続するため間引く
+            @Volatile private var lastPokeAt = 0L
+
+            private fun poke(reason: String) {
+                val now = System.currentTimeMillis()
+                if (now - lastPokeAt < 3_000) return
+                lastPokeAt = now
+                Log.i(TAG, "$reason → 再バインド")
                 // メインスレッドを塞がない(pokeTunnel はソケット操作を含む)
                 Thread { pokeTunnel(slug) }.start()
             }
 
+            override fun onAvailable(network: Network) {
+                poke("実ネットワークが利用可能になりました($network)")
+            }
+
             override fun onLost(network: Network) {
                 // 使っていた回線が消えた → 残っている回線で張り直す
-                Log.i(TAG, "実ネットワークが失われました($network)→ 再バインド")
-                Thread { pokeTunnel(slug) }.start()
+                poke("実ネットワークが失われました($network)")
             }
         }
         try {
