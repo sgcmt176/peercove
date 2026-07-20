@@ -51,4 +51,18 @@ object Prefs {
             val convId = key.removePrefix("read/$slug/")
             if (convId != key && value is Long) convId to value else null
         }.toMap()
+
+    /** トーク一覧のピン留め(常に上へ表示する会話)。 */
+    fun setPinned(context: Context, slug: String, convId: String, pinned: Boolean) {
+        val key = "pin/$slug/$convId"
+        prefs(context).edit().apply {
+            if (pinned) putBoolean(key, true) else remove(key)
+        }.apply()
+    }
+
+    fun allPins(context: Context, slug: String): Set<String> =
+        prefs(context).all.mapNotNull { (key, value) ->
+            val convId = key.removePrefix("pin/$slug/")
+            if (convId != key && value == true) convId else null
+        }.toSet()
 }

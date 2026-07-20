@@ -105,6 +105,37 @@ export function clearChat(config: string): void {
   stores.delete(config);
 }
 
+// ---- ピン留め(localStorage。このマシンだけの表示設定) ----
+
+function pinKey(config: string): string {
+  return `peercove-chat-pins:${config}`;
+}
+
+/** ピン留め中の会話キーの集合。 */
+export function loadPins(config: string): Set<ConversationKey> {
+  try {
+    const raw = localStorage.getItem(pinKey(config));
+    return new Set(raw ? (JSON.parse(raw) as ConversationKey[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** ピン留めの付け外し。 */
+export function togglePin(config: string, conversation: ConversationKey): void {
+  const pins = loadPins(config);
+  if (pins.has(conversation)) {
+    pins.delete(conversation);
+  } else {
+    pins.add(conversation);
+  }
+  try {
+    localStorage.setItem(pinKey(config), JSON.stringify([...pins]));
+  } catch {
+    // 保存できなくても並びが保たれないだけ
+  }
+}
+
 // ---- 未読管理(localStorage) ----
 
 function readKey(config: string): string {

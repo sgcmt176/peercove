@@ -484,6 +484,8 @@ export const ja = {
     allNote: "ネットワーク全員に届きます（送信時にオンラインのメンバーのみ）",
     empty: "まだメッセージはありません。",
     noMessages: "メッセージなし",
+    pin: "ピン留め（常に上に表示）",
+    unpin: "ピン留めを解除",
     previewSelf: "自分: ",
     placeholder: "メッセージを入力（Enter で送信、Shift+Enter で改行）",
     offline: "オフラインのメンバーには送れません",

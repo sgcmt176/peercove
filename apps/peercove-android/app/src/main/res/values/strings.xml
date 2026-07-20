@@ -60,6 +60,8 @@
     <string name="talk_all_avatar">全</string>
     <string name="talk_no_message">メッセージはまだありません</string>
     <string name="talk_new_group">新しいグループを作成</string>
+    <string name="talk_pinned">ピン留めしました(長押しで解除)</string>
+    <string name="talk_unpinned">ピン留めを解除しました</string>
     <string name="group_dialog_title">新しいグループ</string>
     <string name="group_name_label">グループ名</string>
     <string name="group_members_label">メンバー(オンラインの相手だけ選べます)</string>

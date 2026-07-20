@@ -24,8 +24,10 @@ import {
   conversationOf,
   groupConversation,
   groupIdOf,
+  loadPins,
   markRead,
   setActiveConversation,
+  togglePin,
   unreadCounts,
 } from "../chat";
 import { Avatar } from "./Avatar";
@@ -94,8 +96,11 @@ export function ChatPanel({
   const memberByIp = new Map(tunnel.members.map((m) => [m.ip, m]));
   const groupById = new Map(tunnel.groups.map((g) => [g.id, g]));
 
-  // 会話リスト: 全体 → 参加中のグループ → メンバー(台帳順)
-  // → 履歴にだけ残っている会話(退出済みグループ・居なくなった相手)
+  const pins = loadPins(tunnel.config);
+
+  // 会話リストの候補: 全体 → 参加中のグループ → メンバー(台帳順)
+  // → 履歴にだけ残っている会話(退出済みグループ・居なくなった相手)。
+  // 表示順はこの後「ピン留め → 直近のやり取り順」に並べ替える
   const conversations = useMemo(() => {
     const items: ConversationItem[] = [
       {
@@ -150,6 +155,29 @@ export function ChatPanel({
     // groupById は tunnel.groups から導出されるので依存はそちらで足りる
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tunnel.members, tunnel.groups, messages, selfIp]);
+
+  // 表示順: ピン留めが常に上、続いて直近のやり取り(最新メッセージ)順。
+  // メッセージが無い会話は元の並び(全体 → グループ → メンバー)のまま後ろへ
+  const orderedConversations = useMemo(() => {
+    const lastSeq = new Map<ConversationKey, number>();
+    for (const message of messages) {
+      lastSeq.set(conversationOf(message, selfIp), message.seq);
+    }
+    return conversations
+      .map((item, index) => ({ item, index }))
+      .sort((a, b) => {
+        const pinDiff =
+          Number(pins.has(b.item.key)) - Number(pins.has(a.item.key));
+        if (pinDiff !== 0) return pinDiff;
+        const seqDiff =
+          (lastSeq.get(b.item.key) ?? 0) - (lastSeq.get(a.item.key) ?? 0);
+        if (seqDiff !== 0) return seqDiff;
+        return a.index - b.index;
+      })
+      .map(({ item }) => item);
+    // pins は localStorage 由来(togglePin 後は rerender で再計算される)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversations, messages, selfIp, pins]);
 
   const current = messages.filter(
     (message) => conversationOf(message, selfIp) === conversation,
@@ -318,9 +346,10 @@ export function ChatPanel({
         >
           ＋ {t.chat.groupCreate}
         </button>
-        {conversations.map((item) => {
+        {orderedConversations.map((item) => {
           const count = unread.get(item.key) ?? 0;
           const last = lastMessageOf(messages, selfIp, item.key);
+          const pinned = pins.has(item.key);
           return (
             <button
               key={item.key}
@@ -353,12 +382,39 @@ export function ChatPanel({
                 </span>
               )}
               <span className="chat__conv-text">
-                <span className="chat__conv-name ellipsis">{item.name}</span>
+                <span className="chat__conv-name ellipsis">
+                  {pinned && (
+                    <span className="chat__pin-mark" aria-hidden>
+                      📌
+                    </span>
+                  )}
+                  {item.name}
+                </span>
                 <span className="chat__conv-preview ellipsis">
                   {last ? previewOf(last, selfIp) : t.chat.noMessages}
                 </span>
               </span>
               {count > 0 && <span className="chat__badge">{count}</span>}
+              <span
+                role="button"
+                tabIndex={0}
+                className={pinned ? "chat__pin chat__pin--on" : "chat__pin"}
+                title={pinned ? t.chat.unpin : t.chat.pin}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  togglePin(tunnel.config, item.key);
+                  rerender();
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.stopPropagation();
+                    togglePin(tunnel.config, item.key);
+                    rerender();
+                  }
+                }}
+              >
+                📌
+              </span>
             </button>
           );
         })}

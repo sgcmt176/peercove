@@ -1269,6 +1269,32 @@ select {
   color: var(--muted);
 }
 
+/* ピン留めトグル: 行のホバー時だけ薄く出す。ピン留め中は常時表示 */
+.chat__pin {
+  flex-shrink: 0;
+  padding: 2px 4px;
+  border-radius: 6px;
+  font-size: 12px;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.chat__conv:hover .chat__pin,
+.chat__pin:focus-visible {
+  opacity: 0.45;
+}
+
+.chat__pin--on,
+.chat__conv:hover .chat__pin--on {
+  opacity: 1;
+}
+
+.chat__pin-mark {
+  margin-right: 2px;
+  font-size: 11px;
+}
+
 .chat__badge {
   flex-shrink: 0;
   min-width: 18px;

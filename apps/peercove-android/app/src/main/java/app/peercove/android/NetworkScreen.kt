@@ -3,8 +3,10 @@ package app.peercove.android
 import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -105,10 +107,12 @@ fun NetworkScreen(slug: String, networkName: String, onBack: () -> Unit, onNotic
     val clipboard = LocalClipboardManager.current
     val copiedFmt = stringResource(R.string.notice_copied)
 
-    // 既読位置(未読バッジ用)。Prefs が正本、map は表示のための鏡
+    // 既読位置(未読バッジ用)とピン留め。Prefs が正本、map は表示のための鏡
     val readMarks = remember { mutableStateMapOf<String, Long>() }
+    val pinMarks = remember { mutableStateMapOf<String, Boolean>() }
     LaunchedEffect(slug) {
         Prefs.allReadSeqs(context, slug).forEach { (convId, seq) -> readMarks[convId] = seq }
+        Prefs.allPins(context, slug).forEach { convId -> pinMarks[convId] = true }
     }
     // 会話を開いている間はその会話の最新までを既読にする
     LaunchedEffect(conv, messages.size) {
@@ -123,6 +127,15 @@ fun NetworkScreen(slug: String, networkName: String, onBack: () -> Unit, onNotic
         return messages.count {
             it.belongsTo(key) && !it.outgoing && !it.system && it.seq.toLong() > read
         }
+    }
+    val pinnedNotice = stringResource(R.string.talk_pinned)
+    val unpinnedNotice = stringResource(R.string.talk_unpinned)
+    fun togglePin(key: ConvKey) {
+        val id = key.storageId()
+        val next = !(pinMarks[id] ?: false)
+        pinMarks[id] = next
+        Prefs.setPinned(context, slug, id, next)
+        onNotice(if (next) pinnedNotice else unpinnedNotice)
     }
 
     // 会話を開いているときのシステム戻る操作はトーク一覧へ(アプリを閉じない)
@@ -213,6 +226,8 @@ fun NetworkScreen(slug: String, networkName: String, onBack: () -> Unit, onNotic
                 groupList = groupList,
                 messages = messages,
                 unreadOf = ::unreadOf,
+                pinnedOf = { pinMarks[it.storageId()] ?: false },
+                onTogglePin = ::togglePin,
                 onNewGroup = { showGroupDialog = true },
                 onOpen = { conv = it },
             )
@@ -333,21 +348,37 @@ private fun GroupCreateDialog(
     )
 }
 
-/** LINE 風のトーク一覧: 全体 / グループ / メンバー(1:1)+ 未読バッジ。 */
+/** LINE 風のトーク一覧: ピン留め → 直近のやり取り順。未読バッジ付き。
+ *  行の長押しでピン留めの付け外し。 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TalkList(
     memberList: List<MemberInfo>,
     groupList: List<GroupSummary>,
     messages: List<ChatMessage>,
     unreadOf: (ConvKey) -> Int,
+    pinnedOf: (ConvKey) -> Boolean,
+    onTogglePin: (ConvKey) -> Unit,
     onNewGroup: () -> Unit,
     onOpen: (ConvKey) -> Unit,
 ) {
-    val conversations = buildList {
+    // 候補: 全体 → グループ → メンバー(この順は同順位時のフォールバック)
+    val base = buildList {
         add(ConvKey.Network)
         groupList.forEach { add(ConvKey.Group(it.id, it.name)) }
         memberList.filter { !it.isSelf }.forEach { add(ConvKey.Direct(it.ip, it.name)) }
     }
+    // 表示順: ピン留めが常に上、続いて最新メッセージの新しい順。
+    // メッセージが無い会話は元の並びのまま後ろへ
+    val lastSeq = HashMap<String, Long>()
+    messages.forEach { m ->
+        base.forEach { key -> if (m.belongsTo(key)) lastSeq[key.storageId()] = m.seq.toLong() }
+    }
+    val conversations = base.withIndex().sortedWith(
+        compareByDescending<IndexedValue<ConvKey>> { pinnedOf(it.value) }
+            .thenByDescending { lastSeq[it.value.storageId()] ?: 0L }
+            .thenBy { it.index },
+    ).map { it.value }
     LazyColumn {
         items(conversations, key = { it.storageId() }) { key ->
             val last = messages.lastOrNull { it.belongsTo(key) }
@@ -358,7 +389,10 @@ private fun TalkList(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onOpen(key) }
+                    .combinedClickable(
+                        onClick = { onOpen(key) },
+                        onLongClick = { onTogglePin(key) },
+                    )
                     .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -387,6 +421,10 @@ private fun TalkList(
                 Spacer(modifier = Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (pinnedOf(key)) {
+                            Text("📌", style = MaterialTheme.typography.labelSmall)
+                            Spacer(modifier = Modifier.width(4.dp))
+                        }
                         Text(key.title(), style = MaterialTheme.typography.titleSmall)
                         if (key is ConvKey.Direct && online) {
                             Spacer(modifier = Modifier.width(6.dp))
