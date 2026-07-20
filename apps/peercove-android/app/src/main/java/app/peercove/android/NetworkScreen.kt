@@ -19,10 +19,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
@@ -256,14 +258,69 @@ private fun TalkList(
     }
 }
 
+/** コピー候補(ラベルと値)。行タップ時のボトムシートに並べる。 */
+private data class CopyItem(val label: String, val value: String)
+
+/** コピー候補を選ぶボトムシート。候補が 1 つでも値の確認を兼ねて表示する。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CopySheet(
+    title: String,
+    items: List<CopyItem>,
+    onCopy: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Text(
+            title,
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+        )
+        items.forEach { item ->
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        onCopy(item.value)
+                        onDismiss()
+                    }
+                    .padding(horizontal = 20.dp, vertical = 10.dp),
+            ) {
+                Text(
+                    item.label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(item.value, style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+        Spacer(modifier = Modifier.size(24.dp))
+    }
+}
+
 @Composable
 private fun MemberList(memberList: List<MemberInfo>, onCopy: (String) -> Unit) {
+    var sheetFor by remember { mutableStateOf<MemberInfo?>(null) }
+    sheetFor?.let { member ->
+        CopySheet(
+            title = member.name,
+            items = listOf(
+                CopyItem("IP アドレス", member.ip),
+                CopyItem("ドメイン", member.fqdn),
+            ),
+            onCopy = onCopy,
+            onDismiss = { sheetFor = null },
+        )
+    }
     LazyColumn {
         items(memberList, key = { it.ip }) { member ->
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onCopy(member.ip) } // タップで仮想 IP をコピー
+                    .clickable {
+                        // ドメインが無いメンバーは IP 即コピー、あれば選択シート
+                        if (member.fqdn.isEmpty()) onCopy(member.ip) else sheetFor = member
+                    }
                     .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -334,26 +391,48 @@ private fun DnsList(
     dnsList: List<DnsEntry>,
     onCopy: (String) -> Unit,
 ) {
+    // (シートのタイトル, コピー候補)。null なら非表示
+    var sheetFor by remember { mutableStateOf<Pair<String, List<CopyItem>>?>(null) }
+    sheetFor?.let { (title, items) ->
+        CopySheet(
+            title = title,
+            items = items,
+            onCopy = onCopy,
+            onDismiss = { sheetFor = null },
+        )
+    }
+    fun open(fqdn: String, value: String, url: String?) {
+        sheetFor = fqdn to buildList {
+            add(CopyItem("ドメイン", fqdn))
+            add(CopyItem("IP アドレス / 値", value))
+            url?.let { add(CopyItem("URL", it)) }
+        }
+    }
     LazyColumn {
         items(
             memberList.filter { it.fqdn.isNotEmpty() },
             key = { "m-" + it.ip },
         ) { member ->
-            DnsRow(member.fqdn, member.ip, null, onCopy)
+            DnsRow(member.fqdn, member.ip, null, onTap = ::open)
         }
         items(dnsList, key = { "r-" + it.fqdn + it.value }) { entry ->
-            DnsRow(entry.fqdn, entry.value, entry.url, onCopy)
+            DnsRow(entry.fqdn, entry.value, entry.url, onTap = ::open)
         }
     }
 }
 
 @Composable
-private fun DnsRow(fqdn: String, value: String, url: String?, onCopy: (String) -> Unit) {
+private fun DnsRow(
+    fqdn: String,
+    value: String,
+    url: String?,
+    onTap: (String, String, String?) -> Unit,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            // タップで接続 URL(あれば)か IP をコピー
-            .clickable { onCopy(url ?: value) }
+            // タップでコピー候補(ドメイン / IP / URL)の選択シートを開く
+            .clickable { onTap(fqdn, value, url) }
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Text(fqdn, style = MaterialTheme.typography.titleSmall)
