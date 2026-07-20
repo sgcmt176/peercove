@@ -6,6 +6,12 @@
     <!-- 招待 QR コードの読み取り(zxing)。カメラ無し端末でも動くようにする -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- VPN の常駐(Foreground Service + 継続通知)と回線切替の検知(E-D)。
+         systemExempted は VpnService を持つアプリに許可されている型 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:label="@string/app_name"
@@ -46,6 +52,7 @@
         <service
             android:name=".PeercoveVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="systemExempted"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.net.VpnService" />

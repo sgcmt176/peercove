@@ -206,8 +206,19 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
             onNotice(vpnDenied)
         }
     }
+    // 常駐通知(E-D)のための通知権限(Android 13+)。拒否されても接続はできる
+    // (通知が出ないだけ)
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
 
     fun connect(slug: String) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
         val prepare = VpnService.prepare(context)
         if (prepare == null) {
             startVpnService(context, slug)

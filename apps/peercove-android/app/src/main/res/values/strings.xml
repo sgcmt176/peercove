@@ -104,6 +104,14 @@
     <string name="settings_dns_name_label">DNS 名(例: my-phone)</string>
     <string name="settings_dns_name_submit">DNS 名を変更</string>
 
+    <!-- VPN サービスの常駐通知(E-D) -->
+    <string name="notif_channel_name">接続状態</string>
+    <string name="notif_preparing">接続準備中…</string>
+    <string name="notif_connecting">接続試行中…(%1$s)</string>
+    <string name="notif_connected">接続中 ・↑%1$s ↓%2$s</string>
+    <string name="notif_connected_rtt">接続中 ・RTT %1$dms ・↑%2$s ↓%3$s</string>
+    <string name="notif_action_disconnect">切断</string>
+
     <!-- チャット(ChatScreen) -->
     <string name="chat_placeholder">メッセージを入力</string>
     <string name="chat_send">送信</string>

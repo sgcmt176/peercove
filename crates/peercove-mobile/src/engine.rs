@@ -15,7 +15,7 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -65,7 +65,9 @@ pub struct EngineStats {
 
 struct Shared {
     tunn: Mutex<Tunn>,
-    udp: UdpSocket,
+    /// UDP ソケット。Android の回線切替(Wi-Fi ↔ モバイル)で張り直す
+    /// (rebind)ため差し替え可能にする。使う側は毎回 `socket()` で取る
+    udp: RwLock<Arc<UdpSocket>>,
     tun: Arc<dyn TunIo>,
     allowed_ips: Vec<Ipv4Net>,
     /// エンドポイント候補と現在使用中の候補(タイマーがローテートする)
@@ -74,6 +76,12 @@ struct Shared {
     rotate_after: Duration,
     stats: Mutex<EngineStats>,
     stop: AtomicBool,
+}
+
+impl Shared {
+    fn socket(&self) -> Arc<UdpSocket> {
+        Arc::clone(&self.udp.read().unwrap())
+    }
 }
 
 pub struct Engine {
@@ -102,7 +110,7 @@ impl Engine {
         );
         let shared = Arc::new(Shared {
             tunn: Mutex::new(tunn),
-            udp,
+            udp: RwLock::new(Arc::new(udp)),
             tun,
             allowed_ips: spec.allowed_ips,
             endpoints: spec.endpoints,
@@ -119,7 +127,7 @@ impl Engine {
             if let TunnResult::WriteToNetwork(data) =
                 tunn.format_handshake_initiation(&mut buf, false)
             {
-                let _ = shared.udp.send(data);
+                let _ = shared.socket().send(data);
             }
         }
 
@@ -135,6 +143,25 @@ impl Engine {
         let mut stats = self.shared.stats.lock().unwrap().clone();
         stats.current_endpoint = Some(*self.shared.current_peer.lock().unwrap());
         stats
+    }
+
+    /// UDP ソケットを張り直して即ハンドシェイクし直す(M4 E-D)。
+    /// Android の回線切替(Wi-Fi ↔ モバイル)後は旧ソケットの経路が死んで
+    /// いることがあるため、NetworkCallback から protect 済みの新ソケットを
+    /// もらって差し替える。送信元ポートが変わるが、ホスト側(デスクトップ)は
+    /// roaming 学習で追従する。
+    pub fn rebind(&self, udp: UdpSocket) -> anyhow::Result<()> {
+        let peer = *self.shared.current_peer.lock().unwrap();
+        udp.connect(peer)?;
+        udp.set_read_timeout(Some(TICK))?;
+        let udp = Arc::new(udp);
+        *self.shared.udp.write().unwrap() = Arc::clone(&udp);
+        let mut buf = [0u8; BUF_SIZE];
+        let mut tunn = self.shared.tunn.lock().unwrap();
+        if let TunnResult::WriteToNetwork(data) = tunn.format_handshake_initiation(&mut buf, true) {
+            let _ = udp.send(data);
+        }
+        Ok(())
     }
 
     /// トンネルを停止してスレッドを回収する。TUN(fd)は Arc の解放で閉じる。
@@ -174,7 +201,7 @@ fn tun_loop(shared: &Shared) {
         let mut tunn = shared.tunn.lock().unwrap();
         match tunn.encapsulate(&pkt[..n], &mut work) {
             TunnResult::WriteToNetwork(data) => {
-                let _ = shared.udp.send(data);
+                let _ = shared.socket().send(data);
             }
             TunnResult::Done => {} // セッション未確立中はキュー(ハンドシェイクは開始済み)
             TunnResult::Err(e) => tracing::warn!("暗号化に失敗: {e:?}"),
@@ -188,9 +215,10 @@ fn udp_loop(shared: &Shared) {
     let mut datagram = [0u8; BUF_SIZE];
     let mut work = [0u8; BUF_SIZE];
     while !shared.stop.load(Ordering::Relaxed) {
-        // フォールバックのローテートで変わりうるので毎回読む
+        // フォールバックのローテートや rebind で変わりうるので毎回読む
         let peer_ip = shared.current_peer.lock().unwrap().ip();
-        let n = match shared.udp.recv(&mut datagram) {
+        let udp = shared.socket();
+        let n = match udp.recv(&mut datagram) {
             Ok(n) => n,
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
@@ -209,7 +237,7 @@ fn udp_loop(shared: &Shared) {
         loop {
             match result {
                 TunnResult::WriteToNetwork(data) => {
-                    let _ = shared.udp.send(data);
+                    let _ = udp.send(data);
                     result = tunn.decapsulate(None, &[], &mut work);
                 }
                 TunnResult::WriteToTunnelV4(packet, src) => {
@@ -243,7 +271,7 @@ fn timer_loop(shared: &Shared) {
         let mut tunn = shared.tunn.lock().unwrap();
         match tunn.update_timers(&mut work) {
             TunnResult::WriteToNetwork(data) => {
-                let _ = shared.udp.send(data);
+                let _ = shared.socket().send(data);
             }
             TunnResult::Err(WireGuardError::ConnectionExpired) => {}
             TunnResult::Err(e) => tracing::debug!("タイマー処理でエラー: {e:?}"),
@@ -257,24 +285,37 @@ fn timer_loop(shared: &Shared) {
             stats.rx_bytes = rx as u64;
         }
 
-        // エンドポイントのフォールバック(M4 E-C): ハンドシェイクが一度も
-        // 確立しない、または途絶(180 秒 = WG の REJECT_AFTER_TIME)したら
-        // 次の候補へ切り替えて再ハンドシェイクする。候補 1 つなら何もしない
+        // ハンドシェイク未確立・途絶(180 秒 = WG の REJECT_AFTER_TIME)時の
+        // 自己回復(M4 E-C/E-D): rotate_after ごとに再ハンドシェイクを仕掛ける。
+        // 候補が複数あれば次の候補へ切り替え、1 つでも同じ相手へ強制再開する
+        // (放置後に boringtun が再試行を諦めて固まったままになる事例への対策)
         let dead = match since {
             None => true,
             Some(age) => age > Duration::from_secs(180),
         };
-        if shared.endpoints.len() > 1 && dead && last_rotate.elapsed() >= shared.rotate_after {
-            endpoint_index = (endpoint_index + 1) % shared.endpoints.len();
-            let next = shared.endpoints[endpoint_index];
+        if dead && last_rotate.elapsed() >= shared.rotate_after {
             last_rotate = Instant::now();
-            if shared.udp.connect(next).is_ok() {
-                *shared.current_peer.lock().unwrap() = next;
-                tracing::info!("エンドポイントを切り替えます: {next}");
+            if shared.endpoints.len() > 1 {
+                endpoint_index = (endpoint_index + 1) % shared.endpoints.len();
+            }
+            let next = shared.endpoints[endpoint_index];
+            let udp = shared.socket();
+            if udp.connect(next).is_ok() {
+                let changed = {
+                    let mut current = shared.current_peer.lock().unwrap();
+                    let changed = *current != next;
+                    *current = next;
+                    changed
+                };
+                if changed {
+                    tracing::info!("エンドポイントを切り替えます: {next}");
+                } else {
+                    tracing::debug!("再ハンドシェイクを開始します: {next}");
+                }
                 if let TunnResult::WriteToNetwork(data) =
                     tunn.format_handshake_initiation(&mut work, true)
                 {
-                    let _ = shared.udp.send(data);
+                    let _ = udp.send(data);
                 }
             }
         }

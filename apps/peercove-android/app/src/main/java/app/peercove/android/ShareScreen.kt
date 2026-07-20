@@ -88,11 +88,10 @@ fun ShareSendScreen(uri: Uri, onNotice: (String) -> Unit, onClose: () -> Unit) {
                     ?: return@withContext readFailed
                 try {
                     sendFileTo(net.slug, target.ip, cached.absolutePath)
-                    null
+                    null // 成功時は残す(自分の画像サムネイルが参照する)
                 } catch (e: MobileException) {
-                    e.message
-                } finally {
                     cached.delete()
+                    e.message
                 }
             }
             onNotice(error ?: sentMsg)

@@ -18,6 +18,15 @@ object Prefs {
         prefs(context).edit().putString("last_slug", slug).apply()
     }
 
+    /** VPN を維持すべきか(明示的に切断するまで true)。プロセス再生成や
+     *  OS 起動(Always-on)後の null Intent 起動時の復帰判断に使う。 */
+    fun vpnShouldRun(context: Context): Boolean =
+        prefs(context).getBoolean("vpn_should_run", false)
+
+    fun setVpnShouldRun(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean("vpn_should_run", value).apply()
+    }
+
     /** 会話の既読 seq(それ以下は既読)。 */
     fun readSeq(context: Context, slug: String, convId: String): Long =
         prefs(context).getLong("read/$slug/$convId", 0L)

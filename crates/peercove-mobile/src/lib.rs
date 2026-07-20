@@ -102,6 +102,10 @@ pub trait SocketProtector: Send + Sync {
 struct Running {
     engine: engine::Engine,
     session: session::NetSession,
+    /// 回線切替時の UDP 再バインド(poke_tunnel)で新ソケットを protect する
+    /// ために保持する(E-D)。テスト等では None。unix 以外では読まれない
+    #[cfg_attr(not(unix), allow(dead_code))]
+    protector: Option<Arc<dyn SocketProtector>>,
 }
 
 impl Running {
@@ -383,6 +387,7 @@ fn start_tunnel_impl(
         Running {
             engine: new_engine,
             session: new_session,
+            protector: Some(protector),
         },
     );
     if let Some(old) = old {
@@ -418,6 +423,35 @@ pub fn tunnel_status(slug: String) -> Option<TunnelStatus> {
                 .unwrap_or_default(),
         }
     })
+}
+
+/// 回線切替(Wi-Fi ↔ モバイル)を Kotlin(NetworkCallback)が検知したときに
+/// 呼ぶ(M4 E-D)。UDP ソケットを protect し直して張り替え、即再ハンドシェイク
+/// する。稼働していないネットワークなら何もしない(冪等)。
+#[uniffi::export]
+pub fn poke_tunnel(slug: String) {
+    let map = tunnels().lock().unwrap();
+    let Some(running) = map.get(&slug) else {
+        return;
+    };
+    let udp = match std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+        Ok(udp) => udp,
+        Err(e) => {
+            tracing::warn!("再バインド用の UDP ソケットを作れません: {e}");
+            return;
+        }
+    };
+    #[cfg(unix)]
+    if let Some(protector) = &running.protector {
+        use std::os::fd::AsRawFd;
+        if !protector.protect(udp.as_raw_fd()) {
+            tracing::warn!("VpnService.protect が失敗しました(再バインド続行)");
+        }
+    }
+    match running.engine.rebind(udp) {
+        Ok(()) => tracing::info!("回線切替により UDP を再バインドしました: {slug}"),
+        Err(e) => tracing::warn!("UDP の再バインドに失敗しました: {e:#}"),
+    }
 }
 
 // ---- E-C: セッション情報・メンバー・DNS・チャット・ファイル ------------------

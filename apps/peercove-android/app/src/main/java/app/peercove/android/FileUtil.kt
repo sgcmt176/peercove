@@ -29,10 +29,15 @@ object FileUtil {
     /**
      * content URI をキャッシュディレクトリへコピーして File を返す。
      * (Rust 側はパスでファイルを読むため実ファイルが必要)
+     *
+     * 送信成功後も削除しない: チャット履歴の自分の画像サムネイルが
+     * このパスを参照する。キャッシュ領域なのでストレージ逼迫時は OS が
+     * 消してよい(消えたらサムネイルがファイル表示に戻るだけ)。
+     * サブディレクトリを時刻で分けるのは同名ファイルの上書き防止。
      */
     fun copyToCache(context: Context, uri: Uri): File? {
         val name = displayName(context, uri)
-        val dir = File(context.cacheDir, "send").apply { mkdirs() }
+        val dir = File(context.cacheDir, "send/${System.currentTimeMillis()}").apply { mkdirs() }
         val dest = File(dir, name)
         return try {
             context.contentResolver.openInputStream(uri)?.use { input ->

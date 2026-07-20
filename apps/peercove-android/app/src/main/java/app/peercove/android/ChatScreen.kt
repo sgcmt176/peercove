@@ -49,8 +49,17 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.unit.dp
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -163,11 +172,10 @@ fun ConversationScreen(
                     ?: return@withContext fileReadFailed
                 try {
                     sendFileTo(slug, target.ip, cached.absolutePath)
-                    null
+                    null // 成功時は残す(自分の画像サムネイルが参照する)
                 } catch (e: MobileException) {
-                    e.message ?: sendFailed
-                } finally {
                     cached.delete()
+                    e.message ?: sendFailed
                 }
             }
             onNotice(result ?: fileSent)
@@ -431,12 +439,144 @@ private fun Bubble(
                 }
             }
         } else {
-            Text(
-                message.text,
+            val urls = remember(message.text) {
+                urlRegex.findAll(message.text).map { it.value }.toList()
+            }
+            Column(
                 modifier = Modifier
                     .widthIn(max = 260.dp)
                     .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                // URL はリンク化(タップでブラウザ)。無ければ素のテキスト
+                if (urls.isEmpty()) {
+                    Text(message.text, color = content)
+                } else {
+                    Text(linkifyText(message.text, content), color = content)
+                    // 最初の URL のプレビューカード(タイトル / og:image)
+                    LinkPreviewCard(urls.first(), content)
+                }
+            }
+        }
+    }
+}
+
+/** チャット本文から URL を拾う(日本語の句読点や空白で区切る)。 */
+private val urlRegex = Regex("""https?://[^\s　<>"「」]+""")
+
+/** URL をタップ可能なリンクにした AnnotatedString を作る。 */
+private fun linkifyText(text: String, content: Color) = buildAnnotatedString {
+    var last = 0
+    for (match in urlRegex.findAll(text)) {
+        append(text.substring(last, match.range.first))
+        withLink(
+            LinkAnnotation.Url(
+                match.value,
+                TextLinkStyles(
+                    style = SpanStyle(
+                        color = content,
+                        textDecoration = TextDecoration.Underline,
+                    ),
+                ),
+            ),
+        ) { append(match.value) }
+        last = match.range.last + 1
+    }
+    append(text.substring(last))
+}
+
+/** リンクプレビューの取得結果(title / image どちらも無ければ表示しない)。 */
+private data class LinkPreview(val title: String?, val image: android.graphics.Bitmap?)
+
+/** URL → プレビューのキャッシュ(失敗も空として記録し再取得しない)。 */
+private val previewCache = ConcurrentHashMap<String, LinkPreview>()
+
+private fun htmlUnescape(text: String): String = text
+    .replace("&amp;", "&")
+    .replace("&lt;", "<")
+    .replace("&gt;", ">")
+    .replace("&quot;", "\"")
+    .replace("&#39;", "'")
+
+/** 先頭 128KB だけ読んで <title> と og:image を拾う(失敗は握りつぶす)。 */
+private fun fetchPreview(url: String): LinkPreview {
+    fun get(target: String, limit: Int): ByteArray? = try {
+        val conn = URL(target).openConnection() as HttpURLConnection
+        conn.connectTimeout = 5000
+        conn.readTimeout = 5000
+        conn.instanceFollowRedirects = true
+        conn.setRequestProperty("User-Agent", "PeerCove/0.1")
+        conn.inputStream.use { input ->
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            while (out.size() < limit) {
+                val n = input.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n.coerceAtMost(limit - out.size()))
+            }
+            out.toByteArray()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    val html = get(url, 128 * 1024)?.toString(Charsets.UTF_8) ?: return LinkPreview(null, null)
+    val title = Regex("<title[^>]*>(.*?)</title>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        .find(html)?.groupValues?.get(1)?.trim()?.take(120)?.let(::htmlUnescape)
+    val ogImage =
+        Regex("""<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)""", RegexOption.IGNORE_CASE)
+            .find(html)?.groupValues?.get(1)
+            ?: Regex("""<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image["']""", RegexOption.IGNORE_CASE)
+                .find(html)?.groupValues?.get(1)
+    val image = ogImage
+        ?.let { if (it.startsWith("http")) it else null }
+        ?.let { get(it, 1024 * 1024) }
+        ?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+    return LinkPreview(title, image)
+}
+
+/** LINE 風のリンクプレビューカード(タイトル + og:image)。 */
+@Composable
+private fun LinkPreviewCard(url: String, content: Color) {
+    var preview by remember(url) { mutableStateOf(previewCache[url]) }
+    if (preview == null) {
+        LaunchedEffect(url) {
+            preview = withContext(Dispatchers.IO) {
+                fetchPreview(url).also { previewCache[url] = it }
+            }
+        }
+    }
+    val current = preview ?: return
+    if (current.title == null && current.image == null) return
+    val context = LocalContext.current
+    Column(
+        modifier = Modifier
+            .padding(top = 6.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.Black.copy(alpha = 0.08f))
+            .clickable {
+                try {
+                    context.startActivity(
+                        android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url)),
+                    )
+                } catch (_: Exception) {
+                }
+            },
+    ) {
+        current.image?.let {
+            Image(
+                bitmap = it.asImageBitmap(),
+                contentDescription = current.title,
+                modifier = Modifier.fillMaxWidth(),
+                contentScale = ContentScale.FillWidth,
+            )
+        }
+        current.title?.let {
+            Text(
+                it,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                style = MaterialTheme.typography.labelSmall,
                 color = content,
+                maxLines = 2,
             )
         }
     }
