@@ -329,6 +329,17 @@ impl DaemonShared {
                 }
             }
         }
+        // direct 宛は「積んだ時点の宛先の同一性(member_id)」も控える。
+        // 配送直前に台帳と照合し、削除 → 再追加された別人へは送らない(検証 FB)。
+        let to_member_id = match scope {
+            ChatScope::Direct => peer.and_then(|ip| {
+                Self::ledger_of(active)
+                    .iter()
+                    .find(|e| e.ip == ip)
+                    .and_then(|e| e.member_id.clone())
+            }),
+            _ => None,
+        };
         let id = crate::msg::new_transfer_id();
         let sent_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -365,6 +376,7 @@ impl DaemonShared {
                     ChatScope::Direct => peer,
                     _ => None,
                 },
+                to_member_id,
                 group_id: match scope {
                     ChatScope::Group => group_id,
                     _ => None,
@@ -417,6 +429,14 @@ impl DaemonShared {
             if entry.from != active.address || entry.system || entry.file.is_some() {
                 bail!("このメッセージは再送できません");
             }
+            // 手動再送は「今この相手へ送り直す」意図なので、現在の宛先の
+            // member_id を控える(再送時点の相手を対象にする)
+            let to_member_id = entry.to.and_then(|ip| {
+                Self::ledger_of(active)
+                    .iter()
+                    .find(|e| e.ip == ip)
+                    .and_then(|e| e.member_id.clone())
+            });
             active
                 .chat_queue
                 .lock()
@@ -426,6 +446,7 @@ impl DaemonShared {
                     id: entry.id,
                     scope: entry.scope,
                     to: entry.to,
+                    to_member_id,
                     group_id: entry.group_id,
                     text: entry.text,
                     sent_at: entry.sent_at,
@@ -1765,6 +1786,28 @@ async fn pump_chat_queue(
     }
 }
 
+/// direct 送信待ちの現在の宛先を返す(送るなら Some、送らないなら None)。
+/// 積んだ時点の宛先の同一性(`expected` = member_id)を現在の台帳と照合し、
+/// 削除 → 同名・同 IP で再追加された別人には送らない(2026-07-20 検証 FB)。
+/// 台帳が未受信(None)・宛先に member_id が無い(旧ホスト)・積んだ時点の記録が
+/// 無い場合は従来どおり送る。
+fn direct_delivery_target(
+    to: Option<Ipv4Addr>,
+    expected: Option<&str>,
+    ledger: Option<&[peercove_core::proto::LedgerEntry]>,
+) -> Option<Ipv4Addr> {
+    let to = to?;
+    if let (Some(expected), Some(ledger)) = (expected, ledger) {
+        match ledger.iter().find(|e| e.ip == to) {
+            Some(e) if e.member_id.as_deref() == Some(expected) => {} // 同一人物
+            Some(e) if e.member_id.is_some() => return None,          // 別人に置換
+            None => return None,                                      // 削除された
+            Some(_) => {} // 相手に member_id 無し(旧ホスト)→ 判定できず従来どおり
+        }
+    }
+    Some(to)
+}
+
 /// 送信待ちチャットの現時点の宛先(direct = 宛先本人、network/group =
 /// オンラインのメンバー)。
 fn queue_targets(
@@ -1775,7 +1818,20 @@ fn queue_targets(
 ) -> Vec<Ipv4Addr> {
     use peercove_core::msg::ChatScope;
     match pending.scope {
-        ChatScope::Direct => pending.to.into_iter().collect(),
+        ChatScope::Direct => {
+            let ledger = snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|s| s.ledger.clone());
+            direct_delivery_target(
+                pending.to,
+                pending.to_member_id.as_deref(),
+                ledger.as_deref(),
+            )
+            .into_iter()
+            .collect()
+        }
         ChatScope::Network => {
             let ledger = snapshot
                 .lock()
@@ -1889,10 +1945,14 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
                 loop {
                     tick.tick().await;
                     shared.refresh_zones().await;
-                    // チャットの自動再送(E-E 3)も同じ周期で回す
-                    shared.pump_chat_queues().await;
-                    // メンバー再追加の検知 → 1:1 履歴クリア(検証 FB)
+                    // メンバー再追加・削除の検知(1:1 履歴クリア・送信待ちの破棄・
+                    // グループ整理)は**送信より先**に回す。逆順だと、再追加された
+                    // 別人がオンラインになった最初の周回で送信フェーズが古い
+                    // メッセージを配ってしまう(検証 FB 2026-07-20)。配送直前の
+                    // member_id 照合(queue_targets)と二重で防ぐ。
                     shared.reconcile_identities().await;
+                    // チャットの自動再送(E-E 3)
+                    shared.pump_chat_queues().await;
                 }
             }
         });
@@ -2277,6 +2337,68 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 配送直前の本人確認: 積んだ時点の member_id と現在の台帳を照合し、
+    /// 別人に置き換わった/削除された宛先には送らない(2026-07-20 検証 FB)。
+    #[test]
+    fn direct_delivery_target_guards_reassigned_member() {
+        fn ledger_of(ip: &str, member_id: Option<&str>) -> Vec<peercove_core::proto::LedgerEntry> {
+            vec![peercove_core::proto::LedgerEntry {
+                name: Some("m".to_string()),
+                dns_name: None,
+                ip: ip.parse().unwrap(),
+                public_key: PrivateKey::generate().public_key(),
+                app_version: None,
+                platform: None,
+                capabilities: vec![],
+                member_id: member_id.map(String::from),
+                invite_status: None,
+                invite_expires_at: None,
+                online: true,
+                is_host: false,
+                endpoint: None,
+                endpoint_age_secs: None,
+                subnets: vec![],
+                blocked: false,
+                force_relay: false,
+                acl_rule_id: None,
+            }]
+        }
+        let to: Ipv4Addr = "10.0.0.5".parse().unwrap();
+
+        // 同一メンバー(member_id 一致)→ 送る
+        let l = ledger_of("10.0.0.5", Some("inv-1"));
+        assert_eq!(
+            direct_delivery_target(Some(to), Some("inv-1"), Some(&l)),
+            Some(to)
+        );
+        // 別人に置き換わった(member_id 変化)→ 送らない
+        let l = ledger_of("10.0.0.5", Some("inv-2"));
+        assert_eq!(
+            direct_delivery_target(Some(to), Some("inv-1"), Some(&l)),
+            None
+        );
+        // 台帳から消えた(削除された)→ 送らない
+        let l = ledger_of("10.0.0.9", Some("inv-1"));
+        assert_eq!(
+            direct_delivery_target(Some(to), Some("inv-1"), Some(&l)),
+            None
+        );
+        // 相手に member_id が無い(旧ホスト)→ 判定できず従来どおり送る
+        let l = ledger_of("10.0.0.5", None);
+        assert_eq!(
+            direct_delivery_target(Some(to), Some("inv-1"), Some(&l)),
+            Some(to)
+        );
+        // 積んだ時点の記録が無い(旧形式・enqueue 時不明)→ 従来どおり送る
+        let l = ledger_of("10.0.0.5", Some("inv-2"));
+        assert_eq!(direct_delivery_target(Some(to), None, Some(&l)), Some(to));
+        // 台帳が未受信 → 従来どおり送る(通常運用を妨げない)
+        assert_eq!(
+            direct_delivery_target(Some(to), Some("inv-1"), None),
+            Some(to)
+        );
     }
 
     /// duplex ストリーム越しに start → status → stop → shutdown の一連を流す。

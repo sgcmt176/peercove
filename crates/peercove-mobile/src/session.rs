@@ -61,6 +61,10 @@ pub struct PendingChat {
     pub id: String,
     pub scope: ChatScope,
     pub to: Option<Ipv4Addr>,
+    /// direct のとき、積んだ時点の宛先の同一性(ホストが振る member_id)。
+    /// 配送直前に台帳と照合し、別人に置き換わっていたら送らない
+    /// (削除 → 同名・同 IP で再追加された別メンバーへの誤配送を防ぐ)。
+    pub to_member_id: Option<String>,
     pub group_id: Option<String>,
     pub text: String,
     pub sent_at: u64,
@@ -78,6 +82,8 @@ struct PersistedChat {
     scope: ChatScope,
     #[serde(default)]
     to: Option<Ipv4Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_member_id: Option<String>,
     #[serde(default)]
     group_id: Option<String>,
     text: String,
@@ -104,6 +110,7 @@ fn load_chat_queue(config_path: &Path) -> Vec<PendingChat> {
             id: p.id,
             scope: p.scope,
             to: p.to,
+            to_member_id: p.to_member_id,
             group_id: p.group_id,
             text: p.text,
             sent_at: p.sent_at,
@@ -1046,11 +1053,17 @@ impl SessionShared {
             file: None,
             system: false,
         });
+        // direct 宛は積んだ時点の宛先の同一性(member_id)も控える(誤配送防止)
+        let to_member_id = match scope {
+            ChatScope::Direct => to.and_then(|ip| self.member_id_of(ip)),
+            _ => None,
+        };
         self.chat_queue.lock().unwrap().push(PendingChat {
             seq: entry.seq,
             id: entry.id,
             scope,
             to,
+            to_member_id,
             group_id,
             text,
             sent_at: entry.sent_at,
@@ -1060,6 +1073,18 @@ impl SessionShared {
         self.pump_chat_queue();
         self.save_chat_queue();
         Ok(())
+    }
+
+    /// 台帳から IP の member_id を引く(未受信・不明なら None)。
+    fn member_id_of(&self, ip: Ipv4Addr) -> Option<String> {
+        self.ledger
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .members
+            .iter()
+            .find(|e| e.ip == ip)
+            .and_then(|e| e.member_id.clone())
     }
 
     /// 送信待ちキューをディスクへ反映する(空になったらファイルを消す)。
@@ -1076,6 +1101,7 @@ impl SessionShared {
                 id: p.id.clone(),
                 scope: p.scope,
                 to: p.to,
+                to_member_id: p.to_member_id.clone(),
                 group_id: p.group_id.clone(),
                 text: p.text.clone(),
                 sent_at: p.sent_at,
@@ -1138,6 +1164,21 @@ impl SessionShared {
     /// 未達の宛先へ配送を試みる。戻り値 true = 送達条件を満たした
     /// (direct = 宛先本人、network/group = 1 人以上)。
     fn attempt_chat(&self, pending: &mut PendingChat) -> bool {
+        // direct 宛は、積んだ時点の宛先(member_id)が今の台帳の同一 IP の
+        // 相手と一致するか照合する。別人に置き換わっていたら送らない
+        // (削除 → 同名・同 IP で再追加された別メンバーへの誤配送を防ぐ)。
+        if pending.scope == ChatScope::Direct {
+            if let (Some(to), Some(expected)) = (pending.to, &pending.to_member_id) {
+                if let Some(ledger) = self.ledger.lock().unwrap().as_ref() {
+                    match ledger.members.iter().find(|e| e.ip == to) {
+                        Some(e) if e.member_id.as_ref() == Some(expected) => {} // 同一人物
+                        Some(e) if e.member_id.is_some() => return false,       // 別人 → 送らない
+                        None => return false, // 削除された → 送らない
+                        Some(_) => {}         // member_id 無し(旧ホスト)→ 従来どおり
+                    }
+                }
+            }
+        }
         let frame = MsgFrame::Chat {
             id: pending.id.clone(),
             scope: pending.scope,
@@ -1201,11 +1242,14 @@ impl SessionShared {
             if entry.from != self.cfg.own_ip || entry.system || entry.file.is_some() {
                 bail!("このメッセージは再送できません");
             }
+            // 手動再送は「今この相手へ送り直す」意図なので現在の member_id を控える
+            let to_member_id = entry.to.and_then(|ip| self.member_id_of(ip));
             self.chat_queue.lock().unwrap().push(PendingChat {
                 seq: entry.seq,
                 id: entry.id,
                 scope: entry.scope,
                 to: entry.to,
+                to_member_id,
                 group_id: entry.group_id,
                 text: entry.text,
                 sent_at: entry.sent_at,

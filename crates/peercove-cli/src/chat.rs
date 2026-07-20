@@ -203,6 +203,12 @@ pub struct PendingChat {
     pub id: String,
     pub scope: ChatScope,
     pub to: Option<Ipv4Addr>,
+    /// direct のとき、送信を積んだ時点の宛先の同一性(ホストが振る member_id)。
+    /// 配送直前に現在の台帳と照合し、別人に置き換わっていたら送らない
+    /// (削除 → 同名・同 IP で再追加された別メンバーへの誤配送を防ぐ。
+    /// 2026-07-20 検証 FB)。台帳に member_id が無い(旧ホスト)ときは None で、
+    /// その場合は従来どおり照合せず送る。
+    pub to_member_id: Option<String>,
     pub group_id: Option<String>,
     pub text: String,
     pub sent_at: u64,
@@ -222,6 +228,8 @@ struct PersistedChat {
     scope: ChatScope,
     #[serde(default)]
     to: Option<Ipv4Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_member_id: Option<String>,
     #[serde(default)]
     group_id: Option<String>,
     text: String,
@@ -247,6 +255,7 @@ pub fn load_queue(config_path: &Path) -> SharedChatQueue {
             id: p.id,
             scope: p.scope,
             to: p.to,
+            to_member_id: p.to_member_id,
             group_id: p.group_id,
             text: p.text,
             sent_at: p.sent_at,
@@ -270,6 +279,7 @@ pub fn save_queue(config_path: &Path, queue: &SharedChatQueue) {
             id: p.id.clone(),
             scope: p.scope,
             to: p.to,
+            to_member_id: p.to_member_id.clone(),
             group_id: p.group_id.clone(),
             text: p.text.clone(),
             sent_at: p.sent_at,
@@ -549,6 +559,7 @@ mod tests {
             id: format!("p-{to}"),
             scope: ChatScope::Direct,
             to: Some(to.parse().unwrap()),
+            to_member_id: None,
             group_id: None,
             text: "たまっていた".to_string(),
             sent_at: 0,
