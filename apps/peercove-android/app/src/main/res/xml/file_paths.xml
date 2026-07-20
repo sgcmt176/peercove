@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider の公開範囲。受信ボックス(filesDir/networks/…/member.inbox)と
+     送信キャッシュ(cacheDir/send)だけを他アプリへ渡せるようにする。 -->
+<paths>
+    <files-path name="networks" path="networks/" />
+    <cache-path name="send" path="send/" />
+</paths>

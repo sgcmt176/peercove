@@ -6,7 +6,10 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import java.io.File
+import java.security.MessageDigest
 
 /**
  * ファイル送受信の OS 連携(M4 E-C)。
@@ -74,5 +77,45 @@ object FileUtil {
         } catch (e: Exception) {
             false
         }
+    }
+
+    /** アプリ内部のファイルを他アプリへ渡すための content URI(FileProvider)。 */
+    fun contentUri(context: Context, path: String): Uri? = try {
+        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
+    } catch (e: IllegalArgumentException) {
+        null // file_paths.xml の対象外
+    }
+
+    /** 拡張子から MIME タイプを引く(不明は octet-stream)。 */
+    fun mimeOf(name: String): String {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            ?: "application/octet-stream"
+    }
+
+    /** ファイルの SHA-256(16 進小文字)。大きくても逐次読みでメモリを食わない。 */
+    fun sha256Of(path: String): String? = try {
+        val digest = MessageDigest.getInstance("SHA-256")
+        File(path).inputStream().use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                digest.update(buf, 0, n)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** 受信ファイルを SAF で選んだ保存先(content URI)へコピーする。 */
+    fun copyToUri(context: Context, path: String, dest: Uri): Boolean = try {
+        val src = File(path)
+        context.contentResolver.openOutputStream(dest)?.use { output ->
+            src.inputStream().use { input -> input.copyTo(output) }
+        } != null
+    } catch (e: Exception) {
+        false
     }
 }

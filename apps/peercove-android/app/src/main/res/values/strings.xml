@@ -156,6 +156,12 @@
     <string name="chat_saved">ダウンロード(PeerCove)に保存しました</string>
     <string name="chat_save_failed">保存に失敗しました(受信ボックスから消えている可能性)</string>
     <string name="chat_saved_toast">保存しました</string>
-    <string name="chat_tap_to_save"> ・タップで保存</string>
+    <string name="chat_tap_to_save"> ・タップで開く/保存</string>
+    <string name="chat_sheet_share">共有</string>
+    <string name="chat_sheet_save">ダウンロード(PeerCove)へ保存</string>
+    <string name="chat_sheet_save_as">名前を付けて保存</string>
+    <string name="chat_sheet_sha">SHA-256 をコピー</string>
+    <string name="chat_sha_copied">SHA-256 をコピーしました</string>
+    <string name="chat_sha_failed">SHA-256 を計算できませんでした</string>
     <string name="chat_file_prefix">📎 %1$s</string>
 </resources>
