@@ -101,9 +101,10 @@ pub struct SessionShared {
     pub bound_listen: Mutex<Option<SocketAddr>>,
     /// コントロールチャネルへ差し込む送信キュー(表示名・DNS 名の変更依頼)
     outbox: Mutex<Vec<ControlMessage>>,
-    /// SetDnsName / SetDisplayName の応答受け口((accepted, message))
+    /// SetDnsName / SetDisplayName / RotateKey の応答受け口((accepted, message))
     dns_result: Mutex<Option<(bool, String)>>,
     display_result: Mutex<Option<(bool, String)>>,
+    rotate_result: Mutex<Option<(bool, String)>>,
     stop: AtomicBool,
 }
 
@@ -127,6 +128,7 @@ impl NetSession {
             outbox: Mutex::new(Vec::new()),
             dns_result: Mutex::new(None),
             display_result: Mutex::new(None),
+            rotate_result: Mutex::new(None),
             stop: AtomicBool::new(false),
             cfg,
         });
@@ -468,6 +470,9 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
                     }
                     Ok(ControlMessage::SetDisplayNameResult { accepted, message }) => {
                         *shared.display_result.lock().unwrap() = Some((accepted, message));
+                    }
+                    Ok(ControlMessage::RotateKeyResult { accepted, message }) => {
+                        *shared.rotate_result.lock().unwrap() = Some((accepted, message));
                     }
                     Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
                     Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
@@ -823,6 +828,21 @@ impl SessionShared {
         message: ControlMessage,
         slot: &Mutex<Option<(bool, String)>>,
     ) -> anyhow::Result<String> {
+        let (accepted, reply) = self.control_request_raw(message, slot)?;
+        if accepted {
+            Ok(reply)
+        } else {
+            bail!("{reply}")
+        }
+    }
+
+    /// 応答そのもの(accepted, message)が要る版。Err はタイムアウト・未接続のみ
+    /// (拒否と区別したい鍵ローテーションが使う)。
+    fn control_request_raw(
+        &self,
+        message: ControlMessage,
+        slot: &Mutex<Option<(bool, String)>>,
+    ) -> anyhow::Result<(bool, String)> {
         if !self.control_connected.load(Ordering::Relaxed) {
             bail!("ホストと同期していません(接続直後は数秒待ってから再試行してください)");
         }
@@ -830,11 +850,8 @@ impl SessionShared {
         self.outbox.lock().unwrap().push(message);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline && !self.stopped() {
-            if let Some((accepted, reply)) = slot.lock().unwrap().take() {
-                if accepted {
-                    return Ok(reply);
-                }
-                bail!("{reply}");
+            if let Some(result) = slot.lock().unwrap().take() {
+                return Ok(result);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -858,6 +875,19 @@ impl SessionShared {
                 name: name.to_string(),
             },
             &self.dns_result,
+        )
+    }
+
+    /// デバイス鍵の更新依頼(ADR-0020 のモバイル版)。
+    /// 戻り値は (accepted, message)。Err はタイムアウト・未接続のみ
+    /// (呼び出し側が「拒否 = 新鍵破棄」「応答なし = 新鍵温存」を分ける)。
+    pub fn rotate_key_request(
+        &self,
+        new_public_key: peercove_core::keys::PublicKey,
+    ) -> anyhow::Result<(bool, String)> {
+        self.control_request_raw(
+            ControlMessage::RotateKey { new_public_key },
+            &self.rotate_result,
         )
     }
 }
@@ -1482,6 +1512,36 @@ mod tests {
             .write_all((serde_json::to_string(&result).unwrap() + "\n").as_bytes())
             .unwrap();
         assert_eq!(request.join().unwrap().unwrap(), "更新しました");
+
+        // 鍵ローテーションの依頼: rotate_key 行が届き、応答が (accepted, msg) で返る
+        let new_public = PrivateKey::generate().public_key();
+        let session_for_rotate = Arc::clone(&session.shared);
+        let rotate = std::thread::spawn(move || session_for_rotate.rotate_key_request(new_public));
+        let mut got_rotate = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            if line.contains(r#""type":"rotate_key""#) {
+                assert!(line.contains(&new_public.to_base64()), "{line}");
+                got_rotate = true;
+                break;
+            }
+        }
+        assert!(got_rotate, "鍵の更新依頼が届かない");
+        let result = ControlMessage::RotateKeyResult {
+            accepted: true,
+            message: "鍵を更新しました".to_string(),
+        };
+        writer
+            .write_all((serde_json::to_string(&result).unwrap() + "\n").as_bytes())
+            .unwrap();
+        assert_eq!(
+            rotate.join().unwrap().unwrap(),
+            (true, "鍵を更新しました".to_string())
+        );
 
         // removed で再接続をやめる
         let removed = ControlMessage::Removed {

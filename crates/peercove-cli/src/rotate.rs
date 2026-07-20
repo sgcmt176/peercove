@@ -18,15 +18,17 @@
 //! - 現行鍵で繋がったまま応答が来ない(旧ホスト等)→ 何もしない
 //!   (次のセッションで同じ新鍵の依頼を再送。冪等)
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use peercove_core::config::{Config, KeySource};
-use peercove_core::keys::{read_private_key_file, write_secret_file, PrivateKey};
+use peercove_core::keys::PrivateKey;
 use peercove_core::proto::ControlMessage;
+// 鍵ファイル操作はモバイル(peercove-mobile)と共用のため peercove-ops へ
+// 移設した(ADR-0044)。ここは再エクスポートして既存の呼び出し元を保つ
+pub use peercove_ops::keyfiles::{load_pending, pending_path};
 
 use crate::backend::PeerStats;
 use crate::control::MemberLink;
@@ -35,18 +37,6 @@ use crate::control::MemberLink;
 /// keepalive(25 秒)への受動 keepalive で 35 秒以内に必ず何か届く。
 /// 最終ハンドシェイク経過は通常運転でも 2 分まで伸びるため判定に使わない。
 const DEAD_LINK_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// 更新待ちの新鍵ファイル(`<private_key_file>.new`)。
-pub fn pending_path(key_path: &Path) -> PathBuf {
-    let mut path = key_path.as_os_str().to_owned();
-    path.push(".new");
-    PathBuf::from(path)
-}
-
-/// 更新待ちの新鍵を読む(無い・読めないなら None)。
-pub fn load_pending(key_path: &Path) -> Option<PrivateKey> {
-    read_private_key_file(&pending_path(key_path)).ok()
-}
 
 /// supervisor へ返す要求: トンネルを入れ直す(鍵の切り替え)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,68 +182,20 @@ impl Rotation {
 
     /// 更新待ちの新鍵を用意する(あれば再利用 — 依頼の再送を冪等にする)。
     fn ensure_pending(&self) -> anyhow::Result<PrivateKey> {
-        if let Some(key) = load_pending(&self.key_path) {
-            return Ok(key);
-        }
-        let key = PrivateKey::generate();
-        let path = pending_path(&self.key_path);
-        write_secret_file(&path, &format!("{}\n", key.to_base64()))
-            .with_context(|| format!("{} を書き込めません", path.display()))?;
-        // root デーモンが作るファイルの所有者を、既存の鍵ファイルに合わせる
-        // (ユーザーが join し直すときに消せなくならないように)
-        #[cfg(unix)]
-        if let Ok(meta) = std::fs::metadata(&self.key_path) {
-            use std::os::unix::fs::MetadataExt as _;
-            let _ = std::os::unix::fs::chown(&path, Some(meta.uid()), Some(meta.gid()));
-        }
-        Ok(key)
+        peercove_ops::keyfiles::ensure_pending(&self.key_path)
     }
 
-    /// 更新を確定する: `member.key` を新鍵で上書き → `.new` を削除 →
-    /// member.toml の key_source を "self" へ。
-    ///
-    /// 既存ファイルは中身の上書き(所有権・権限を保つ)。key_source の更新に
-    /// 失敗しても鍵ファイルは一貫しているため警告のみ(次のセッションで
-    /// もう一度ローテーションが走るだけで、締め出しは起きない)。
+    /// 更新を確定する(peercove-ops::keyfiles、モバイルと共用)。
     fn commit(&mut self) -> anyhow::Result<()> {
-        let pending = pending_path(&self.key_path);
-        let key = read_private_key_file(&pending)
-            .with_context(|| format!("{} を読めません", pending.display()))?;
-        write_secret_file(&self.key_path, &format!("{}\n", key.to_base64()))
-            .with_context(|| format!("{} を書き込めません", self.key_path.display()))?;
-        if let Err(e) = std::fs::remove_file(&pending) {
-            tracing::warn!("{} の削除に失敗しました: {e}", pending.display());
-        }
-        if let Err(e) = mark_key_self(&self.config_path) {
-            tracing::warn!("member.toml の key_source 更新に失敗しました: {e:#}");
-        }
-        Ok(())
+        peercove_ops::keyfiles::commit_pending(&self.config_path, &self.key_path)
     }
-}
-
-/// member.toml の `[interface] key_source` を "self" にする(コメント保持)。
-fn mark_key_self(config_path: &Path) -> anyhow::Result<()> {
-    // 設定保存(UI)など他プロセスの書き込みと直列化する(peercove-ops と同じロック)。
-    let _lock = peercove_ops::peers::lock_config(config_path)?;
-    let text = std::fs::read_to_string(config_path)
-        .with_context(|| format!("{} の読み込みに失敗しました", config_path.display()))?;
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .context("member.toml の解析に失敗しました(手編集の構文エラー?)")?;
-    doc.get_mut("interface")
-        .and_then(|item| item.as_table_mut())
-        .context("[interface] が見つかりません")?
-        .insert("key_source", toml_edit::value("self"));
-    let updated = doc.to_string();
-    let _: Config = toml::from_str(&updated).context("編集結果の TOML が不正です")?;
-    std::fs::write(config_path, updated)
-        .with_context(|| format!("{} の書き込みに失敗しました", config_path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::MemberLink;
+    use peercove_core::keys::{read_private_key_file, write_secret_file};
 
     struct Env {
         config_path: PathBuf,

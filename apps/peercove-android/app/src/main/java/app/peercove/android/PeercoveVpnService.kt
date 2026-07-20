@@ -14,8 +14,11 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import uniffi.peercove_mobile.SocketProtector
+import uniffi.peercove_mobile.commitPendingKey
 import uniffi.peercove_mobile.listNetworks
+import uniffi.peercove_mobile.pendingKeyExists
 import uniffi.peercove_mobile.pokeTunnel
+import uniffi.peercove_mobile.rotateKey
 import uniffi.peercove_mobile.sessionState
 import uniffi.peercove_mobile.startTunnel
 import uniffi.peercove_mobile.stopTunnel
@@ -46,6 +49,10 @@ class PeercoveVpnService : VpnService() {
 
     private var currentSlug: String? = null
     private var currentName: String? = null
+    /// 更新待ちの鍵(member.key.new)で起動中か(鍵ローテーションの自己回復)
+    private var usingPendingKey = false
+    /// 監視スレッドの世代(接続し直しで旧スレッドを退役させる)
+    @Volatile private var watchGeneration = 0
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val handler = Handler(Looper.getMainLooper())
     private val notifyTick = object : Runnable {
@@ -116,7 +123,7 @@ class PeercoveVpnService : VpnService() {
         }
     }
 
-    private fun connect(slug: String) {
+    private fun connect(slug: String, usePendingKey: Boolean = false) {
         val info = listNetworks(filesDir.absolutePath).firstOrNull { it.slug == slug }
         if (info == null) {
             Log.e(TAG, "ネットワークが見つかりません: $slug")
@@ -144,17 +151,79 @@ class PeercoveVpnService : VpnService() {
                     // WG の UDP ソケットを VPN ルーティングから除外する
                     override fun protect(fd: Int): Boolean = this@PeercoveVpnService.protect(fd)
                 },
+                usePendingKey,
             )
             currentSlug = slug
             currentName = info.name
+            usingPendingKey = usePendingKey
             watchNetworkChanges(slug)
+            startKeyWatchdog(slug)
             handler.removeCallbacks(notifyTick)
             handler.post(notifyTick)
-            Log.i(TAG, "トンネル開始: $slug")
+            Log.i(TAG, "トンネル開始: $slug(pendingKey=$usePendingKey)")
         } catch (e: Exception) {
             Log.e(TAG, "接続に失敗: $slug", e)
             stopSelf()
         }
+    }
+
+    /**
+     * 鍵ローテーションの監視(ADR-0020 のモバイル版 = ADR-0044)。
+     * - 招待由来の鍵で同期できたら自動で鍵を更新して接続し直す
+     * - 更新待ちの鍵(応答喪失の名残)があるのに 45 秒疎通しないときは、
+     *   確定鍵と更新待ちの鍵を切り替えて試す(締め出しからの自己回復)
+     * - 更新待ちの鍵で疎通できたら確定する
+     */
+    private fun startKeyWatchdog(slug: String) {
+        val gen = ++watchGeneration
+        Thread {
+            val base = filesDir.absolutePath
+            var lastHandshakeAt = System.currentTimeMillis()
+            var rotateAttempted = false
+            while (gen == watchGeneration && currentSlug == slug) {
+                Thread.sleep(5000)
+                if (gen != watchGeneration || currentSlug != slug) break
+                val status = tunnelStatus(slug) ?: continue
+                val now = System.currentTimeMillis()
+                if (status.handshakeAgeSecs != null) {
+                    lastHandshakeAt = now
+                    if (usingPendingKey) {
+                        // 更新待ちの鍵で疎通できた = ホストは新鍵を登録済み → 確定
+                        try {
+                            commitPendingKey(base, slug)
+                            usingPendingKey = false
+                            Log.i(TAG, "更新待ちの鍵で疎通できたため確定しました")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "鍵の確定に失敗", e)
+                        }
+                    }
+                    if (!rotateAttempted && sessionState(slug)?.controlConnected == true) {
+                        rotateAttempted = true
+                        val rotated = listNetworks(base)
+                            .firstOrNull { it.slug == slug }?.keyRotated ?: true
+                        if (!rotated) {
+                            try {
+                                rotateKey(base, slug)
+                                Log.i(TAG, "鍵を自動更新しました(新しい鍵で接続し直します)")
+                                handler.post { if (currentSlug == slug) connect(slug) }
+                                break
+                            } catch (e: Exception) {
+                                Log.w(TAG, "鍵の自動更新に失敗(次回接続時に再試行)", e)
+                            }
+                        }
+                    }
+                } else if (now - lastHandshakeAt > 45_000) {
+                    if (pendingKeyExists(base, slug)) {
+                        // 鍵の不一致(更新応答の喪失)を疑い、もう一方の鍵で試す
+                        val next = !usingPendingKey
+                        Log.i(TAG, "疎通しないため鍵を切り替えて再接続します(pending=$next)")
+                        handler.post { if (currentSlug == slug) connect(slug, next) }
+                        break
+                    }
+                    lastHandshakeAt = now // 通常の未達はエンジンの自己回復に任せる
+                }
+            }
+        }.start()
     }
 
     /** 回線切替(Wi-Fi ↔ モバイル)の検知 → Rust へ UDP の張り直しを依頼。 */
@@ -243,6 +312,7 @@ class PeercoveVpnService : VpnService() {
 
     /** トンネル停止(冪等)。fd は Rust 側で close され、VPN も終了する */
     private fun teardown() {
+        watchGeneration++ // 監視スレッドを退役させる
         handler.removeCallbacks(notifyTick)
         unwatchNetworkChanges()
         currentSlug?.let {

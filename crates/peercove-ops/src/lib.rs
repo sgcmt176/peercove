@@ -12,6 +12,7 @@ pub mod dns;
 pub mod init;
 pub mod invite;
 pub mod join;
+pub mod keyfiles;
 pub mod net;
 pub mod networks;
 pub mod peers;

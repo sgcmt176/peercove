@@ -72,6 +72,7 @@ import uniffi.peercove_mobile.createGroup
 import uniffi.peercove_mobile.dnsEntries
 import uniffi.peercove_mobile.listNetworks
 import uniffi.peercove_mobile.members
+import uniffi.peercove_mobile.rotateKey
 import uniffi.peercove_mobile.sessionState
 import uniffi.peercove_mobile.setDisplayName
 import uniffi.peercove_mobile.setDnsName
@@ -724,10 +725,12 @@ private fun SettingsTab(
     var limitText by remember { mutableStateOf("") }
     var displayName by remember { mutableStateOf("") }
     var dnsName by remember { mutableStateOf("") }
+    var keyRotated by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
     val failed = stringResource(R.string.failed_generic)
     val savedRestart = stringResource(R.string.settings_saved_restart)
     val saved = stringResource(R.string.settings_saved)
+    val keyRotateDone = stringResource(R.string.settings_key_rotate_done)
 
     LaunchedEffect(slug) {
         val info = withContext(Dispatchers.IO) {
@@ -738,6 +741,7 @@ private fun SettingsTab(
             mtuText = info.mtu.toString()
             limitText = info.maxRecvFileMb.toString()
             displayName = info.displayName
+            keyRotated = info.keyRotated
         }
     }
 
@@ -896,5 +900,35 @@ private fun SettingsTab(
             enabled = !busy && dnsName.isNotBlank(),
             onClick = { run { setDnsName(slug, dnsName) } },
         ) { Text(stringResource(R.string.settings_dns_name_submit)) }
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+
+        // デバイス鍵(ADR-0044)。更新後は新しい鍵での接続し直しが必要なので
+        // サービスへ再接続を依頼する
+        Text(
+            stringResource(R.string.settings_key_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            if (keyRotated) {
+                stringResource(R.string.settings_key_rotated)
+            } else {
+                stringResource(R.string.settings_key_from_invite)
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.padding(2.dp))
+        Button(
+            enabled = !busy,
+            onClick = {
+                run {
+                    rotateKey(baseDir, slug)
+                    keyRotated = true
+                    startVpnService(context, slug) // 新しい鍵で入れ直し
+                    keyRotateDone
+                }
+            },
+        ) { Text(stringResource(R.string.settings_key_rotate)) }
     }
 }

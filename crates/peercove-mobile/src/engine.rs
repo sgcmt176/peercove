@@ -74,6 +74,9 @@ struct Shared {
     endpoints: Vec<SocketAddr>,
     current_peer: Mutex<SocketAddr>,
     rotate_after: Duration,
+    /// 最後に rebind(回線切替)した時刻。それ以降にハンドシェイクが
+    /// 成立するまで、途絶判定(180 秒)を待たずにローテーションを回す
+    rebound_at: Mutex<Option<Instant>>,
     stats: Mutex<EngineStats>,
     stop: AtomicBool,
 }
@@ -116,6 +119,7 @@ impl Engine {
             endpoints: spec.endpoints,
             current_peer: Mutex::new(first),
             rotate_after: spec.rotate_after,
+            rebound_at: Mutex::new(None),
             stats: Mutex::new(EngineStats::default()),
             stop: AtomicBool::new(false),
         });
@@ -156,6 +160,7 @@ impl Engine {
         udp.set_read_timeout(Some(TICK))?;
         let udp = Arc::new(udp);
         *self.shared.udp.write().unwrap() = Arc::clone(&udp);
+        *self.shared.rebound_at.lock().unwrap() = Some(Instant::now());
         let mut buf = [0u8; BUF_SIZE];
         let mut tunn = self.shared.tunn.lock().unwrap();
         if let TunnResult::WriteToNetwork(data) = tunn.format_handshake_initiation(&mut buf, true) {
@@ -225,9 +230,14 @@ fn udp_loop(shared: &Shared) {
             {
                 continue
             }
+            // 到達不能ポートへ送った後の ICMP(ConnectionRefused/Reset)や
+            // 回線切替直後の一時エラーで受信ループを終わらせない(終わらせると
+            // 以後ハンドシェイク応答を読めず永久に復帰不能 = 実機で観測)。
+            // スピン防止に 1 tick 待って続行する
             Err(e) => {
-                tracing::warn!("UDP 受信に失敗: {e}");
-                break;
+                tracing::debug!("UDP 受信エラー(継続): {e}");
+                std::thread::sleep(TICK);
+                continue;
             }
         };
         let mut tunn = shared.tunn.lock().unwrap();
@@ -289,10 +299,22 @@ fn timer_loop(shared: &Shared) {
         // 自己回復(M4 E-C/E-D): rotate_after ごとに再ハンドシェイクを仕掛ける。
         // 候補が複数あれば次の候補へ切り替え、1 つでも同じ相手へ強制再開する
         // (放置後に boringtun が再試行を諦めて固まったままになる事例への対策)
-        let dead = match since {
+        let mut dead = match since {
             None => true,
             Some(age) => age > Duration::from_secs(180),
         };
+        // rebind(回線切替)後は、その後にハンドシェイクが成立するまで
+        // 途絶扱いにする(Wi-Fi の LAN 接続先はモバイル回線から届かないため、
+        // 180 秒待たずに外部 IP 候補への切替を始める)
+        {
+            let mut rebound = shared.rebound_at.lock().unwrap();
+            if let Some(at) = *rebound {
+                match since {
+                    Some(age) if age < at.elapsed() => *rebound = None, // 切替後に成立
+                    _ => dead = true,
+                }
+            }
+        }
         if dead && last_rotate.elapsed() >= shared.rotate_after {
             last_rotate = Instant::now();
             if shared.endpoints.len() > 1 {
@@ -487,6 +509,65 @@ mod tests {
             false
         });
         assert!(established, "フォールバック先でハンドシェイクが確立しない");
+
+        a.stop();
+        b.stop();
+    }
+
+    /// 先頭候補が「誰も居ないポート」(ICMP 到達不能 → recv がエラーを返す)
+    /// でも受信ループが死なず、次の候補へフォールバックして確立する。
+    /// 回線切替後に永久に復帰しなかった実機不具合の回帰テスト。
+    #[test]
+    fn engine_survives_recv_errors_and_falls_back() {
+        let a_key = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let b_key = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let a_pub = x25519::PublicKey::from(&a_key);
+        let b_pub = x25519::PublicKey::from(&b_key);
+
+        // bind してすぐ閉じたポート = 送ると ICMP 到達不能が返ってくる
+        let ghost_addr = {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap()
+        };
+
+        let a_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a_addr = a_udp.local_addr().unwrap();
+        let b_addr = b_udp.local_addr().unwrap();
+
+        let (_a_in, a_rx) = mpsc::channel::<Vec<u8>>();
+        let (a_out_tx, _a_out) = mpsc::channel();
+        let tun = Arc::new(ChanTun {
+            rx: Mutex::new(a_rx),
+            tx: a_out_tx,
+        });
+        let a = Engine::start(
+            EngineSpec {
+                private_key: a_key.to_bytes(),
+                peer_public_key: b_pub.to_bytes(),
+                preshared_key: None,
+                endpoints: vec![ghost_addr, b_addr],
+                rotate_after: Duration::from_millis(500),
+                allowed_ips: vec!["10.99.0.2/32".parse().unwrap()],
+                persistent_keepalive: Some(5),
+            },
+            tun,
+            a_udp,
+        )
+        .unwrap();
+        let (b, _b_in, _b_out) = make_engine(&b_key, a_pub, a_addr, b_udp, "10.99.0.1/32");
+
+        let established = (0..100).any(|_| {
+            if a.stats().handshake_age_secs.is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            false
+        });
+        assert!(
+            established,
+            "recv エラー(ICMP 到達不能)後にフォールバックで確立しない"
+        );
 
         a.stop();
         b.stop();

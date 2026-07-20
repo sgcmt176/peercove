@@ -77,6 +77,9 @@ pub struct NetworkInfo {
     pub mtu: u16,
     /// 受信ファイルサイズ上限(MB、0 = 無制限。mobile.toml、既定 10)
     pub max_recv_file_mb: u64,
+    /// デバイス鍵をこの端末で生成済みか(false = 招待トークン由来のまま。
+    /// ADR-0020: 接続後に自動ローテーションの対象になる)
+    pub key_rotated: bool,
 }
 
 /// 稼働中トンネルの状態(2 秒ポーリング想定)。
@@ -235,7 +238,23 @@ fn network_info(entry: &NetworkEntry) -> Option<NetworkInfo> {
         mtu: config.interface.mtu,
         // 明示されていない古い設定はモバイル既定の 10 MB として扱う
         max_recv_file_mb: session::recv_limit_mb_for(&entry.config_path),
+        key_rotated: config.interface.key_source
+            == Some(peercove_core::config::KeySource::SelfGenerated),
     })
+}
+
+/// member.toml から設定パスと鍵ファイルパスを引く(鍵ローテーション用)。
+fn key_paths(
+    base_dir: &str,
+    slug: &str,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use anyhow::Context;
+    let config_path = networks::networks_dir(Path::new(base_dir))
+        .join(slug)
+        .join(networks::MEMBER_FILE);
+    let config = Config::load(&config_path)
+        .with_context(|| format!("ネットワーク {slug} の設定を読めません"))?;
+    Ok((config_path, config.interface.private_key_file))
 }
 
 /// 設定を「現在値を全部読んでから一部だけ変えて書き戻す」共通処理。
@@ -291,20 +310,25 @@ pub fn update_network_settings(
 
 /// VpnService の TUN fd で WG トンネルを開始する。
 /// `tun_fd` の所有権はこの呼び出しで Rust 側へ移る(停止時に close)。
+///
+/// `use_pending_key` = true なら更新待ちの鍵(`member.key.new`)で起動する
+/// (鍵ローテーションの応答が失われた後の自己回復。ADR-0020/0044:
+/// Kotlin 側の監視が「確定鍵で疎通しない + 更新待ちあり」のとき指定する)。
 #[uniffi::export]
 pub fn start_tunnel(
     base_dir: String,
     slug: String,
     tun_fd: i32,
     protector: Arc<dyn SocketProtector>,
+    use_pending_key: bool,
 ) -> Result<(), MobileError> {
     #[cfg(unix)]
     {
-        start_tunnel_impl(&base_dir, &slug, tun_fd, protector).map_err(Into::into)
+        start_tunnel_impl(&base_dir, &slug, tun_fd, protector, use_pending_key).map_err(Into::into)
     }
     #[cfg(not(unix))]
     {
-        let _ = (base_dir, slug, tun_fd, protector);
+        let _ = (base_dir, slug, tun_fd, protector, use_pending_key);
         Err(MobileError::Failure {
             msg: "この OS ではトンネルを起動できません(Android 専用)".to_string(),
         })
@@ -317,6 +341,7 @@ fn start_tunnel_impl(
     slug: &str,
     tun_fd: i32,
     protector: Arc<dyn SocketProtector>,
+    use_pending_key: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::os::fd::AsRawFd;
@@ -328,7 +353,13 @@ fn start_tunnel_impl(
     let dir = networks::networks_dir(Path::new(base_dir)).join(slug);
     let config = Config::load(&dir.join(networks::MEMBER_FILE))
         .with_context(|| format!("ネットワーク {slug} の設定を読めません"))?;
-    let private = peercove_core::keys::read_private_key_file(&config.interface.private_key_file)?;
+    let key_path = &config.interface.private_key_file;
+    let private = if use_pending_key {
+        peercove_ops::keyfiles::load_pending(key_path)
+            .context("更新待ちの鍵(member.key.new)がありません")?
+    } else {
+        peercove_core::keys::read_private_key_file(key_path)?
+    };
     let peer = config
         .peers
         .iter()
@@ -423,6 +454,57 @@ pub fn tunnel_status(slug: String) -> Option<TunnelStatus> {
                 .unwrap_or_default(),
         }
     })
+}
+
+// ---- 鍵ローテーション(ADR-0020 のモバイル版、ADR-0044)------------------------
+
+/// デバイス鍵の更新(手動 / 参加後の自動)。同期中(コントロール接続済み)に
+/// 呼ぶこと。成功したら**トンネルの接続し直しが必要**(Kotlin 側が行う)。
+///
+/// 締め出し防止: 依頼を送る**前に**新鍵を `member.key.new` として保存し、
+/// 承認応答が来たときだけ確定する。応答が失われた場合は `.new` が残り、
+/// 次回接続の監視(pending_key_exists + use_pending_key)で自己回復する。
+/// ブロッキング(応答待ち最大 10 秒)なので Kotlin 側は IO ディスパッチャで呼ぶ。
+#[uniffi::export]
+pub fn rotate_key(base_dir: String, slug: String) -> Result<String, MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    let (config_path, key_path) = key_paths(&base_dir, &slug)?;
+    let new_key = peercove_ops::keyfiles::ensure_pending(&key_path)?;
+    let public = new_key.public_key();
+    tracing::info!("デバイス鍵の更新をホストへ依頼します(新しい公開鍵 {public})");
+    let (accepted, message) = s.rotate_key_request(public)?;
+    if accepted {
+        peercove_ops::keyfiles::commit_pending(&config_path, &key_path)?;
+        tracing::info!("デバイス鍵を更新しました(新しい鍵での接続し直しが必要)");
+        Ok(message)
+    } else {
+        // 拒否 = ホストは旧鍵のまま。新鍵を破棄して現状維持(締め出しなし)
+        peercove_ops::keyfiles::discard_pending(&key_path);
+        Err(MobileError::Failure {
+            msg: format!("ホストに拒否されました: {message}"),
+        })
+    }
+}
+
+/// 更新待ちの鍵(`member.key.new`)が残っているか。
+/// 残っている = ローテーションの応答が失われた可能性(ADR-0020 の自己回復対象)。
+#[uniffi::export]
+pub fn pending_key_exists(base_dir: String, slug: String) -> bool {
+    key_paths(&base_dir, &slug)
+        .map(|(_, key_path)| peercove_ops::keyfiles::load_pending(&key_path).is_some())
+        .unwrap_or(false)
+}
+
+/// 更新待ちの鍵で疎通が確認できたとき(use_pending_key で起動して
+/// ハンドシェイクが成立)に確定させる。
+#[uniffi::export]
+pub fn commit_pending_key(base_dir: String, slug: String) -> Result<(), MobileError> {
+    let (config_path, key_path) = key_paths(&base_dir, &slug)?;
+    peercove_ops::keyfiles::commit_pending(&config_path, &key_path)?;
+    tracing::info!("更新待ちの鍵で疎通できたため確定しました");
+    Ok(())
 }
 
 /// 回線切替(Wi-Fi ↔ モバイル)を Kotlin(NetworkCallback)が検知したときに
