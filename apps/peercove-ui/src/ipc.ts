@@ -43,6 +43,10 @@ export interface Member {
   /** ACL v2のためホスト中継へ固定されている。 */
   forceRelay: boolean;
   aclRuleId: string | null;
+  /** この端末がメンバー招待を発行できるか（ADR-0048）。自分の行の値でボタン表示を決める。 */
+  canInvite: boolean;
+  /** このメンバーを招待した発行者の表示名（ADR-0048）。ホスト発行は null。 */
+  invitedBy: string | null;
 }
 
 /** カスタム DNS レコード（M3-1c、ADR-0022 で拡張）。 */
@@ -293,6 +297,14 @@ export interface InviteResult {
   expiresAt: number | null;
 }
 
+/** メンバー発行の招待（ADR-0048）。token は秘密情報（発行直後のみ表示）。 */
+export interface MemberInviteResult {
+  token: string;
+  qrSvg: string;
+  name: string;
+  expiresAt: number | null;
+}
+
 export interface JoinResult {
   configPath: string;
   name: string;
@@ -318,6 +330,8 @@ export interface Settings {
   maxRecvFileMb: number;
   /** ホストのみ。新規参加端末を承認まで隔離する。 */
   requireInviteApproval: boolean;
+  /** ホストのみ。メンバーによる招待発行を許可する（ADR-0048、既定 true）。 */
+  memberInvites: boolean;
   defaultMtu: number;
   defaultListenPort: number;
   defaultMaxRecvFileMb: number;
@@ -333,6 +347,8 @@ export interface SettingsUpdate {
   direct: boolean;
   maxRecvFileMb: number;
   requireInviteApproval: boolean;
+  /** ホストのみ。メンバーによる招待発行を許可する（ADR-0048）。 */
+  memberInvites: boolean;
 }
 
 export interface SaveResult {
@@ -460,6 +476,20 @@ export const api = {
     invoke<void>("approve_member", { configPath, publicKey }),
   renameMember: (configPath: string, publicKey: string, newName: string) =>
     invoke<void>("rename_member", { configPath, publicKey, newName }),
+  // メンバー招待の発行（ADR-0048）。ホストは端末指名（can_invite）を切り替え、
+  // メンバーはデーモン経由でホストへ発行を依頼する（token は秘密情報）
+  setMemberCanInvite: (configPath: string, publicKey: string, allowed: boolean) =>
+    invoke<void>("set_member_can_invite", { configPath, publicKey, allowed }),
+  memberCreateInvite: (
+    configPath: string,
+    name: string | null,
+    expiresInSecs: number | null,
+  ) =>
+    invoke<MemberInviteResult>("member_create_invite", {
+      configPath,
+      name,
+      expiresInSecs,
+    }),
   // DNS 名（ADR-0021、M3-14a）。ホストは任意メンバーを直接、メンバー本人は
   // デーモン経由（接続中のみ・ホストが検証）で変更する
   setMemberDnsName: (configPath: string, publicKey: string, dnsName: string) =>

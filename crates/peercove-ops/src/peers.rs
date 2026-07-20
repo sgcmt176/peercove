@@ -25,6 +25,10 @@ pub struct NewPeer<'a> {
     pub invite_id: Option<&'a str>,
     pub invite_issued_at: Option<u64>,
     pub invite_expires_at: Option<u64>,
+    /// 発行を依頼したメンバーの invite_id(ADR-0048。ホスト発行では None)
+    pub invited_by_id: Option<&'a str>,
+    /// 発行時点の発行者表示名のスナップショット
+    pub invited_by_name: Option<&'a str>,
 }
 
 /// 削除・変更対象の指定(いずれか 1 つ)。
@@ -93,6 +97,12 @@ pub fn append_peer(config_path: &Path, peer: &NewPeer) -> anyhow::Result<()> {
     }
     if let Some(expires_at) = peer.invite_expires_at {
         block.push_str(&format!("invite_expires_at = {expires_at}\n"));
+    }
+    if let Some(id) = peer.invited_by_id {
+        block.push_str(&format!("invited_by_id = {}\n", toml_string(id)));
+    }
+    if let Some(name) = peer.invited_by_name {
+        block.push_str(&format!("invited_by_name = {}\n", toml_string(name)));
     }
     if config.interface.require_invite_approval && peer.invite_id.is_some() {
         block.push_str("invite_requires_approval = true\n");
@@ -647,6 +657,47 @@ pub fn set_peer_display_name_by_ip(
     Ok(name.to_string())
 }
 
+/// メンバー招待の発行許可(ADR-0048)を端末単位で切り替える。
+/// 既定(false)なら項目を消す(設定ファイルを汚さない)。
+/// 戻り値は表示用の名前(ログ用)。
+pub fn set_peer_can_invite(
+    config_path: &Path,
+    selector: &Selector,
+    allowed: bool,
+) -> anyhow::Result<String> {
+    let config = Config::load(config_path)?;
+    let target = find_peer(&config, selector)?;
+    let display = target
+        .name
+        .clone()
+        .unwrap_or_else(|| target.public_key.to_string());
+    let target_key = target.public_key.to_base64();
+    let (lock, mut doc) = load_doc_locked(config_path)?;
+    let mut updated = false;
+    for table in peer_tables(&mut doc)?.iter_mut() {
+        let matches = table
+            .get("public_key")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            == Some(target_key.as_str());
+        if matches {
+            if allowed {
+                table["can_invite"] = toml_edit::value(true);
+            } else {
+                table.remove("can_invite");
+            }
+            updated = true;
+        }
+    }
+    if !updated {
+        bail!(
+            "host.toml から対象ピアを特定できませんでした(手編集で public_key が変わっている可能性)"
+        );
+    }
+    write_validated(lock, config_path, &doc.to_string())?;
+    Ok(display)
+}
+
 /// 招待 v3 の初回認証済み Hello を記録する。旧招待・既に記録済みなら変更しない。
 pub fn mark_invite_accepted_by_ip(
     config_path: &Path,
@@ -792,10 +843,59 @@ mod tests {
                 invite_id: None,
                 invite_issued_at: None,
                 invite_expires_at: None,
+                invited_by_id: None,
+                invited_by_name: None,
             },
         )
         .unwrap();
         key
+    }
+
+    /// 招待発行の端末指名(ADR-0048)。有効化で can_invite = true が書かれ、
+    /// 無効化で項目ごと消える(設定ファイルを汚さない)。招待者の記録
+    /// (invited_by_id/name)も append_peer で保存される。
+    #[test]
+    fn can_invite_toggle_and_invited_by_roundtrip() {
+        let config = setup("caninvite");
+        let key = PrivateKey::generate().public_key();
+        let alice_id = peercove_core::token::generate_invite_id();
+        let bob_id = peercove_core::token::generate_invite_id();
+        append_peer(
+            &config,
+            &NewPeer {
+                public_key: key,
+                ip: "10.100.42.2".parse().unwrap(),
+                name: Some("alice"),
+                dns_name: None,
+                preshared_key_file: None,
+                invite_id: Some(&alice_id),
+                invite_issued_at: Some(1_700_000_000),
+                invite_expires_at: None,
+                invited_by_id: Some(&bob_id),
+                invited_by_name: Some("bob"),
+            },
+        )
+        .unwrap();
+        let parsed = Config::load(&config).unwrap();
+        assert_eq!(
+            parsed.peers[0].invited_by_id.as_deref(),
+            Some(bob_id.as_str())
+        );
+        assert_eq!(parsed.peers[0].invited_by_name.as_deref(), Some("bob"));
+        assert!(!parsed.peers[0].can_invite, "既定は発行不可");
+
+        let ip: Ipv4Addr = "10.100.42.2".parse().unwrap();
+        set_peer_can_invite(&config, &Selector::Ip(ip), true).unwrap();
+        assert!(Config::load(&config).unwrap().peers[0].can_invite);
+
+        set_peer_can_invite(&config, &Selector::Ip(ip), false).unwrap();
+        assert!(!Config::load(&config).unwrap().peers[0].can_invite);
+        assert!(
+            !std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("can_invite"),
+            "無効化で項目ごと消える"
+        );
     }
 
     #[test]
@@ -825,6 +925,7 @@ mod tests {
             extra_endpoints: &[],
             psk: true,
             expires_in_secs: None,
+            invited_by: None,
         })
         .unwrap();
 
@@ -910,6 +1011,8 @@ mod tests {
             invite_id: None,
             invite_issued_at: None,
             invite_expires_at: None,
+            invited_by_id: None,
+            invited_by_name: None,
         };
         assert!(append_peer(&config, &dup).is_err(), "公開鍵の重複");
 
@@ -924,6 +1027,8 @@ mod tests {
                 invite_id: None,
                 invite_issued_at: None,
                 invite_expires_at: None,
+                invited_by_id: None,
+                invited_by_name: None,
             };
             assert!(
                 append_peer(&config, &peer).is_err(),

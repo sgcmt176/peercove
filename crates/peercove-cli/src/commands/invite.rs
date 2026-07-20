@@ -49,6 +49,7 @@ pub fn run(options: &CliOptions) -> anyhow::Result<()> {
         extra_endpoints: &extra,
         psk: options.psk,
         expires_in_secs: options.expires_in_secs,
+        invited_by: None,
     })?;
 
     write_secret(options.out, &format!("{}\n", result.token))?;

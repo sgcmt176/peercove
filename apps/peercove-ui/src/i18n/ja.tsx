@@ -473,6 +473,26 @@ export const ja = {
       approve: "承認",
       approved: "参加端末を承認しました。隔離は数秒以内に解除されます。",
       inviteExpires: (value: string) => `招待期限: ${value}`,
+      // メンバー詳細ページ(ADR-0048)
+      detail: "詳細",
+      detailTitle: (name: string) => `${name} の詳細`,
+      detailName: "表示名",
+      detailRole: "役割",
+      detailDns: "DNS 名",
+      detailOs: "OS",
+      detailVersion: "アプリ",
+      detailKey: "公開鍵",
+      detailState: "状態",
+      detailRoute: "経路",
+      detailInvite: "招待の状態",
+      detailSubnets: "公開サブネット",
+      invitedBy: "招待者",
+      invitedByHost: "ホスト",
+      // メンバーによる招待発行の端末指名(ADR-0048)
+      canInviteLabel: "この端末にメンバー招待の発行を許可",
+      canInviteHint:
+        "許可すると、この端末から新しいメンバーを招待できます（発行はホストの記録と全体チャットに残ります）。ネットワーク設定の「メンバーによる招待発行を許可」が OFF の間は無効です。",
+      canInviteUpdated: "招待発行の許可を変更しました。数秒で反映されます。",
     },
     // 直接通信の説明(M3-4)。外部 IP の共有について明記する(ADR-0013 条件 3)
     directNote:
@@ -769,6 +789,11 @@ export const ja = {
     expiryHint: "期限切れ後は、まだ参加していない端末からの接続をホストが拒否します。",
     issuing: "発行中…",
     issue: "招待を発行",
+    // メンバーによる招待発行(ADR-0048)
+    memberFormNote:
+      "ホストに依頼して招待を発行します。発行はホストの記録と全体チャットのお知らせに残ります。有効期限は最長 7 日です。",
+    memberResultNote:
+      "接続先の候補はホストが自動で決めます。取り消しはホストに依頼してください。",
   },
 
   logs: {
@@ -842,6 +867,10 @@ export const ja = {
       "— 可能なら相手と直接つなぎます（速く・ホスト回線の負荷なし）。あなたのグローバル IP がネットワーク内のメンバーに共有されます。オフにすると常にホスト経由。約 10 秒で反映されます",
     inviteApprovalLabel: "新しい端末の参加を承認する",
     inviteApprovalHint: "— 承認まではコントロール通信以外を隔離します",
+    // メンバーによる招待発行(ADR-0048)
+    memberInvitesLabel: "メンバーによる招待発行を許可",
+    memberInvitesHint:
+      "— 許可した端末（メンバー詳細で指名）だけが招待を発行できます。OFF にすると全端末で無効になります",
     // 受信ファイルサイズ上限(ADR-0015、M3-9)
     maxFileLabel: "受信ファイルの上限（MB）",
     maxFileHint: (defaultMb: number) =>

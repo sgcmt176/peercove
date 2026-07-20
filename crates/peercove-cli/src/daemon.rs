@@ -281,6 +281,47 @@ impl DaemonShared {
                     ),
                 }
             }
+            IpcRequest::CreateInvite {
+                config,
+                name,
+                expires_in_secs,
+            } => {
+                // (member)メンバー招待の発行依頼(ADR-0048)。ホストへ送って
+                // 権限確認・発行の結果を待つ。ロックは送信前に手放す
+                let (link, network) = {
+                    let active = self.active.lock().await;
+                    let active = active.get(&Self::key_for(&config)).with_context(|| {
+                        format!("この設定のトンネルは動いていません({})", config.display())
+                    })?;
+                    if active.role != Role::Member {
+                        bail!(
+                            "この操作はメンバーとして参加しているネットワーク用です\
+                            (ホストは招待画面から発行できます)"
+                        );
+                    }
+                    (Arc::clone(&active.member_link), active.network.clone())
+                };
+                let reply = link
+                    .request_create_invite(name, expires_in_secs)
+                    .context("ホストに接続していません(接続が確立してからやり直してください)")?;
+                // 発行はホスト側で設定ロック待ちがありうるため少し長めに待つ
+                match tokio::time::timeout(std::time::Duration::from_secs(15), reply).await {
+                    Ok(Ok(reply)) if reply.accepted => {
+                        // トークンは秘密情報なのでログへ出さない(ADR-0008)
+                        tracing::info!("メンバー招待を発行しました(network={network})");
+                        Ok(IpcResponse::InviteIssued {
+                            token: reply.token.context("ホストの応答にトークンがありません")?,
+                            name: reply.name.unwrap_or_default(),
+                            expires_at: reply.expires_at,
+                        })
+                    }
+                    Ok(Ok(reply)) => bail!("{}", reply.message),
+                    Ok(Err(_)) => bail!("ホストとの接続が切れました。やり直してください"),
+                    Err(_) => bail!(
+                        "ホストから応答がありません(ホストのバージョンが古い可能性があります)"
+                    ),
+                }
+            }
         }
     }
 
@@ -2353,6 +2394,8 @@ mod tests {
                 platform: None,
                 capabilities: vec![],
                 member_id: member_id.map(String::from),
+                can_invite: false,
+                invited_by: None,
                 invite_status: None,
                 invite_expires_at: None,
                 online: true,

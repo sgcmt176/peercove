@@ -30,6 +30,9 @@ pub struct InviteOptions<'a> {
     pub psk: bool,
     /// None は無期限。UI/CLI の既定は 7 日。
     pub expires_in_secs: Option<u64>,
+    /// 発行を依頼したメンバー(ADR-0048)。`(invite_id, 発行時の表示名)`。
+    /// ホスト自身の発行では None。
+    pub invited_by: Option<(&'a str, &'a str)>,
 }
 
 pub struct InviteResult {
@@ -145,6 +148,8 @@ pub fn invite(options: &InviteOptions) -> anyhow::Result<InviteResult> {
             invite_id: Some(&invite_id),
             invite_issued_at: Some(issued_at),
             invite_expires_at: expires_at,
+            invited_by_id: options.invited_by.map(|(id, _)| id),
+            invited_by_name: options.invited_by.map(|(_, name)| name),
         },
     )?;
 
@@ -220,6 +225,7 @@ mod tests {
             extra_endpoints: &[],
             psk: false,
             expires_in_secs: Some(7 * 24 * 60 * 60),
+            invited_by: None,
         }
     }
 

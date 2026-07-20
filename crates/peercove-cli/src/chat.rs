@@ -54,6 +54,8 @@ pub fn reconcile_identities(
         .unwrap_or_default();
     let mut outcome = ReconcileOutcome::default();
     let mut changed = false;
+    // 初回同期(サイドカーが空)では過去の招待までお知らせしない(ADR-0048)
+    let known_before = !map.is_empty();
     for entry in ledger {
         if entry.ip == self_ip || entry.is_host {
             continue;
@@ -97,6 +99,22 @@ pub fn reconcile_identities(
                 changed = true;
             }
             None => {
+                // 新しく台帳に現れた IP。メンバー発行の招待(ADR-0048)なら
+                // 全体会話へお知らせ行で可視化する(参加前の pending 段階で出る)
+                if known_before {
+                    if let Some(inviter) = entry.invited_by.as_deref() {
+                        append_system(
+                            chat,
+                            ChatScope::Network,
+                            None,
+                            self_ip,
+                            format!(
+                                "{inviter} がメンバー招待を発行しました({})",
+                                entry.name.as_deref().unwrap_or(&ip)
+                            ),
+                        );
+                    }
+                }
                 map.insert(ip, id);
                 changed = true;
             }
@@ -512,6 +530,8 @@ mod tests {
             platform: None,
             capabilities: vec![],
             member_id: Some(member_id.to_string()),
+            can_invite: false,
+            invited_by: None,
             invite_status: None,
             invite_expires_at: None,
             online: true,
@@ -523,6 +543,54 @@ mod tests {
             force_relay: false,
             acl_rule_id: None,
         }
+    }
+
+    /// メンバー発行の招待(ADR-0048)は、新しく台帳に現れたときに全体会話へ
+    /// お知らせ行を出す。初回同期(サイドカーが空)では過去分を通知しない。
+    #[test]
+    fn invited_notice_appears_for_new_entries_only() {
+        let config = temp_config("invitednotice");
+        let log = ChatLog::load(&config);
+        let self_ip = "10.0.0.1".parse().unwrap();
+        let queue: SharedChatQueue = Arc::new(Mutex::new(vec![]));
+        let invited = |ip: &str, id: &str| LedgerEntry {
+            invited_by: Some("bob".to_string()),
+            ..ledger_entry(ip, id)
+        };
+        // 初回同期: 招待済みエントリが居てもお知らせしない(参加直後の端末が
+        // 過去の招待を全部通知しないため)
+        reconcile_identities(
+            &config,
+            self_ip,
+            &[invited("10.0.0.5", "inv-a")],
+            &log,
+            &queue,
+        );
+        assert!(log.lock().unwrap().fetch(0).1.is_empty());
+        // 2 回目以降に現れた新エントリはお知らせする
+        reconcile_identities(
+            &config,
+            self_ip,
+            &[invited("10.0.0.5", "inv-a"), invited("10.0.0.6", "inv-b")],
+            &log,
+            &queue,
+        );
+        let (_, messages) = log.lock().unwrap().fetch(0);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].system);
+        assert_eq!(messages[0].scope, ChatScope::Network);
+        assert!(messages[0]
+            .text
+            .contains("bob がメンバー招待を発行しました"));
+        // 同じ台帳の再同期では重複しない
+        reconcile_identities(
+            &config,
+            self_ip,
+            &[invited("10.0.0.5", "inv-a"), invited("10.0.0.6", "inv-b")],
+            &log,
+            &queue,
+        );
+        assert_eq!(log.lock().unwrap().fetch(0).1.len(), 1);
     }
 
     /// clear_direct はその IP との 1:1 だけ消し、seq は続きから振る。

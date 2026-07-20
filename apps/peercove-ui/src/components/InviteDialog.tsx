@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { InviteResult, api, errorMessage } from "../ipc";
+import { InviteResult, MemberInviteResult, api, errorMessage } from "../ipc";
 import { Modal } from "./Modal";
 import { t } from "../i18n";
 
@@ -157,6 +157,143 @@ export function InviteDialog({
             <option value="604800">{t.invite.expiryWeek}</option>
             <option value="2592000">{t.invite.expiryMonth}</option>
             <option value="none">{t.invite.never}</option>
+          </select>
+          <small className="muted">{t.invite.expiryHint}</small>
+        </label>
+        {error && <p className="error-text">{error}</p>}
+      </div>
+      <div className="modal__actions">
+        <button type="button" className="button--ghost" onClick={onClose}>
+          {t.common.cancel}
+        </button>
+        <button type="button" onClick={() => void submit()} disabled={busy}>
+          {busy ? t.invite.issuing : t.invite.issue}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * メンバーによる招待の発行(ADR-0048)。ホストに依頼して発行してもらう。
+ * 名前と有効期限(最長 7 日)だけの簡易フォーム。PSK・無期限は指定できない。
+ * トークンの扱いはホスト発行と同じ(**この画面でしか表示しない**)。
+ */
+export function MemberInviteDialog({
+  configPath,
+  onClose,
+}: {
+  configPath: string;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [expiry, setExpiry] = useState("604800");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<MemberInviteResult | null>(null);
+  const [copied, setCopied] = useState<"token" | "link" | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setResult(
+        await api.memberCreateInvite(
+          configPath,
+          name.trim() || null,
+          Number(expiry),
+        ),
+      );
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async (kind: "token" | "link") => {
+    if (!result) return;
+    try {
+      const text =
+        kind === "token"
+          ? result.token
+          : `peercove://join?token=${encodeURIComponent(result.token)}`;
+      await writeText(text);
+      setCopied(kind);
+      setTimeout(() => setCopied(null), 2000);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
+  if (result) {
+    return (
+      <Modal title={t.invite.resultTitle(result.name)} onClose={onClose} wide>
+        <div className="modal__body">
+          <p className="warn">{t.invite.warn}</p>
+          <div className="invite">
+            <div
+              className="invite__qr"
+              // fast_qr が生成した SVG。入力はホストが発行したトークンのみ
+              dangerouslySetInnerHTML={{ __html: result.qrSvg }}
+            />
+            <div className="invite__detail">
+              <dl className="facts">
+                <dt>{t.invite.expires}</dt>
+                <dd>
+                  {result.expiresAt
+                    ? new Date(result.expiresAt * 1000).toLocaleString()
+                    : t.invite.never}
+                </dd>
+              </dl>
+              <textarea className="token" readOnly value={result.token} rows={3} />
+              <div className="row">
+                <button type="button" onClick={() => void copy("token")}>
+                  {copied === "token" ? t.invite.copied : t.invite.copy}
+                </button>
+                <button
+                  type="button"
+                  className="button--ghost"
+                  title={t.invite.copyLinkHint}
+                  onClick={() => void copy("link")}
+                >
+                  {copied === "link" ? t.invite.copied : t.invite.copyLink}
+                </button>
+              </div>
+              <p className="muted small">{t.invite.copyLinkHint}</p>
+              {error && <p className="error-text">{error}</p>}
+            </div>
+          </div>
+          <p className="muted">{t.invite.memberResultNote}</p>
+        </div>
+        <div className="modal__actions">
+          <button type="button" onClick={onClose}>
+            {t.common.close}
+          </button>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal title={t.invite.formTitle} onClose={onClose}>
+      <div className="modal__body">
+        <p className="muted small">{t.invite.memberFormNote}</p>
+        <label className="field">
+          <span>{t.invite.nameLabel}</span>
+          <input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder={t.invite.namePlaceholder}
+            autoFocus
+          />
+        </label>
+        <label className="field">
+          <span>{t.invite.expiryLabel}</span>
+          <select value={expiry} onChange={(event) => setExpiry(event.target.value)}>
+            <option value="3600">{t.invite.expiryHour}</option>
+            <option value="86400">{t.invite.expiryDay}</option>
+            <option value="604800">{t.invite.expiryWeek}</option>
           </select>
           <small className="muted">{t.invite.expiryHint}</small>
         </label>

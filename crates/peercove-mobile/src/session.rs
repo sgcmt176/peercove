@@ -177,7 +177,18 @@ pub struct SessionShared {
     dns_result: Mutex<Option<(bool, String)>>,
     display_result: Mutex<Option<(bool, String)>>,
     rotate_result: Mutex<Option<(bool, String)>>,
+    /// CreateInvite(ADR-0048)の応答受け口。token は秘密情報 — ログへ
+    /// 出さず、取り出したら永続化しない
+    invite_result: Mutex<Option<(bool, String, Option<IssuedInvite>)>>,
     stop: AtomicBool,
+}
+
+/// メンバー発行で受け取った招待(ADR-0048)。`token` は秘密情報。
+#[derive(Clone)]
+pub struct IssuedInvite {
+    pub token: String,
+    pub name: String,
+    pub expires_at: Option<u64>,
 }
 
 pub struct NetSession {
@@ -202,6 +213,7 @@ impl NetSession {
             dns_result: Mutex::new(None),
             display_result: Mutex::new(None),
             rotate_result: Mutex::new(None),
+            invite_result: Mutex::new(None),
             stop: AtomicBool::new(false),
             cfg,
         });
@@ -550,6 +562,21 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
                     }
                     Ok(ControlMessage::RotateKeyResult { accepted, message }) => {
                         *shared.rotate_result.lock().unwrap() = Some((accepted, message));
+                    }
+                    Ok(ControlMessage::CreateInviteResult {
+                        accepted,
+                        message,
+                        token,
+                        name,
+                        expires_at,
+                    }) => {
+                        // 招待発行の応答(ADR-0048)。token はログへ出さない
+                        let invite = token.map(|token| IssuedInvite {
+                            token,
+                            name: name.unwrap_or_default(),
+                            expires_at,
+                        });
+                        *shared.invite_result.lock().unwrap() = Some((accepted, message, invite));
                     }
                     Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
                     Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
@@ -981,6 +1008,44 @@ impl SessionShared {
         )
     }
 
+    /// メンバー招待の発行依頼(ADR-0048)。ホストが権限(グローバルトグル +
+    /// can_invite)を確認したうえで発行し、トークンを返す。
+    /// 戻り値のトークンは秘密情報 — 表示・共有のみで永続化しない。
+    pub fn create_invite(
+        &self,
+        name: Option<String>,
+        expires_in_secs: Option<u64>,
+    ) -> anyhow::Result<IssuedInvite> {
+        if !self.control_connected.load(Ordering::Relaxed) {
+            bail!("ホストと同期していません(接続直後は数秒待ってから再試行してください)");
+        }
+        *self.invite_result.lock().unwrap() = None;
+        self.outbox
+            .lock()
+            .unwrap()
+            .push(ControlMessage::CreateInvite {
+                name: name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                expires_in_secs,
+            });
+        // 発行はホスト側で設定ロック待ちがありうるため少し長めに待つ
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !self.stopped() {
+            if let Some((accepted, message, invite)) = self.invite_result.lock().unwrap().take() {
+                return match (accepted, invite) {
+                    (true, Some(invite)) => Ok(invite),
+                    (true, None) => bail!("ホストの応答にトークンがありません"),
+                    (false, _) => bail!("{message}"),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        bail!("ホストから応答がありません(ホストが旧バージョンの可能性)");
+    }
+
     /// デバイス鍵の更新依頼(ADR-0020 のモバイル版)。
     /// 戻り値は (accepted, message)。Err はタイムアウト・未接続のみ
     /// (呼び出し側が「拒否 = 新鍵破棄」「応答なし = 新鍵温存」を分ける)。
@@ -1288,6 +1353,8 @@ impl SessionShared {
             .unwrap_or_default();
         let mut replaced: Vec<Ipv4Addr> = Vec::new();
         let mut changed = false;
+        // 初回同期(サイドカーが空)では過去の招待までお知らせしない(ADR-0048)
+        let known_before = !map.is_empty();
         for entry in members {
             if entry.ip == self.cfg.own_ip || entry.is_host {
                 continue;
@@ -1326,6 +1393,21 @@ impl SessionShared {
                     changed = true;
                 }
                 None => {
+                    // 新しく台帳に現れた IP。メンバー発行の招待(ADR-0048)なら
+                    // 全体会話へお知らせ行で可視化する
+                    if known_before {
+                        if let Some(inviter) = entry.invited_by.as_deref() {
+                            self.append_system_line(
+                                ChatScope::Network,
+                                None,
+                                None,
+                                format!(
+                                    "{inviter} がメンバー招待を発行しました({})",
+                                    entry.name.as_deref().unwrap_or(&ip)
+                                ),
+                            );
+                        }
+                    }
                     map.insert(ip, id);
                     changed = true;
                 }
@@ -2120,6 +2202,8 @@ mod tests {
             platform: None,
             capabilities: vec![],
             member_id: None,
+            can_invite: false,
+            invited_by: None,
             invite_status: None,
             invite_expires_at: None,
             online,
@@ -2695,6 +2779,7 @@ mod tests {
                 direct: current.direct,
                 max_recv_file_mb: 1,
                 require_invite_approval: current.require_invite_approval,
+                member_invites: current.member_invites,
             },
         )
         .unwrap();

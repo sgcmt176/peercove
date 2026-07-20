@@ -122,6 +122,35 @@ pub enum ControlMessage {
     /// host → member: [`ControlMessage::SetDisplayName`] への応答。
     /// 拒否時は `message` に理由(重複・空など)が入る。
     SetDisplayNameResult { accepted: bool, message: String },
+    /// member → host: メンバー招待の発行依頼(ADR-0048)。ホストが権限
+    /// (グローバルトグル + ピアの can_invite)を確認し、従来の invite を
+    /// 実行してトークンを返す。有効期限はホストが上限(既定 7 日)を強制し、
+    /// 無期限・PSK は指定できない。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
+    /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
+    CreateInvite {
+        /// 新メンバーの表示名(省略時はホストが自動命名)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// 希望する有効期限(秒)。ホスト既定を超える指定は切り詰められる。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_in_secs: Option<u64>,
+    },
+    /// host → member: [`ControlMessage::CreateInvite`] への応答。
+    /// **依頼が来た接続にだけ**返す。`token` はメンバー秘密鍵を含む
+    /// 秘密情報(ADR-0008) — ログへ出さず、受信側も永続化しない。
+    CreateInviteResult {
+        accepted: bool,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        /// 発行された新メンバーの表示名。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+    },
 }
 
 /// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。
@@ -155,6 +184,17 @@ pub struct LedgerEntry {
     /// 互換規則は endpoint と同じ(追加フィールド — 旧版とは互いに無視し合う)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_id: Option<String>,
+    /// この端末がメンバー招待を発行できるか(ADR-0048)。ホストの
+    /// グローバルトグルとピアの can_invite の両方が有効なときだけ true。
+    /// 受信側は自分のエントリの値で「招待を発行」ボタンの表示を決める。
+    /// 互換規則は endpoint と同じ(追加フィールド — 旧版とは互いに無視し合う)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_invite: bool,
+    /// このメンバーを招待した発行者の表示名(ADR-0048)。ホストが
+    /// invited_by_id → 現在の表示名に解決して載せる(発行者が削除済みなら
+    /// 発行時のスナップショット名)。ホスト発行・旧ピアは None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_by: Option<String>,
     /// ホスト正本の招待状態(M3-22)。旧版・ホスト自身は None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_status: Option<String>,
@@ -210,6 +250,8 @@ mod tests {
             platform: None,
             capabilities: vec![],
             member_id: None,
+            can_invite: false,
+            invited_by: None,
             invite_status: None,
             invite_expires_at: None,
             online: true,

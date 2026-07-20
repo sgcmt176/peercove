@@ -304,6 +304,17 @@ pub struct MemberLink {
     inner: Mutex<MemberLinkState>,
 }
 
+/// [`ControlMessage::CreateInviteResult`] の中身(メンバー側の受け口用)。
+/// `token` はメンバー秘密鍵を含む秘密情報 — ログへ出さず、永続化しない。
+#[derive(Debug)]
+pub struct InviteReply {
+    pub accepted: bool,
+    pub message: String,
+    pub token: Option<String>,
+    pub name: Option<String>,
+    pub expires_at: Option<u64>,
+}
+
 #[derive(Default)]
 struct MemberLinkState {
     /// セッション世代。接続のたびに増える(「このセッションで依頼済みか」の判定用)。
@@ -316,6 +327,8 @@ struct MemberLinkState {
     dns_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
     /// 表示名変更(ADR-0027)の応答待ち。dns_reply と同じ仕組み。
     display_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
+    /// メンバー招待の発行依頼(ADR-0048)の応答待ち。dns_reply と同じ仕組み。
+    invite_reply: Option<tokio::sync::oneshot::Sender<InviteReply>>,
     /// 自動再試行では回復しない、ホストからの参加拒否理由。
     connection_error: Option<String>,
 }
@@ -382,6 +395,29 @@ impl MemberLink {
         Some(rx)
     }
 
+    /// メンバー招待の発行をホストへ依頼し、応答の受け口を返す(ADR-0048)。
+    /// 切断中なら `None`。仕組みは [`Self::request_dns_name`] と同じ。
+    pub fn request_create_invite(
+        &self,
+        name: Option<String>,
+        expires_in_secs: Option<u64>,
+    ) -> Option<tokio::sync::oneshot::Receiver<InviteReply>> {
+        let mut state = self.inner.lock().unwrap();
+        let outbox = state.outbox.as_ref()?;
+        if outbox
+            .send(ControlMessage::CreateInvite {
+                name,
+                expires_in_secs,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.invite_reply = Some(tx);
+        Some(rx)
+    }
+
     fn attach(&self, outbox: Outbox) {
         let mut state = self.inner.lock().unwrap();
         state.session += 1;
@@ -389,6 +425,7 @@ impl MemberLink {
         state.rotate_result = None;
         state.dns_reply = None; // 応答待ちの受け口は Err(切断)になる
         state.display_reply = None;
+        state.invite_reply = None;
         state.connection_error = None;
     }
 
@@ -397,6 +434,7 @@ impl MemberLink {
         state.outbox = None;
         state.dns_reply = None;
         state.display_reply = None;
+        state.invite_reply = None;
     }
 
     fn put_rotate_result(&self, accepted: bool, message: String) {
@@ -412,6 +450,12 @@ impl MemberLink {
     fn put_display_result(&self, accepted: bool, message: String) {
         if let Some(reply) = self.inner.lock().unwrap().display_reply.take() {
             let _ = reply.send((accepted, message));
+        }
+    }
+
+    fn put_invite_result(&self, result: InviteReply) {
+        if let Some(reply) = self.inner.lock().unwrap().invite_reply.take() {
+            let _ = reply.send(result);
         }
     }
 
@@ -442,6 +486,9 @@ impl MemberLink {
 pub struct HostRequests {
     config_path: std::path::PathBuf,
     host_public_key: peercove_core::keys::PublicKey,
+    /// (host)UPnP で観測した外部エンドポイント。メンバー発行の招待
+    /// (ADR-0048)のエンドポイント候補に自動で足す(ホスト UI 発行と同等)。
+    external_endpoint: Option<std::net::SocketAddrV4>,
     /// host.toml の読み書きを直列化する(複数メンバーの同時依頼)。
     lock: tokio::sync::Mutex<()>,
 }
@@ -450,10 +497,12 @@ impl HostRequests {
     pub fn new(
         config_path: std::path::PathBuf,
         host_public_key: peercove_core::keys::PublicKey,
+        external_endpoint: Option<std::net::SocketAddrV4>,
     ) -> Self {
         Self {
             config_path,
             host_public_key,
+            external_endpoint,
             lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -549,6 +598,96 @@ impl HostRequests {
             Err(e) => {
                 tracing::warn!("表示名変更の適用タスクが失敗しました: {e}");
                 (false, "ホスト側の内部エラーです".to_string())
+            }
+        }
+    }
+
+    /// メンバー招待の発行依頼(ADR-0048)を適用し、応答メッセージを返す。
+    /// 権限(グローバルトグル + can_invite)はホスト正本で依頼ごとに確認する。
+    /// トークンは秘密情報 — ログには発行者 IP と invite_id だけ残す。
+    async fn apply_create_invite(
+        &self,
+        member_ip: Ipv4Addr,
+        name: Option<String>,
+        expires_in_secs: Option<u64>,
+    ) -> ControlMessage {
+        /// メンバー発行の有効期限の上限(ホスト UI の既定と同じ 7 日)。
+        /// 無期限(None)は指定できず、上限に丸める(ADR-0048)。
+        const MAX_EXPIRES_SECS: u64 = 7 * 24 * 60 * 60;
+        let _guard = self.lock.lock().await;
+        let path = self.config_path.clone();
+        let external = self.external_endpoint;
+        let outcome = tokio::task::spawn_blocking(move || {
+            let config = peercove_core::config::Config::load(&path)?;
+            if !config.interface.member_invites {
+                anyhow::bail!("ホストの設定でメンバーによる招待発行が無効になっています");
+            }
+            let issuer = peercove_ops::peers::find_peer(
+                &config,
+                &peercove_ops::peers::Selector::Ip(member_ip),
+            )?;
+            if !issuer.can_invite {
+                anyhow::bail!(
+                    "この端末には招待発行の権限がありません(ホスト管理者が許可すると使えます)"
+                );
+            }
+            let issuer_id = issuer
+                .invite_id
+                .clone()
+                .context("発行者の識別子が無いため発行できません(旧形式の登録)")?;
+            let issuer_name = issuer
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("member-{member_ip}"));
+            let expires = expires_in_secs
+                .unwrap_or(MAX_EXPIRES_SECS)
+                .clamp(60, MAX_EXPIRES_SECS);
+            let extra: Vec<std::net::SocketAddrV4> = external.into_iter().collect();
+            peercove_ops::invite::invite(&peercove_ops::invite::InviteOptions {
+                config_path: &path,
+                name: name.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                ip: None,
+                extra_endpoints: &extra,
+                psk: false, // メンバー発行では PSK は指定不可(ADR-0048)
+                expires_in_secs: Some(expires),
+                invited_by: Some((&issuer_id, &issuer_name)),
+            })
+        })
+        .await;
+        match outcome {
+            Ok(Ok(result)) => {
+                // 可視化(ADR-0048)。名前・トークンはログへ出さない
+                tracing::info!(
+                    "メンバー {member_ip} がメンバー招待を発行しました(invite_id={})",
+                    result.invite_id
+                );
+                ControlMessage::CreateInviteResult {
+                    accepted: true,
+                    message: "招待を発行しました".to_string(),
+                    token: Some(result.token),
+                    name: Some(result.name),
+                    expires_at: result.expires_at,
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::info!("メンバー {member_ip} の招待発行を受け付けませんでした: {e:#}");
+                ControlMessage::CreateInviteResult {
+                    accepted: false,
+                    message: format!("{e:#}"),
+                    token: None,
+                    name: None,
+                    expires_at: None,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("招待発行の適用タスクが失敗しました: {e}");
+                ControlMessage::CreateInviteResult {
+                    accepted: false,
+                    message: "ホスト側の内部エラーです".to_string(),
+                    token: None,
+                    name: None,
+                    expires_at: None,
+                }
             }
         }
     }
@@ -936,9 +1075,11 @@ async fn host_reader(
             Ok(ControlMessage::RotateKey { .. }) if isolation.load(Ordering::Relaxed) => {
                 tracing::debug!("承認待ち端末 {member_ip} からの鍵更新依頼を拒否しました");
             }
-            Ok(ControlMessage::SetDnsName { .. } | ControlMessage::SetDisplayName { .. })
-                if isolation.load(Ordering::Relaxed) =>
-            {
+            Ok(
+                ControlMessage::SetDnsName { .. }
+                | ControlMessage::SetDisplayName { .. }
+                | ControlMessage::CreateInvite { .. },
+            ) if isolation.load(Ordering::Relaxed) => {
                 tracing::debug!("承認待ち端末 {member_ip} からの設定変更依頼を拒否しました");
             }
             Ok(ControlMessage::RotateKey { new_public_key }) => {
@@ -960,6 +1101,17 @@ async fn host_reader(
                 // 台帳への反映は supervisor の次回再読込(≤5 秒)が行う
                 let (accepted, message) = requests.apply_display_name(member_ip, name).await;
                 let _ = out.send(ControlMessage::SetDisplayNameResult { accepted, message });
+            }
+            Ok(ControlMessage::CreateInvite {
+                name,
+                expires_in_secs,
+            }) => {
+                // メンバー招待の発行依頼(ADR-0048)。応答(トークン入り)は
+                // 依頼が来たこの接続の outbox にだけ流す
+                let reply = requests
+                    .apply_create_invite(member_ip, name, expires_in_secs)
+                    .await;
+                let _ = out.send(reply);
             }
             Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
@@ -1186,6 +1338,23 @@ async fn member_reader(
                 // 表示名変更の応答(ADR-0027)。IPC ハンドラが待つ受け口へ渡す
                 link.put_display_result(accepted, message);
             }
+            Ok(ControlMessage::CreateInviteResult {
+                accepted,
+                message,
+                token,
+                name,
+                expires_at,
+            }) => {
+                // 招待発行の応答(ADR-0048)。IPC ハンドラが待つ受け口へ渡す。
+                // token は秘密情報なのでログへ出さない
+                link.put_invite_result(InviteReply {
+                    accepted,
+                    message,
+                    token,
+                    name,
+                    expires_at,
+                });
+            }
             Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
         }
@@ -1207,6 +1376,8 @@ mod tests {
             platform: None,
             capabilities: vec![],
             member_id: None,
+            can_invite: false,
+            invited_by: None,
             invite_status: None,
             invite_expires_at: None,
             online,
@@ -1232,7 +1403,11 @@ mod tests {
             ),
         )
         .unwrap();
-        Arc::new(HostRequests::new(path, PrivateKey::generate().public_key()))
+        Arc::new(HostRequests::new(
+            path,
+            PrivateKey::generate().public_key(),
+            None,
+        ))
     }
 
     #[test]
@@ -1576,6 +1751,7 @@ mod tests {
         let requests = Arc::new(HostRequests::new(
             config_path,
             PrivateKey::generate().public_key(),
+            None,
         ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1719,7 +1895,11 @@ mod tests {
         )
         .unwrap();
         let host_public_key = PrivateKey::generate().public_key();
-        let requests = Arc::new(HostRequests::new(config_path.clone(), host_public_key));
+        let requests = Arc::new(HostRequests::new(
+            config_path.clone(),
+            host_public_key,
+            None,
+        ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

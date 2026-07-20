@@ -207,6 +207,13 @@ pub struct InterfaceConfig {
     /// (host のみ)新しく発行する招待を、ホスト管理者の承認まで隔離する。
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_invite_approval: bool,
+    /// (host のみ)メンバーによる招待発行(ADR-0048)を許可する(既定 true)。
+    /// これは機能全体のトグルで、端末単位の許可は `[[peer]].can_invite`
+    /// (既定 false)。両方が有効なメンバーだけ発行できる。
+    /// 注意: `deny_unknown_fields` のため、false を書いた設定は旧バージョン
+    /// では読めない(明示エラーになる)。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub member_invites: bool,
     /// (host のみ)ホスト自身の DNS 名(ADR-0021、M3-14a)。正規化済みラベル。
     /// 省略時は従来どおり表示名から導出される(実質 `host`)。
     /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
@@ -284,6 +291,20 @@ pub struct PeerConfig {
     /// ホスト管理者が承認した時刻。None の承認必須 peer は隔離する。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_approved_at: Option<u64>,
+    /// この端末にメンバー招待の発行を許可する(ADR-0048)。既定 false。
+    /// `[interface].member_invites`(既定 true)と両方が有効なときだけ
+    /// 発行できる。注意: `deny_unknown_fields` のため、これを書いた設定は
+    /// 旧バージョンでは読めない(明示エラーになる)。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_invite: bool,
+    /// このピアを招待した発行メンバーの invite_id(= 台帳の member_id、
+    /// ADR-0048)。ホスト自身が発行した招待では書かない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invited_by_id: Option<String>,
+    /// 発行時点の発行者表示名のスナップショット(発行者が削除された後の
+    /// 表示用。現在名は台帳構築時に invited_by_id から解決する)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invited_by_name: Option<String>,
     /// このピア(ホスト)の仮想 IP。メンバー側でコントロールチャネルの
     /// 接続先として使う(join が設定する)。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,6 +380,14 @@ impl PeerConfig {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_mtu() -> u16 {

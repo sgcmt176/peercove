@@ -80,6 +80,8 @@ function SettingsForm({
   const [requireInviteApproval, setRequireInviteApproval] = useState(
     settings.requireInviteApproval,
   );
+  // メンバーによる招待発行(ADR-0048)。端末指名はメンバー詳細から行う
+  const [memberInvites, setMemberInvites] = useState(settings.memberInvites);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -131,6 +133,7 @@ function SettingsForm({
         direct,
         maxRecvFileMb: maxFileValue,
         requireInviteApproval,
+        memberInvites,
       });
       setNotice(
         result.restartRequired
@@ -244,6 +247,20 @@ function SettingsForm({
             <span>
               {t.settings.inviteApprovalLabel}
               <small className="muted"> {t.settings.inviteApprovalHint}</small>
+            </span>
+          </label>
+        )}
+
+        {!settings.isMember && (
+          <label className="field--check">
+            <input
+              type="checkbox"
+              checked={memberInvites}
+              onChange={(event) => setMemberInvites(event.target.checked)}
+            />
+            <span>
+              {t.settings.memberInvitesLabel}
+              <small className="muted"> {t.settings.memberInvitesHint}</small>
             </span>
           </label>
         )}

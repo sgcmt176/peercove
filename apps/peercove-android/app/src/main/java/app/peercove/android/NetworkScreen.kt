@@ -5,6 +5,8 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -36,6 +38,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
@@ -59,6 +62,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -71,6 +75,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.peercove_mobile.ChatMessage
 import uniffi.peercove_mobile.DnsEntry
+import uniffi.peercove_mobile.IssuedInviteInfo
+import uniffi.peercove_mobile.createMemberInvite
 import uniffi.peercove_mobile.GroupSummary
 import uniffi.peercove_mobile.MemberInfo
 import uniffi.peercove_mobile.MobileException
@@ -355,7 +361,7 @@ fun NetworkScreen(
                 onOpenFiles = { showFiles = true },
                 onOpen = { conv = it },
             )
-            1 -> MemberList(memberList, onCopy = ::copy)
+            1 -> MemberList(memberList, slug, onCopy = ::copy)
             2 -> DnsList(memberList, dnsList, onCopy = ::copy, onNotice = onNotice)
             else -> SettingsTab(slug, state, tunnel, onNotice, onChatCleared = { chatEpoch++ })
         }
@@ -1172,8 +1178,16 @@ private fun platformLabel(platform: String): String = when (platform) {
 }
 
 @Composable
-private fun MemberList(memberList: List<MemberInfo>, onCopy: (String) -> Unit) {
+private fun MemberList(
+    memberList: List<MemberInfo>,
+    slug: String,
+    onCopy: (String) -> Unit,
+) {
     var sheetFor by remember { mutableStateOf<MemberInfo?>(null) }
+    // メンバー詳細(ADR-0048)。行末の ℹ から開く
+    var detailFor by remember { mutableStateOf<MemberInfo?>(null) }
+    // メンバーによる招待発行(ADR-0048)。自分の行の canInvite が true のときだけ
+    var showInvite by remember { mutableStateOf(false) }
     sheetFor?.let { member ->
         CopySheet(
             title = member.name,
@@ -1184,6 +1198,25 @@ private fun MemberList(memberList: List<MemberInfo>, onCopy: (String) -> Unit) {
             onCopy = onCopy,
             onDismiss = { sheetFor = null },
         )
+    }
+    detailFor?.let { member ->
+        MemberDetailDialog(member = member, onDismiss = { detailFor = null })
+    }
+    if (showInvite) {
+        MemberInviteDialog(slug = slug, onCopy = onCopy, onDismiss = { showInvite = false })
+    }
+    if (memberList.any { it.isSelf && it.canInvite }) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Spacer(modifier = Modifier.weight(1f))
+            TextButton(onClick = { showInvite = true }) {
+                Text(stringResource(R.string.member_invite_button))
+            }
+        }
     }
     LazyColumn {
         items(memberList, key = { it.ip }) { member ->
@@ -1236,10 +1269,254 @@ private fun MemberList(memberList: List<MemberInfo>, onCopy: (String) -> Unit) {
                             CircleShape,
                         ),
                 )
+                IconButton(onClick = { detailFor = member }) {
+                    Text("ℹ", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
         }
     }
+}
+
+/** メンバー詳細(ADR-0048)。一覧に出し切れない情報(招待者など)をまとめる。 */
+@Composable
+private fun MemberDetailDialog(member: MemberInfo, onDismiss: () -> Unit) {
+    @Composable
+    fun DetailRow(label: String, value: String) {
+        Row(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                label,
+                modifier = Modifier.width(96.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(value, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(member.name) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                DetailRow(
+                    stringResource(R.string.member_detail_role),
+                    stringResource(
+                        if (member.isHost) R.string.member_detail_role_host
+                        else R.string.member_detail_role_member,
+                    ) + if (member.isSelf) " ・${stringResource(R.string.badge_self)}" else "",
+                )
+                DetailRow(stringResource(R.string.member_detail_ip), member.ip)
+                if (member.fqdn.isNotEmpty()) {
+                    DetailRow(stringResource(R.string.member_detail_domain), member.fqdn)
+                }
+                DetailRow(
+                    stringResource(R.string.member_detail_os),
+                    member.platform?.let { platformLabel(it) } ?: "—",
+                )
+                DetailRow(
+                    stringResource(R.string.member_detail_version),
+                    member.appVersion?.let { "v$it" } ?: "—",
+                )
+                DetailRow(
+                    stringResource(R.string.member_detail_state),
+                    stringResource(
+                        if (member.online) R.string.member_detail_online
+                        else R.string.member_detail_offline,
+                    ) + if (member.blocked) {
+                        " ・${stringResource(R.string.member_detail_blocked)}"
+                    } else {
+                        ""
+                    },
+                )
+                if (!member.isHost) {
+                    DetailRow(
+                        stringResource(R.string.member_detail_invited_by),
+                        member.invitedBy
+                            ?: stringResource(R.string.member_detail_invited_by_host),
+                    )
+                }
+                if (member.canInvite) {
+                    Text(
+                        stringResource(R.string.member_detail_can_invite),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
+        },
+    )
+}
+
+/**
+ * メンバーによる招待の発行(ADR-0048)。ホストへ依頼して発行してもらい、
+ * トークンを QR + コピー + 共有で提示する。**トークンは秘密情報**なので
+ * この画面を閉じたら二度と表示せず、端末にも保存しない。
+ */
+@Composable
+private fun MemberInviteDialog(
+    slug: String,
+    onCopy: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var name by remember { mutableStateOf("") }
+    var expiry by remember { mutableStateOf(604_800L) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var result by remember { mutableStateOf<IssuedInviteInfo?>(null) }
+    val issueFailed = stringResource(R.string.member_invite_issuing)
+
+    val issued = result
+    if (issued != null) {
+        // QR は zxing(スキャンで導入済み)のエンコーダで生成する
+        val qr = remember(issued.token) {
+            runCatching {
+                com.journeyapps.barcodescanner.BarcodeEncoder()
+                    .encodeBitmap(issued.token, com.google.zxing.BarcodeFormat.QR_CODE, 640, 640)
+            }.getOrNull()
+        }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text(stringResource(R.string.member_invite_result_title, issued.name)) },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        stringResource(R.string.member_invite_warn),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    qr?.let {
+                        Image(
+                            bitmap = it.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier.size(220.dp),
+                        )
+                    }
+                    issued.expiresAt?.let {
+                        Text(
+                            stringResource(
+                                R.string.member_invite_expires,
+                                java.text.DateFormat.getDateTimeInstance()
+                                    .format(java.util.Date(it.toLong() * 1000)),
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Row {
+                        TextButton(onClick = { onCopy(issued.token) }) {
+                            Text(stringResource(R.string.member_invite_copy))
+                        }
+                        TextButton(onClick = {
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, issued.token)
+                            }
+                            context.startActivity(Intent.createChooser(send, null))
+                        }) {
+                            Text(stringResource(R.string.member_invite_share))
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
+            },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text(stringResource(R.string.member_invite_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    stringResource(R.string.member_invite_note),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text(stringResource(R.string.member_invite_name_label)) },
+                    singleLine = true,
+                )
+                Text(
+                    stringResource(R.string.member_invite_expiry_label),
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                listOf(
+                    3_600L to R.string.member_invite_expiry_hour,
+                    86_400L to R.string.member_invite_expiry_day,
+                    604_800L to R.string.member_invite_expiry_week,
+                ).forEach { (secs, labelRes) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { expiry = secs },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = expiry == secs, onClick = { expiry = secs })
+                        Text(stringResource(labelRes))
+                    }
+                }
+                error?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !busy,
+                onClick = {
+                    busy = true
+                    error = null
+                    scope.launch {
+                        try {
+                            result = withContext(Dispatchers.IO) {
+                                createMemberInvite(
+                                    slug,
+                                    name.trim().ifEmpty { null },
+                                    expiry.toULong(),
+                                )
+                            }
+                        } catch (e: MobileException) {
+                            error = e.message ?: issueFailed
+                        } finally {
+                            busy = false
+                        }
+                    }
+                },
+            ) {
+                Text(
+                    stringResource(
+                        if (busy) R.string.member_invite_issuing else R.string.member_invite_issue,
+                    ),
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !busy) {
+                Text(stringResource(R.string.action_cancel))
+            }
+        },
+    )
 }
 
 @Composable

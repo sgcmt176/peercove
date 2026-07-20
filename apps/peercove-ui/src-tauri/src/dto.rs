@@ -117,6 +117,11 @@ pub struct Member {
     pub blocked: bool,
     pub force_relay: bool,
     pub acl_rule_id: Option<String>,
+    /// この端末がメンバー招待を発行できるか(ADR-0048)。member ロールの
+    /// UI は自分の行の値で「招待を発行」ボタンの表示を決める。
+    pub can_invite: bool,
+    /// このメンバーを招待した発行者の表示名(ADR-0048)。ホスト発行は null。
+    pub invited_by: Option<String>,
 }
 
 impl Member {
@@ -144,6 +149,8 @@ impl Member {
             blocked: entry.blocked,
             force_relay: entry.force_relay,
             acl_rule_id: entry.acl_rule_id.clone(),
+            can_invite: entry.can_invite,
+            invited_by: entry.invited_by.clone(),
         }
     }
 }
@@ -743,6 +750,8 @@ pub struct Settings {
     /// 受信するファイルサイズの上限(MB、ADR-0015)。0 で無制限。
     pub max_recv_file_mb: u64,
     pub require_invite_approval: bool,
+    /// (host のみ)メンバーによる招待発行を許可する(ADR-0048、既定 true)。
+    pub member_invites: bool,
     /// 既定値。UI の入力欄のプレースホルダに使う。
     pub default_mtu: u16,
     pub default_listen_port: u16,
@@ -763,6 +772,7 @@ impl From<peercove_ops::settings::Settings> for Settings {
             direct: settings.direct,
             max_recv_file_mb: settings.max_recv_file_mb,
             require_invite_approval: settings.require_invite_approval,
+            member_invites: settings.member_invites,
             default_mtu: peercove_core::config::DEFAULT_MTU,
             default_listen_port: peercove_core::config::DEFAULT_LISTEN_PORT,
             default_max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
@@ -784,6 +794,13 @@ pub struct SettingsUpdate {
     pub max_recv_file_mb: u64,
     #[serde(default)]
     pub require_invite_approval: bool,
+    /// (host のみ)メンバーによる招待発行を許可する(ADR-0048)。
+    #[serde(default = "default_member_invites")]
+    pub member_invites: bool,
+}
+
+fn default_member_invites() -> bool {
+    true
 }
 
 impl From<SettingsUpdate> for peercove_ops::settings::Update {
@@ -797,6 +814,7 @@ impl From<SettingsUpdate> for peercove_ops::settings::Update {
             direct: update.direct,
             max_recv_file_mb: update.max_recv_file_mb,
             require_invite_approval: update.require_invite_approval,
+            member_invites: update.member_invites,
         }
     }
 }
@@ -863,6 +881,8 @@ mod tests {
                 platform: Some("android".to_string()),
                 capabilities: peercove_core::proto::current_capabilities(),
                 member_id: None,
+                can_invite: false,
+                invited_by: None,
                 invite_status: Some("joined".to_string()),
                 invite_expires_at: Some(1_700_086_400),
                 online: true,
@@ -972,6 +992,8 @@ mod tests {
             platform: None,
             capabilities: vec![],
             member_id: None,
+            can_invite: false,
+            invited_by: None,
             invite_status: None,
             invite_expires_at: None,
             online: true,
@@ -1093,6 +1115,7 @@ mod tests {
             direct: true,
             max_recv_file_mb: 100,
             require_invite_approval: false,
+            member_invites: true,
         }))
         .unwrap();
         assert_eq!(json["hostEndpoint"], "203.0.113.5:51820");

@@ -951,6 +951,7 @@ async fn create_invite(
         extra_endpoints: &extra,
         psk,
         expires_in_secs,
+        invited_by: None,
     })
     .map_err(to_message)?;
 
@@ -1039,6 +1040,66 @@ fn rename_member(config_path: String, public_key: String, new_name: String) -> R
         new_name.trim(),
     )
     .map_err(to_message)
+}
+
+/// メンバー招待の発行許可(ADR-0048)を端末単位で切り替える(host.toml)。
+/// 反映は次のデーモン同期(約 5 秒)で台帳に載る。
+#[tauri::command]
+fn set_member_can_invite(
+    config_path: String,
+    public_key: String,
+    allowed: bool,
+) -> Result<(), String> {
+    peercove_ops::peers::set_peer_can_invite(
+        Path::new(&config_path),
+        &Selector::PublicKey(&public_key),
+        allowed,
+    )
+    .map(|_| ())
+    .map_err(to_message)
+}
+
+/// (member)メンバー招待の発行結果。**token は秘密情報**(発行直後のみ表示)。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberInviteResult {
+    token: String,
+    qr_svg: String,
+    name: String,
+    expires_at: Option<u64>,
+}
+
+/// (member)メンバー招待の発行をホストへ依頼する(ADR-0048)。
+/// 権限確認・割当・記録はすべてホスト側で行われる。
+#[tauri::command]
+async fn member_create_invite(
+    config_path: String,
+    name: Option<String>,
+    expires_in_secs: Option<u64>,
+) -> Result<MemberInviteResult, String> {
+    match peercove_ipc::request_async(IpcRequest::CreateInvite {
+        config: PathBuf::from(&config_path),
+        name,
+        expires_in_secs,
+    })
+    .await
+    {
+        Ok(IpcResponse::InviteIssued {
+            token,
+            name,
+            expires_at,
+        }) => {
+            let qr_svg = render_qr_svg(&token)?;
+            Ok(MemberInviteResult {
+                token,
+                qr_svg,
+                name,
+                expires_at,
+            })
+        }
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
 }
 
 /// メンバーの DNS 名を変更する(ADR-0021、M3-14a)。ホスト設定(host.toml)に
@@ -1374,6 +1435,8 @@ pub fn run() {
             remove_member,
             approve_member,
             rename_member,
+            set_member_can_invite,
+            member_create_invite,
             set_member_dns_name,
             set_my_dns_name,
             set_host_dns_name,

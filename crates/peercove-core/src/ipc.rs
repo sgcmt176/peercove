@@ -151,6 +151,20 @@ pub enum IpcRequest {
     /// (peercove-ops)で行い、IPC には乗せない。
     /// 追加メソッドなので [`IPC_VERSION`] は上げない。
     SetDisplayName { config: PathBuf, name: String },
+    /// (member のみ)メンバー招待の発行をホストへ依頼する(ADR-0048)。
+    /// デーモンがコントロールチャネルで届け、ホストの権限確認
+    /// (グローバルトグル + can_invite)と発行の結果を待って返す
+    /// (成功 = InviteIssued / 拒否・タイムアウト = Err に理由)。
+    /// ホスト自身の発行は従来どおり設定ファイル操作(peercove-ops)。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    CreateInvite {
+        config: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// 希望する有効期限(秒)。ホスト上限(7 日)を超える指定は丸められる。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_in_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +209,15 @@ pub enum IpcResponse {
     },
     /// GroupCreate / GroupUpdate への応答(作成・更新後のグループ全量)。
     Group { group: GroupInfo },
+    /// CreateInvite への応答(ADR-0048)。`token` はメンバー秘密鍵を含む
+    /// 秘密情報 — ログへ出さず、呼び出し側も永続化しない。
+    InviteIssued {
+        token: String,
+        /// 発行された新メンバーの表示名。
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+    },
 }
 
 /// 1 応答で返すチャットの上限(IPC の 1 行上限 256 KiB に収めるため、

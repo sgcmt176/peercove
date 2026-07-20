@@ -609,6 +609,7 @@ mod tests {
             extra_endpoints: &[],
             psk: false,
             expires_in_secs: None,
+            invited_by: None,
         });
         // init 環境ではエンドポイント検出に失敗する場合があるためスキップ可
         if result.is_ok() {
@@ -639,6 +640,8 @@ mod tests {
                 invite_id: None,
                 invite_issued_at: None,
                 invite_expires_at: None,
+                invited_by_id: None,
+                invited_by_name: None,
             },
         )
         .unwrap();

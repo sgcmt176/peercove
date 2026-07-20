@@ -15,7 +15,7 @@ import {
 } from "../ipc";
 import { rateSeries } from "../history";
 import { ConfirmModal, Modal } from "./Modal";
-import { InviteDialog } from "./InviteDialog";
+import { InviteDialog, MemberInviteDialog } from "./InviteDialog";
 import { DnsView } from "./DnsDialog";
 import { SubnetView } from "./SubnetDialog";
 import { Avatar } from "./Avatar";
@@ -53,6 +53,10 @@ export function TunnelView({
   /** 受信ボックスの中身(M3-9b)。status のポーリングに合わせて読み直す。 */
   const [inbox, setInbox] = useState<InboxItem[]>([]);
   const [inviting, setInviting] = useState(false);
+  // メンバーによる招待発行(ADR-0048)。自分の行の canInvite が true のときだけ
+  const [memberInviting, setMemberInviting] = useState(false);
+  // メンバー詳細ページ(ADR-0048)。一覧の ℹ から開く
+  const [detail, setDetail] = useState<Member | null>(null);
   const [removing, setRemoving] = useState<Member | null>(null);
   /** ファイル送信ダイアログ(M3-13e: 宛先をチェックボックスで選ぶ)。 */
   const [sendingFile, setSendingFile] = useState(false);
@@ -211,6 +215,12 @@ export function TunnelView({
                     {t.tunnel.invite}
                   </button>
                 )}
+                {!isHost &&
+                  tunnel.members.some((m) => m.isSelf && m.canInvite) && (
+                    <button type="button" onClick={() => setMemberInviting(true)}>
+                      {t.tunnel.invite}
+                    </button>
+                  )}
               </div>
             </div>
 
@@ -242,6 +252,7 @@ export function TunnelView({
                           canManage={isHost && !member.isHost}
                           canEditDns={isHost || member.isSelf}
                           onChat={() => onOpenChat(member.ip)}
+                          onDetail={() => setDetail(member)}
                           onRemove={() => setRemoving(member)}
                           onApprove={() => void approve(member)}
                           onRename={(newName) => void rename(member, newName)}
@@ -294,6 +305,34 @@ export function TunnelView({
             setInviting(false);
             onChanged();
           }}
+        />
+      )}
+
+      {memberInviting && (
+        <MemberInviteDialog
+          configPath={tunnel.config}
+          onClose={() => {
+            setMemberInviting(false);
+            onChanged();
+          }}
+        />
+      )}
+
+      {detail && (
+        <MemberDetailDialog
+          config={tunnel.config}
+          // 台帳の更新(2 秒ポーリング)を追いかけて最新の行を出す
+          member={
+            tunnel.members.find((m) => m.publicKey === detail.publicKey) ??
+            detail
+          }
+          isHost={isHost}
+          onClose={() => setDetail(null)}
+          onNotice={(text) => {
+            setNotice(text);
+            setTimeout(() => setNotice(null), 8000);
+          }}
+          onError={(text) => setError(text)}
         />
       )}
 
@@ -641,6 +680,7 @@ function MemberRow({
   canManage,
   canEditDns,
   onChat,
+  onDetail,
   onRemove,
   onApprove,
   onRename,
@@ -655,6 +695,8 @@ function MemberRow({
   canEditDns: boolean;
   /** 1:1 チャットを開く(自分以外の行の 💬)。 */
   onChat: () => void;
+  /** メンバー詳細ページを開く(ADR-0048)。 */
+  onDetail: () => void;
   onRemove: () => void;
   onApprove: () => void;
   onRename: (newName: string) => void;
@@ -858,6 +900,14 @@ function MemberRow({
             💬
           </button>
         )}
+        <button
+          type="button"
+          className="button--icon"
+          title={t.tunnel.member.detail}
+          onClick={onDetail}
+        >
+          ℹ
+        </button>
         {(canManage || member.isSelf) && !editing && (
           <button
             type="button"
@@ -883,6 +933,142 @@ function MemberRow({
         )}
       </td>
     </tr>
+  );
+}
+
+/**
+ * メンバー詳細ページ(ADR-0048)。一覧では出し切れない情報(公開鍵・招待者・
+ * 招待状態など)をまとめ、ホストには「招待発行の許可」(端末指名)も出す。
+ * 今後メンバー単位の情報・操作を足す受け皿。
+ */
+function MemberDetailDialog({
+  config,
+  member,
+  isHost,
+  onClose,
+  onNotice,
+  onError,
+}: {
+  config: string;
+  member: Member;
+  isHost: boolean;
+  onClose: () => void;
+  onNotice: (text: string) => void;
+  onError: (text: string) => void;
+}) {
+  // 端末指名のチェックは楽観更新(台帳への反映は約 5 秒後)
+  const [canInvite, setCanInvite] = useState(member.canInvite);
+  const [busy, setBusy] = useState(false);
+
+  const toggleCanInvite = async (allowed: boolean) => {
+    setBusy(true);
+    onError("");
+    try {
+      await api.setMemberCanInvite(config, member.publicKey, allowed);
+      setCanInvite(allowed);
+      onNotice(t.tunnel.member.canInviteUpdated);
+    } catch (e) {
+      onError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      title={t.tunnel.member.detailTitle(member.name ?? member.ip)}
+      onClose={onClose}
+    >
+      <div className="modal__body">
+        <dl className="facts">
+          <dt>{t.tunnel.member.detailName}</dt>
+          <dd>{member.name ?? t.tunnel.member.noName}</dd>
+          <dt>{t.tunnel.member.detailRole}</dt>
+          <dd>{member.isHost ? t.networks.roleHost : t.networks.roleMember}</dd>
+          <dt>{t.tunnel.table.virtualIp}</dt>
+          <dd className="mono">
+            {member.ip}
+            <CopyIcon value={member.ip} title={t.tunnel.table.copyIp} />
+          </dd>
+          {member.dnsName && (
+            <>
+              <dt>{t.tunnel.member.detailDns}</dt>
+              <dd className="mono wrap-anywhere">
+                {member.dnsName}
+                <CopyIcon value={member.dnsName} title={t.dns.copy} />
+              </dd>
+            </>
+          )}
+          <dt>{t.tunnel.member.detailOs}</dt>
+          <dd>{member.platform ? platformLabel(member.platform) : "—"}</dd>
+          <dt>{t.tunnel.member.detailVersion}</dt>
+          <dd>{member.appVersion ? `v${member.appVersion}` : "—"}</dd>
+          <dt>{t.tunnel.member.detailKey}</dt>
+          <dd className="mono wrap-anywhere small">{member.publicKey}</dd>
+          <dt>{t.tunnel.member.detailState}</dt>
+          <dd>
+            {member.online
+              ? t.tunnel.member.online
+              : t.tunnel.member.offline}
+            {member.blocked && ` · 🚫 ${t.tunnel.member.blocked}`}
+          </dd>
+          {member.route && (
+            <>
+              <dt>{t.tunnel.member.detailRoute}</dt>
+              <dd>
+                {member.forceRelay
+                  ? t.tunnel.member.route.aclRelay
+                  : t.tunnel.member.route[member.route]}
+              </dd>
+            </>
+          )}
+          {!member.isHost && member.inviteStatus && (
+            <>
+              <dt>{t.tunnel.member.detailInvite}</dt>
+              <dd>
+                {t.tunnel.member.inviteStatus[member.inviteStatus]}
+                {member.inviteExpiresAt &&
+                  ` · ${t.tunnel.member.inviteExpires(
+                    new Date(member.inviteExpiresAt * 1000).toLocaleString(),
+                  )}`}
+              </dd>
+            </>
+          )}
+          {!member.isHost && (
+            <>
+              <dt>{t.tunnel.member.invitedBy}</dt>
+              <dd>{member.invitedBy ?? t.tunnel.member.invitedByHost}</dd>
+            </>
+          )}
+          {member.subnets.length > 0 && (
+            <>
+              <dt>{t.tunnel.member.detailSubnets}</dt>
+              <dd className="mono">{member.subnets.join(", ")}</dd>
+            </>
+          )}
+        </dl>
+
+        {isHost && !member.isHost && !member.isSelf && (
+          <label className="field--check">
+            <input
+              type="checkbox"
+              checked={canInvite}
+              disabled={busy}
+              onChange={(event) => void toggleCanInvite(event.target.checked)}
+            />
+            <span>
+              {t.tunnel.member.canInviteLabel}
+              <small className="muted"> {t.tunnel.member.canInviteHint}</small>
+            </span>
+          </label>
+        )}
+      </div>
+      <div className="modal__actions">
+        <button type="button" onClick={onClose}>
+          {t.common.close}
+        </button>
+      </div>
+    </Modal>
   );
 }
 

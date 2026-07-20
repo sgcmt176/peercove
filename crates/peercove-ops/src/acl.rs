@@ -195,6 +195,8 @@ mod tests {
                 invite_id: None,
                 invite_issued_at: None,
                 invite_expires_at: None,
+                invited_by_id: None,
+                invited_by_name: None,
             },
         )
         .unwrap();

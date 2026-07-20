@@ -276,6 +276,7 @@ fn update_settings_with(
         direct: current.direct,
         max_recv_file_mb: current.max_recv_file_mb,
         require_invite_approval: current.require_invite_approval,
+        member_invites: current.member_invites,
     };
     apply(&current, &mut update);
     let restart = current.restart_required(&update);
@@ -569,6 +570,11 @@ pub struct MemberInfo {
     /// この端末の OS("windows" / "linux" / "android"。E-E 11)。
     /// 旧バージョン・オフライン中は None。
     pub platform: Option<String>,
+    /// この端末がメンバー招待を発行できるか(ADR-0048)。自分のエントリの
+    /// 値で「招待を発行」ボタンの表示を決める。
+    pub can_invite: bool,
+    /// このメンバーを招待した発行者の表示名(ADR-0048)。ホスト発行は None。
+    pub invited_by: Option<String>,
 }
 
 /// チャット 1 通(UI 表示用)。
@@ -676,6 +682,8 @@ pub fn members(slug: String) -> Vec<MemberInfo> {
                 blocked: m.blocked,
                 app_version: m.app_version.clone(),
                 platform: m.platform.clone(),
+                can_invite: m.can_invite,
+                invited_by: m.invited_by.clone(),
             }
         })
         .collect()
@@ -1003,6 +1011,37 @@ pub fn set_display_name(
         tracing::warn!("表示名のローカル保存に失敗しました: {e:#}");
     }
     Ok(reply)
+}
+
+/// メンバー発行の招待(ADR-0048)の結果。`token` は秘密情報 —
+/// 表示・コピー・共有のみに使い、永続化しない。
+#[derive(uniffi::Record)]
+pub struct IssuedInviteInfo {
+    pub token: String,
+    /// 発行された新メンバーの表示名。
+    pub name: String,
+    /// 有効期限(UNIX 秒)。
+    pub expires_at: Option<u64>,
+}
+
+/// メンバー招待の発行をホストへ依頼する(ADR-0048)。自分の台帳エントリの
+/// `can_invite` が true のときだけ UI に入り口を出すこと(最終判定はホスト)。
+/// ブロッキング(応答待ち最大 15 秒)なので Kotlin 側は IO ディスパッチャで呼ぶ。
+#[uniffi::export]
+pub fn create_member_invite(
+    slug: String,
+    name: Option<String>,
+    expires_in_secs: Option<u64>,
+) -> Result<IssuedInviteInfo, MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    let invite = s.create_invite(name, expires_in_secs)?;
+    Ok(IssuedInviteInfo {
+        token: invite.token,
+        name: invite.name,
+        expires_at: invite.expires_at,
+    })
 }
 
 /// 自分の DNS 名の変更(ホストへ依頼。正本は host.toml)。

@@ -190,6 +190,7 @@ impl ActiveTunnel {
             self.role,
             self.backend.as_mut(),
             &self.spec,
+            self.external_endpoint,
             stop,
             snapshot,
             transfers,
@@ -287,6 +288,7 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
                 role,
                 tunnel.backend.as_mut(),
                 &tunnel.spec,
+                tunnel.external_endpoint,
                 stop_rx,
                 None,
                 Default::default(),
@@ -384,6 +386,9 @@ pub async fn supervise(
     role: Role,
     backend: &mut dyn WgBackend,
     spec: &TunnelSpec,
+    // (host)UPnP で観測した外部エンドポイント。メンバー発行の招待
+    // (ADR-0048)のエンドポイント候補に使う
+    external_endpoint: Option<std::net::SocketAddrV4>,
     mut stop: tokio::sync::watch::Receiver<bool>,
     snapshot: Option<SharedSnapshot>,
     transfers: crate::msg::TransferRegistry,
@@ -463,6 +468,7 @@ pub async fn supervise(
                     Arc::new(control::HostRequests::new(
                         config_path.to_path_buf(),
                         host_public_key,
+                        external_endpoint,
                     )),
                 )));
             }
@@ -836,6 +842,8 @@ fn build_ledger(
         platform: Some(std::env::consts::OS.to_string()),
         capabilities: peercove_core::proto::current_capabilities(),
         member_id: None,
+        can_invite: false,
+        invited_by: None,
         invite_status: None,
         invite_expires_at: None,
         online: true,
@@ -884,6 +892,18 @@ fn build_ledger(
             capabilities: vec![],
             // 同一性 ID(再追加検知用)。鍵ローテーションでは変わらない
             member_id: peer.invite_id.clone(),
+            // 招待発行の可否(ADR-0048)。グローバルトグルと端末指名の AND
+            can_invite: config.interface.member_invites && peer.can_invite,
+            // 招待者(ADR-0048)。現在名に解決し、発行者が消えていれば
+            // 発行時のスナップショット名で代替する
+            invited_by: peer.invited_by_id.as_ref().and_then(|id| {
+                config
+                    .peers
+                    .iter()
+                    .find(|p| p.invite_id.as_deref() == Some(id.as_str()))
+                    .and_then(|p| p.name.clone())
+                    .or_else(|| peer.invited_by_name.clone())
+            }),
             invite_status: Some(invite_status.to_string()),
             invite_expires_at: peer.invite_expires_at,
             online,
