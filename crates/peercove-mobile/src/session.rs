@@ -659,6 +659,8 @@ fn handle_conn(
             name,
             size,
             chat: chat_ctx,
+            // モバイルは中断再開(E-E 6)未対応: 常に先頭(offset 0)から受ける
+            resume: _,
         } => {
             let limit = shared.recv_limit_bytes();
             if limit > 0 && size > limit {
@@ -813,7 +815,13 @@ fn receive_file(
     });
 
     let result = (|| -> anyhow::Result<()> {
-        send_json(writer, &MsgFrame::FileAccept { id: id.clone() })?;
+        send_json(
+            writer,
+            &MsgFrame::FileAccept {
+                id: id.clone(),
+                offset: 0,
+            },
+        )?;
 
         // 本体: take の上限を本体サイズに切り替えて読む(超過分は読まない)
         reader.get_mut().set_limit(size);
@@ -1578,11 +1586,17 @@ impl SessionShared {
                         scope: ChatScope::Direct,
                         group_id: None,
                     }),
+                    // モバイル送信側も再開未対応(resume を立てないので相手は
+                    // 常に offset 0 を返す)
+                    resume: false,
                 },
             )?;
             let mut line = String::new();
             match read_msg_frame(&mut reader, &mut line)? {
-                MsgFrame::FileAccept { id: accepted } if accepted == id => {}
+                MsgFrame::FileAccept {
+                    id: accepted,
+                    offset: 0,
+                } if accepted == id => {}
                 MsgFrame::FileReject { reason, .. } => bail!("受信側が拒否しました: {reason}"),
                 other => bail!("FileAccept 以外の応答: {other:?}"),
             }

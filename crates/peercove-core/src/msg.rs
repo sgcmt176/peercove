@@ -82,15 +82,26 @@ pub enum MsgFrame {
     Hello { version: u32 },
     /// ファイル送信の申し出。`name` はファイル名のみ(パスは含めない)。
     /// `chat` はチャット内ファイル送信の文脈(M3-13d、任意)。
+    /// `resume` = 送信側が中断再開(E-E 6)に対応している(受信側は書きかけが
+    /// あれば `FileAccept.offset` で続きを要求してよい)。旧受信側は無視する。
     FileOffer {
         id: String,
         name: String,
         size: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat: Option<ChatContext>,
+        #[serde(default, skip_serializing_if = "bool_is_false")]
+        resume: bool,
     },
     /// 受信側: 受け入れる(この後に生バイト列が流れる)。
-    FileAccept { id: String },
+    /// `offset` > 0 は中断再開(E-E 6): 送信側はファイルの `offset` バイト目
+    /// から送る(申し出が `resume` のときだけ返してよい。旧送信側は resume を
+    /// 立てないので常に 0)。ハッシュは従来どおり**ファイル全体**の SHA-256。
+    FileAccept {
+        id: String,
+        #[serde(default, skip_serializing_if = "u64_is_zero")]
+        offset: u64,
+    },
     /// 受信側: 受け取れない(不正なファイル名など)。
     FileReject { id: String, reason: String },
     /// 送信側: 本体を送り終えた。`sha256` は本体の SHA-256(16 進小文字)。
@@ -118,6 +129,14 @@ pub enum MsgFrame {
     GroupAck { id: String },
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +152,7 @@ mod tests {
                 name: "写真.jpg".to_string(),
                 size: 1024,
                 chat: None,
+                resume: false,
             },
             MsgFrame::FileOffer {
                 id: "t2".to_string(),
@@ -142,9 +162,15 @@ mod tests {
                     scope: ChatScope::Group,
                     group_id: Some("g1".to_string()),
                 }),
+                resume: true,
             },
             MsgFrame::FileAccept {
                 id: "t1".to_string(),
+                offset: 0,
+            },
+            MsgFrame::FileAccept {
+                id: "t3".to_string(),
+                offset: 4096,
             },
             MsgFrame::FileReject {
                 id: "t1".to_string(),
@@ -213,11 +239,12 @@ mod tests {
             name: "b.txt".to_string(),
             size: 3,
             chat: None,
+            resume: false,
         })
         .unwrap();
         assert_eq!(
             json, r#"{"type":"file_offer","id":"a","name":"b.txt","size":3}"#,
-            "chat なしは M3-9a と同じワイヤ表現(旧デーモン互換)"
+            "chat・resume なしは M3-9a と同じワイヤ表現(旧デーモン互換)"
         );
         let json = serde_json::to_string(&MsgFrame::FileOffer {
             id: "a".to_string(),
@@ -227,11 +254,45 @@ mod tests {
                 scope: ChatScope::Direct,
                 group_id: None,
             }),
+            resume: false,
         })
         .unwrap();
         assert_eq!(
             json,
             r#"{"type":"file_offer","id":"a","name":"b.txt","size":3,"chat":{"scope":"direct"}}"#
+        );
+        // 中断再開(E-E 6): resume/offset は付いたときだけワイヤに現れる。
+        // 旧バージョンの file_accept(offset なし)は 0 として読める
+        let json = serde_json::to_string(&MsgFrame::FileAccept {
+            id: "a".to_string(),
+            offset: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            json, r#"{"type":"file_accept","id":"a"}"#,
+            "offset 0 は M3-9a と同じワイヤ表現(旧デーモン互換)"
+        );
+        let parsed: MsgFrame = serde_json::from_str(r#"{"type":"file_accept","id":"a"}"#).unwrap();
+        assert_eq!(
+            parsed,
+            MsgFrame::FileAccept {
+                id: "a".to_string(),
+                offset: 0,
+            }
+        );
+        let parsed: MsgFrame =
+            serde_json::from_str(r#"{"type":"file_offer","id":"a","name":"b.txt","size":3}"#)
+                .unwrap();
+        assert_eq!(
+            parsed,
+            MsgFrame::FileOffer {
+                id: "a".to_string(),
+                name: "b.txt".to_string(),
+                size: 3,
+                chat: None,
+                resume: false,
+            },
+            "旧送信側の file_offer は resume なしとして読める"
         );
         let json = serde_json::to_string(&MsgFrame::Chat {
             id: "a".to_string(),

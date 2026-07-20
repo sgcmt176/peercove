@@ -488,8 +488,9 @@ fn list_inbox(config_path: String) -> Result<Vec<InboxItem>, String> {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // 書きかけ(.part)と受信メタ(.pcvmeta)は一覧に出さない
-        if name.ends_with(".part") || name.ends_with(".pcvmeta") {
+        // 書きかけ(.part)・受信メタ(.pcvmeta)・再開の目印(.pcvresume)は
+        // 一覧に出さない
+        if name.ends_with(".part") || name.ends_with(".pcvmeta") || name.ends_with(".pcvresume") {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };

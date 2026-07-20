@@ -269,6 +269,7 @@ async fn handle_incoming(
             name,
             size,
             chat: chat_ctx,
+            resume,
         } => {
             // 受信サイズ上限(0 は無制限)。受け取る側の設定として効く
             if limit > 0 && size > limit {
@@ -298,6 +299,7 @@ async fn handle_incoming(
                 id,
                 &name,
                 size,
+                resume,
             )
             .await
         }
@@ -509,6 +511,8 @@ async fn connect_and_hello(
 /// ファイルを受信ボックスへ保存する。書きかけは `.part`、完了時に本名へ
 /// リネームし、隣に `.pcvmeta`(送信者などのメタ情報)を置く。
 /// チャット文脈付き(M3-13d)なら履歴にもファイルのエントリを記録する。
+/// 送信側が `resume` 対応なら、途中失敗した書きかけを保持し(`.pcvresume`)、
+/// 同じファイルの申し出が来たら続きから受け取る(E-E 6)。
 #[allow(clippy::too_many_arguments)]
 async fn receive_file(
     reader: &mut LineReader,
@@ -523,6 +527,7 @@ async fn receive_file(
     id: String,
     name: &str,
     size: u64,
+    resume: bool,
 ) -> anyhow::Result<()> {
     let Some(safe_name) = sanitize_file_name(name) else {
         send_frame(
@@ -546,8 +551,24 @@ async fn receive_file(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(inbox, std::fs::Permissions::from_mode(0o777));
     }
-    let final_path = unique_path(inbox, &safe_name);
-    let part_path = append_suffix(&final_path, ".part");
+    // 中断再開(E-E 6): 同じ送信元・名前・サイズの書きかけがあれば続きから。
+    // 無ければ従来どおり新しい保存先を決める
+    let resumable = if resume {
+        find_resumable(inbox, peer_ip, &safe_name, size).await
+    } else {
+        None
+    };
+    let (final_path, part_path, offset) = match resumable {
+        Some((final_path, part_path, offset)) => {
+            tracing::info!("書きかけから再開します({peer_ip}、{offset}/{size} バイト、id={id})");
+            (final_path, part_path, offset)
+        }
+        None => {
+            let final_path = unique_path(inbox, &safe_name);
+            let part_path = append_suffix(&final_path, ".part");
+            (final_path, part_path, 0)
+        }
+    };
 
     register(
         transfers,
@@ -557,7 +578,7 @@ async fn receive_file(
             peer: peer_ip,
             name: safe_name.clone(),
             size,
-            transferred: 0,
+            transferred: offset,
             done: false,
             error: None,
         },
@@ -609,12 +630,35 @@ async fn receive_file(
         &final_path,
         &part_path,
         size,
+        offset,
     )
     .await;
     match &result {
         Ok(()) => update(transfers, &id, |t| t.done = true),
         Err(e) => {
-            let _ = tokio::fs::remove_file(&part_path).await;
+            // 中断再開(E-E 6): 送信側が対応していれば書きかけを保持して
+            // 次の申し出で続きから受け取る。チェックサム不一致(壊れた書き
+            // かけ)は捨てて最初からやり直す
+            let checksum_broken = format!("{e:#}").contains("チェックサム");
+            let keep_partial = resume
+                && !checksum_broken
+                && tokio::fs::metadata(&part_path)
+                    .await
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+            if keep_partial {
+                let meta = serde_json::json!({
+                    "from": peer_ip.to_string(),
+                    "name": safe_name,
+                    "size": size,
+                });
+                let _ =
+                    tokio::fs::write(append_suffix(&final_path, ".pcvresume"), meta.to_string())
+                        .await;
+            } else {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                let _ = tokio::fs::remove_file(append_suffix(&final_path, ".pcvresume")).await;
+            }
             mark_failed(transfers, &id, e);
             // チャット内ファイルの受信失敗は会話にお知らせを出す(M3-13e)。
             // バブルの失敗表示は転送一覧との突き合わせだが、一覧は直近分しか
@@ -657,17 +701,49 @@ async fn receive_body(
     final_path: &Path,
     part_path: &Path,
     size: u64,
+    offset: u64,
 ) -> anyhow::Result<()> {
-    let mut file = tokio::fs::File::create(part_path)
-        .await
-        .context("受信ファイルを作成できません")?;
-    send_frame(write_half, &MsgFrame::FileAccept { id: id.to_string() }).await?;
-
-    // 本体: take の上限を残りバイト数に切り替えて読む(超過分は読まない)
+    // ハッシュは**ファイル全体**が対象(ADR-0015)。再開時は既存の書きかけを
+    // 先にハッシュへ流し込み、本体は続き(offset 以降)だけ受け取る
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
-    let mut received: u64 = 0;
-    reader.set_limit(size);
+    let mut file = if offset > 0 {
+        {
+            let mut existing = tokio::fs::File::open(part_path)
+                .await
+                .context("書きかけを開けません")?;
+            let mut hashed: u64 = 0;
+            while hashed < offset {
+                let n = existing.read(&mut buf).await?;
+                if n == 0 {
+                    bail!("書きかけが途中で読めなくなりました");
+                }
+                hasher.update(&buf[..n]);
+                hashed += n as u64;
+            }
+        }
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(part_path)
+            .await
+            .context("書きかけを追記で開けません")?
+    } else {
+        tokio::fs::File::create(part_path)
+            .await
+            .context("受信ファイルを作成できません")?
+    };
+    send_frame(
+        write_half,
+        &MsgFrame::FileAccept {
+            id: id.to_string(),
+            offset,
+        },
+    )
+    .await?;
+
+    // 本体: take の上限を残りバイト数に切り替えて読む(超過分は読まない)
+    let mut received: u64 = offset;
+    reader.set_limit(size - offset);
     while received < size {
         let n = tokio::time::timeout(IO_TIMEOUT, reader.read(&mut buf))
             .await
@@ -713,9 +789,57 @@ async fn receive_body(
     tokio::fs::rename(part_path, final_path)
         .await
         .context("受信ファイルの確定(リネーム)に失敗しました")?;
+    // 再開用の目印は完了したら不要
+    let _ = tokio::fs::remove_file(append_suffix(final_path, ".pcvresume")).await;
     send_frame(write_half, &MsgFrame::FileDone { id: id.to_string() }).await?;
     tracing::info!("{sender_name}({peer_ip})からファイルを受信しました({size} バイト、id={id})");
     Ok(())
+}
+
+/// 再開できる書きかけを探す(E-E 6)。`<保存名>.pcvresume` の
+/// {from, name, size} が申し出と一致し、`.part` の実体が size 以下のもの。
+/// 戻りは (最終パス, .part パス, 再開位置)。見つけた目印は消す
+/// (また失敗したら書き直される)。
+async fn find_resumable(
+    inbox: &Path,
+    from: Ipv4Addr,
+    name: &str,
+    size: u64,
+) -> Option<(PathBuf, PathBuf, u64)> {
+    let mut dir = tokio::fs::read_dir(inbox).await.ok()?;
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let marker = entry.path();
+        let Some(fname) = marker.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(base) = fname.strip_suffix(".pcvresume") else {
+            continue;
+        };
+        let Ok(data) = tokio::fs::read_to_string(&marker).await else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if meta.get("from").and_then(|v| v.as_str()) != Some(from.to_string().as_str())
+            || meta.get("name").and_then(|v| v.as_str()) != Some(name)
+            || meta.get("size").and_then(|v| v.as_u64()) != Some(size)
+        {
+            continue;
+        }
+        let final_path = inbox.join(base);
+        let part_path = append_suffix(&final_path, ".part");
+        let Ok(part_meta) = tokio::fs::metadata(&part_path).await else {
+            let _ = tokio::fs::remove_file(&marker).await; // 実体のない残骸
+            continue;
+        };
+        if part_meta.len() > size {
+            continue;
+        }
+        let _ = tokio::fs::remove_file(&marker).await;
+        return Some((final_path, part_path, part_meta.len()));
+    }
+    None
 }
 
 /// 送信側: 相手の仮想 IP のメッセージングポートへ接続してファイルを送る。
@@ -822,20 +946,33 @@ async fn send_body(
             name,
             size,
             chat,
+            resume: true, // 中断再開に対応(E-E 6)。旧受信側はこの欄を無視する
         },
     )
     .await?;
-    match expect_frame(&mut reader, &mut line).await? {
-        MsgFrame::FileAccept { id: ack_id } if ack_id == id => {}
+    let offset = match expect_frame(&mut reader, &mut line).await? {
+        MsgFrame::FileAccept { id: ack_id, offset } if ack_id == id => {
+            if offset > size {
+                bail!("再開位置がファイルサイズを超えています({offset}/{size})");
+            }
+            offset
+        }
         MsgFrame::FileReject { reason, .. } => bail!("相手が受信を拒否しました: {reason}"),
         other => bail!("FileAccept を期待しましたが別のフレームが届きました: {other:?}"),
+    };
+    if offset > 0 {
+        tracing::info!("相手の書きかけの続きから送ります({offset}/{size} バイト、id={id})");
+        update(transfers, id, |t| t.transferred = offset);
     }
 
     let mut file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("{} を開けません", path.display()))?;
+    // ハッシュは**ファイル全体**が対象なので先頭から読むが、本体として流すのは
+    // offset 以降だけ(再開時)
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
+    let mut read_total: u64 = 0;
     let mut sent: u64 = 0;
     loop {
         let n = file.read(&mut buf).await?;
@@ -843,15 +980,23 @@ async fn send_body(
             break;
         }
         hasher.update(&buf[..n]);
-        tokio::time::timeout(IO_TIMEOUT, write_half.write_all(&buf[..n]))
-            .await
-            .map_err(|_| anyhow::anyhow!("転送がタイムアウトしました"))??;
-        sent += n as u64;
-        update(transfers, id, |t| t.transferred = sent);
+        let chunk_start = read_total;
+        read_total += n as u64;
+        if read_total > offset {
+            let skip = offset.saturating_sub(chunk_start) as usize;
+            tokio::time::timeout(IO_TIMEOUT, write_half.write_all(&buf[skip..n]))
+                .await
+                .map_err(|_| anyhow::anyhow!("転送がタイムアウトしました"))??;
+            sent += (n - skip) as u64;
+            update(transfers, id, |t| t.transferred = offset + sent);
+        }
     }
-    if sent != size {
+    if offset + sent != size {
         // 送信中にファイルが書き換えられた等。受信側はサイズ不一致で検出する
-        bail!("ファイルサイズが途中で変わりました({sent}/{size} バイト)");
+        bail!(
+            "ファイルサイズが途中で変わりました({}/{size} バイト)",
+            offset + sent
+        );
     }
     send_frame(
         &mut write_half,
@@ -1199,6 +1344,7 @@ mod tests {
                     scope: ChatScope::Direct,
                     group_id: None,
                 }),
+                resume: false,
             },
         )
         .await
@@ -1326,6 +1472,7 @@ mod tests {
                 name: "x.bin".to_string(),
                 size: 4,
                 chat: None,
+                resume: false,
             },
         ] {
             send_frame(&mut stream, &frame).await.unwrap();
@@ -1602,6 +1749,179 @@ mod tests {
         let _ = std::fs::remove_dir_all(&inbox);
     }
 
+    /// 中断再開(E-E 6)の受信側ハーネス: 1 接続だけ受けて処理する。
+    fn spawn_recv_server(
+        listener: TcpListener,
+        inbox: PathBuf,
+        transfers: TransferRegistry,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ip = match peer.ip() {
+                IpAddr::V4(ip) => ip,
+                _ => unreachable!(),
+            };
+            handle_incoming(
+                stream,
+                ip,
+                ip,
+                "alice".to_string(),
+                &Default::default(),
+                &inbox,
+                &transfers,
+                0,
+                &test_chat_log(),
+                &test_groups(),
+            )
+            .await
+        })
+    }
+
+    /// resume 付きの申し出を送って FileAccept(offset)を返してもらう。
+    async fn offer_resumable(
+        addr: SocketAddr,
+        id: &str,
+        name: &str,
+        size: u64,
+    ) -> (LineReader, tokio::net::tcp::OwnedWriteHalf, u64) {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = line_reader(read_half);
+        let mut line = String::new();
+        send_frame(
+            &mut write_half,
+            &MsgFrame::Hello {
+                version: MSG_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        send_frame(
+            &mut write_half,
+            &MsgFrame::FileOffer {
+                id: id.to_string(),
+                name: name.to_string(),
+                size,
+                chat: None,
+                resume: true,
+            },
+        )
+        .await
+        .unwrap();
+        let offset = match expect_frame(&mut reader, &mut line).await.unwrap() {
+            MsgFrame::FileAccept { offset, .. } => offset,
+            other => panic!("FileAccept を期待しましたが {other:?}"),
+        };
+        (reader, write_half, offset)
+    }
+
+    /// 中断再開(E-E 6): 途中で切れた受信の書きかけが保持され、同じファイルの
+    /// 再送では FileAccept.offset で続きから受け取り、全体ハッシュで検証される。
+    #[tokio::test]
+    async fn interrupted_transfer_resumes_from_partial() {
+        let inbox = temp_dir("resume");
+        let payload: Vec<u8> = (0..50_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let size = payload.len() as u64;
+        let half = payload.len() / 2;
+
+        // 1 回目: 半分だけ送って切断 → 書きかけ + 再開の目印が残る
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_recv_server(listener, inbox.clone(), Default::default());
+        let (reader, mut write_half, offset) = offer_resumable(addr, "r-1", "big.bin", size).await;
+        assert_eq!(offset, 0, "初回は先頭から");
+        write_half.write_all(&payload[..half]).await.unwrap();
+        drop(write_half);
+        drop(reader);
+        assert!(server.await.unwrap().is_err(), "途中切断で受信は失敗");
+        assert_eq!(
+            std::fs::metadata(inbox.join("big.bin.part")).unwrap().len(),
+            half as u64,
+            "書きかけが保持される"
+        );
+        assert!(inbox.join("big.bin.pcvresume").exists(), "再開の目印");
+
+        // 2 回目: 続き(offset = 書きかけの長さ)から送って完了する
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_recv_server(listener, inbox.clone(), Default::default());
+        let (mut reader, mut write_half, offset) =
+            offer_resumable(addr, "r-2", "big.bin", size).await;
+        assert_eq!(offset, half as u64, "書きかけの続きを要求される");
+        write_half.write_all(&payload[half..]).await.unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        send_frame(
+            &mut write_half,
+            &MsgFrame::FileHash {
+                id: "r-2".to_string(),
+                sha256: hex(&hasher.finalize()),
+            },
+        )
+        .await
+        .unwrap();
+        let mut line = String::new();
+        match expect_frame(&mut reader, &mut line).await.unwrap() {
+            MsgFrame::FileDone { .. } => {}
+            other => panic!("FileDone を期待しましたが {other:?}"),
+        }
+        server.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(inbox.join("big.bin")).unwrap(),
+            payload,
+            "全体が正しく揃う"
+        );
+        assert!(!inbox.join("big.bin.part").exists());
+        assert!(!inbox.join("big.bin.pcvresume").exists(), "目印は消える");
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// 壊れた書きかけからの再開はハッシュ不一致で失敗し、書きかけごと捨てられる
+    /// (次の申し出は最初からになる)。
+    #[tokio::test]
+    async fn corrupted_partial_is_discarded_on_resume() {
+        let inbox = temp_dir("resumebad");
+        let payload = vec![7u8; 8192];
+        let size = payload.len() as u64;
+        let half = payload.len() / 2;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_recv_server(listener, inbox.clone(), Default::default());
+        let (reader, mut write_half, _) = offer_resumable(addr, "b-1", "x.bin", size).await;
+        write_half.write_all(&payload[..half]).await.unwrap();
+        drop(write_half);
+        drop(reader);
+        assert!(server.await.unwrap().is_err());
+
+        // 書きかけを壊す(長さは保ったまま中身を変える)
+        std::fs::write(inbox.join("x.bin.part"), vec![9u8; half]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_recv_server(listener, inbox.clone(), Default::default());
+        let (_reader, mut write_half, offset) = offer_resumable(addr, "b-2", "x.bin", size).await;
+        assert_eq!(offset, half as u64);
+        write_half.write_all(&payload[half..]).await.unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        send_frame(
+            &mut write_half,
+            &MsgFrame::FileHash {
+                id: "b-2".to_string(),
+                sha256: hex(&hasher.finalize()),
+            },
+        )
+        .await
+        .unwrap();
+        let err = server.await.unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("チェックサム"), "{err:#}");
+        assert!(!inbox.join("x.bin").exists());
+        assert!(!inbox.join("x.bin.part").exists(), "壊れた書きかけは捨てる");
+        assert!(!inbox.join("x.bin.pcvresume").exists());
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
     /// 受け入れられないファイル名は FileReject が返り、送信側はエラーになる。
     #[tokio::test]
     async fn invalid_name_is_rejected() {
@@ -1653,6 +1973,7 @@ mod tests {
                 name: "..".to_string(),
                 size: 1,
                 chat: None,
+                resume: false,
             },
         )
         .await
