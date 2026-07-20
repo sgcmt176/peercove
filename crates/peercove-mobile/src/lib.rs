@@ -91,6 +91,9 @@ pub struct TunnelStatus {
     pub rx_bytes: u64,
     /// いま使っている接続先(LAN → 外部 IP のフォールバック確認用)
     pub endpoint: String,
+    /// UDP 送信が失敗し続けている(回線消失の即時シグナル。監視が
+    /// これを見て UDP を張り直す = E-D)
+    pub send_failing: bool,
 }
 
 /// Android の VpnService.protect() を Rust から呼ぶためのコールバック。
@@ -452,6 +455,7 @@ pub fn tunnel_status(slug: String) -> Option<TunnelStatus> {
                 .current_endpoint
                 .map(|e| e.to_string())
                 .unwrap_or_default(),
+            send_failing: s.send_failing,
         }
     })
 }

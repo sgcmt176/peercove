@@ -61,6 +61,10 @@ pub struct EngineStats {
     pub rx_bytes: u64,
     /// いま使っているエンドポイント(フォールバック切替の確認用)
     pub current_endpoint: Option<SocketAddr>,
+    /// UDP 送信が失敗し続けているか(回線消失の即時シグナル。keepalive が
+    /// 25 秒ごとに送信されるため、回線が死ぬと数十秒以内に必ず立つ。
+    /// Kotlin 側の監視がこれを見て UDP を張り直す = E-D)
+    pub send_failing: bool,
 }
 
 struct Shared {
@@ -81,6 +85,9 @@ struct Shared {
     /// 強制再ハンドシェイクに rotate_after ぶんの猶予を与える(与えないと
     /// 一時的な「未確立」を見て即座に別候補へ切り替え、自分で接続を壊す)
     last_rotate: Mutex<Instant>,
+    /// 直近の UDP 送信の成否(send_failing の判定用)
+    last_send_ok: Mutex<Option<Instant>>,
+    last_send_err: Mutex<Option<Instant>>,
     stats: Mutex<EngineStats>,
     stop: AtomicBool,
 }
@@ -88,6 +95,28 @@ struct Shared {
 impl Shared {
     fn socket(&self) -> Arc<UdpSocket> {
         Arc::clone(&self.udp.read().unwrap())
+    }
+
+    /// UDP 送信 + 成否の記録(send_failing の判定材料)。
+    fn send_tracked(&self, udp: &UdpSocket, data: &[u8]) {
+        match udp.send(data) {
+            Ok(_) => *self.last_send_ok.lock().unwrap() = Some(Instant::now()),
+            Err(e) => {
+                tracing::debug!("UDP 送信エラー: {e}");
+                *self.last_send_err.lock().unwrap() = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 送信が失敗し続けているか(最後のエラーが最後の成功より新しい)。
+    fn send_failing(&self) -> bool {
+        let err = *self.last_send_err.lock().unwrap();
+        let ok = *self.last_send_ok.lock().unwrap();
+        match (err, ok) {
+            (Some(err), Some(ok)) => err > ok,
+            (Some(_), None) => true,
+            _ => false,
+        }
     }
 }
 
@@ -125,6 +154,8 @@ impl Engine {
             rotate_after: spec.rotate_after,
             rebound_at: Mutex::new(None),
             last_rotate: Mutex::new(Instant::now()),
+            last_send_ok: Mutex::new(None),
+            last_send_err: Mutex::new(None),
             stats: Mutex::new(EngineStats::default()),
             stop: AtomicBool::new(false),
         });
@@ -136,7 +167,7 @@ impl Engine {
             if let TunnResult::WriteToNetwork(data) =
                 tunn.format_handshake_initiation(&mut buf, false)
             {
-                let _ = shared.socket().send(data);
+                shared.send_tracked(&shared.socket(), data);
             }
         }
 
@@ -171,7 +202,7 @@ impl Engine {
         let mut buf = [0u8; BUF_SIZE];
         let mut tunn = self.shared.tunn.lock().unwrap();
         if let TunnResult::WriteToNetwork(data) = tunn.format_handshake_initiation(&mut buf, true) {
-            let _ = udp.send(data);
+            self.shared.send_tracked(&udp, data);
         }
         Ok(())
     }
@@ -213,7 +244,7 @@ fn tun_loop(shared: &Shared) {
         let mut tunn = shared.tunn.lock().unwrap();
         match tunn.encapsulate(&pkt[..n], &mut work) {
             TunnResult::WriteToNetwork(data) => {
-                let _ = shared.socket().send(data);
+                shared.send_tracked(&shared.socket(), data);
             }
             TunnResult::Done => {} // セッション未確立中はキュー(ハンドシェイクは開始済み)
             TunnResult::Err(e) => tracing::warn!("暗号化に失敗: {e:?}"),
@@ -254,7 +285,7 @@ fn udp_loop(shared: &Shared) {
         loop {
             match result {
                 TunnResult::WriteToNetwork(data) => {
-                    let _ = udp.send(data);
+                    shared.send_tracked(&udp, data);
                     result = tunn.decapsulate(None, &[], &mut work);
                 }
                 TunnResult::WriteToTunnelV4(packet, src) => {
@@ -287,7 +318,7 @@ fn timer_loop(shared: &Shared) {
         let mut tunn = shared.tunn.lock().unwrap();
         match tunn.update_timers(&mut work) {
             TunnResult::WriteToNetwork(data) => {
-                let _ = shared.socket().send(data);
+                shared.send_tracked(&shared.socket(), data);
             }
             TunnResult::Err(WireGuardError::ConnectionExpired) => {}
             TunnResult::Err(e) => tracing::debug!("タイマー処理でエラー: {e:?}"),
@@ -299,6 +330,7 @@ fn timer_loop(shared: &Shared) {
             stats.handshake_age_secs = since.map(|d| d.as_secs());
             stats.tx_bytes = tx as u64;
             stats.rx_bytes = rx as u64;
+            stats.send_failing = shared.send_failing();
         }
 
         // ハンドシェイク未確立・途絶(180 秒 = WG の REJECT_AFTER_TIME)時の
@@ -344,7 +376,7 @@ fn timer_loop(shared: &Shared) {
                 if let TunnResult::WriteToNetwork(data) =
                     tunn.format_handshake_initiation(&mut work, true)
                 {
-                    let _ = udp.send(data);
+                    shared.send_tracked(&udp, data);
                 }
             }
         }

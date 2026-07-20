@@ -189,10 +189,18 @@ class PeercoveVpnService : VpnService() {
                 if (gen != watchGeneration || currentSlug != slug) break
                 val status = tunnelStatus(slug) ?: continue
                 val now = System.currentTimeMillis()
-                // 保険の自己回復: NetworkCallback が来ない機種・状況向け。
-                // 健全なら keepalive によりハンドシェイクは 2〜3 分ごとに
-                // 更新されるので、「未確立 or 150 秒超」が 30 秒続いたら
-                // 30 秒間隔で UDP を張り直す。
+                // 自己回復(NetworkCallback が来ない機種・状況向け)。
+                // 早い経路: UDP 送信自体が失敗し続けている = 回線消失の確実な
+                // シグナル(keepalive が 25 秒ごとに送信されるので数十秒以内に
+                // 立つ)→ 10 秒間隔で張り直す
+                if (status.sendFailing && now - lastPokeAt > 10_000) {
+                    lastPokeAt = now
+                    Log.i(TAG, "UDP 送信が失敗しているため張り直します")
+                    pokeTunnel(slug)
+                }
+                // 遅い経路(最後の保険): 健全なら keepalive によりハンドシェイクは
+                // 2〜3 分ごとに更新されるので、「未確立 or 150 秒超」が 30 秒
+                // 続いたら 30 秒間隔で張り直す。
                 // ※受信バイト数は keepalive(ペイロード 0)で増えないため
                 //   判定に使わない(誤検知して健全な接続を揺らした実機報告)
                 val age = status.handshakeAgeSecs?.toLong()
