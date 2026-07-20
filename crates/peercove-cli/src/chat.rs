@@ -125,6 +125,12 @@ impl ChatLog {
         }
     }
 
+    /// メッセージ ID が既に履歴にあるか。モバイルの再送キュー(E-E 3)は
+    /// ack を取り損ねると同じ ID で再送してくるため、受信側で重複を弾く。
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.entries.iter().any(|e| e.id == id)
+    }
+
     /// `after_seq` より後のエントリを返す(IPC の 1 応答に収まるよう件数と
     /// 本文バイトで打ち切る)。戻りは `(履歴全体の最新 seq, エントリ)`。
     /// エントリの末尾 seq が最新 seq に達するまで繰り返し呼ぶ。

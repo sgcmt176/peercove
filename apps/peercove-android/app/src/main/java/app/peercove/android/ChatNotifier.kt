@@ -21,7 +21,10 @@ import uniffi.peercove_mobile.sendChatMessage
  * サーバーレス構成のため、VPN サービスが動いていない間の通知は仕様として無い。
  */
 object ChatNotifier {
-    const val CHANNEL_ID = "peercove_chat"
+    // v1 は IMPORTANCE_DEFAULT で作ってしまいバナー(ヘッズアップ)が出ない。
+    // チャンネル設定は端末に固定されるため ID を切り替えて作り直す
+    const val CHANNEL_ID = "peercove_chat_v2"
+    private const val OLD_CHANNEL_ID = "peercove_chat"
     const val ACTION_REPLY = "app.peercove.android.action.CHAT_REPLY"
     const val ACTION_MARK_READ = "app.peercove.android.action.CHAT_MARK_READ"
     const val EXTRA_SLUG = "slug"
@@ -30,13 +33,15 @@ object ChatNotifier {
     const val KEY_REPLY_TEXT = "reply_text"
 
     fun ensureChannel(context: Context) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        // HIGH = バナー(ヘッズアップ)表示 + 音。アプリを閉じていても気付ける
         val channel = NotificationChannel(
             CHANNEL_ID,
             context.getString(R.string.notif_chat_channel),
-            NotificationManager.IMPORTANCE_DEFAULT,
+            NotificationManager.IMPORTANCE_HIGH,
         )
-        context.getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(channel)
+        manager.createNotificationChannel(channel)
+        manager.deleteNotificationChannel(OLD_CHANNEL_ID)
     }
 
     fun notificationId(convId: String): Int = convId.hashCode()

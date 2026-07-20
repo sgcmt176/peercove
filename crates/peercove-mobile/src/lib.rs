@@ -584,6 +584,9 @@ pub struct ChatMessage {
     pub outgoing: bool,
     pub system: bool,
     pub failed: bool,
+    /// 送信待ち(自動再送中)か(E-E 3)。failed と組み合わせて
+    /// 「送信中 / 再送待ち / 失敗(取消済み)」を UI が描き分ける
+    pub sending: bool,
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
     pub file_path: Option<String>,
@@ -785,6 +788,7 @@ pub fn chat_fetch(slug: String, after_seq: u64, limit: u32) -> Vec<ChatMessage> 
         return Vec::new();
     };
     let own_ip = s.cfg.own_ip;
+    let sending: std::collections::HashSet<u64> = s.sending_seqs().into_iter().collect();
     let entries = s
         .chat
         .lock()
@@ -804,6 +808,7 @@ pub fn chat_fetch(slug: String, after_seq: u64, limit: u32) -> Vec<ChatMessage> 
             sent_at: e.sent_at,
             outgoing: e.from == own_ip,
             system: e.system,
+            sending: sending.contains(&e.seq),
             failed: e.failed,
             file_name: e.file.as_ref().map(|f| f.name.clone()),
             file_size: e.file.as_ref().map(|f| f.size),
@@ -845,6 +850,23 @@ pub fn send_chat_message(
         None => None,
     };
     s.send_chat(scope, to, group_id, text).map_err(Into::into)
+}
+
+/// 失敗したチャットの手動再送(E-E 3)。
+#[uniffi::export]
+pub fn resend_chat(slug: String, seq: u64) -> Result<(), MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    s.resend_chat(seq).map_err(Into::into)
+}
+
+/// 送信の取消(自動再送をやめる。履歴には失敗として残る)。
+#[uniffi::export]
+pub fn cancel_chat_send(slug: String, seq: u64) {
+    if let Some(s) = session_of(&slug) {
+        s.cancel_chat_send(seq);
+    }
 }
 
 /// ファイルを 1 人へ送る(チャットの文脈付き)。戻り値は転送 ID。

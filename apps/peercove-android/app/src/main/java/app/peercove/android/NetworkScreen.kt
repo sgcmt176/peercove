@@ -188,7 +188,8 @@ fun NetworkScreen(
             delay(2000)
         }
     }
-    // チャット履歴の差分ポーリング
+    // チャット履歴の差分ポーリング。新着が無いときは末尾 30 件を取り直して
+    // 送信状態(送信中 → 送信済み / 失敗)の変化を反映する(E-E 3)
     LaunchedEffect(slug) {
         var after = 0uL
         while (true) {
@@ -197,6 +198,11 @@ fun NetworkScreen(
                 messages = messages + batch
                 after = batch.last().seq
             } else {
+                val tailStart = if (after > 30uL) after - 30uL else 0uL
+                val tail = withContext(Dispatchers.IO) { chatFetch(slug, tailStart, 30u) }
+                if (tail.isNotEmpty()) {
+                    messages = messages.filter { it.seq <= tailStart } + tail
+                }
                 delay(1500)
             }
         }

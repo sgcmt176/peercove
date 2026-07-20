@@ -115,6 +115,23 @@ impl ChatLog {
         }
     }
 
+    /// 再送が成功したとき失敗の印を外す(E-E 3)。
+    pub fn clear_failed(&mut self, seq: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
+            entry.failed = false;
+        }
+    }
+
+    /// メッセージ ID が既に履歴にあるか(再送の二重受信防止)。
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.entries.iter().any(|e| e.id == id)
+    }
+
+    /// seq からエントリを引く(手動再送用)。
+    pub fn get(&self, seq: u64) -> Option<ChatMessageInfo> {
+        self.entries.iter().find(|e| e.seq == seq).cloned()
+    }
+
     /// `after_seq` より後のエントリを最大 `limit` 通返す。
     pub fn fetch(&self, after_seq: u64, limit: usize) -> Vec<ChatMessageInfo> {
         self.entries

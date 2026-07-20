@@ -315,6 +315,13 @@ async fn handle_incoming(
             if scope == ChatScope::Group && group_id.is_none() {
                 bail!("group 宛なのに group_id がありません({peer_ip})");
             }
+            // 再送の重複(ack の取り損ね後に同じ ID で再送 — E-E 3)は
+            // 取り込まず ack だけ返す
+            if chat.lock().unwrap().contains_id(&id) {
+                send_frame(&mut write_half, &MsgFrame::ChatAck { id: id.clone() }).await?;
+                tracing::debug!("重複したチャットを ack のみで処理しました(id={id})");
+                return Ok(());
+            }
             let entry = ChatMessageInfo {
                 seq: 0, // append が振る
                 id: id.clone(),

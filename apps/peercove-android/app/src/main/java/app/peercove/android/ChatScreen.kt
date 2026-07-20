@@ -66,6 +66,8 @@ import kotlinx.coroutines.withContext
 import uniffi.peercove_mobile.ChatMessage
 import uniffi.peercove_mobile.MemberInfo
 import uniffi.peercove_mobile.MobileException
+import uniffi.peercove_mobile.cancelChatSend
+import uniffi.peercove_mobile.resendChat
 import uniffi.peercove_mobile.sendChatMessage
 import uniffi.peercove_mobile.sendFileTo
 import java.text.SimpleDateFormat
@@ -193,7 +195,7 @@ fun ConversationScreen(
             items(convMessages, key = { it.seq.toLong() }) { message ->
                 when {
                     message.system -> SystemLine(message.text)
-                    message.outgoing -> OutgoingBubble(message, context, onNotice)
+                    message.outgoing -> OutgoingBubble(slug, message, context, onNotice)
                     else -> IncomingBubble(
                         message,
                         showName = conv !is ConvKey.Direct,
@@ -306,22 +308,72 @@ private fun IncomingBubble(
 
 @Composable
 private fun OutgoingBubble(
+    slug: String,
     message: ChatMessage,
     context: android.content.Context,
     onNotice: (String) -> Unit,
 ) {
+    val scope = rememberCoroutineScope()
+    val resendFailed = stringResource(R.string.chat_send_failed)
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.End,
         verticalAlignment = Alignment.Bottom,
     ) {
+        // 送信状態(E-E 3): 送信中 / 再送待ち(+取消) / 失敗(+再送)
         Column(horizontalAlignment = Alignment.End) {
-            if (message.failed) {
-                Text(
-                    stringResource(R.string.chat_failed_line),
+            when {
+                message.sending && !message.failed -> Text(
+                    stringResource(R.string.chat_sending_state),
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                message.sending -> {
+                    Text(
+                        stringResource(R.string.chat_retrying),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        stringResource(R.string.chat_cancel_send),
+                        modifier = Modifier
+                            .clickable {
+                                scope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        cancelChatSend(slug, message.seq)
+                                    }
+                                }
+                            }
+                            .padding(2.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                message.failed -> {
+                    Text(
+                        stringResource(R.string.chat_failed_line),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        stringResource(R.string.chat_resend),
+                        modifier = Modifier
+                            .clickable {
+                                scope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) {
+                                            resendChat(slug, message.seq)
+                                        }
+                                    } catch (e: MobileException) {
+                                        onNotice(e.message ?: resendFailed)
+                                    }
+                                }
+                            }
+                            .padding(2.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
         }
         Text(

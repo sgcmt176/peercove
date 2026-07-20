@@ -139,6 +139,10 @@
     <string name="chat_attach">ファイルを送る</string>
     <string name="chat_send_failed">送信に失敗しました</string>
     <string name="chat_failed_line">送信できませんでした</string>
+    <string name="chat_sending_state">送信中…</string>
+    <string name="chat_retrying">未送信(自動再送します)</string>
+    <string name="chat_resend">再送</string>
+    <string name="chat_cancel_send">取消</string>
     <string name="chat_saved">ダウンロード(PeerCove)に保存しました</string>
     <string name="chat_save_failed">保存に失敗しました(受信ボックスから消えている可能性)</string>
     <string name="chat_saved_toast">保存しました</string>

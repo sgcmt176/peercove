@@ -13,6 +13,7 @@
 //! 秘匿ルール: チャット本文・グループ名・ファイル名の中身はログへ出さない
 //! (seq・id・IP・サイズは可)。
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,24 @@ const MOBILE_CAPABILITIES: &[&str] = &["chat", "file_transfer"];
 /// スマホの受信ファイルサイズ上限の既定(MB)。デスクトップは 100 MB だが
 /// スマホはストレージが限られるため小さくする(2026-07-19 依頼者指定)。
 pub const MOBILE_DEFAULT_MAX_RECV_FILE_MB: u64 = 10;
+/// チャットの自動再送間隔(E-E 3)。
+const CHAT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 送信待ち(再送キュー)のチャット 1 通(E-E 3)。送達条件を満たすまで
+/// [`CHAT_RESEND_INTERVAL`] ごとに再送する。同じ ID を使い続けるので、
+/// 受信側の重複弾き(contains_id)と対で冪等。
+pub struct PendingChat {
+    pub seq: u64,
+    pub id: String,
+    pub scope: ChatScope,
+    pub to: Option<Ipv4Addr>,
+    pub group_id: Option<String>,
+    pub text: String,
+    pub sent_at: u64,
+    /// ack が取れた宛先(network/group の部分送達を重複させない)
+    delivered: HashSet<Ipv4Addr>,
+    next_at: Instant,
+}
 
 /// セッション 1 本の設定。アドレスを差し替え可能にしてあるのはテストのため
 /// (本番は control = ホスト仮想 IP:51821、listen = 自分の仮想 IP:51822)。
@@ -95,6 +114,8 @@ pub struct SessionShared {
     pub rejected: Mutex<Option<String>>,
     pub rtt_ms: Mutex<Option<u64>>,
     pub chat: Mutex<ChatLog>,
+    /// チャットの送信待ちキュー(E-E 3)
+    pub chat_queue: Mutex<Vec<PendingChat>>,
     pub groups: Mutex<GroupStore>,
     pub transfers: Mutex<Vec<TransferInfo>>,
     /// listener が実際に bind したアドレス(テストが接続先を知るため)
@@ -117,6 +138,7 @@ impl NetSession {
     pub fn start(cfg: SessionConfig) -> NetSession {
         let shared = Arc::new(SessionShared {
             chat: Mutex::new(ChatLog::load(&cfg.config_path)),
+            chat_queue: Mutex::new(Vec::new()),
             groups: Mutex::new(GroupStore::load(&cfg.config_path)),
             ledger: Mutex::new(None),
             control_connected: AtomicBool::new(false),
@@ -135,6 +157,7 @@ impl NetSession {
         let threads = vec![
             spawn_named("peercove-control", Arc::clone(&shared), control_loop),
             spawn_named("peercove-msg", Arc::clone(&shared), listener_loop),
+            spawn_named("peercove-chatq", Arc::clone(&shared), chat_queue_loop),
         ];
         NetSession { shared, threads }
     }
@@ -493,6 +516,17 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
     }
 }
 
+/// チャット送信キューの巡回(E-E 3)。2 秒ごとに期限の来た送信待ちを再送する。
+fn chat_queue_loop(shared: &Arc<SessionShared>) {
+    while !shared.stopped() {
+        shared.sleep_with_stop(Duration::from_secs(2));
+        if shared.stopped() {
+            return;
+        }
+        shared.pump_chat_queue();
+    }
+}
+
 // ---- メッセージング(listener)-----------------------------------------------
 
 fn listener_loop(shared: &Arc<SessionShared>) {
@@ -620,6 +654,13 @@ fn handle_conn(
             }
             if scope == ChatScope::Group && group_id.is_none() {
                 bail!("group 宛なのに group_id がありません({peer_ip})");
+            }
+            // 再送の重複(ack の取り損ね後に同じ ID で再送 — E-E 3)は
+            // 取り込まず ack だけ返す
+            if shared.chat.lock().unwrap().contains_id(&id) {
+                send_json(&mut writer, &MsgFrame::ChatAck { id: id.clone() })?;
+                tracing::debug!("重複したチャットを ack のみで処理しました(id={id})");
+                return Ok(());
             }
             let entry = ChatMessageInfo {
                 seq: 0,
@@ -912,8 +953,9 @@ impl SessionShared {
         Ok((line_reader(stream), writer))
     }
 
-    /// チャットを送る。宛先ごとに個別送信し、1 件も届かなければ失敗の印を付けて
-    /// エラーを返す(デスクトップと同じ振る舞い)。
+    /// チャットを送る(E-E 3: 再送キュー方式)。履歴へ追記してキューに積み、
+    /// その場で 1 回配送を試みる。届かなくてもエラーにせず、失敗の印を付けて
+    /// 10 秒間隔で自動再送する(同じ ID を使うので受信側の重複弾きと対で冪等)。
     pub fn send_chat(
         &self,
         scope: ChatScope,
@@ -930,7 +972,9 @@ impl SessionShared {
         if scope == ChatScope::Group && group_id.is_none() {
             bail!("グループ宛なのにグループ ID がありません");
         }
-        let targets = self.chat_targets(scope, to, group_id.as_deref())?;
+        if scope == ChatScope::Direct && to.is_none() {
+            bail!("宛先がありません");
+        }
         let entry = self.chat.lock().unwrap().append(ChatMessageInfo {
             seq: 0,
             id: new_transfer_id(),
@@ -947,25 +991,145 @@ impl SessionShared {
             file: None,
             system: false,
         });
-        let frame = MsgFrame::Chat {
-            id: entry.id.clone(),
+        self.chat_queue.lock().unwrap().push(PendingChat {
+            seq: entry.seq,
+            id: entry.id,
             scope,
+            to,
             group_id,
             text,
             sent_at: entry.sent_at,
+            delivered: HashSet::new(),
+            next_at: Instant::now(),
+        });
+        self.pump_chat_queue();
+        Ok(())
+    }
+
+    /// 送信待ちキューを 1 巡処理する(期限が来たものだけ)。送信キュー
+    /// スレッドと send_chat / resend_chat から呼ばれる。取り出してから
+    /// 配送する(remove → 処理 → 未達なら戻す)ので並行 pump でも二重配送しない。
+    pub fn pump_chat_queue(&self) {
+        let due: Vec<u64> = {
+            let now = Instant::now();
+            self.chat_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.next_at <= now)
+                .map(|p| p.seq)
+                .collect()
         };
-        let mut delivered = 0usize;
-        for target in &targets {
-            match self.deliver_chat(*target, &frame, &entry.id) {
-                Ok(()) => delivered += 1,
-                Err(e) => tracing::warn!("{target} への送信に失敗しました: {e:#}"),
+        for seq in due {
+            let pending = {
+                let mut queue = self.chat_queue.lock().unwrap();
+                queue
+                    .iter()
+                    .position(|p| p.seq == seq)
+                    .map(|index| queue.remove(index))
+            };
+            let Some(mut pending) = pending else { continue };
+            if self.attempt_chat(&mut pending) {
+                self.chat.lock().unwrap().clear_failed(pending.seq);
+                tracing::info!(
+                    "チャットを送信しました(seq={} id={})",
+                    pending.seq,
+                    pending.id
+                );
+            } else {
+                self.chat.lock().unwrap().mark_failed(pending.seq);
+                pending.next_at = Instant::now() + CHAT_RESEND_INTERVAL;
+                self.chat_queue.lock().unwrap().push(pending);
             }
         }
-        if delivered == 0 {
-            self.chat.lock().unwrap().mark_failed(entry.seq);
-            bail!("どの宛先にも届きませんでした({} 宛先)", targets.len());
+    }
+
+    /// 未達の宛先へ配送を試みる。戻り値 true = 送達条件を満たした
+    /// (direct = 宛先本人、network/group = 1 人以上)。
+    fn attempt_chat(&self, pending: &mut PendingChat) -> bool {
+        let frame = MsgFrame::Chat {
+            id: pending.id.clone(),
+            scope: pending.scope,
+            group_id: pending.group_id.clone(),
+            text: pending.text.clone(),
+            sent_at: pending.sent_at,
+        };
+        // 宛先は毎回引き直す(台帳の到着やオンライン状態の変化に追従)
+        let targets = self
+            .chat_targets(pending.scope, pending.to, pending.group_id.as_deref())
+            .unwrap_or_default();
+        for target in targets {
+            if pending.delivered.contains(&target) {
+                continue;
+            }
+            match self.deliver_chat(target, &frame, &pending.id) {
+                Ok(()) => {
+                    pending.delivered.insert(target);
+                }
+                Err(e) => tracing::debug!("{target} への送信に失敗(自動再送します): {e:#}"),
+            }
         }
+        match pending.scope {
+            ChatScope::Direct => pending
+                .to
+                .is_some_and(|target| pending.delivered.contains(&target)),
+            _ => !pending.delivered.is_empty(),
+        }
+    }
+
+    /// 送信待ち(= まだ送達条件を満たしていない)メッセージの seq 一覧。
+    pub fn sending_seqs(&self) -> Vec<u64> {
+        self.chat_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.seq)
+            .collect()
+    }
+
+    /// 手動再送(失敗した吹き出しの「再送」)。キューに居ればすぐ再試行、
+    /// 居なければ(取消後・アプリ再起動後)履歴から積み直す。
+    pub fn resend_chat(&self, seq: u64) -> anyhow::Result<()> {
+        let requeued = {
+            let mut queue = self.chat_queue.lock().unwrap();
+            match queue.iter_mut().find(|p| p.seq == seq) {
+                Some(pending) => {
+                    pending.next_at = Instant::now();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !requeued {
+            let entry = self
+                .chat
+                .lock()
+                .unwrap()
+                .get(seq)
+                .context("メッセージが見つかりません")?;
+            if entry.from != self.cfg.own_ip || entry.system || entry.file.is_some() {
+                bail!("このメッセージは再送できません");
+            }
+            self.chat_queue.lock().unwrap().push(PendingChat {
+                seq: entry.seq,
+                id: entry.id,
+                scope: entry.scope,
+                to: entry.to,
+                group_id: entry.group_id,
+                text: entry.text,
+                sent_at: entry.sent_at,
+                delivered: HashSet::new(),
+                next_at: Instant::now(),
+            });
+        }
+        self.pump_chat_queue();
         Ok(())
+    }
+
+    /// 送信の取消(自動再送をやめる)。履歴には失敗の印を付けたまま残す。
+    pub fn cancel_chat_send(&self, seq: u64) {
+        self.chat_queue.lock().unwrap().retain(|p| p.seq != seq);
+        self.chat.lock().unwrap().mark_failed(seq);
     }
 
     fn chat_targets(
@@ -1702,6 +1866,67 @@ mod tests {
             .shared
             .create_group("x", vec!["10.9.9.9".parse().unwrap()])
             .is_err());
+
+        a.stop();
+        b.stop();
+    }
+
+    /// 送信キュー(E-E 3): 相手が受け取れない間はエラーにせず失敗の印付きで
+    /// キューに残り、受け取れるようになると自動再送で届いて印が消える。
+    /// 手動再送で同じ ID が二重に届いても受信側が弾く。
+    #[test]
+    fn chat_queue_retries_and_receiver_dedups() {
+        let a = test_session("queue-a", "127.0.0.1:1".parse().unwrap(), 1);
+        let a_addr = bound_addr(&a);
+        let b = test_session("queue-b", "127.0.0.1:1".parse().unwrap(), a_addr.port());
+
+        // A は台帳未受信 = 送信元不明として受信を拒否する状態。
+        // B が送ってもエラーにはならず、失敗の印 + 送信待ちになる
+        b.shared
+            .send_chat(
+                ChatScope::Direct,
+                Some("127.0.0.1".parse().unwrap()),
+                None,
+                "遅れて届く".to_string(),
+            )
+            .unwrap();
+        let sent = b.shared.chat.lock().unwrap().fetch(0, 10);
+        assert!(sent[0].failed, "未達は失敗の印");
+        assert_eq!(b.shared.sending_seqs(), vec![sent[0].seq], "送信待ちに残る");
+
+        // 台帳が届くと自動再送(10 秒間隔)で A に届き、失敗の印が消える
+        let both = vec![ledger_entry("127.0.0.1", "pair", true)];
+        seed_ledger(&a, both.clone());
+        seed_ledger(&b, both);
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                a.shared.chat.lock().unwrap().fetch(0, 10).len() == 1
+            }),
+            "自動再送で届くはず"
+        );
+        assert!(wait_until(Duration::from_secs(5), || {
+            !b.shared.chat.lock().unwrap().fetch(0, 10)[0].failed
+                && b.shared.sending_seqs().is_empty()
+        }));
+
+        // 手動再送(送達済みの同じ ID)を受信側が弾いて履歴が増えない
+        b.shared.resend_chat(sent[0].seq).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(a.shared.chat.lock().unwrap().fetch(0, 10).len(), 1);
+
+        // 取消: キューから消え、失敗の印が付く
+        b.shared
+            .send_chat(
+                ChatScope::Direct,
+                Some("10.99.99.99".parse().unwrap()),
+                None,
+                "取消する".to_string(),
+            )
+            .unwrap();
+        let seq = b.shared.chat.lock().unwrap().latest_seq();
+        b.shared.cancel_chat_send(seq);
+        assert!(b.shared.sending_seqs().is_empty());
+        assert!(b.shared.chat.lock().unwrap().get(seq).unwrap().failed);
 
         a.stop();
         b.stop();
