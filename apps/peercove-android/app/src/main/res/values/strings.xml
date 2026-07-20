@@ -34,6 +34,8 @@
     <string name="action_disconnect">切断</string>
     <string name="action_open">開く</string>
     <string name="action_remove">削除</string>
+    <string name="remove_confirm_title">ネットワークを削除</string>
+    <string name="remove_confirm_body">「%1$s」を一覧から削除します。再参加には新しい招待が必要です。よろしいですか?</string>
 
     <!-- 共有シートからのファイル送信 -->
     <string name="share_title">共有ファイルの送信先</string>

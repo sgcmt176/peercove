@@ -256,6 +256,8 @@ private fun HomeScreen(
     var statuses by remember { mutableStateOf(mapOf<String, TunnelStatus?>()) }
     var tokenInput by remember { mutableStateOf("") }
     var pendingSlug by remember { mutableStateOf<String?>(null) }
+    // 削除確認中のネットワーク(slug, 表示名)。誤タップで即消えるのを防ぐ
+    var confirmRemove by remember { mutableStateOf<Pair<String, String>?>(null) }
     val vpnDenied = stringResource(R.string.vpn_denied)
     val emptyToken = stringResource(R.string.join_empty_token)
     val joinFailed = stringResource(R.string.join_failed)
@@ -309,6 +311,30 @@ private fun HomeScreen(
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.let { tokenInput = it }
+    }
+
+    confirmRemove?.let { (slug, name) ->
+        AlertDialog(
+            onDismissRequest = { confirmRemove = null },
+            title = { Text(stringResource(R.string.remove_confirm_title)) },
+            text = { Text(stringResource(R.string.remove_confirm_body, name)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRemove = null
+                    try {
+                        removeNetwork(baseDir, slug)
+                        refresh()
+                    } catch (e: MobileException) {
+                        onNotice(e.message ?: removeFailed)
+                    }
+                }) { Text(stringResource(R.string.action_remove)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRemove = null }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
     }
 
     if (showThemeDialog) {
@@ -382,14 +408,7 @@ private fun HomeScreen(
                     onConnect = { connect(network.slug) },
                     onDisconnect = { stopVpnService(context) },
                     onOpen = { onOpen(network.slug, network.name) },
-                    onRemove = {
-                        try {
-                            removeNetwork(baseDir, network.slug)
-                            refresh()
-                        } catch (e: MobileException) {
-                            onNotice(e.message ?: removeFailed)
-                        }
-                    },
+                    onRemove = { confirmRemove = network.slug to network.name },
                 )
             }
         }
