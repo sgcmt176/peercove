@@ -488,18 +488,29 @@ impl DaemonShared {
     /// 別の鍵)を検知して 1:1 履歴を消す(検証フィードバック 2026-07-20)。
     /// 台帳同期と同じ 5 秒周期で回す。同期 I/O だが少量なので許容。
     async fn reconcile_identities(&self) {
-        for active in self.active.lock().await.values() {
+        // active(tokio ロック)をブロッキング I/O 中に握り続けないよう、必要な
+        // ハンドルだけ複製してから解放する(pump_chat_queues と同じ方針)。
+        let jobs: Vec<_> = self
+            .active
+            .lock()
+            .await
+            .values()
+            .map(|a| {
+                (
+                    a.config.clone(),
+                    a.address,
+                    Arc::clone(&a.snapshot),
+                    Arc::clone(&a.chat),
+                )
+            })
+            .collect();
+        for (config, address, snapshot, chat) in jobs {
             let ledger = {
-                let snapshot = active.snapshot.lock().unwrap();
+                let snapshot = snapshot.lock().unwrap();
                 snapshot.as_ref().and_then(|s| s.ledger.clone())
             };
             if let Some(ledger) = ledger {
-                crate::chat::reconcile_identities(
-                    &active.config,
-                    active.address,
-                    &ledger,
-                    &active.chat,
-                );
+                crate::chat::reconcile_identities(&config, address, &ledger, &chat);
             }
         }
     }
@@ -1141,18 +1152,27 @@ impl DaemonShared {
 
     /// 全トンネルを停止する(shutdown・常駐終了時)。エラーはログに落として続行。
     async fn stop_all(self: &Arc<Self>) {
+        // トンネル破棄(TUN/WG のクリーンアップ)は OS 側で稀に固まることがある。
+        // その場合でもサービスが必ず停止できるよう、破棄待ちに上限を設ける。
+        // 上限を超えたら諦めて次へ進む(残った OS 資源は次回起動時に掃除される)。
+        const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
         let all: Vec<Active> = self.active.lock().await.drain().map(|(_, a)| a).collect();
         for active in all {
             let network = active.network.clone();
             active.dns_task.abort();
             active.health.lock().unwrap().stop();
             let _ = active.stop_tx.send(true);
-            match active.task.await {
-                Ok(Ok(())) => tracing::info!("トンネルを停止しました(network={network})"),
-                Ok(Err(e)) => {
+            match tokio::time::timeout(TEARDOWN_TIMEOUT, active.task).await {
+                Ok(Ok(Ok(()))) => tracing::info!("トンネルを停止しました(network={network})"),
+                Ok(Ok(Err(e))) => {
                     tracing::warn!("トンネル(network={network})の停止でエラー: {e:#}")
                 }
-                Err(e) => tracing::warn!("トンネルタスクの終了待ちに失敗: {e:#}"),
+                Ok(Err(e)) => tracing::warn!("トンネルタスクの終了待ちに失敗: {e:#}"),
+                Err(_) => tracing::warn!(
+                    "トンネル(network={network})の停止が {} 秒で完了しませんでした。\
+                     強制的に終了します(OS 側の残骸は次回起動時に掃除します)",
+                    TEARDOWN_TIMEOUT.as_secs()
+                ),
             }
         }
         self.sync_os_dns().await;
@@ -1794,6 +1814,10 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
     #[cfg(unix)]
     let _ = std::fs::remove_file(peercove_ipc::socket_path());
     println!("peercove デーモンを終了しました");
+    // トンネル破棄が OS 側で固まってブロッキングスレッドが残っても、ランタイム
+    // 破棄で無限に待たないよう明示的に短いタイムアウトで畳む(残ったスレッドは
+    // プロセス終了で片付く)。これで Windows サービスが確実に停止できる
+    runtime.shutdown_timeout(std::time::Duration::from_secs(3));
     Ok(())
 }
 
