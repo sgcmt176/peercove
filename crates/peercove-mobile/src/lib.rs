@@ -612,6 +612,33 @@ pub fn chat_groups(slug: String) -> Vec<GroupSummary> {
         .collect()
 }
 
+/// グループを作る(スマホから。ADR-0016 のモバイル版)。`member_ips` に自分は
+/// 含めなくてよい。オンラインのメンバー 1 人以上へ届いたときだけ成立する
+/// (届いた先のデスクトップの再送で残りへ収束する)。
+/// ブロッキング(ネットワーク I/O)なので Kotlin 側は IO ディスパッチャで呼ぶ。
+#[uniffi::export]
+pub fn create_group(
+    slug: String,
+    name: String,
+    member_ips: Vec<String>,
+) -> Result<GroupSummary, MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    let mut members = Vec::new();
+    for ip in member_ips {
+        members.push(ip.parse::<Ipv4Addr>().map_err(|_| MobileError::Failure {
+            msg: format!("メンバー IP が不正です: {ip}"),
+        })?);
+    }
+    let group = s.create_group(&name, members)?;
+    Ok(GroupSummary {
+        id: group.id,
+        name: group.name,
+        member_ips: group.members.iter().map(|ip| ip.to_string()).collect(),
+    })
+}
+
 fn scope_to_str(scope: ChatScope) -> &'static str {
     match scope {
         ChatScope::Direct => "direct",

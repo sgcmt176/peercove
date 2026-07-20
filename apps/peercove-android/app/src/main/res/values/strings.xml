@@ -1,4 +1,118 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 文言カタログ(多言語対応の下地。現時点は日本語のみ = 既定ロケール)。
+     英語などを足すときは res/values-en/strings.xml に同じ name で訳を置く。
+     Rust 側(peercove-mobile)から返るエラーメッセージは対象外(デスクトップと同方針)。 -->
 <resources>
     <string name="app_name">PeerCove</string>
+
+    <!-- 共通 -->
+    <string name="notice_copied">コピーしました: %1$s</string>
+    <string name="action_cancel">キャンセル</string>
+    <string name="action_close">閉じる</string>
+    <string name="action_save">保存</string>
+    <string name="action_back">戻る</string>
+    <string name="failed_generic">失敗しました</string>
+
+    <!-- ホーム(MainActivity) -->
+    <string name="mobile_core_version">mobile core v%1$s</string>
+    <string name="vpn_denied">VPN の使用が許可されませんでした</string>
+    <string name="join_title">ネットワークに参加</string>
+    <string name="join_token_label">招待コード(pcv1.…)</string>
+    <string name="join_scan">QR を読み取り</string>
+    <string name="join_submit">参加</string>
+    <string name="join_empty_token">招待コードを入力するか QR を読み取ってください</string>
+    <string name="join_success">「%1$s」に参加しました</string>
+    <string name="join_failed">参加に失敗しました</string>
+    <string name="scan_prompt">招待 QR コードを読み取ってください</string>
+    <string name="remove_failed">削除に失敗しました</string>
+    <string name="net_self_line">自分: %1$s(%2$s)/ ホスト: %3$s</string>
+    <string name="net_endpoint_line">接続先: %1$s</string>
+    <string name="status_disconnected">未接続</string>
+    <string name="status_connecting">接続試行中…(%1$s へハンドシェイク待ち)</string>
+    <string name="status_connected">接続中(%1$s / ハンドシェイク %2$d 秒前 / ↑%3$s ↓%4$s)</string>
+    <string name="action_connect">接続</string>
+    <string name="action_disconnect">切断</string>
+    <string name="action_open">開く</string>
+    <string name="action_remove">削除</string>
+
+    <!-- 共有シートからのファイル送信 -->
+    <string name="share_title">共有ファイルの送信先</string>
+    <string name="share_no_network">接続中のネットワークがありません。PeerCove で接続してから共有し直してください</string>
+    <string name="share_pick_network">ネットワークを選択</string>
+    <string name="share_pick_member">送信先のメンバーをタップ(オンラインのみ)</string>
+    <string name="share_no_member">オンラインのメンバーがいません</string>
+    <string name="share_sending">ファイルを送信中…</string>
+    <string name="share_sent">ファイルを送信しました</string>
+    <string name="share_read_failed">ファイルを読み込めませんでした</string>
+
+    <!-- ネットワーク詳細(NetworkScreen) -->
+    <string name="session_not_connected">未接続(ホームから接続してください)</string>
+    <string name="session_removed">ホストから削除されました</string>
+    <string name="session_rejected">参加が拒否されました: %1$s</string>
+    <string name="session_synced">同期中</string>
+    <string name="session_synced_rtt">同期中 ・RTT %1$dms</string>
+    <string name="session_waiting">ホストと同期待ち…</string>
+    <string name="tab_talk">トーク</string>
+    <string name="tab_members">メンバー</string>
+    <string name="tab_dns">DNS</string>
+    <string name="tab_settings">設定</string>
+    <string name="talk_all">全体</string>
+    <string name="talk_all_avatar">全</string>
+    <string name="talk_no_message">メッセージはまだありません</string>
+    <string name="talk_new_group">新しいグループを作成</string>
+    <string name="group_dialog_title">新しいグループ</string>
+    <string name="group_name_label">グループ名</string>
+    <string name="group_members_label">メンバー(オンラインの相手だけ選べます)</string>
+    <string name="group_create">作成</string>
+    <string name="group_created">グループ「%1$s」を作成しました</string>
+    <string name="badge_self">自分</string>
+    <string name="badge_host">ホスト</string>
+    <string name="badge_blocked">通信不可</string>
+    <string name="copy_ip">IP アドレス</string>
+    <string name="copy_domain">ドメイン</string>
+    <string name="copy_value">IP アドレス / 値</string>
+    <string name="copy_url">URL をコピー</string>
+    <string name="open_in_browser">ブラウザで開く</string>
+    <string name="open_failed">開けませんでした(対応アプリなし)</string>
+    <string name="tap_to_copy"> ・タップでコピー</string>
+
+    <!-- 設定タブ -->
+    <string name="settings_diag_title">接続診断</string>
+    <string name="diag_tunnel">トンネル</string>
+    <string name="diag_tunnel_up">確立(ハンドシェイク %1$d 秒前)</string>
+    <string name="diag_tunnel_trying">未確立(ハンドシェイク待ち)</string>
+    <string name="diag_tunnel_down">停止中</string>
+    <string name="diag_endpoint">使用中の接続先</string>
+    <string name="diag_traffic">送受信</string>
+    <string name="diag_traffic_value">↑%1$s ↓%2$s</string>
+    <string name="diag_control">ホストとの同期</string>
+    <string name="diag_control_ok">同期中</string>
+    <string name="diag_control_waiting">同期待ち</string>
+    <string name="diag_rtt">ホスト応答(RTT)</string>
+    <string name="diag_rtt_value">%1$d ms</string>
+    <string name="diag_none">—</string>
+    <string name="settings_conn_title">接続</string>
+    <string name="settings_endpoint_label">接続先エンドポイント(IP:ポート)</string>
+    <string name="settings_mtu_label">MTU(既定 1420)</string>
+    <string name="settings_limit_label">受信サイズ上限(MB、0 で無制限)</string>
+    <string name="settings_saved_restart">保存しました(切断 → 接続のし直しで反映されます)</string>
+    <string name="settings_saved">保存しました</string>
+    <string name="settings_profile_title">プロフィール</string>
+    <string name="settings_profile_hint">ホストへ依頼して変更します(「同期中」のときのみ)</string>
+    <string name="settings_display_name_label">表示名</string>
+    <string name="settings_display_name_submit">表示名を変更</string>
+    <string name="settings_dns_name_label">DNS 名(例: my-phone)</string>
+    <string name="settings_dns_name_submit">DNS 名を変更</string>
+
+    <!-- チャット(ChatScreen) -->
+    <string name="chat_placeholder">メッセージを入力</string>
+    <string name="chat_send">送信</string>
+    <string name="chat_attach">ファイルを送る</string>
+    <string name="chat_send_failed">送信に失敗しました</string>
+    <string name="chat_failed_line">送信できませんでした</string>
+    <string name="chat_saved">ダウンロード(PeerCove)に保存しました</string>
+    <string name="chat_save_failed">保存に失敗しました(受信ボックスから消えている可能性)</string>
+    <string name="chat_saved_toast">保存しました</string>
+    <string name="chat_tap_to_save"> ・タップで保存</string>
+    <string name="chat_file_prefix">📎 %1$s</string>
 </resources>

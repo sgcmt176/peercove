@@ -3,7 +3,9 @@ package app.peercove.android
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -38,6 +40,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -54,7 +57,8 @@ import uniffi.peercove_mobile.tunnelStatus
 
 /**
  * M4 E-C の画面: 参加(貼り付け / QR)、接続・切断、ネットワーク詳細
- * (トーク / メンバー / DNS)への遷移。
+ * (トーク / メンバー / DNS)への遷移。共有シート(ACTION_SEND)経由の
+ * ファイル送信もここで受ける。
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,10 +69,22 @@ class MainActivity : ComponentActivity() {
         // 余白が大きくなりすぎる
         enableEdgeToEdge()
         initLogging()
+        val shareUri = extractShareUri(intent)
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { App() }
+                Surface(modifier = Modifier.fillMaxSize()) { App(shareUri) }
             }
+        }
+    }
+
+    /** 共有シート(ACTION_SEND)で渡されたファイルの URI。 */
+    private fun extractShareUri(intent: Intent?): Uri? {
+        if (intent?.action != Intent.ACTION_SEND) return null
+        return if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(Intent.EXTRA_STREAM)
         }
     }
 }
@@ -78,7 +94,8 @@ private sealed class Route {
     data class Net(val slug: String, val name: String) : Route()
 }
 
-private fun startVpnService(context: Context, slug: String) {
+fun startVpnService(context: Context, slug: String) {
+    Prefs.setLastSlug(context, slug) // クイック設定タイルの接続先に使う
     val intent = Intent(context, PeercoveVpnService::class.java)
         .setAction(PeercoveVpnService.ACTION_CONNECT)
         .putExtra(PeercoveVpnService.EXTRA_SLUG, slug)
@@ -92,13 +109,26 @@ private fun stopVpnService(context: Context) {
 }
 
 @Composable
-private fun App() {
-    val context = LocalContext.current
+private fun App(shareUri: Uri?) {
     var route by remember { mutableStateOf<Route>(Route.Home) }
     var notice by remember { mutableStateOf<String?>(null) }
+    var noticeCount by remember { mutableStateOf(0) }
+    var pendingShare by remember { mutableStateOf(shareUri) }
 
     // システムの戻る操作でひとつ前の画面へ(アプリを閉じない)
     BackHandler(enabled = route is Route.Net) { route = Route.Home }
+
+    val onNotice: (String) -> Unit = {
+        notice = it
+        noticeCount++ // 同文の連続通知でもタイマーを引き直す
+    }
+    // 通知は出しっぱなしにせず時間経過で消す
+    LaunchedEffect(noticeCount) {
+        if (notice != null) {
+            delay(5000)
+            notice = null
+        }
+    }
 
     // エッジツーエッジ対策の余白はここに一本化する。safeDrawing はステータス
     // バー・ナビバー・カメラ切欠き・キーボード(ime)の合成(union = 最大値)
@@ -114,16 +144,25 @@ private fun App() {
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+        val share = pendingShare
+        if (share != null) {
+            ShareSendScreen(
+                uri = share,
+                onNotice = onNotice,
+                onClose = { pendingShare = null },
+            )
+            return@Column
+        }
         when (val r = route) {
             is Route.Home -> HomeScreen(
-                onNotice = { notice = it },
+                onNotice = onNotice,
                 onOpen = { slug, name -> route = Route.Net(slug, name) },
             )
             is Route.Net -> NetworkScreen(
                 slug = r.slug,
                 networkName = r.name,
                 onBack = { route = Route.Home },
-                onNotice = { notice = it },
+                onNotice = onNotice,
             )
         }
     }
@@ -138,6 +177,12 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
     var statuses by remember { mutableStateOf(mapOf<String, TunnelStatus?>()) }
     var tokenInput by remember { mutableStateOf("") }
     var pendingSlug by remember { mutableStateOf<String?>(null) }
+    val vpnDenied = stringResource(R.string.vpn_denied)
+    val emptyToken = stringResource(R.string.join_empty_token)
+    val joinFailed = stringResource(R.string.join_failed)
+    val joinSuccess = stringResource(R.string.join_success)
+    val removeFailed = stringResource(R.string.remove_failed)
+    val scanPrompt = stringResource(R.string.scan_prompt)
 
     fun refresh() {
         networks = listNetworks(baseDir)
@@ -158,7 +203,7 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
         if (result.resultCode == Activity.RESULT_OK && slug != null) {
             startVpnService(context, slug)
         } else {
-            onNotice("VPN の使用が許可されませんでした")
+            onNotice(vpnDenied)
         }
     }
 
@@ -179,7 +224,7 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("PeerCove", style = MaterialTheme.typography.headlineMedium)
         Text(
-            "mobile core v${remember { coreVersion() }}",
+            stringResource(R.string.mobile_core_version, remember { coreVersion() }),
             style = MaterialTheme.typography.bodySmall,
         )
         Spacer(modifier = Modifier.padding(4.dp))
@@ -191,7 +236,7 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
                 scanLauncher.launch(
                     ScanOptions()
                         .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                        .setPrompt("招待 QR コードを読み取ってください")
+                        .setPrompt(scanPrompt)
                         .setBeepEnabled(false)
                         // 既定の CaptureActivity は横向きなので縦固定版を使う
                         .setCaptureActivity(PortraitCaptureActivity::class.java)
@@ -201,16 +246,16 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
             onJoin = joinAction@{
                 val token = tokenInput.trim()
                 if (token.isEmpty()) {
-                    onNotice("招待コードを入力するか QR を読み取ってください")
+                    onNotice(emptyToken)
                     return@joinAction
                 }
                 try {
                     val info = joinNetwork(baseDir, token)
-                    onNotice("「${info.name}」に参加しました")
+                    onNotice(joinSuccess.format(info.name))
                     tokenInput = ""
                     refresh()
                 } catch (e: MobileException) {
-                    onNotice(e.message ?: "参加に失敗しました")
+                    onNotice(e.message ?: joinFailed)
                 }
             },
         )
@@ -230,7 +275,7 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
                             removeNetwork(baseDir, network.slug)
                             refresh()
                         } catch (e: MobileException) {
-                            onNotice(e.message ?: "削除に失敗しました")
+                            onNotice(e.message ?: removeFailed)
                         }
                     },
                 )
@@ -248,20 +293,20 @@ private fun JoinCard(
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
-            Text("ネットワークに参加", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.join_title), style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(
                 value = token,
                 onValueChange = onTokenChange,
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("招待コード(pcv1.…)") },
+                label = { Text(stringResource(R.string.join_token_label)) },
                 minLines = 1,
                 maxLines = 3,
             )
             Spacer(modifier = Modifier.padding(4.dp))
             Row {
-                OutlinedButton(onClick = onScan) { Text("QR を読み取り") }
+                OutlinedButton(onClick = onScan) { Text(stringResource(R.string.join_scan)) }
                 Spacer(modifier = Modifier.width(8.dp))
-                Button(onClick = onJoin) { Text("参加") }
+                Button(onClick = onJoin) { Text(stringResource(R.string.join_submit)) }
             }
         }
     }
@@ -280,10 +325,18 @@ private fun NetworkCard(
         Column(modifier = Modifier.padding(12.dp)) {
             Text(network.name, style = MaterialTheme.typography.titleMedium)
             Text(
-                "自分: ${network.memberIp}(${network.displayName})/ ホスト: ${network.hostIp}",
+                stringResource(
+                    R.string.net_self_line,
+                    network.memberIp,
+                    network.displayName,
+                    network.hostIp,
+                ),
                 style = MaterialTheme.typography.bodyMedium,
             )
-            Text("接続先: ${network.endpoint}", style = MaterialTheme.typography.bodySmall)
+            Text(
+                stringResource(R.string.net_endpoint_line, network.endpoint),
+                style = MaterialTheme.typography.bodySmall,
+            )
             Spacer(modifier = Modifier.padding(2.dp))
             Text(
                 statusLine(status),
@@ -297,23 +350,31 @@ private fun NetworkCard(
             Spacer(modifier = Modifier.padding(4.dp))
             Row {
                 if (status == null) {
-                    Button(onClick = onConnect) { Text("接続") }
+                    Button(onClick = onConnect) { Text(stringResource(R.string.action_connect)) }
                     Spacer(modifier = Modifier.width(8.dp))
-                    TextButton(onClick = onRemove) { Text("削除") }
+                    TextButton(onClick = onRemove) { Text(stringResource(R.string.action_remove)) }
                 } else {
-                    Button(onClick = onOpen) { Text("開く") }
+                    Button(onClick = onOpen) { Text(stringResource(R.string.action_open)) }
                     Spacer(modifier = Modifier.width(8.dp))
-                    OutlinedButton(onClick = onDisconnect) { Text("切断") }
+                    OutlinedButton(onClick = onDisconnect) {
+                        Text(stringResource(R.string.action_disconnect))
+                    }
                 }
             }
         }
     }
 }
 
+@Composable
 private fun statusLine(status: TunnelStatus?): String {
-    if (status == null) return "未接続"
+    if (status == null) return stringResource(R.string.status_disconnected)
     val age = status.handshakeAgeSecs
-        ?: return "接続試行中…(${status.endpoint} へハンドシェイク待ち)"
-    return "接続中(${status.endpoint} / ハンドシェイク ${age} 秒前 / " +
-        "↑${formatBytesLong(status.txBytes)} ↓${formatBytesLong(status.rxBytes)})"
+        ?: return stringResource(R.string.status_connecting, status.endpoint)
+    return stringResource(
+        R.string.status_connected,
+        status.endpoint,
+        age.toLong(),
+        formatBytesLong(status.txBytes),
+        formatBytesLong(status.rxBytes),
+    )
 }

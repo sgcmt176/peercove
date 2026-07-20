@@ -1,9 +1,11 @@
 package app.peercove.android
 
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -40,8 +42,13 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -63,8 +70,9 @@ sealed class ConvKey {
     data class Group(val id: String, val name: String) : ConvKey()
 }
 
+@Composable
 fun ConvKey.title(): String = when (this) {
-    is ConvKey.Network -> "全体"
+    is ConvKey.Network -> stringResource(R.string.talk_all)
     is ConvKey.Direct -> name
     is ConvKey.Group -> name
 }
@@ -105,6 +113,10 @@ fun ConversationScreen(
     var sending by remember { mutableStateOf(false) }
     val convMessages = remember(messages, conv) { messages.filter { it.belongsTo(conv) } }
     val listState = rememberLazyListState()
+    val sendFailed = stringResource(R.string.chat_send_failed)
+    val fileSending = stringResource(R.string.share_sending)
+    val fileSent = stringResource(R.string.share_sent)
+    val fileReadFailed = stringResource(R.string.share_read_failed)
 
     // 新着で最下部へ
     LaunchedEffect(convMessages.size) {
@@ -131,7 +143,7 @@ fun ConversationScreen(
                 }
                 input = ""
             } catch (e: MobileException) {
-                onNotice(e.message ?: "送信に失敗しました")
+                onNotice(e.message ?: sendFailed)
             } finally {
                 sending = false
             }
@@ -145,20 +157,20 @@ fun ConversationScreen(
         val target = conv as? ConvKey.Direct ?: return@rememberLauncherForActivityResult
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
-            onNotice("ファイルを送信中…")
+            onNotice(fileSending)
             val result = withContext(Dispatchers.IO) {
                 val cached = FileUtil.copyToCache(context, uri)
-                    ?: return@withContext "ファイルを読み込めませんでした"
+                    ?: return@withContext fileReadFailed
                 try {
                     sendFileTo(slug, target.ip, cached.absolutePath)
                     null
                 } catch (e: MobileException) {
-                    e.message ?: "送信に失敗しました"
+                    e.message ?: sendFailed
                 } finally {
                     cached.delete()
                 }
             }
-            onNotice(result ?: "ファイルを送信しました")
+            onNotice(result ?: fileSent)
         }
     }
 
@@ -190,20 +202,23 @@ fun ConversationScreen(
         ) {
             if (conv is ConvKey.Direct) {
                 IconButton(onClick = { pickFile.launch("*/*") }) {
-                    Icon(Icons.Filled.Add, contentDescription = "ファイルを送る")
+                    Icon(
+                        Icons.Filled.Add,
+                        contentDescription = stringResource(R.string.chat_attach),
+                    )
                 }
             }
             OutlinedTextField(
                 value = input,
                 onValueChange = { input = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("メッセージを入力") },
+                placeholder = { Text(stringResource(R.string.chat_placeholder)) },
                 maxLines = 4,
             )
             IconButton(onClick = { doSend() }, enabled = !sending && input.isNotBlank()) {
                 Icon(
                     Icons.AutoMirrored.Filled.Send,
-                    contentDescription = "送信",
+                    contentDescription = stringResource(R.string.chat_send),
                     tint = if (input.isNotBlank()) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -295,7 +310,7 @@ private fun OutgoingBubble(
         Column(horizontalAlignment = Alignment.End) {
             if (message.failed) {
                 Text(
-                    "送信できませんでした",
+                    stringResource(R.string.chat_failed_line),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error,
                 )
@@ -319,6 +334,24 @@ private fun OutgoingBubble(
     }
 }
 
+/** 画像として表示できる拡張子(BitmapFactory で読めるもの)。 */
+private val imageExtensions = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp")
+
+private fun isImageFile(name: String?): Boolean =
+    (name?.substringAfterLast('.', "")?.lowercase() ?: "") in imageExtensions
+
+/** サムネイル用に縮小して読み込む(原寸ロードによるメモリ圧を避ける)。 */
+private fun decodeSampled(path: String, maxDim: Int): android.graphics.Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    var sample = 1
+    while (bounds.outWidth / (sample * 2) >= maxDim || bounds.outHeight / (sample * 2) >= maxDim) {
+        sample *= 2
+    }
+    return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+}
+
 @Composable
 private fun Bubble(
     message: ChatMessage,
@@ -328,32 +361,74 @@ private fun Bubble(
     context: android.content.Context,
     onNotice: (String) -> Unit,
 ) {
+    val savedMsg = stringResource(R.string.chat_saved)
+    val saveFailedMsg = stringResource(R.string.chat_save_failed)
+    val savedToast = stringResource(R.string.chat_saved_toast)
+    // 受信ファイルのタップ = ダウンロードへ保存(送信側は無効)
+    val saveOnTap: () -> Unit = saveOnTap@{
+        val path = message.filePath ?: return@saveOnTap
+        val ok = FileUtil.copyToDownloads(context, path)
+        onNotice(if (ok) savedMsg else saveFailedMsg)
+        if (ok) {
+            Toast.makeText(context, savedToast, Toast.LENGTH_SHORT).show()
+        }
+    }
     Surface(shape = shape, color = container) {
         if (message.fileName != null) {
-            // ファイルバブル: タップでダウンロードへコピー(受信側)
-            Column(
-                modifier = Modifier
-                    .widthIn(max = 260.dp)
-                    .clickable(enabled = !message.outgoing && message.filePath != null) {
-                        val path = message.filePath ?: return@clickable
-                        val ok = FileUtil.copyToDownloads(context, path)
-                        onNotice(
-                            if (ok) "ダウンロード(PeerCove)に保存しました"
-                            else "保存に失敗しました(受信ボックスから消えている可能性)",
-                        )
-                        if (ok) {
-                            Toast.makeText(context, "保存しました", Toast.LENGTH_SHORT).show()
-                        }
+            // 画像はバブル内にサムネイル表示(受信済み or 手元にある場合)
+            var thumbnail by remember(message.filePath) { mutableStateOf<ImageBitmap?>(null) }
+            if (message.filePath != null && isImageFile(message.fileName)) {
+                LaunchedEffect(message.filePath) {
+                    thumbnail = withContext(Dispatchers.IO) {
+                        message.filePath?.let { decodeSampled(it, 640)?.asImageBitmap() }
                     }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            ) {
-                Text("📎 ${message.fileName}", color = content)
-                Text(
-                    formatBytesLong(message.fileSize ?: 0u) +
-                        if (!message.outgoing) " ・タップで保存" else "",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = content.copy(alpha = 0.7f),
-                )
+                }
+            }
+            val image = thumbnail
+            if (image != null) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 240.dp)
+                        .clickable(enabled = !message.outgoing, onClick = saveOnTap)
+                        .padding(4.dp),
+                ) {
+                    Image(
+                        bitmap = image,
+                        contentDescription = message.fileName,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.FillWidth,
+                    )
+                    Text(
+                        (message.fileName ?: "") +
+                            if (!message.outgoing) stringResource(R.string.chat_tap_to_save) else "",
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = content.copy(alpha = 0.7f),
+                        maxLines = 1,
+                    )
+                }
+            } else {
+                // ファイルバブル: タップでダウンロードへコピー(受信側)
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 260.dp)
+                        .clickable(
+                            enabled = !message.outgoing && message.filePath != null,
+                            onClick = saveOnTap,
+                        )
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                ) {
+                    Text(
+                        stringResource(R.string.chat_file_prefix, message.fileName ?: ""),
+                        color = content,
+                    )
+                    Text(
+                        formatBytesLong(message.fileSize ?: 0u) +
+                            if (!message.outgoing) stringResource(R.string.chat_tap_to_save) else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = content.copy(alpha = 0.7f),
+                    )
+                }
             }
         } else {
             Text(

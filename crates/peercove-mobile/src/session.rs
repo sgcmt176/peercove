@@ -25,8 +25,8 @@ use anyhow::{bail, Context};
 use peercove_core::dns::{CnameRecord, DnsRecord};
 use peercove_core::ipc::{ChatFileInfo, ChatMessageInfo};
 use peercove_core::msg::{
-    ChatContext, ChatScope, MsgFrame, MAX_CHAT_TEXT_BYTES, MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES,
-    MSG_VERSION,
+    ChatContext, ChatScope, GroupInfo, MsgFrame, MAX_CHAT_TEXT_BYTES, MAX_GROUP_MEMBERS,
+    MAX_GROUP_NAME_BYTES, MSG_VERSION,
 };
 use peercove_core::proto::{ControlMessage, LedgerEntry, PROTO_VERSION};
 use serde::Serialize;
@@ -999,6 +999,106 @@ impl SessionShared {
         }
     }
 
+    /// グループを作る(ADR-0016 のモバイル版)。`members` に自分は含めなくてよい。
+    ///
+    /// デスクトップと違いモバイルは送達再送(pending_sync)を持たないため、
+    /// **オンラインのメンバー 1 人以上に届いたときだけ作成が成立**する
+    /// (届いた先のデスクトップの ack ベース再送で残りのメンバーへ収束する)。
+    /// 誰にも届かなければローカルにも作らずエラーを返す(幽霊グループ防止)。
+    pub fn create_group(&self, name: &str, members: Vec<Ipv4Addr>) -> anyhow::Result<GroupInfo> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("グループ名を入力してください");
+        }
+        if name.len() > MAX_GROUP_NAME_BYTES {
+            bail!("グループ名が長すぎます(上限 {MAX_GROUP_NAME_BYTES} バイト)");
+        }
+        let (member_states, mut group_members) = {
+            let ledger = self.ledger.lock().unwrap();
+            let snapshot = ledger.as_ref().context("台帳が未受信です(接続直後?)")?;
+            let mut group_members = vec![self.cfg.own_ip];
+            for ip in members {
+                if ip == self.cfg.own_ip || group_members.contains(&ip) {
+                    continue;
+                }
+                if !snapshot.members.iter().any(|m| m.ip == ip) {
+                    bail!("{ip} はこのネットワークのメンバーにいません");
+                }
+                group_members.push(ip);
+            }
+            let states: Vec<(Ipv4Addr, bool)> = snapshot
+                .members
+                .iter()
+                .map(|m| (m.ip, m.online && !m.blocked))
+                .collect();
+            (states, group_members)
+        };
+        if group_members.len() < 2 {
+            bail!("グループに入れるメンバーを 1 人以上選んでください");
+        }
+        if group_members.len() > MAX_GROUP_MEMBERS {
+            bail!("グループのメンバーが多すぎます(上限 {MAX_GROUP_MEMBERS} 人)");
+        }
+        group_members.sort();
+        let group = GroupInfo {
+            id: new_transfer_id(),
+            name: name.to_string(),
+            members: group_members.clone(),
+            revision: 1,
+            updated_by: self.cfg.own_ip,
+        };
+        let mut delivered = 0usize;
+        for target in group_members.iter().filter(|ip| **ip != self.cfg.own_ip) {
+            let online = member_states.iter().any(|(ip, ok)| ip == target && *ok);
+            if !online {
+                continue;
+            }
+            match self.deliver_group(*target, &group) {
+                Ok(()) => delivered += 1,
+                Err(e) => tracing::warn!("{target} へのグループ配布に失敗しました: {e:#}"),
+            }
+        }
+        if delivered == 0 {
+            bail!("オンラインのメンバーに届けられませんでした(全員オフラインの可能性)。あとでやり直してください");
+        }
+        // ローカルへ取り込み + 作成のお知らせ(グループ名はログへ出さない)
+        self.groups.lock().unwrap().apply(group.clone());
+        self.chat.lock().unwrap().append(ChatMessageInfo {
+            seq: 0,
+            id: new_transfer_id(),
+            scope: ChatScope::Group,
+            group_id: Some(group.id.clone()),
+            from: self.cfg.own_ip,
+            to: None,
+            text: format!("グループ「{}」を作成しました", group.name),
+            sent_at: now_unix_ms(),
+            failed: false,
+            file: None,
+            system: true,
+        });
+        tracing::info!(
+            "グループを作成しました(id={} members={} delivered={delivered})",
+            group.id,
+            group.members.len()
+        );
+        Ok(group)
+    }
+
+    fn deliver_group(&self, target: Ipv4Addr, group: &GroupInfo) -> anyhow::Result<()> {
+        let (mut reader, mut writer) = self.open_peer(target)?;
+        send_json(
+            &mut writer,
+            &MsgFrame::GroupUpdate {
+                group: group.clone(),
+            },
+        )?;
+        let mut line = String::new();
+        match read_msg_frame(&mut reader, &mut line)? {
+            MsgFrame::GroupAck { id } if id == group.id => Ok(()),
+            other => bail!("GroupAck 以外の応答: {other:?}"),
+        }
+    }
+
     /// ファイルを 1 人へ送る(チャット文脈付き = 会話にファイルバブルが出る)。
     /// 進捗は transfers に載る。完了時に自分のチャット履歴にも記録する。
     pub fn send_file(&self, target: Ipv4Addr, src: &Path) -> anyhow::Result<String> {
@@ -1219,6 +1319,17 @@ mod tests {
     /// member.toml は本物(ops::join で生成)なので、設定読み出し(受信上限
     /// など)も実物の経路で動く。
     fn test_session(label: &str, control_addr: SocketAddr, peer_msg_port: u16) -> NetSession {
+        test_session_at(label, "127.0.0.1", control_addr, peer_msg_port)
+    }
+
+    /// own_ip / listen の IP を指定できる版(グループ配布テストは送り手と
+    /// 受け手で別のループバック IP を使う必要がある)。
+    fn test_session_at(
+        label: &str,
+        ip: &str,
+        control_addr: SocketAddr,
+        peer_msg_port: u16,
+    ) -> NetSession {
         let dir = temp_dir(label);
         let token = peercove_core::token::InviteToken {
             member_private_key: PrivateKey::generate(),
@@ -1239,12 +1350,12 @@ mod tests {
         NetSession::start(SessionConfig {
             slug: label.to_string(),
             config_path: dir.join("member.toml"),
-            own_ip: "127.0.0.1".parse().unwrap(),
+            own_ip: ip.parse().unwrap(),
             display_name: Some(format!("test-{label}")),
             device_id: None,
             network_name: "testnet".to_string(),
             control_addr,
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            listen_addr: format!("{ip}:0").parse().unwrap(),
             peer_msg_port,
         })
     }
@@ -1487,6 +1598,50 @@ mod tests {
         assert!(a_chat.iter().any(|m| m.file.is_some()));
         let b_chat = b.shared.chat.lock().unwrap().fetch(0, 10);
         assert!(b_chat.iter().any(|m| m.file.is_some()));
+
+        a.stop();
+        b.stop();
+    }
+
+    /// グループ作成(モバイル発)がメンバーへ届き、双方の GroupStore と
+    /// 作成者のチャット履歴(お知らせ)に反映される。
+    #[test]
+    fn create_group_delivers_to_online_member() {
+        // 受け手 A は 127.0.0.2、作り手 B は 127.0.0.1(別 IP でないと
+        // 自分とメンバーが同一視されてグループが成立しない)
+        let a = test_session_at("group-a", "127.0.0.2", "127.0.0.1:1".parse().unwrap(), 1);
+        let a_addr = bound_addr(&a);
+        let b = test_session("group-b", "127.0.0.1:1".parse().unwrap(), a_addr.port());
+        let both = vec![
+            ledger_entry("127.0.0.1", "creator", true),
+            ledger_entry("127.0.0.2", "member", true),
+        ];
+        seed_ledger(&a, both.clone());
+        seed_ledger(&b, both);
+
+        let group = b
+            .shared
+            .create_group("家族", vec!["127.0.0.2".parse().unwrap()])
+            .unwrap();
+        assert_eq!(group.members.len(), 2);
+        assert_eq!(group.revision, 1);
+
+        // 受け手にも保存され、追加のお知らせがチャットに載る
+        let received = a.shared.groups.lock().unwrap().get(&group.id).cloned();
+        assert_eq!(received.map(|g| g.name).as_deref(), Some("家族"));
+        let a_chat = a.shared.chat.lock().unwrap().fetch(0, 10);
+        assert!(a_chat.iter().any(|m| m.system && m.text.contains("追加")));
+        // 作り手側にも保存 + 作成のお知らせ
+        assert!(b.shared.groups.lock().unwrap().get(&group.id).is_some());
+        let b_chat = b.shared.chat.lock().unwrap().fetch(0, 10);
+        assert!(b_chat.iter().any(|m| m.system && m.text.contains("作成")));
+
+        // バリデーション: 空名・台帳外メンバー・メンバー不足
+        assert!(b.shared.create_group(" ", vec![]).is_err());
+        assert!(b
+            .shared
+            .create_group("x", vec!["10.9.9.9".parse().unwrap()])
+            .is_err());
 
         a.stop();
         b.stop();

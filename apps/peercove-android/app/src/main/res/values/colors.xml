@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ランチャーアイコンのロゴ地色(icon.png の角の色と同じ紺) -->
+    <color name="ic_launcher_background">#FF011128</color>
+</resources>
