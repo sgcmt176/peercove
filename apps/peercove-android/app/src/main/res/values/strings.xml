@@ -121,6 +121,23 @@
     <string name="settings_dns_name_label">DNS 名(例: my-phone)</string>
     <string name="settings_dns_name_submit">DNS 名を変更</string>
 
+    <!-- 通信品質履歴(E-E 9) -->
+    <string name="quality_title">通信品質(この端末の履歴)</string>
+    <string name="quality_rtt_caption">RTT の推移(直近 6 時間)・最大 %1$d ms</string>
+    <string name="quality_no_data">まだデータがありません(接続中に 30 秒ごとに記録します)</string>
+    <string name="quality_events_title">イベント履歴</string>
+    <string name="quality_event_connected">接続しました</string>
+    <string name="quality_event_disconnected">切断しました</string>
+    <string name="quality_event_net_change">回線切替を検知 → UDP を張り直し</string>
+    <string name="quality_event_send_fail">UDP 送信失敗 → 張り直し</string>
+    <string name="quality_event_stale">疎通の途絶 → 張り直し</string>
+    <string name="quality_event_degraded">品質低下(%1$s)</string>
+    <string name="quality_event_recovered">品質が回復しました</string>
+    <string name="quality_reason_rtt">RTT %1$d ms</string>
+    <string name="quality_reason_send">送信失敗</string>
+    <string name="notif_quality_channel">通信品質</string>
+    <string name="notif_quality_degraded">通信品質が低下しています(%1$s)</string>
+
     <!-- 表示テーマ -->
     <string name="theme_title">表示テーマ</string>
     <string name="theme_system">システムに合わせる</string>

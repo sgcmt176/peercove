@@ -3,6 +3,7 @@ package app.peercove.android
 import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -54,6 +56,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -334,6 +337,85 @@ private fun statusColor(state: SessionState?): Color = when {
     state.removed || state.rejected != null -> MaterialTheme.colorScheme.error
     state.controlConnected -> MaterialTheme.colorScheme.primary
     else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+/** 通信品質履歴(E-E 9)。10 秒ごとに読み直す。 */
+@Composable
+private fun QualitySection(slug: String) {
+    val context = LocalContext.current
+    var entries by remember { mutableStateOf<List<QualityLog.Entry>>(emptyList()) }
+    LaunchedEffect(slug) {
+        while (true) {
+            entries = withContext(Dispatchers.IO) {
+                QualityLog.list(context, slug, System.currentTimeMillis() - 6 * 60 * 60 * 1000L)
+            }
+            delay(10_000)
+        }
+    }
+    val samples = entries.filter { it.kind == "sample" }
+    val rtts = samples.mapNotNull { it.rttMs }
+    if (rtts.size < 2) {
+        Text(
+            stringResource(R.string.quality_no_data),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    } else {
+        Text(
+            stringResource(R.string.quality_rtt_caption, rtts.max()),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        RttSparkline(samples)
+    }
+    val events = entries.filter { it.kind == "event" }.takeLast(12).reversed()
+    if (events.isNotEmpty()) {
+        Spacer(modifier = Modifier.padding(2.dp))
+        Text(
+            stringResource(R.string.quality_events_title),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        events.forEach { entry ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    eventTimeFormat.format(java.util.Date(entry.t)),
+                    modifier = Modifier.width(84.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(entry.label ?: "", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+private val eventTimeFormat = java.text.SimpleDateFormat("M/d HH:mm", java.util.Locale.JAPAN)
+
+/** RTT の推移をつなぐだけの簡易スパークライン(欠測 = 未同期は飛ばす)。 */
+@Composable
+private fun RttSparkline(samples: List<QualityLog.Entry>) {
+    val color = MaterialTheme.colorScheme.primary
+    val points = samples.mapNotNull { it.rttMs }
+    val max = (points.maxOrNull() ?: 1L).coerceAtLeast(50L).toFloat()
+    Canvas(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .padding(vertical = 4.dp),
+    ) {
+        if (points.size < 2) return@Canvas
+        val stepX = size.width / (points.size - 1)
+        var prev: Offset? = null
+        points.forEachIndexed { index, value ->
+            val point = Offset(
+                index * stepX,
+                size.height - (value.toFloat() / max) * size.height,
+            )
+            prev?.let { drawLine(color, it, point, strokeWidth = 3f) }
+            prev = point
+        }
+    }
 }
 
 /** グループの管理ダイアログ(改名・メンバー追加・退出)。
@@ -1113,6 +1195,15 @@ private fun SettingsTab(
             stringResource(R.string.diag_rtt),
             state?.rttMs?.let { stringResource(R.string.diag_rtt_value, it.toLong()) } ?: none,
         )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+
+        // 通信品質履歴(E-E 9): RTT スパークライン + イベントタイムライン
+        Text(
+            stringResource(R.string.quality_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        QualitySection(slug)
 
         HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
 

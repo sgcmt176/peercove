@@ -47,8 +47,13 @@ class PeercoveVpnService : VpnService() {
         const val ACTION_DISCONNECT = "app.peercove.android.action.DISCONNECT"
         const val EXTRA_SLUG = "slug"
         private const val CHANNEL_ID = "peercove_vpn"
+        private const val QUALITY_CHANNEL_ID = "peercove_quality"
         private const val NOTIFICATION_ID = 1
+        private const val QUALITY_NOTIFICATION_ID = 2
         private const val NOTIFY_INTERVAL_MS = 10_000L
+
+        /** 品質低下とみなす RTT(ms)。 */
+        private const val DEGRADED_RTT_MS = 500L
     }
 
     private var currentSlug: String? = null
@@ -58,6 +63,10 @@ class PeercoveVpnService : VpnService() {
     /// 監視スレッドの世代(接続し直しで旧スレッドを退役させる)
     @Volatile private var watchGeneration = 0
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    /// 品質履歴(E-E 9): サンプル間引き用の連番と、品質低下の連続回数・通知中か
+    private var qualityTick = 0
+    private var degradedCount = 0
+    private var degradedNotified = false
     private val handler = Handler(Looper.getMainLooper())
     private val notifyTick = object : Runnable {
         override fun run() {
@@ -74,6 +83,14 @@ class PeercoveVpnService : VpnService() {
             NotificationManager.IMPORTANCE_LOW, // 音を鳴らさない常駐通知
         )
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        // 品質低下の通知(E-E 9)。常駐通知とは別チャンネル(既定の重要度)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(
+                QUALITY_CHANNEL_ID,
+                getString(R.string.notif_quality_channel),
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ),
+        )
         ChatNotifier.ensureChannel(this)
     }
 
@@ -166,6 +183,7 @@ class PeercoveVpnService : VpnService() {
             startChatWatcher(slug, watchGeneration)
             handler.removeCallbacks(notifyTick)
             handler.post(notifyTick)
+            QualityLog.event(this, slug, getString(R.string.quality_event_connected))
             Log.i(TAG, "トンネル開始: $slug(pendingKey=$usePendingKey)")
         } catch (e: Exception) {
             Log.e(TAG, "接続に失敗: $slug", e)
@@ -200,6 +218,7 @@ class PeercoveVpnService : VpnService() {
                 if (status.sendFailing && now - lastPokeAt > 10_000) {
                     lastPokeAt = now
                     Log.i(TAG, "UDP 送信が失敗しているため張り直します")
+                    QualityLog.event(this, slug, getString(R.string.quality_event_send_fail))
                     pokeTunnel(slug)
                 }
                 // 遅い経路(最後の保険): 健全なら keepalive によりハンドシェイクは
@@ -213,6 +232,7 @@ class PeercoveVpnService : VpnService() {
                 } else if (now - deadSince > 30_000 && now - lastPokeAt > 30_000) {
                     lastPokeAt = now
                     Log.i(TAG, "疎通が途絶えているため UDP を張り直します")
+                    QualityLog.event(this, slug, getString(R.string.quality_event_stale))
                     pokeTunnel(slug)
                 }
                 if (status.handshakeAgeSecs != null) {
@@ -318,6 +338,11 @@ class PeercoveVpnService : VpnService() {
                 if (now - lastPokeAt < 3_000) return
                 lastPokeAt = now
                 Log.i(TAG, "$reason → 再バインド")
+                QualityLog.event(
+                    this@PeercoveVpnService,
+                    slug,
+                    getString(R.string.quality_event_net_change),
+                )
                 // メインスレッドを塞がない(pokeTunnel はソケット操作を含む)
                 Thread { pokeTunnel(slug) }.start()
             }
@@ -379,11 +404,13 @@ class PeercoveVpnService : VpnService() {
             .build()
     }
 
-    /** 常駐通知へ状態(接続・RTT・転送量)を反映する(10 秒ごと)。 */
+    /** 常駐通知へ状態(接続・RTT・転送量)を反映する(10 秒ごと)。
+     *  品質履歴のサンプリング(30 秒ごと)と品質低下の検知もここで行う。 */
     private fun updateNotification() {
         val slug = currentSlug ?: return
         val status = tunnelStatus(slug)
         val rtt = sessionState(slug)?.rttMs
+        recordQuality(slug, status, rtt?.toLong())
         val text = when {
             status == null -> getString(R.string.notif_preparing)
             status.handshakeAgeSecs == null ->
@@ -404,6 +431,58 @@ class PeercoveVpnService : VpnService() {
             .notify(NOTIFICATION_ID, buildNotification(text))
     }
 
+    /** 品質履歴(E-E 9): 30 秒ごとのサンプル + 品質低下の検知と通知。
+     *  低下条件(RTT 500ms 超 or UDP 送信失敗)が 3 回(30 秒)続いたら
+     *  1 回だけ通知し、回復したら取り下げる。 */
+    private fun recordQuality(
+        slug: String,
+        status: uniffi.peercove_mobile.TunnelStatus?,
+        rttMs: Long?,
+    ) {
+        qualityTick++
+        if (qualityTick % 3 == 0) {
+            QualityLog.sample(this, slug, rttMs)
+        }
+        val degraded = status != null &&
+            (status.sendFailing || (rttMs != null && rttMs >= DEGRADED_RTT_MS))
+        if (degraded) {
+            degradedCount++
+            if (degradedCount == 3 && !degradedNotified) {
+                degradedNotified = true
+                val reason = if (status?.sendFailing == true) {
+                    getString(R.string.quality_reason_send)
+                } else {
+                    getString(R.string.quality_reason_rtt, rttMs ?: 0L)
+                }
+                QualityLog.event(this, slug, getString(R.string.quality_event_degraded, reason))
+                val open = PendingIntent.getActivity(
+                    this,
+                    2,
+                    Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_IMMUTABLE,
+                )
+                getSystemService(NotificationManager::class.java).notify(
+                    QUALITY_NOTIFICATION_ID,
+                    Notification.Builder(this, QUALITY_CHANNEL_ID)
+                        .setSmallIcon(R.drawable.ic_tile)
+                        .setContentTitle(currentName?.let { "PeerCove ・$it" } ?: "PeerCove")
+                        .setContentText(getString(R.string.notif_quality_degraded, reason))
+                        .setContentIntent(open)
+                        .setAutoCancel(true)
+                        .build(),
+                )
+            }
+        } else {
+            if (degradedNotified) {
+                QualityLog.event(this, slug, getString(R.string.quality_event_recovered))
+                getSystemService(NotificationManager::class.java)
+                    .cancel(QUALITY_NOTIFICATION_ID)
+            }
+            degradedCount = 0
+            degradedNotified = false
+        }
+    }
+
     /** トンネル停止(冪等)。fd は Rust 側で close され、VPN も終了する */
     private fun teardown() {
         watchGeneration++ // 監視スレッドを退役させる
@@ -411,8 +490,12 @@ class PeercoveVpnService : VpnService() {
         unwatchNetworkChanges()
         currentSlug?.let {
             stopTunnel(it)
+            QualityLog.event(this, it, getString(R.string.quality_event_disconnected))
             Log.i(TAG, "トンネル停止: $it")
         }
+        getSystemService(NotificationManager::class.java).cancel(QUALITY_NOTIFICATION_ID)
+        degradedCount = 0
+        degradedNotified = false
         currentSlug = null
         currentName = null
     }
