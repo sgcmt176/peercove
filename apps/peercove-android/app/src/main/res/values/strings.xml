@@ -73,6 +73,15 @@
     <string name="group_members_label">メンバー(オンラインの相手だけ選べます)</string>
     <string name="group_create">作成</string>
     <string name="group_created">グループ「%1$s」を作成しました</string>
+    <string name="group_manage">グループを管理</string>
+    <string name="group_manage_title">グループの管理</string>
+    <string name="group_add_label">メンバーを追加</string>
+    <string name="group_updated">グループを更新しました</string>
+    <string name="group_leave_action">このグループから退出する…</string>
+    <string name="group_leave">退出</string>
+    <string name="group_leave_title">グループから退出</string>
+    <string name="group_leave_confirm">「%1$s」から退出しますか？これまでの履歴はこの端末に残ります。</string>
+    <string name="group_left">グループから退出しました</string>
     <string name="badge_self">自分</string>
     <string name="badge_host">ホスト</string>
     <string name="badge_blocked">通信不可</string>

@@ -762,6 +762,43 @@ pub fn create_group(
     })
 }
 
+/// グループの改名・メンバー追加(スマホから)。どちらも省略可。
+/// オンラインのメンバー 1 人以上へ届いたときだけ成立する(create_group と同じ)。
+/// ブロッキング(ネットワーク I/O)なので Kotlin 側は IO ディスパッチャで呼ぶ。
+#[uniffi::export]
+pub fn update_group(
+    slug: String,
+    id: String,
+    name: Option<String>,
+    add_member_ips: Vec<String>,
+) -> Result<GroupSummary, MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    let mut add = Vec::new();
+    for ip in add_member_ips {
+        add.push(ip.parse::<Ipv4Addr>().map_err(|_| MobileError::Failure {
+            msg: format!("メンバー IP が不正です: {ip}"),
+        })?);
+    }
+    let group = s.update_group(&id, name, add)?;
+    Ok(GroupSummary {
+        id: group.id,
+        name: group.name,
+        member_ips: group.members.iter().map(|ip| ip.to_string()).collect(),
+    })
+}
+
+/// 自分がグループから抜ける(スマホから)。履歴はローカルに残る。
+#[uniffi::export]
+pub fn leave_group(slug: String, id: String) -> Result<(), MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    s.leave_group(&id)?;
+    Ok(())
+}
+
 fn scope_to_str(scope: ChatScope) -> &'static str {
     match scope {
         ChatScope::Direct => "direct",

@@ -43,6 +43,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -75,6 +76,7 @@ import uniffi.peercove_mobile.chatFetch
 import uniffi.peercove_mobile.chatGroups
 import uniffi.peercove_mobile.createGroup
 import uniffi.peercove_mobile.dnsEntries
+import uniffi.peercove_mobile.leaveGroup
 import uniffi.peercove_mobile.listNetworks
 import uniffi.peercove_mobile.members
 import uniffi.peercove_mobile.rotateKey
@@ -82,6 +84,7 @@ import uniffi.peercove_mobile.sessionState
 import uniffi.peercove_mobile.setDisplayName
 import uniffi.peercove_mobile.setDnsName
 import uniffi.peercove_mobile.tunnelStatus
+import uniffi.peercove_mobile.updateGroup
 import uniffi.peercove_mobile.updateNetworkSettings
 
 /** 既読管理のキー(Prefs 保存用の安定 ID)。 */
@@ -113,6 +116,7 @@ fun NetworkScreen(
     var messages by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
     var conv by remember { mutableStateOf<ConvKey?>(null) }
     var showGroupDialog by remember { mutableStateOf(false) }
+    var showGroupManage by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val copiedFmt = stringResource(R.string.notice_copied)
 
@@ -231,6 +235,20 @@ fun NetworkScreen(
             onDismiss = { showGroupDialog = false },
         )
     }
+    (conv as? ConvKey.Group)?.let { manageConv ->
+        val summary = groupList.firstOrNull { it.id == manageConv.id }
+        if (showGroupManage && summary != null) {
+            GroupManageDialog(
+                slug = slug,
+                group = summary,
+                memberList = memberList,
+                onRenamed = { newName -> conv = ConvKey.Group(manageConv.id, newName) },
+                onLeft = { conv = null },
+                onNotice = onNotice,
+                onDismiss = { showGroupManage = false },
+            )
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // ヘッダ
@@ -241,7 +259,7 @@ fun NetworkScreen(
                     contentDescription = stringResource(R.string.action_back),
                 )
             }
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     conv?.title() ?: networkName,
                     style = MaterialTheme.typography.titleMedium,
@@ -251,6 +269,15 @@ fun NetworkScreen(
                     style = MaterialTheme.typography.labelSmall,
                     color = statusColor(state),
                 )
+            }
+            // グループ会話には管理(改名・メンバー追加・退出)の入口を出す
+            if (conv is ConvKey.Group) {
+                IconButton(onClick = { showGroupManage = true }) {
+                    Icon(
+                        Icons.Filled.Settings,
+                        contentDescription = stringResource(R.string.group_manage),
+                    )
+                }
             }
         }
 
@@ -307,6 +334,147 @@ private fun statusColor(state: SessionState?): Color = when {
     state.removed || state.rejected != null -> MaterialTheme.colorScheme.error
     state.controlConnected -> MaterialTheme.colorScheme.primary
     else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+/** グループの管理ダイアログ(改名・メンバー追加・退出)。
+ *  変更はオンラインのメンバー 1 人以上に届いたときだけ成立する(Rust 側の制約)。 */
+@Composable
+private fun GroupManageDialog(
+    slug: String,
+    group: GroupSummary,
+    memberList: List<MemberInfo>,
+    onRenamed: (String) -> Unit,
+    onLeft: () -> Unit,
+    onNotice: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var name by remember(group.id) { mutableStateOf(group.name) }
+    val checked = remember { mutableStateMapOf<String, Boolean>() }
+    var busy by remember { mutableStateOf(false) }
+    var confirmLeave by remember { mutableStateOf(false) }
+    val failed = stringResource(R.string.failed_generic)
+    val updatedMsg = stringResource(R.string.group_updated)
+    val leftMsg = stringResource(R.string.group_left)
+    val candidates = memberList.filter {
+        !it.isSelf && !it.blocked && !group.memberIps.contains(it.ip)
+    }
+
+    if (confirmLeave) {
+        AlertDialog(
+            onDismissRequest = { confirmLeave = false },
+            title = { Text(stringResource(R.string.group_leave_title)) },
+            text = { Text(stringResource(R.string.group_leave_confirm, group.name)) },
+            confirmButton = {
+                Button(
+                    enabled = !busy,
+                    onClick = {
+                        busy = true
+                        scope.launch {
+                            try {
+                                withContext(Dispatchers.IO) { leaveGroup(slug, group.id) }
+                                onNotice(leftMsg)
+                                onDismiss()
+                                onLeft()
+                            } catch (e: MobileException) {
+                                onNotice(e.message ?: failed)
+                            } finally {
+                                busy = false
+                                confirmLeave = false
+                            }
+                        }
+                    },
+                ) { Text(stringResource(R.string.group_leave)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmLeave = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.group_manage_title)) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(stringResource(R.string.group_name_label)) },
+                    singleLine = true,
+                )
+                if (candidates.isNotEmpty()) {
+                    Spacer(modifier = Modifier.padding(4.dp))
+                    Text(
+                        stringResource(R.string.group_add_label),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                        candidates.forEach { member ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        checked[member.ip] = !(checked[member.ip] ?: false)
+                                    },
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(
+                                    checked = checked[member.ip] ?: false,
+                                    onCheckedChange = { checked[member.ip] = it },
+                                )
+                                Text(member.name)
+                            }
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.padding(4.dp))
+                TextButton(onClick = { confirmLeave = true }) {
+                    Text(
+                        stringResource(R.string.group_leave_action),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            val selected = checked.filterValues { it }.keys.toList()
+            val renamed = name.trim() != group.name
+            Button(
+                enabled = !busy && name.isNotBlank() && (renamed || selected.isNotEmpty()),
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        try {
+                            val result = withContext(Dispatchers.IO) {
+                                updateGroup(
+                                    slug,
+                                    group.id,
+                                    if (renamed) name.trim() else null,
+                                    selected,
+                                )
+                            }
+                            onNotice(updatedMsg)
+                            onRenamed(result.name)
+                            onDismiss()
+                        } catch (e: MobileException) {
+                            onNotice(e.message ?: failed)
+                        } finally {
+                            busy = false
+                        }
+                    }
+                },
+            ) { Text(stringResource(R.string.action_save)) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
+        },
+    )
 }
 
 /** 新しいグループの作成ダイアログ(名前 + オンラインメンバーの選択)。 */

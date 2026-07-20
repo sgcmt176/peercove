@@ -1360,6 +1360,151 @@ impl SessionShared {
         Ok(group)
     }
 
+    /// グループの改名・メンバー追加(デスクトップの GroupUpdate のモバイル版)。
+    /// create_group と同じ理由で、オンラインのメンバー 1 人以上に届いたとき
+    /// だけ成立する。
+    pub fn update_group(
+        &self,
+        id: &str,
+        name: Option<String>,
+        add: Vec<Ipv4Addr>,
+    ) -> anyhow::Result<GroupInfo> {
+        let previous = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .context("このグループはありません")?;
+        if !previous.members.contains(&self.cfg.own_ip) {
+            bail!("このグループのメンバーではありません");
+        }
+        let mut group = previous.clone();
+        if let Some(name) = name {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                bail!("グループ名を入力してください");
+            }
+            if name.len() > MAX_GROUP_NAME_BYTES {
+                bail!("グループ名が長すぎます(上限 {MAX_GROUP_NAME_BYTES} バイト)");
+            }
+            group.name = name;
+        }
+        {
+            let ledger = self.ledger.lock().unwrap();
+            let snapshot = ledger.as_ref().context("台帳が未受信です(接続直後?)")?;
+            for ip in add {
+                if group.members.contains(&ip) {
+                    continue;
+                }
+                if !snapshot.members.iter().any(|m| m.ip == ip) {
+                    bail!("{ip} はこのネットワークのメンバーにいません");
+                }
+                group.members.push(ip);
+            }
+        }
+        if group.members.len() > MAX_GROUP_MEMBERS {
+            bail!("グループのメンバーが多すぎます(上限 {MAX_GROUP_MEMBERS} 人)");
+        }
+        group.revision += 1;
+        group.updated_by = self.cfg.own_ip;
+        self.commit_group_change(&previous, group)
+    }
+
+    /// 自分がグループから抜ける。ローカルには自分抜きの全量が残る
+    /// (履歴の表示名に使う。UI は会話リストから隠す)。
+    pub fn leave_group(&self, id: &str) -> anyhow::Result<()> {
+        let previous = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .context("このグループはありません")?;
+        if !previous.members.contains(&self.cfg.own_ip) {
+            bail!("このグループのメンバーではありません");
+        }
+        let mut group = previous.clone();
+        group.members.retain(|ip| *ip != self.cfg.own_ip);
+        group.revision += 1;
+        group.updated_by = self.cfg.own_ip;
+        self.commit_group_change(&previous, group)?;
+        Ok(())
+    }
+
+    /// 変更後の全量を残りのオンラインメンバーへ配って取り込む(1 人以上に
+    /// 届いたときだけ成立 = create_group と同じ収束前提)。お知らせ行も足す。
+    fn commit_group_change(
+        &self,
+        previous: &GroupInfo,
+        group: GroupInfo,
+    ) -> anyhow::Result<GroupInfo> {
+        let (online, names): (Vec<Ipv4Addr>, Vec<(Ipv4Addr, String)>) = {
+            let ledger = self.ledger.lock().unwrap();
+            let snapshot = ledger.as_ref().context("台帳が未受信です(接続直後?)")?;
+            (
+                snapshot
+                    .members
+                    .iter()
+                    .filter(|m| m.online && !m.blocked)
+                    .map(|m| m.ip)
+                    .collect(),
+                snapshot
+                    .members
+                    .iter()
+                    .map(|m| (m.ip, m.name.clone().unwrap_or_else(|| m.ip.to_string())))
+                    .collect(),
+            )
+        };
+        let mut delivered = 0usize;
+        for target in group
+            .members
+            .iter()
+            .filter(|ip| **ip != self.cfg.own_ip && online.contains(ip))
+        {
+            match self.deliver_group(*target, &group) {
+                Ok(()) => delivered += 1,
+                Err(e) => tracing::warn!("{target} へのグループ配布に失敗しました: {e:#}"),
+            }
+        }
+        if delivered == 0 {
+            bail!("オンラインのメンバーに届けられませんでした(全員オフラインの可能性)。あとでやり直してください");
+        }
+        let name_of = |ip: Ipv4Addr| -> String {
+            if ip == self.cfg.own_ip {
+                return "自分".to_string();
+            }
+            names
+                .iter()
+                .find(|(addr, _)| *addr == ip)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| ip.to_string())
+        };
+        let lines = groups::system_messages(Some(previous), &group, self.cfg.own_ip, &name_of);
+        self.groups.lock().unwrap().apply(group.clone());
+        for text in lines {
+            self.chat.lock().unwrap().append(ChatMessageInfo {
+                seq: 0,
+                id: new_transfer_id(),
+                scope: ChatScope::Group,
+                group_id: Some(group.id.clone()),
+                from: self.cfg.own_ip,
+                to: None,
+                text,
+                sent_at: now_unix_ms(),
+                failed: false,
+                file: None,
+                system: true,
+            });
+        }
+        tracing::info!(
+            "グループを更新しました(id={} rev={} delivered={delivered})",
+            group.id,
+            group.revision
+        );
+        Ok(group)
+    }
+
     fn deliver_group(&self, target: Ipv4Addr, group: &GroupInfo) -> anyhow::Result<()> {
         let (mut reader, mut writer) = self.open_peer(target)?;
         send_json(
@@ -1947,6 +2092,79 @@ mod tests {
         assert!(b
             .shared
             .create_group("x", vec!["10.9.9.9".parse().unwrap()])
+            .is_err());
+
+        a.stop();
+        b.stop();
+    }
+
+    /// グループの改名・メンバー追加・退出がスマホから配布される(E-E 8)。
+    #[test]
+    fn update_and_leave_group_propagate() {
+        let a = test_session_at("gedit-a", "127.0.0.2", "127.0.0.1:1".parse().unwrap(), 1);
+        let a_addr = bound_addr(&a);
+        let b = test_session("gedit-b", "127.0.0.1:1".parse().unwrap(), a_addr.port());
+        let both = vec![
+            ledger_entry("127.0.0.1", "editor", true),
+            ledger_entry("127.0.0.2", "member", true),
+        ];
+        seed_ledger(&a, both.clone());
+        seed_ledger(&b, both);
+
+        let group = b
+            .shared
+            .create_group("旧名", vec!["127.0.0.2".parse().unwrap()])
+            .unwrap();
+
+        // 改名: 配布は同期(deliver → apply)なので、成功時点で相手にも届いている
+        let renamed = b
+            .shared
+            .update_group(&group.id, Some("新名".to_string()), vec![])
+            .unwrap();
+        assert_eq!(renamed.revision, 2);
+        assert_eq!(
+            a.shared
+                .groups
+                .lock()
+                .unwrap()
+                .get(&group.id)
+                .map(|g| g.name.clone())
+                .as_deref(),
+            Some("新名")
+        );
+        let b_chat = b.shared.chat.lock().unwrap().fetch(0, 20);
+        assert!(b_chat.iter().any(|m| m.system && m.text.contains("新名")));
+
+        // 台帳外メンバーの追加は拒否
+        assert!(b
+            .shared
+            .update_group(&group.id, None, vec!["10.9.9.9".parse().unwrap()])
+            .is_err());
+
+        // 退出: 相手側では自分抜きの全量になり、自分の一覧からは消える
+        b.shared.leave_group(&group.id).unwrap();
+        let after = a
+            .shared
+            .groups
+            .lock()
+            .unwrap()
+            .get(&group.id)
+            .cloned()
+            .unwrap();
+        assert!(!after.members.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(b
+            .shared
+            .groups
+            .lock()
+            .unwrap()
+            .joined(b.shared.cfg.own_ip)
+            .iter()
+            .all(|g| g.id != group.id));
+
+        // 非メンバーになった後の更新は拒否される
+        assert!(b
+            .shared
+            .update_group(&group.id, Some("x".to_string()), vec![])
             .is_err());
 
         a.stop();
