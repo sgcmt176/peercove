@@ -283,6 +283,32 @@ async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))
 }
 
+/// クリップボードから貼り付けた画像(base64)を一時ファイルへ書き出し、その
+/// パスを返す。デーモンはファイルをパスで読むため、送信前に実体化が要る。
+/// 一時ファイルは OS の temp 配下(peercove-paste/<ミリ秒>/)に置く。
+#[tauri::command]
+fn save_pasted_file(name: String, data_base64: String) -> Result<String, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| format!("貼り付けデータを復号できません: {e}"))?;
+    // ファイル名はベース名だけにする(パス区切りを剥がす)
+    let safe = Path::new(&name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("pasted");
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join("peercove-paste").join(ms.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("一時フォルダを作れません: {e}"))?;
+    let path = dir.join(safe);
+    std::fs::write(&path, &bytes).map_err(|e| format!("一時ファイルの書き出しに失敗: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// メンバーへファイルを送る(デーモンが送信し、進捗は status の transfers)。
 /// `chat` を付けるとチャット内ファイル送信になり、履歴にも記録される
 /// (M3-13d。network / group 宛は peer 省略)。
@@ -1354,6 +1380,7 @@ pub fn run() {
             read_acl_policy,
             write_acl_policy,
             pick_file,
+            save_pasted_file,
             send_file,
             chat_send,
             chat_resend,

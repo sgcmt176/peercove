@@ -37,6 +37,18 @@ import { Avatar } from "./Avatar";
 import { ConfirmModal, Modal } from "./Modal";
 import { t } from "../i18n";
 
+/** ArrayBuffer を base64 文字列へ(貼り付け画像を Rust へ渡す用)。
+ *  大きい画像でもスタックを溢れさせないよう分割して変換する。 */
+function bytesToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
 /** 会話リストの 1 行(全体・グループ・メンバー 1:1)。 */
 interface ConversationItem {
   key: ConversationKey;
@@ -372,6 +384,32 @@ export function ChatPanel({
     }
   };
 
+  /** クリップボードの画像を貼り付けて送る(スクリーンショット等)。
+   *  一時ファイル化してから、ドロップと同じ送信確認モーダルへ渡す。 */
+  const handlePaste = async (event: React.ClipboardEvent) => {
+    if (!canSendFiles) return;
+    const items = Array.from(event.clipboardData?.items ?? []);
+    const images = items.filter(
+      (it) => it.kind === "file" && it.type.startsWith("image/"),
+    );
+    if (images.length === 0) return; // 画像でなければ通常のテキスト貼り付け
+    event.preventDefault();
+    const paths: string[] = [];
+    for (const item of images) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      try {
+        const b64 = bytesToBase64(await file.arrayBuffer());
+        const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+        const name = `貼り付け-${Date.now()}.${ext}`;
+        paths.push(await api.savePastedFile(name, b64));
+      } catch (e) {
+        setError(errorMessage(e));
+      }
+    }
+    if (paths.length > 0) setDropPaths(paths); // 送信確認モーダルを開く
+  };
+
   /** 受信ファイルの保存(バブルの「保存」— 実体は受信ボックス)。 */
   const saveFile = async (name: string) => {
     setError(null);
@@ -642,6 +680,7 @@ export function ChatPanel({
             }
             disabled={!canSend || sending}
             onChange={(event) => setDraft(event.target.value)}
+            onPaste={(event) => void handlePaste(event)}
             onKeyDown={(event) => {
               // Enter で送信、Shift+Enter で改行。IME の変換確定では送らない
               if (

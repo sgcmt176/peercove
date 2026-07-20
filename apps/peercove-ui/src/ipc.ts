@@ -512,6 +512,9 @@ export const api = {
   // ファイル送信・受信ボックス（ADR-0015、M3-9b）。chat 付きはチャット内
   // ファイル送信（M3-13d。network / group 宛は peer = null）
   pickFile: () => invoke<string | null>("pick_file"),
+  // クリップボードから貼り付けた画像を一時ファイルにして送信できるようにする
+  savePastedFile: (name: string, dataBase64: string) =>
+    invoke<string>("save_pasted_file", { name, dataBase64 }),
   sendFile: (
     configPath: string,
     peer: string | null,
