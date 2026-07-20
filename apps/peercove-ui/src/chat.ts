@@ -34,6 +34,8 @@ interface ChatState {
   messages: ChatMessage[];
   /** フェッチ済みの最終 seq。 */
   lastSeq: number;
+  /** 直近に見たチャット消去世代。増えたら手元を捨てて取り直す。 */
+  generation: number;
 }
 
 const stores = new Map<string, ChatState>();
@@ -60,17 +62,20 @@ export function chatMessages(config: string): ChatMessage[] {
 export async function syncChat(
   config: string,
   chatSeq: number,
+  chatGeneration = 0,
 ): Promise<ChatMessage[]> {
   let state = stores.get(config);
   const isFirst = state === undefined;
   if (state === undefined) {
-    state = { messages: [], lastSeq: 0 };
+    state = { messages: [], lastSeq: 0, generation: chatGeneration };
     stores.set(config, state);
   }
-  // 履歴ファイルが消された等で seq が巻き戻ったら、取り直す
-  if (chatSeq < state.lastSeq) {
+  // 履歴が消された(メンバー再追加での 1:1 クリア等)= 消去世代が変わった、
+  // または seq が巻き戻ったら、手元を捨てて取り直す
+  if (chatGeneration !== state.generation || chatSeq < state.lastSeq) {
     state.messages = [];
     state.lastSeq = 0;
+    state.generation = chatGeneration;
   }
   if (chatSeq <= state.lastSeq) {
     // 新着なしでも末尾を取り直す: 送信キュー(E-E 3)の failed フラグは
@@ -107,7 +112,11 @@ async function refreshTail(config: string, state: ChatState): Promise<void> {
 
 /** 自分の送信直後に、フェッチを待たず履歴へ足す(デーモンの応答をそのまま)。 */
 export function appendLocal(config: string, message: ChatMessage): void {
-  const state = stores.get(config) ?? { messages: [], lastSeq: 0 };
+  const state = stores.get(config) ?? {
+    messages: [],
+    lastSeq: 0,
+    generation: 0,
+  };
   stores.set(config, state);
   if (message.seq > state.lastSeq) {
     state.messages.push(message);

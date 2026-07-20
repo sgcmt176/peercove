@@ -111,7 +111,11 @@ export default function App() {
       await Promise.all(
         status.tunnels.map(async (tunnel) => {
           try {
-            const fresh = await syncChat(tunnel.config, tunnel.chatSeq);
+            const fresh = await syncChat(
+              tunnel.config,
+              tunnel.chatSeq,
+              tunnel.chatGeneration,
+            );
             void notifyChatEvents(fresh, tunnel, tunnel.members);
           } catch {
             // フェッチ失敗で状態表示を止めない(次のポーリングで再試行)

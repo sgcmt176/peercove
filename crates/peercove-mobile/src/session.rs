@@ -504,6 +504,8 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
                         cname_records,
                     }) => {
                         tracing::debug!("台帳を受信しました({} 名)", members.len());
+                        // メンバー再追加(別の鍵)を検知して 1:1 履歴をクリア(検証 FB)
+                        shared.reconcile_identities(&members);
                         *shared.ledger.lock().unwrap() = Some(LedgerSnapshot {
                             members,
                             dns_records,
@@ -1221,6 +1223,51 @@ impl SessionShared {
         self.chat_queue.lock().unwrap().retain(|p| p.seq != seq);
         self.chat.lock().unwrap().mark_failed(seq);
         self.save_chat_queue();
+    }
+
+    /// メンバーの再追加(削除 → 同名・同 IP で再参加 = 別の鍵)を検知して
+    /// その相手との 1:1 履歴を消す(検証 FB 2026-07-20)。同一性は公開鍵で判定し、
+    /// `<config>.chatids.json` に IP → 公開鍵 を保存して台帳受信のたびに突き合わせる。
+    /// 初回(サイドカー無し)は記録するだけ(既存履歴は消さない)。
+    fn reconcile_identities(&self, members: &[LedgerEntry]) {
+        let path = self.cfg.config_path.with_extension("chatids.json");
+        let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let mut changed = false;
+        for entry in members {
+            if entry.ip == self.cfg.own_ip || entry.is_host {
+                continue;
+            }
+            let ip = entry.ip.to_string();
+            let key = entry.public_key.to_base64();
+            match map.get(&ip) {
+                Some(prev) if *prev == key => {}
+                Some(_) => {
+                    if self.chat.lock().unwrap().clear_direct(entry.ip) {
+                        tracing::info!(
+                            "{} は別の端末に置き換わったため 1:1 履歴を消去しました",
+                            entry.ip
+                        );
+                    }
+                    map.insert(ip, key);
+                    changed = true;
+                }
+                None => {
+                    map.insert(ip, key);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            if let Ok(json) = serde_json::to_string(&map) {
+                let tmp = path.with_extension("chatids.json.tmp");
+                if std::fs::write(&tmp, json).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                }
+            }
+        }
     }
 
     /// チャット履歴を全消去する(E-E 10 のストレージ管理)。送信待ちも破棄。

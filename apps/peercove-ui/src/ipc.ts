@@ -210,6 +210,8 @@ export interface Tunnel {
   transfers: Transfer[];
   /** チャット履歴の最新 seq（ADR-0016）。進んだら差分フェッチする。 */
   chatSeq: number;
+  /** チャット履歴の消去世代。変わったら手元の履歴を捨てて取り直す。 */
+  chatGeneration: number;
   /** 送信待ち（再送キューに残っている）チャットの seq（E-E 3）。 */
   chatSending: number[];
   /** 既知のグループ（M3-13c）。自分が抜けたグループも含む。 */

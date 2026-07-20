@@ -803,6 +803,15 @@ pub fn leave_group(slug: String, id: String) -> Result<(), MobileError> {
     Ok(())
 }
 
+/// チャット履歴の消去世代。増えたら UI は手元の履歴を捨てて取り直す
+/// (メンバー再追加での 1:1 履歴クリアや、ストレージ管理での全消去を反映)。
+#[uniffi::export]
+pub fn chat_generation(slug: String) -> u64 {
+    session_of(&slug)
+        .map(|s| s.chat.lock().unwrap().generation())
+        .unwrap_or(0)
+}
+
 /// チャット履歴を全消去する(ストレージ管理)。接続中のみ。
 /// 送信待ちキューも破棄し、削除のお知らせ行を 1 行だけ残す。
 #[uniffi::export]

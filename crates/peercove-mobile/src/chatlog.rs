@@ -8,10 +8,12 @@
 
 use std::collections::VecDeque;
 use std::io::Write as _;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use peercove_core::ipc::ChatMessageInfo;
+use peercove_core::msg::ChatScope;
 
 /// 保持する履歴の上限(通)。デスクトップと同値。
 const MAX_HISTORY: usize = 10_000;
@@ -24,6 +26,10 @@ pub struct ChatLog {
     entries: VecDeque<ChatMessageInfo>,
     file_lines: usize,
     next_seq: u64,
+    /// 履歴を消した(clear / clear_direct)たびに増える世代番号。UI が
+    /// これの変化を見て、手元に貯めた履歴を捨てて取り直す(seq は据え置き
+    /// なので seq だけでは消去を検知できないため)。
+    generation: u64,
 }
 
 impl ChatLog {
@@ -53,7 +59,13 @@ impl ChatLog {
             entries,
             file_lines,
             next_seq,
+            generation: 0,
         }
+    }
+
+    /// 履歴の消去世代(UI の取り直し判定用)。
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// 1 通追記する(seq はここで振る)。ファイルへの追記に失敗しても
@@ -153,7 +165,25 @@ impl ChatLog {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.file_lines = 0;
+        self.generation += 1;
         let _ = std::fs::remove_file(&self.path);
+    }
+
+    /// 指定 IP との 1:1(direct)履歴を消す。メンバーを削除 → 同名・同 IP で
+    /// 再追加すると別人(別の鍵)になるため、旧履歴が混ざらないよう消す。
+    /// 件数が変わったら true。seq は据え置き(以後の新着は続きの seq)。
+    pub fn clear_direct(&mut self, ip: Ipv4Addr) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !(e.scope == ChatScope::Direct && (e.from == ip || e.to == Some(ip))));
+        if self.entries.len() == before {
+            return false;
+        }
+        self.generation += 1;
+        if let Err(e) = self.rewrite() {
+            tracing::warn!("履歴の詰め直しに失敗しました: {e:#}");
+        }
+        true
     }
 }
 
@@ -203,6 +233,24 @@ mod tests {
         assert_eq!(messages[0].text, "一通目");
         assert_eq!(log.fetch(1, 100).len(), 1, "after_seq より後だけ");
         assert_eq!(log.fetch(0, 1).len(), 1, "limit で打ち切り");
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    /// clear_direct はその IP との 1:1 だけ消す(メンバー再追加対策)。
+    #[test]
+    fn clear_direct_removes_only_that_peer() {
+        let config = temp_config("cleardirect");
+        let mut log = ChatLog::load(&config);
+        log.append(entry("a")); // to 10.0.0.2
+        log.append(ChatMessageInfo {
+            to: Some("10.0.0.9".parse().unwrap()),
+            ..entry("keep")
+        });
+        assert!(log.clear_direct("10.0.0.2".parse().unwrap()));
+        let after = log.fetch(0, 100);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].text, "keep");
+        assert_eq!(log.append(entry("next")).seq, 3, "seq は続きから");
         let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 

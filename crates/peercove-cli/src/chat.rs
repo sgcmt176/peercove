@@ -9,7 +9,7 @@
 //!
 //! 秘匿ルール: 本文はログへ出さない(seq・id・IP は可)。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use peercove_core::ipc::{ChatMessageInfo, MAX_CHAT_BYTES_PER_REPLY, MAX_CHAT_MESSAGES_PER_REPLY};
 use peercove_core::msg::ChatScope;
+use peercove_core::proto::LedgerEntry;
 use serde::{Deserialize, Serialize};
 
 /// 保持する履歴の上限(通)。超えたら古い方から捨てる(ADR-0015/0016)。
@@ -27,6 +28,64 @@ const MAX_HISTORY: usize = 10_000;
 const REWRITE_THRESHOLD: usize = MAX_HISTORY + 1_000;
 
 pub type SharedChatLog = Arc<Mutex<ChatLog>>;
+
+/// 台帳の各メンバーの「同一性」を公開鍵で覚えておくサイドカーの場所。
+fn identity_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("chatids.json")
+}
+
+/// メンバーの再追加(削除 → 同名・同 IP で再参加)を検知して、その相手との
+/// 1:1 履歴を消す。同一性は**公開鍵**で判定する(再追加すると鍵が変わる)。
+///
+/// `<config>.chatids.json` に `IP → 公開鍵` を保存し、台帳同期のたびに突き合わせる。
+/// 初回(サイドカー無し)は現状を記録するだけ(既存履歴は消さない)。
+/// `self_ip`(自分)と `is_host` は 1:1 の対象外なので飛ばす。
+pub fn reconcile_identities(
+    config_path: &Path,
+    self_ip: Ipv4Addr,
+    ledger: &[LedgerEntry],
+    chat: &SharedChatLog,
+) {
+    let path = identity_path(config_path);
+    let mut map: HashMap<String, String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut changed = false;
+    for entry in ledger {
+        if entry.ip == self_ip || entry.is_host {
+            continue;
+        }
+        let ip = entry.ip.to_string();
+        let key = entry.public_key.to_base64();
+        match map.get(&ip) {
+            Some(prev) if *prev == key => {} // 同一端末
+            Some(_) => {
+                // 鍵が変わった = 別の端末に置き換わった。1:1 履歴を消す
+                if chat.lock().unwrap().clear_direct(entry.ip) {
+                    tracing::info!(
+                        "{} は別の端末に置き換わったため 1:1 履歴を消去しました",
+                        entry.ip
+                    );
+                }
+                map.insert(ip, key);
+                changed = true;
+            }
+            None => {
+                map.insert(ip, key);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        if let Ok(json) = serde_json::to_string(&map) {
+            let tmp = path.with_extension("chatids.json.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+}
 
 /// チャットの自動再送間隔(E-E 3。モバイルと同値)。
 pub const CHAT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
@@ -134,6 +193,9 @@ pub struct ChatLog {
     /// ファイル内の行数(メモリから溢れた古い行を含む)。詰め直しの判定に使う。
     file_lines: usize,
     next_seq: u64,
+    /// 履歴を消した(clear_direct)たびに増える世代番号。UI が変化を見て、
+    /// 手元の履歴を捨てて取り直す(seq は据え置きなので seq では検知できない)。
+    generation: u64,
 }
 
 impl ChatLog {
@@ -165,7 +227,13 @@ impl ChatLog {
             entries,
             file_lines,
             next_seq,
+            generation: 0,
         }))
+    }
+
+    /// 履歴の消去世代(UI の取り直し判定用)。status 応答に載せる。
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// 1 通追記する(seq はここで振る)。ファイルへの追記に失敗しても
@@ -239,6 +307,23 @@ impl ChatLog {
         self.entries.iter().find(|e| e.seq == seq).cloned()
     }
 
+    /// 指定 IP との 1:1(direct)履歴を消す。メンバーを削除 → 同名・同 IP で
+    /// 再追加すると別人(別の鍵)になるため、旧履歴が混ざらないよう消す。
+    /// 件数が変わったら true。seq は据え置き(以後の新着は続きの seq)。
+    pub fn clear_direct(&mut self, ip: Ipv4Addr) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !(e.scope == ChatScope::Direct && (e.from == ip || e.to == Some(ip))));
+        if self.entries.len() == before {
+            return false;
+        }
+        self.generation += 1;
+        if let Err(e) = self.rewrite() {
+            tracing::warn!("履歴の詰め直しに失敗しました: {e:#}");
+        }
+        true
+    }
+
     /// メッセージ ID が既に履歴にあるか。モバイルの再送キュー(E-E 3)は
     /// ack を取り損ねると同じ ID で再送してくるため、受信側で重複を弾く。
     pub fn contains_id(&self, id: &str) -> bool {
@@ -299,6 +384,73 @@ mod tests {
             file: None,
             system: false,
         }
+    }
+
+    fn ledger_entry(ip: &str, key: peercove_core::keys::PublicKey) -> LedgerEntry {
+        LedgerEntry {
+            name: Some("m".to_string()),
+            dns_name: None,
+            ip: ip.parse().unwrap(),
+            public_key: key,
+            app_version: None,
+            platform: None,
+            capabilities: vec![],
+            invite_status: None,
+            invite_expires_at: None,
+            online: true,
+            is_host: false,
+            endpoint: None,
+            endpoint_age_secs: None,
+            subnets: vec![],
+            blocked: false,
+            force_relay: false,
+            acl_rule_id: None,
+        }
+    }
+
+    /// clear_direct はその IP との 1:1 だけ消し、seq は続きから振る。
+    #[test]
+    fn clear_direct_removes_only_that_peer() {
+        use peercove_core::keys::PrivateKey;
+        let config = temp_config("cleardirect");
+        let log = ChatLog::load(&config);
+        let mut log = log.lock().unwrap();
+        // 10.0.0.2 との 1:1(entry の from/to)を 2 通
+        log.append(entry("a"));
+        log.append(entry("b"));
+        // 別の相手 10.0.0.9 との 1:1 を 1 通
+        log.append(ChatMessageInfo {
+            to: Some("10.0.0.9".parse().unwrap()),
+            ..entry("keep")
+        });
+        assert_eq!(log.latest_seq(), 3);
+        assert!(log.clear_direct("10.0.0.2".parse().unwrap()));
+        let (seq, messages) = log.fetch(0);
+        assert_eq!(seq, 3, "seq は据え置き");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "keep");
+        // 新着は続きの seq
+        assert_eq!(log.append(entry("next")).seq, 4);
+        drop(log);
+
+        // reconcile: 鍵が変わったら 1:1 を消す。初回は消さない
+        let log = ChatLog::load(&config);
+        let k1 = PrivateKey::generate().public_key();
+        let k2 = PrivateKey::generate().public_key();
+        let self_ip = "10.0.0.1".parse().unwrap();
+        // 初回: 記録するだけ(履歴は残る)
+        reconcile_identities(&config, self_ip, &[ledger_entry("10.0.0.2", k1)], &log);
+        assert!(!log.lock().unwrap().fetch(0).1.is_empty());
+        // 鍵が変わる = 再追加。10.0.0.2 との 1:1 が消える
+        reconcile_identities(&config, self_ip, &[ledger_entry("10.0.0.2", k2)], &log);
+        let (_, after) = log.lock().unwrap().fetch(0);
+        assert!(
+            after
+                .iter()
+                .all(|m| m.to != Some("10.0.0.2".parse().unwrap())),
+            "再追加で 1:1 が消える: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 
     /// 追記 → 再読込で seq が続きから振られ、内容も残る。

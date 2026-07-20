@@ -355,6 +355,8 @@ pub struct Tunnel {
     pub transfers: Vec<Transfer>,
     /// チャット履歴の最新 seq(ADR-0016、M3-13b)。これが進んだら差分フェッチする。
     pub chat_seq: u64,
+    /// チャット履歴の消去世代。変わったら手元の履歴を捨てて取り直す。
+    pub chat_generation: u64,
     /// 送信待ち(再送キューに残っている)チャットの seq(E-E 3)。
     pub chat_sending: Vec<u64>,
     /// 既知のグループ(ADR-0016、M3-13c)。自分が抜けたグループも含む
@@ -413,6 +415,7 @@ impl From<&TunnelInfo> for Tunnel {
             connection_error: info.connection_error.clone(),
             transfers: info.transfers.iter().map(Transfer::from).collect(),
             chat_seq: info.chat_seq,
+            chat_generation: info.chat_generation,
             chat_sending: info.chat_sending.clone(),
             groups: info.groups.iter().map(Group::from).collect(),
             // 配布形式は解決済み(A は {name, ip}、CNAME は {name, target})。
@@ -876,6 +879,7 @@ mod tests {
             direct: Default::default(),
             transfers: vec![],
             chat_seq: 0,
+            chat_generation: 0,
             chat_sending: vec![],
             groups: vec![],
             dns_records: vec![peercove_core::dns::DnsRecord {
@@ -1006,6 +1010,7 @@ mod tests {
             direct,
             transfers: vec![],
             chat_seq: 0,
+            chat_generation: 0,
             chat_sending: vec![],
             groups: vec![],
             dns_records: vec![],

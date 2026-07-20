@@ -484,6 +484,26 @@ impl DaemonShared {
         }
     }
 
+    /// 各稼働ネットワークで、メンバーの再追加(削除 → 同名・同 IP で再参加 =
+    /// 別の鍵)を検知して 1:1 履歴を消す(検証フィードバック 2026-07-20)。
+    /// 台帳同期と同じ 5 秒周期で回す。同期 I/O だが少量なので許容。
+    async fn reconcile_identities(&self) {
+        for active in self.active.lock().await.values() {
+            let ledger = {
+                let snapshot = active.snapshot.lock().unwrap();
+                snapshot.as_ref().and_then(|s| s.ledger.clone())
+            };
+            if let Some(ledger) = ledger {
+                crate::chat::reconcile_identities(
+                    &active.config,
+                    active.address,
+                    &ledger,
+                    &active.chat,
+                );
+            }
+        }
+    }
+
     /// グループを作る(ADR-0016、M3-13c)。`members` に自分は含めなくてよい
     /// (必ず足す)。オフラインのメンバーも入れられる(オンライン復帰時の
     /// 追いつき再送で届く)。
@@ -1527,6 +1547,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)
         transfers: active.transfers.lock().unwrap().clone(),
         chat_seq: active.chat.lock().unwrap().latest_seq(),
+        chat_generation: active.chat.lock().unwrap().generation(),
         chat_sending: active
             .chat_queue
             .lock()
@@ -1741,6 +1762,8 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
                     shared.refresh_zones().await;
                     // チャットの自動再送(E-E 3)も同じ周期で回す
                     shared.pump_chat_queues().await;
+                    // メンバー再追加の検知 → 1:1 履歴クリア(検証 FB)
+                    shared.reconcile_identities().await;
                 }
             }
         });

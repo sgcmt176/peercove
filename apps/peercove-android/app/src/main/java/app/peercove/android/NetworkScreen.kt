@@ -77,6 +77,7 @@ import uniffi.peercove_mobile.MobileException
 import uniffi.peercove_mobile.SessionState
 import uniffi.peercove_mobile.TunnelStatus
 import uniffi.peercove_mobile.chatFetch
+import uniffi.peercove_mobile.chatGeneration
 import uniffi.peercove_mobile.chatGroups
 import uniffi.peercove_mobile.clearChatHistory
 import uniffi.peercove_mobile.createGroup
@@ -214,15 +215,22 @@ fun NetworkScreen(
         onNotice(copiedFmt.format(text))
     }
 
-    // セッション情報のポーリング
+    // セッション情報のポーリング。履歴の消去世代が変わったら(メンバー再追加で
+    // 1:1 履歴がクリアされた等)手元の履歴を捨てて取り直す
+    var lastChatGen by remember(slug) { mutableStateOf(0uL) }
     LaunchedEffect(slug) {
         while (true) {
-            withContext(Dispatchers.IO) {
+            val gen = withContext(Dispatchers.IO) {
                 state = sessionState(slug)
                 tunnel = tunnelStatus(slug)
                 memberList = members(slug)
                 groupList = chatGroups(slug)
                 dnsList = dnsEntries(slug)
+                chatGeneration(slug)
+            }
+            if (gen != lastChatGen) {
+                lastChatGen = gen
+                chatEpoch++
             }
             delay(2000)
         }

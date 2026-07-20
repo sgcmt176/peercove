@@ -355,6 +355,10 @@ pub struct TunnelInfo {
     /// UI が「送信中 / 未送信(自動再送)」の表示に使う。旧デーモンには無い(空)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chat_sending: Vec<u64>,
+    /// チャット履歴の消去世代。メンバー再追加での 1:1 履歴クリア等で増える。
+    /// UI はこれが変わったら手元の履歴を捨てて取り直す。旧デーモンには無い(0)。
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub chat_generation: u64,
     /// 既知のグループ(ADR-0016、M3-13c)。自分が抜けた/外されたグループも
     /// 含む(UI が履歴の表示名に使う — 会話リストからは隠す)。
     /// 旧デーモンの応答には無い(空)。
