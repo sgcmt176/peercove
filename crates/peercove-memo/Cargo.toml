@@ -1,0 +1,16 @@
+[package]
+name = "peercove-memo"
+description = "PeerCove のメモ帳ストレージ(SQLite、ADR-0049)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+peercove-core = { workspace = true }
+# SQLite 同梱ビルド(ADR-0049。FTS5 は bundled で有効)。0.40.1 = 2026-06、MIT
+rusqlite = { version = "0.40", features = ["bundled"] }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

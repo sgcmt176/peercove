@@ -165,6 +165,15 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_in_secs: Option<u64>,
     },
+    /// 個人メモの操作(ADR-0049、M5 F-1)。デーモンがメモ DB を所有し、
+    /// UI は表示しか持たない。`db` は個人メモ DB のパス(ネットワーク非依存
+    /// なので設定ディレクトリ直下。UI が決めて渡す)。
+    /// 応答は [`IpcResponse::Memo`]。追加メソッドなので [`IPC_VERSION`] は
+    /// 上げない(旧デーモンは解析エラーを返す → UI が「デーモンが古い」と案内)。
+    Memo {
+        db: PathBuf,
+        op: crate::memo::MemoOp,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -218,6 +227,8 @@ pub enum IpcResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_at: Option<u64>,
     },
+    /// Memo への応答(ADR-0049)。メモの内容はログへ出さないこと。
+    Memo { reply: crate::memo::MemoReply },
 }
 
 /// 1 応答で返すチャットの上限(IPC の 1 行上限 256 KiB に収めるため、

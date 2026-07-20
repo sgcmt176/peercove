@@ -432,6 +432,101 @@ export interface QualityReport {
   samples: QualityPoint[];
 }
 
+// ---- 個人メモ (M5 F-1, ADR-0049) ----
+// 型は Rust 側(peercove-core::memo)の serde 表現をそのまま使うため、この
+// セクションだけ snake_case。時刻は UNIX ミリ秒
+
+export type MemoScope = "active" | "archived" | "trash";
+export type MemoSort = "updated" | "created" | "title";
+
+export interface MemoQuery {
+  scope: MemoScope;
+  folder_id?: string;
+  tag?: string;
+  search?: string;
+  sort: MemoSort;
+}
+
+export interface MemoFolder {
+  id: string;
+  name: string;
+  memo_count: number;
+}
+
+export interface MemoTagCount {
+  tag: string;
+  count: number;
+}
+
+export interface MemoSummary {
+  id: string;
+  title: string;
+  excerpt: string;
+  folder_id?: string;
+  tags?: string[];
+  pinned?: boolean;
+  archived?: boolean;
+  created_at: number;
+  updated_at: number;
+  deleted_at?: number;
+  checklist_done?: number;
+  checklist_total?: number;
+}
+
+export interface MemoDetail {
+  id: string;
+  title: string;
+  body: string;
+  folder_id?: string;
+  tags?: string[];
+  pinned?: boolean;
+  archived?: boolean;
+  created_at: number;
+  updated_at: number;
+  deleted_at?: number;
+}
+
+/** 部分更新。省略 = 変更しない。folder は `{}` で「フォルダーなし」へ移動。 */
+export interface MemoPatch {
+  title?: string;
+  body?: string;
+  folder?: { id?: string };
+  pinned?: boolean;
+  archived?: boolean;
+  tags?: string[];
+}
+
+export type MemoOp =
+  | { op: "list"; query: MemoQuery }
+  | { op: "get"; id: string }
+  | {
+      op: "create";
+      title: string;
+      body: string;
+      folder_id?: string;
+      tags?: string[];
+    }
+  | { op: "update"; id: string; patch: MemoPatch }
+  | { op: "duplicate"; id: string }
+  | { op: "trash"; id: string }
+  | { op: "restore"; id: string }
+  | { op: "delete_forever"; id: string }
+  | { op: "empty_trash" }
+  | { op: "folder_create"; name: string }
+  | { op: "folder_rename"; id: string; name: string }
+  | { op: "folder_delete"; id: string };
+
+export type MemoReply =
+  | {
+      kind: "memos";
+      memos: MemoSummary[];
+      folders: MemoFolder[];
+      tags: MemoTagCount[];
+    }
+  | { kind: "memo"; memo: MemoDetail }
+  | { kind: "folder"; folder: MemoFolder }
+  | { kind: "done" };
+
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =
   | { kind: "connecting" }
@@ -613,6 +708,11 @@ export const api = {
     invoke<Settings>("read_settings", { configPath }),
   saveSettings: (configPath: string, update: SettingsUpdate) =>
     invoke<SaveResult>("save_settings", { configPath, update }),
+  // 個人メモ(M5 F-1、ADR-0049)。デーモンが DB を所有し IPC で操作する
+  memoOp: (op: MemoOp) => invoke<MemoReply>("memo_op", { op }),
+  memoExport: (id: string) => invoke<string | null>("memo_export", { id }),
+  memoImport: (folderId: string | null) =>
+    invoke<number | null>("memo_import", { folderId }),
 };
 
 // ---- 表示ヘルパ ----

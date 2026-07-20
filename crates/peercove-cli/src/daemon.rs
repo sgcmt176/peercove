@@ -322,6 +322,18 @@ impl DaemonShared {
                     ),
                 }
             }
+            IpcRequest::Memo { db, op } => {
+                // 個人メモ(ADR-0049、M5 F-1)。SQLite は同期 API なので
+                // blocking スレッドで開いて 1 操作だけ適用する(WAL + busy_timeout
+                // で多重アクセスにも耐える)。メモの内容はログへ出さない
+                let reply = tokio::task::spawn_blocking(move || {
+                    let mut store = peercove_memo::MemoStore::open(&db)?;
+                    store.apply(op)
+                })
+                .await
+                .context("メモ処理がクラッシュしました")??;
+                Ok(IpcResponse::Memo { reply })
+            }
         }
     }
 

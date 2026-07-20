@@ -11,6 +11,7 @@ pub mod dns;
 pub mod ipalloc;
 pub mod ipc;
 pub mod keys;
+pub mod memo;
 pub mod msg;
 pub mod names;
 pub mod proto;

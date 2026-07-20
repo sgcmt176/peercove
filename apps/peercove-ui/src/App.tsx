@@ -22,6 +22,7 @@ import {
 import { clearChat, syncChat, totalUnread } from "./chat";
 import { clearHistory, recordStatus } from "./history";
 import { Theme, applyTheme, loadTheme, nextTheme } from "./theme";
+import { MemoView } from "./components/MemoView";
 import { NetworksView } from "./components/NetworksView";
 import { TunnelView } from "./components/TunnelView";
 import { LogsView } from "./components/LogsDialog";
@@ -35,6 +36,7 @@ import { checkForUpdate } from "./update";
 /** サイドバーで選ぶ表示。openConfig の有無で有効な値が決まる(M3-16)。 */
 type View =
   | "networks"
+  | "memos"
   | "app-settings"
   | "logs"
   | "members"
@@ -389,6 +391,15 @@ export default function App() {
                 onClick={backToList}
               />
               <SidebarItem
+                icon="📝"
+                label={t.sidebar.memos}
+                active={view === "memos"}
+                onClick={() => {
+                  setOpenConfig(null);
+                  setView("memos");
+                }}
+              />
+              <SidebarItem
                 icon="🧾"
                 label={t.sidebar.logs}
                 active={view === "logs"}
@@ -496,7 +507,9 @@ export default function App() {
           ) : view === "logs" ? (
             <LogsView />
           ) : !detail ? (
-            view === "app-settings" ? (
+            view === "memos" ? (
+              <MemoView />
+            ) : view === "app-settings" ? (
               <AppSettingsView
                 version={version}
                 daemonVersion={

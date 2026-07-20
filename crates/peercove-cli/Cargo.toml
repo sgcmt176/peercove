@@ -14,6 +14,8 @@ path = "src/main.rs"
 peercove-core.workspace = true
 peercove-ipc.workspace = true
 peercove-ops.workspace = true
+# 個人メモのストレージ(ADR-0049、M5 F-1)。デーモンがメモ DB を所有する
+peercove-memo.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

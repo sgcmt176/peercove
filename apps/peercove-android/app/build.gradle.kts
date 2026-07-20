@@ -71,7 +71,7 @@ android {
         applicationId = "app.peercove.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
+        versionCode = 5
         versionName = "0.1.2"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
@@ -111,4 +111,8 @@ dependencies {
 
     // 招待 QR コードの読み取り(M4 E-B)
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    // メモの Markdown プレビュー(M5 F-1、ADR-0049)。Apache-2.0、活発にメンテ
+    // されている(0.39.2 = 2026-05)。m3 = Material3 の既定スタイル
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.39.2")
 }

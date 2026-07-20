@@ -38,6 +38,116 @@ fn config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("設定ディレクトリを特定できません: {e}"))
 }
 
+// ---- 個人メモ (M5 F-1, ADR-0049) ----
+
+/// 個人メモ DB のパス。ネットワーク非依存なので設定ディレクトリ直下に置く。
+/// DB を所有するのはデーモン(ADR-0049)— UI はパスを決めて IPC で操作するだけ。
+fn memo_db(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(config_dir(app)?.join("memos.db"))
+}
+
+async fn memo_request(
+    db: PathBuf,
+    op: peercove_core::memo::MemoOp,
+) -> Result<peercove_core::memo::MemoReply, String> {
+    match peercove_ipc::request_async(IpcRequest::Memo { db, op }).await {
+        Ok(IpcResponse::Memo { reply }) => Ok(reply),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        // 旧デーモンは Memo メソッドを解析できず Err を返す(IPC_VERSION 据え置き)
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+#[tauri::command]
+async fn memo_op(
+    app: tauri::AppHandle,
+    op: peercove_core::memo::MemoOp,
+) -> Result<peercove_core::memo::MemoReply, String> {
+    memo_request(memo_db(&app)?, op).await
+}
+
+/// メモ 1 件を `.txt` へ保存する(要件 §16。本文の受け渡しであり、タグ等は
+/// 含まれない)。保存先は OS のダイアログで選ぶ。None = キャンセル。
+#[tauri::command]
+async fn memo_export(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let reply = memo_request(memo_db(&app)?, peercove_core::memo::MemoOp::Get { id }).await?;
+    let peercove_core::memo::MemoReply::Memo { memo } = reply else {
+        return Err("想定外の応答です".to_string());
+    };
+    let suggested = format!(
+        "{}.txt",
+        peercove_core::memo::sanitize_filename(&memo.title)
+    );
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("テキスト", &["txt"])
+            .set_file_name(&suggested)
+            .blocking_save_file()
+            .map(|path| path.to_string())
+    })
+    .await
+    .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))?;
+    let Some(output) = picked else {
+        return Ok(None);
+    };
+    std::fs::write(&output, memo.body.as_bytes())
+        .map_err(|e| format!("書き込みに失敗しました: {e}"))?;
+    Ok(Some(output))
+}
+
+/// `.txt` を個人メモとして取り込む(要件 §16。ファイル名がタイトル、本文が
+/// メモ本文)。複数選択可。None = キャンセル、Some(n) = 取り込んだ件数。
+#[tauri::command]
+async fn memo_import(
+    app: tauri::AppHandle,
+    folder_id: Option<String>,
+) -> Result<Option<u32>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let db = memo_db(&app)?;
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("テキスト", &["txt"])
+            .blocking_pick_files()
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|path| path.to_string())
+                    .collect::<Vec<_>>()
+            })
+    })
+    .await
+    .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))?;
+    let Some(paths) = picked else {
+        return Ok(None);
+    };
+    let mut imported = 0u32;
+    for path in paths {
+        let path = Path::new(&path);
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("ファイルを読み込めません: {e}"))?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let title = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        memo_request(
+            db.clone(),
+            peercove_core::memo::MemoOp::Create {
+                title,
+                body,
+                folder_id: folder_id.clone(),
+                tags: vec![],
+            },
+        )
+        .await?;
+        imported += 1;
+    }
+    Ok(Some(imported))
+}
+
 // ---- 暗号化バックアップ / 復元 (M3-24, ADR-0034) ----
 
 #[tauri::command]
@@ -1413,6 +1523,9 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            memo_op,
+            memo_export,
+            memo_import,
             create_backup,
             pick_backup,
             inspect_backup,

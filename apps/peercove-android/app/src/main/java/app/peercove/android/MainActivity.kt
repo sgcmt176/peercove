@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -148,6 +149,8 @@ class MainActivity : ComponentActivity() {
 
 private sealed class Route {
     data object Home : Route()
+    /** 個人メモ(M5 F-1、ADR-0049)。ネットワーク非依存なのでホーム直下 */
+    data object Memos : Route()
     data class Net(val slug: String, val name: String) : Route()
 }
 
@@ -183,7 +186,7 @@ private fun App(
     var pendingShare by remember { mutableStateOf(shareUri) }
 
     // システムの戻る操作でひとつ前の画面へ(アプリを閉じない)
-    BackHandler(enabled = route is Route.Net) { route = Route.Home }
+    BackHandler(enabled = route !is Route.Home) { route = Route.Home }
 
     val onNotice: (String) -> Unit = {
         notice = it
@@ -226,6 +229,11 @@ private fun App(
                 onThemeChange = onThemeChange,
                 onNotice = onNotice,
                 onOpen = { slug, name -> route = Route.Net(slug, name) },
+                onOpenMemos = { route = Route.Memos },
+            )
+            is Route.Memos -> MemoScreen(
+                onBack = { route = Route.Home },
+                onNotice = onNotice,
             )
             is Route.Net -> NetworkScreen(
                 slug = r.slug,
@@ -247,6 +255,7 @@ private fun HomeScreen(
     onThemeChange: (String) -> Unit,
     onNotice: (String) -> Unit,
     onOpen: (String, String) -> Unit,
+    onOpenMemos: () -> Unit,
 ) {
     val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
@@ -355,6 +364,13 @@ private fun HomeScreen(
                 Text(
                     stringResource(R.string.mobile_core_version, remember { coreVersion() }),
                     style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            IconButton(onClick = onOpenMemos) {
+                Icon(
+                    Icons.Filled.EditNote,
+                    contentDescription = stringResource(R.string.memo_open),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             IconButton(onClick = { showThemeDialog = true }) {

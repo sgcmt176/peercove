@@ -16,6 +16,7 @@ uniffi::setup_scaffolding!();
 pub mod chatlog;
 pub mod engine;
 pub mod groups;
+pub mod memo;
 pub mod session;
 #[cfg(unix)]
 mod tun_fd;
