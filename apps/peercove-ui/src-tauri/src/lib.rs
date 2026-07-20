@@ -364,6 +364,28 @@ async fn chat_send(
     }
 }
 
+/// 送信待ち(または失敗した)チャットを再送する(E-E 3 のデスクトップ版)。
+#[tauri::command]
+async fn chat_resend(config_path: String, seq: u64) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    match peercove_ipc::request_async(IpcRequest::ChatResend { config, seq }).await {
+        Ok(IpcResponse::Done) => Ok(()),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+/// 送信待ちチャットの自動再送をやめる(履歴には失敗の印を残す)。
+#[tauri::command]
+async fn chat_cancel_send(config_path: String, seq: u64) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    match peercove_ipc::request_async(IpcRequest::ChatCancelSend { config, seq }).await {
+        Ok(IpcResponse::Done) => Ok(()),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
 /// 仮想 IP 文字列の一覧を検証つきで変換する(グループ操作用)。
 fn parse_ips(list: Vec<String>) -> Result<Vec<std::net::Ipv4Addr>, String> {
     list.iter()
@@ -1333,6 +1355,8 @@ pub fn run() {
             pick_file,
             send_file,
             chat_send,
+            chat_resend,
+            chat_cancel_send,
             chat_fetch,
             group_create,
             group_update,

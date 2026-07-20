@@ -68,6 +68,9 @@ struct Active {
     /// チャット履歴(ADR-0016、M3-13)。supervise 内の受信サーバーと
     /// ChatSend が書き、ChatFetch / status 応答(chat_seq)が読む
     chat: crate::chat::SharedChatLog,
+    /// チャットの送信待ちキュー(E-E 3 のデスクトップ版)。ChatSend が積み、
+    /// serve() の 5 秒周期が再送する。<config>.chatq.json に永続化
+    chat_queue: crate::chat::SharedChatQueue,
     /// 既知のグループ(ADR-0016、M3-13c)。supervise 内の受信サーバーと
     /// Group 系リクエストが書き、status 応答(groups)が読む
     groups: crate::groups::SharedGroups,
@@ -165,6 +168,14 @@ impl DaemonShared {
                 group_id,
                 text,
             } => self.chat_send(config, scope, peer, group_id, text).await,
+            IpcRequest::ChatResend { config, seq } => {
+                self.chat_resend(config, seq).await?;
+                Ok(IpcResponse::Done)
+            }
+            IpcRequest::ChatCancelSend { config, seq } => {
+                self.chat_cancel_send(config, seq).await?;
+                Ok(IpcResponse::Done)
+            }
             IpcRequest::GroupCreate {
                 config,
                 name,
@@ -267,8 +278,9 @@ impl DaemonShared {
         }
     }
 
-    /// チャットを送る(ADR-0016、M3-13)。履歴への記録は即時、相手への配送は
-    /// バックグラウンド(全宛先に失敗したら履歴に失敗の印が付く)。
+    /// チャットを送る(ADR-0016 → E-E 3 で再送キュー方式に変更)。履歴への記録は
+    /// 即時、配送は送信待ちキュー経由(届くまで 10 秒間隔で自動再送。オフライン
+    /// 宛でもエラーにせず、失敗の印を付けて相手の復帰を待つ — モバイルと同挙動)。
     async fn chat_send(
         &self,
         config: PathBuf,
@@ -289,40 +301,15 @@ impl DaemonShared {
         let active = active
             .get(&Self::key_for(&config))
             .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
-        let ledger = {
-            let snapshot = active.snapshot.lock().unwrap();
-            snapshot
-                .as_ref()
-                .and_then(|s| s.ledger.clone())
-                .unwrap_or_default()
-        };
-        // 宛先の決定(オフライン宛は V1 非対応 — ADR-0015/0016)
-        let targets: Vec<Ipv4Addr> = match scope {
+        // 宛先の妥当性だけ確認する(オンライン状態は見ない — 配送はキューの仕事)
+        match scope {
             ChatScope::Direct => {
                 let peer = peer.context("宛先(peer)が指定されていません")?;
                 if peer == active.address {
                     bail!("自分自身へは送れません");
                 }
-                let entry = ledger
-                    .iter()
-                    .find(|e| e.ip == peer)
-                    .with_context(|| format!("{peer} はこのネットワークのメンバーにいません"))?;
-                if !entry.online {
-                    bail!(
-                        "{} はオフラインです(オフラインのメンバーへは送れません)",
-                        entry.name.as_deref().unwrap_or(&peer.to_string())
-                    );
-                }
-                vec![peer]
             }
-            // 全体宛: 送信時にオンラインのメンバー全員へ個別送信。全員オフライン
-            // でも履歴には残す(誰にも届かないことは README に明記)
-            ChatScope::Network => ledger
-                .iter()
-                .filter(|e| e.ip != active.address && e.online)
-                .map(|e| e.ip)
-                .collect(),
-            // グループ宛: オンラインのグループメンバーへ個別送信(M3-13c)
+            ChatScope::Network => {}
             ChatScope::Group => {
                 let group_id = group_id
                     .as_deref()
@@ -334,13 +321,8 @@ impl DaemonShared {
                 if !group.members.contains(&active.address) {
                     bail!("このグループのメンバーではありません");
                 }
-                ledger
-                    .iter()
-                    .filter(|e| e.ip != active.address && e.online && group.members.contains(&e.ip))
-                    .map(|e| e.ip)
-                    .collect()
             }
-        };
+        }
         let id = crate::msg::new_transfer_id();
         let sent_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -365,45 +347,141 @@ impl DaemonShared {
             file: None,
             system: false,
         });
-        let chat = Arc::clone(&active.chat);
-        let seq = entry.seq;
-        tokio::spawn(async move {
-            let mut delivered = targets.is_empty(); // 宛先ゼロの全体/グループ宛は失敗扱いにしない
-            let sends = targets.into_iter().map(|target| {
-                let id = id.clone();
-                let group_id = group_id.clone();
-                let text = text.clone();
-                tokio::spawn(async move {
-                    // 本文はログに出さない(秘匿ルール)
-                    match crate::msg::send_chat(
-                        target,
-                        &id,
-                        scope,
-                        group_id.as_deref(),
-                        &text,
-                        sent_at,
-                    )
-                    .await
-                    {
-                        Ok(()) => true,
-                        Err(e) => {
-                            tracing::warn!("{target} へのチャット送信に失敗しました: {e:#}");
-                            false
-                        }
-                    }
-                })
+        active
+            .chat_queue
+            .lock()
+            .unwrap()
+            .push(crate::chat::PendingChat {
+                seq: entry.seq,
+                id,
+                scope,
+                to: match scope {
+                    ChatScope::Direct => peer,
+                    _ => None,
+                },
+                group_id: match scope {
+                    ChatScope::Group => group_id,
+                    _ => None,
+                },
+                text,
+                sent_at,
+                delivered: Default::default(),
+                next_at: std::time::Instant::now(),
             });
-            for send in sends.collect::<Vec<_>>() {
-                delivered |= send.await.unwrap_or(false);
-            }
-            if !delivered {
-                chat.lock().unwrap().mark_failed(seq);
-            }
-        });
+        crate::chat::save_queue(&active.config, &active.chat_queue);
+        // その場で 1 回配送を試みる(結果と再送はキューが管理)
+        tokio::spawn(pump_chat_queue(
+            active.address,
+            Arc::clone(&active.chat_queue),
+            Arc::clone(&active.chat),
+            Arc::clone(&active.snapshot),
+            Arc::clone(&active.groups),
+            active.config.clone(),
+        ));
         Ok(IpcResponse::Chat {
-            seq,
+            seq: entry.seq,
             messages: vec![entry],
         })
+    }
+
+    /// 手動再送(失敗した吹き出しの「再送」)。キューに居ればすぐ再試行、
+    /// 居なければ(取消後・デーモン再起動後)履歴から積み直す。
+    async fn chat_resend(&self, config: PathBuf, seq: u64) -> anyhow::Result<()> {
+        let active = self.active.lock().await;
+        let active = active
+            .get(&Self::key_for(&config))
+            .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
+        let requeued = {
+            let mut queue = active.chat_queue.lock().unwrap();
+            match queue.iter_mut().find(|p| p.seq == seq) {
+                Some(pending) => {
+                    pending.next_at = std::time::Instant::now();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !requeued {
+            let entry = active
+                .chat
+                .lock()
+                .unwrap()
+                .get(seq)
+                .context("メッセージが見つかりません")?;
+            if entry.from != active.address || entry.system || entry.file.is_some() {
+                bail!("このメッセージは再送できません");
+            }
+            active
+                .chat_queue
+                .lock()
+                .unwrap()
+                .push(crate::chat::PendingChat {
+                    seq: entry.seq,
+                    id: entry.id,
+                    scope: entry.scope,
+                    to: entry.to,
+                    group_id: entry.group_id,
+                    text: entry.text,
+                    sent_at: entry.sent_at,
+                    delivered: Default::default(),
+                    next_at: std::time::Instant::now(),
+                });
+        }
+        crate::chat::save_queue(&active.config, &active.chat_queue);
+        tokio::spawn(pump_chat_queue(
+            active.address,
+            Arc::clone(&active.chat_queue),
+            Arc::clone(&active.chat),
+            Arc::clone(&active.snapshot),
+            Arc::clone(&active.groups),
+            active.config.clone(),
+        ));
+        Ok(())
+    }
+
+    /// 送信の取消(自動再送をやめる)。履歴には失敗の印を付けたまま残す。
+    async fn chat_cancel_send(&self, config: PathBuf, seq: u64) -> anyhow::Result<()> {
+        let active = self.active.lock().await;
+        let active = active
+            .get(&Self::key_for(&config))
+            .with_context(|| format!("この設定のトンネルは動いていません({})", config.display()))?;
+        active.chat_queue.lock().unwrap().retain(|p| p.seq != seq);
+        active.chat.lock().unwrap().mark_failed(seq);
+        crate::chat::save_queue(&active.config, &active.chat_queue);
+        Ok(())
+    }
+
+    /// 全稼働ネットワークの送信待ちチャットを処理する(serve() の 5 秒周期)。
+    /// 配送はタイムアウト持ちのネットワーク I/O なので、active のロックを
+    /// 持たずに spawn へ切り出す。
+    async fn pump_chat_queues(&self) {
+        let jobs: Vec<_> = self
+            .active
+            .lock()
+            .await
+            .values()
+            .map(|a| {
+                (
+                    a.address,
+                    Arc::clone(&a.chat_queue),
+                    Arc::clone(&a.chat),
+                    Arc::clone(&a.snapshot),
+                    Arc::clone(&a.groups),
+                    a.config.clone(),
+                )
+            })
+            .collect();
+        for (address, queue, chat, snapshot, groups, config) in jobs {
+            let has_due = {
+                let now = std::time::Instant::now();
+                queue.lock().unwrap().iter().any(|p| p.next_at <= now)
+            };
+            if has_due {
+                tokio::spawn(pump_chat_queue(
+                    address, queue, chat, snapshot, groups, config,
+                ));
+            }
+        }
     }
 
     /// グループを作る(ADR-0016、M3-13c)。`members` に自分は含めなくてよい
@@ -842,6 +920,7 @@ impl DaemonShared {
         let member_link: Arc<crate::control::MemberLink> = Default::default();
         // チャット履歴・グループ情報の読み込み(数 MB 程度の同期 I/O。起動時のみ)
         let chat = crate::chat::ChatLog::load(&config);
+        let chat_queue = crate::chat::load_queue(&config);
         let groups = crate::groups::GroupStore::load(&config);
         let quality = crate::quality::QualityStore::load(&config);
         let health: crate::health::SharedHealth = Default::default();
@@ -936,6 +1015,7 @@ impl DaemonShared {
                 snapshot,
                 transfers,
                 chat,
+                chat_queue,
                 groups,
                 rotate_request,
                 member_link,
@@ -1447,7 +1527,140 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)
         transfers: active.transfers.lock().unwrap().clone(),
         chat_seq: active.chat.lock().unwrap().latest_seq(),
+        chat_sending: active
+            .chat_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.seq)
+            .collect(),
         groups: active.groups.lock().unwrap().list(),
+    }
+}
+
+/// 送信待ちキューを 1 巡処理する(期限が来たものだけ)。取り出してから
+/// 配送する(remove → 処理 → 未達なら戻す)ので、5 秒周期と ChatSend の
+/// 並行 pump でも二重配送しない(モバイル session.rs と同じ設計)。
+async fn pump_chat_queue(
+    address: Ipv4Addr,
+    queue: crate::chat::SharedChatQueue,
+    chat: crate::chat::SharedChatLog,
+    snapshot: SharedSnapshot,
+    groups: crate::groups::SharedGroups,
+    config: PathBuf,
+) {
+    use peercove_core::msg::ChatScope;
+    let due: Vec<u64> = {
+        let now = std::time::Instant::now();
+        queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.next_at <= now)
+            .map(|p| p.seq)
+            .collect()
+    };
+    for seq in due {
+        let pending = {
+            let mut queue = queue.lock().unwrap();
+            queue
+                .iter()
+                .position(|p| p.seq == seq)
+                .map(|index| queue.remove(index))
+        };
+        let Some(mut pending) = pending else { continue };
+        // 宛先は毎回引き直す(台帳の到着やオンライン状態の変化に追従)
+        let targets = queue_targets(address, &pending, &snapshot, &groups);
+        for target in targets {
+            if pending.delivered.contains(&target) {
+                continue;
+            }
+            // 本文はログに出さない(秘匿ルール)
+            match crate::msg::send_chat(
+                target,
+                &pending.id,
+                pending.scope,
+                pending.group_id.as_deref(),
+                &pending.text,
+                pending.sent_at,
+            )
+            .await
+            {
+                Ok(()) => {
+                    pending.delivered.insert(target);
+                }
+                Err(e) => tracing::debug!("{target} へのチャット送信に失敗(自動再送します): {e:#}"),
+            }
+        }
+        let done = match pending.scope {
+            ChatScope::Direct => pending
+                .to
+                .is_some_and(|target| pending.delivered.contains(&target)),
+            _ => !pending.delivered.is_empty(),
+        };
+        if done {
+            chat.lock().unwrap().clear_failed(pending.seq);
+            tracing::info!(
+                "チャットを送信しました(seq={} id={})",
+                pending.seq,
+                pending.id
+            );
+        } else {
+            chat.lock().unwrap().mark_failed(pending.seq);
+            pending.next_at = std::time::Instant::now() + crate::chat::CHAT_RESEND_INTERVAL;
+            queue.lock().unwrap().push(pending);
+        }
+        // 送達済みの除去・部分送達(delivered)の変化を保存へ反映
+        crate::chat::save_queue(&config, &queue);
+    }
+}
+
+/// 送信待ちチャットの現時点の宛先(direct = 宛先本人、network/group =
+/// オンラインのメンバー)。
+fn queue_targets(
+    address: Ipv4Addr,
+    pending: &crate::chat::PendingChat,
+    snapshot: &SharedSnapshot,
+    groups: &crate::groups::SharedGroups,
+) -> Vec<Ipv4Addr> {
+    use peercove_core::msg::ChatScope;
+    match pending.scope {
+        ChatScope::Direct => pending.to.into_iter().collect(),
+        ChatScope::Network => {
+            let ledger = snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|s| s.ledger.clone())
+                .unwrap_or_default();
+            ledger
+                .iter()
+                .filter(|e| e.ip != address && e.online)
+                .map(|e| e.ip)
+                .collect()
+        }
+        ChatScope::Group => {
+            let Some(group_id) = pending.group_id.as_deref() else {
+                return Vec::new();
+            };
+            let Some(group) = groups.lock().unwrap().get(group_id) else {
+                return Vec::new();
+            };
+            if !group.members.contains(&address) {
+                return Vec::new(); // 退出済み — 宛先なしのまま再送を続けない
+            }
+            let ledger = snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|s| s.ledger.clone())
+                .unwrap_or_default();
+            ledger
+                .iter()
+                .filter(|e| e.ip != address && e.online && group.members.contains(&e.ip))
+                .map(|e| e.ip)
+                .collect()
+        }
     }
 }
 
@@ -1526,6 +1739,8 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
                 loop {
                     tick.tick().await;
                     shared.refresh_zones().await;
+                    // チャットの自動再送(E-E 3)も同じ周期で回す
+                    shared.pump_chat_queues().await;
                 }
             }
         });

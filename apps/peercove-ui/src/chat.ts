@@ -72,7 +72,12 @@ export async function syncChat(
     state.messages = [];
     state.lastSeq = 0;
   }
-  if (chatSeq <= state.lastSeq) return [];
+  if (chatSeq <= state.lastSeq) {
+    // 新着なしでも末尾を取り直す: 送信キュー(E-E 3)の failed フラグは
+    // 揮発で、フェッチ済みの通のまま変化するため
+    await refreshTail(config, state);
+    return [];
+  }
 
   const fresh: ChatMessage[] = [];
   // 1 応答には上限があるため、追いつくまで繰り返す(進まなければ打ち切り)
@@ -88,6 +93,16 @@ export async function syncChat(
     }
   }
   return isFirst ? [] : fresh;
+}
+
+/** フェッチ済みの末尾(直近 30 通)を取り直して差し替える。 */
+async function refreshTail(config: string, state: ChatState): Promise<void> {
+  if (state.messages.length === 0) return;
+  const from = Math.max(0, state.lastSeq - 30);
+  const page = await api.chatFetch(config, from);
+  if (page.messages.length === 0) return;
+  const bySeq = new Map(page.messages.map((m) => [m.seq, m]));
+  state.messages = state.messages.map((m) => bySeq.get(m.seq) ?? m);
 }
 
 /** 自分の送信直後に、フェッチを待たず履歴へ足す(デーモンの応答をそのまま)。 */

@@ -30,7 +30,7 @@ use peercove_core::msg::{
     MAX_GROUP_NAME_BYTES, MSG_VERSION,
 };
 use peercove_core::proto::{ControlMessage, LedgerEntry, PROTO_VERSION};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::chatlog::ChatLog;
@@ -67,6 +67,50 @@ pub struct PendingChat {
     /// ack が取れた宛先(network/group の部分送達を重複させない)
     delivered: HashSet<Ipv4Addr>,
     next_at: Instant,
+}
+
+/// 送信待ちキューの保存形式(<config>.chatq.json)。アプリ再起動を跨いで
+/// 自動再送を続けるための永続化。next_at は保存せず、読み直したら即時再送。
+#[derive(Serialize, Deserialize)]
+struct PersistedChat {
+    seq: u64,
+    id: String,
+    scope: ChatScope,
+    #[serde(default)]
+    to: Option<Ipv4Addr>,
+    #[serde(default)]
+    group_id: Option<String>,
+    text: String,
+    sent_at: u64,
+    #[serde(default)]
+    delivered: Vec<Ipv4Addr>,
+}
+
+fn chat_queue_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("chatq.json")
+}
+
+/// 保存済みの送信待ちキューを読む(壊れていたら空 = 諦めて捨てる)。
+fn load_chat_queue(config_path: &Path) -> Vec<PendingChat> {
+    let Ok(data) = std::fs::read_to_string(chat_queue_path(config_path)) else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_str::<Vec<PersistedChat>>(&data) else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .map(|p| PendingChat {
+            seq: p.seq,
+            id: p.id,
+            scope: p.scope,
+            to: p.to,
+            group_id: p.group_id,
+            text: p.text,
+            sent_at: p.sent_at,
+            delivered: p.delivered.into_iter().collect(),
+            next_at: Instant::now(),
+        })
+        .collect()
 }
 
 /// セッション 1 本の設定。アドレスを差し替え可能にしてあるのはテストのため
@@ -138,7 +182,7 @@ impl NetSession {
     pub fn start(cfg: SessionConfig) -> NetSession {
         let shared = Arc::new(SessionShared {
             chat: Mutex::new(ChatLog::load(&cfg.config_path)),
-            chat_queue: Mutex::new(Vec::new()),
+            chat_queue: Mutex::new(load_chat_queue(&cfg.config_path)),
             groups: Mutex::new(GroupStore::load(&cfg.config_path)),
             ledger: Mutex::new(None),
             control_connected: AtomicBool::new(false),
@@ -1003,7 +1047,41 @@ impl SessionShared {
             next_at: Instant::now(),
         });
         self.pump_chat_queue();
+        self.save_chat_queue();
         Ok(())
+    }
+
+    /// 送信待ちキューをディスクへ反映する(空になったらファイルを消す)。
+    /// 件数は高々数十なので毎回全量書き直しで足りる。
+    fn save_chat_queue(&self) {
+        let path = chat_queue_path(&self.cfg.config_path);
+        let snapshot: Vec<PersistedChat> = self
+            .chat_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| PersistedChat {
+                seq: p.seq,
+                id: p.id.clone(),
+                scope: p.scope,
+                to: p.to,
+                group_id: p.group_id.clone(),
+                text: p.text.clone(),
+                sent_at: p.sent_at,
+                delivered: p.delivered.iter().copied().collect(),
+            })
+            .collect();
+        if snapshot.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let Ok(json) = serde_json::to_string(&snapshot) else {
+            return;
+        };
+        let tmp = path.with_extension("chatq.json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     /// 送信待ちキューを 1 巡処理する(期限が来たものだけ)。送信キュー
@@ -1041,6 +1119,8 @@ impl SessionShared {
                 pending.next_at = Instant::now() + CHAT_RESEND_INTERVAL;
                 self.chat_queue.lock().unwrap().push(pending);
             }
+            // 送達済みの除去・部分送達(delivered)の変化を保存へ反映
+            self.save_chat_queue();
         }
     }
 
@@ -1123,6 +1203,7 @@ impl SessionShared {
             });
         }
         self.pump_chat_queue();
+        self.save_chat_queue();
         Ok(())
     }
 
@@ -1130,6 +1211,7 @@ impl SessionShared {
     pub fn cancel_chat_send(&self, seq: u64) {
         self.chat_queue.lock().unwrap().retain(|p| p.seq != seq);
         self.chat.lock().unwrap().mark_failed(seq);
+        self.save_chat_queue();
     }
 
     fn chat_targets(
@@ -1929,6 +2011,48 @@ mod tests {
         assert!(b.shared.chat.lock().unwrap().get(seq).unwrap().failed);
 
         a.stop();
+        b.stop();
+    }
+
+    /// 送信待ちキューは再起動を跨いで保持される(E-E 3 残: 永続化)。
+    #[test]
+    fn chat_queue_survives_restart() {
+        let a = test_session("queueper", "127.0.0.1:1".parse().unwrap(), 1);
+        a.shared
+            .send_chat(
+                ChatScope::Direct,
+                Some("10.99.99.98".parse().unwrap()),
+                None,
+                "再起動しても送る".to_string(),
+            )
+            .unwrap();
+        let seq = a.shared.chat.lock().unwrap().latest_seq();
+        assert_eq!(a.shared.sending_seqs(), vec![seq]);
+        let config_path = a.shared.cfg.config_path.clone();
+        assert!(
+            chat_queue_path(&config_path).is_file(),
+            "キューが保存される"
+        );
+        a.stop();
+
+        // 同じ設定で立て直すとキューが復元され、自動再送が続く
+        let b = NetSession::start(SessionConfig {
+            slug: "queueper-2".to_string(),
+            config_path: config_path.clone(),
+            own_ip: "127.0.0.1".parse().unwrap(),
+            display_name: None,
+            device_id: None,
+            network_name: "testnet".to_string(),
+            control_addr: "127.0.0.1:1".parse().unwrap(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            peer_msg_port: 1,
+        });
+        assert_eq!(b.shared.sending_seqs(), vec![seq], "キューが復元される");
+
+        // 取消でキューとファイルが消える
+        b.shared.cancel_chat_send(seq);
+        assert!(b.shared.sending_seqs().is_empty());
+        assert!(!chat_queue_path(&config_path).is_file());
         b.stop();
     }
 

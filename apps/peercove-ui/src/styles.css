@@ -1525,6 +1525,17 @@ select {
   white-space: nowrap;
 }
 
+/* 送信キュー(E-E 3)の「再送」「取消」リンク */
+.msg__action {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 10px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 /* 入力欄 */
 .chat__error {
   padding: 4px 14px 0;

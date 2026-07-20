@@ -493,6 +493,11 @@ export const ja = {
     left: "このメンバーは現在ネットワークにいません（履歴のみ）",
     send: "送信",
     failed: "送信失敗",
+    // 送信キュー(E-E 3)
+    sendingState: "送信中…",
+    retrying: "未送信（自動再送します）",
+    resend: "再送",
+    cancelSend: "取消",
     // グループ(M3-13c)
     groupCreate: "グループ作成",
     groupTitle: "新しいグループ",

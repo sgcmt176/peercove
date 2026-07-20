@@ -9,13 +9,17 @@
 //!
 //! 秘匿ルール: 本文はログへ出さない(seq・id・IP は可)。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write as _;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use peercove_core::ipc::{ChatMessageInfo, MAX_CHAT_BYTES_PER_REPLY, MAX_CHAT_MESSAGES_PER_REPLY};
+use peercove_core::msg::ChatScope;
+use serde::{Deserialize, Serialize};
 
 /// 保持する履歴の上限(通)。超えたら古い方から捨てる(ADR-0015/0016)。
 const MAX_HISTORY: usize = 10_000;
@@ -23,6 +27,104 @@ const MAX_HISTORY: usize = 10_000;
 const REWRITE_THRESHOLD: usize = MAX_HISTORY + 1_000;
 
 pub type SharedChatLog = Arc<Mutex<ChatLog>>;
+
+/// チャットの自動再送間隔(E-E 3。モバイルと同値)。
+pub const CHAT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 送信待ち(再送キュー)のチャット 1 通(E-E 3 のデスクトップ版)。
+/// 送達条件(direct = 宛先本人、network/group = 1 人以上)を満たすまで
+/// [`CHAT_RESEND_INTERVAL`] ごとに再送する。同じ ID を使い続けるので
+/// 受信側の重複弾き(contains_id)と対で冪等。
+pub struct PendingChat {
+    pub seq: u64,
+    pub id: String,
+    pub scope: ChatScope,
+    pub to: Option<Ipv4Addr>,
+    pub group_id: Option<String>,
+    pub text: String,
+    pub sent_at: u64,
+    /// ack が取れた宛先(network/group の部分送達を重複させない)
+    pub delivered: HashSet<Ipv4Addr>,
+    pub next_at: Instant,
+}
+
+pub type SharedChatQueue = Arc<Mutex<Vec<PendingChat>>>;
+
+/// 送信待ちキューの保存形式(`<config>.chatq.json`)。デーモン再起動を
+/// 跨いで自動再送を続けるための永続化。next_at は保存せず即時再送。
+#[derive(Serialize, Deserialize)]
+struct PersistedChat {
+    seq: u64,
+    id: String,
+    scope: ChatScope,
+    #[serde(default)]
+    to: Option<Ipv4Addr>,
+    #[serde(default)]
+    group_id: Option<String>,
+    text: String,
+    sent_at: u64,
+    #[serde(default)]
+    delivered: Vec<Ipv4Addr>,
+}
+
+/// 送信待ちキューの保存先(`game.toml` → `game.chatq.json`)。
+pub fn queue_path_for(config_path: &Path) -> PathBuf {
+    config_path.with_extension("chatq.json")
+}
+
+/// 保存済みの送信待ちキューを読む(壊れていたら空 = 諦めて捨てる)。
+pub fn load_queue(config_path: &Path) -> SharedChatQueue {
+    let queue = std::fs::read_to_string(queue_path_for(config_path))
+        .ok()
+        .and_then(|data| serde_json::from_str::<Vec<PersistedChat>>(&data).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| PendingChat {
+            seq: p.seq,
+            id: p.id,
+            scope: p.scope,
+            to: p.to,
+            group_id: p.group_id,
+            text: p.text,
+            sent_at: p.sent_at,
+            delivered: p.delivered.into_iter().collect(),
+            next_at: Instant::now(),
+        })
+        .collect();
+    Arc::new(Mutex::new(queue))
+}
+
+/// 送信待ちキューをディスクへ反映する(空になったらファイルを消す)。
+/// 件数は高々数十なので毎回全量書き直しで足りる。
+pub fn save_queue(config_path: &Path, queue: &SharedChatQueue) {
+    let path = queue_path_for(config_path);
+    let snapshot: Vec<PersistedChat> = queue
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| PersistedChat {
+            seq: p.seq,
+            id: p.id.clone(),
+            scope: p.scope,
+            to: p.to,
+            group_id: p.group_id.clone(),
+            text: p.text.clone(),
+            sent_at: p.sent_at,
+            delivered: p.delivered.iter().copied().collect(),
+        })
+        .collect();
+    if snapshot.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let Ok(json) = serde_json::to_string(&snapshot) else {
+        return;
+    };
+    let tmp = path.with_extension("chatq.json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
 
 /// 1 ネットワーク分のチャット履歴(メモリ上の直近 [`MAX_HISTORY`] 通 +
 /// 追記ファイル)。
@@ -123,6 +225,18 @@ impl ChatLog {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
             entry.failed = true;
         }
+    }
+
+    /// 送信失敗の印を消す(自動再送で届いたとき)。
+    pub fn clear_failed(&mut self, seq: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
+            entry.failed = false;
+        }
+    }
+
+    /// seq のエントリを返す(手動再送がキューへ積み直すのに使う)。
+    pub fn get(&self, seq: u64) -> Option<ChatMessageInfo> {
+        self.entries.iter().find(|e| e.seq == seq).cloned()
     }
 
     /// メッセージ ID が既に履歴にあるか。モバイルの再送キュー(E-E 3)は

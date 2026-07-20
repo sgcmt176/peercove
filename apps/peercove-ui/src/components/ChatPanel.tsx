@@ -185,11 +185,19 @@ export function ChatPanel({
   const selected = conversations.find((item) => item.key === conversation);
   /** 相手がホストの ACL で遮断されている(M3-10)。送っても届かない。 */
   const selectedBlocked = selected?.member?.blocked ?? false;
+  // テキストは送信キュー(E-E 3)がオフライン宛も面倒を見るので、
+  // 遮断・退出以外は送信可。ファイルは即時転送のみなのでオンライン必須
   const canSend =
     conversation === NETWORK_CONVERSATION ||
     (selected !== undefined &&
       !selected.left &&
-      (selected.group !== null || (selected.online && !selectedBlocked)));
+      (selected.group !== null || !selectedBlocked));
+  const canSendFiles =
+    canSend &&
+    (conversation === NETWORK_CONVERSATION ||
+      selected?.group != null ||
+      selected?.online === true);
+  const sendingSeqs = new Set(tunnel.chatSending ?? []);
 
   // いま見ている会話を申告する(新着通知を鳴らさないため — notify.ts)
   useEffect(() => {
@@ -294,7 +302,7 @@ export function ChatPanel({
 
   /** ファイルを送る(📎 / ドロップ共通)。バブルは次のポーリングで出る。 */
   const sendFiles = async (paths: string[]) => {
-    if (!canSend || paths.length === 0) return;
+    if (!canSendFiles || paths.length === 0) return;
     setError(null);
     try {
       const { peer, chat } = destination();
@@ -471,6 +479,17 @@ export function ChatPanel({
               memberByIp={memberByIp}
               showNames={showNames}
               transfers={tunnel.transfers}
+              sendingSeqs={sendingSeqs}
+              onResend={(seq) =>
+                void api
+                  .chatResend(tunnel.config, seq)
+                  .catch((e) => setError(errorMessage(e)))
+              }
+              onCancelSend={(seq) =>
+                void api
+                  .chatCancelSend(tunnel.config, seq)
+                  .catch((e) => setError(errorMessage(e)))
+              }
               onSaveFile={(name) => void saveFile(name)}
               onEnlarge={(src, name) => setViewer({ kind: "image", src, name })}
               onOpenText={(name, preview) =>
@@ -478,7 +497,7 @@ export function ChatPanel({
               }
             />
           )}
-          {dragOver && canSend && (
+          {dragOver && canSendFiles && (
             <div className="chat__drop" aria-hidden>
               {t.chat.dropHint(selected?.name ?? conversation)}
             </div>
@@ -492,7 +511,7 @@ export function ChatPanel({
             type="button"
             className="button--icon chat__attach"
             title={t.chat.attach}
-            disabled={!canSend}
+            disabled={!canSendFiles}
             onClick={() => void attach()}
           >
             📎
@@ -982,6 +1001,9 @@ function Bubbles({
   transfers,
   onSaveFile,
   onEnlarge,
+  sendingSeqs,
+  onResend,
+  onCancelSend,
   onOpenText,
 }: {
   messages: ChatMessage[];
@@ -989,6 +1011,9 @@ function Bubbles({
   memberByIp: Map<string, Member>;
   showNames: boolean;
   transfers: Transfer[];
+  sendingSeqs: Set<number>;
+  onResend: (seq: number) => void;
+  onCancelSend: (seq: number) => void;
   onSaveFile: (name: string) => void;
   onEnlarge: (src: string, name: string) => void;
   onOpenText: (name: string, preview: TextPreview) => void;
@@ -1055,8 +1080,34 @@ function Bubbles({
                     )}
                     <span className="msg__time muted">
                       {timeOf(message.sentAtMs)}
-                      {message.failed && (
-                        <span className="error-text"> {t.chat.failed}</span>
+                      {/* 送信キュー(E-E 3): 送信中 / 未送信(自動再送)+取消 /
+                          失敗+再送 の 3 状態 */}
+                      {own && sendingSeqs.has(message.seq) && !message.failed && (
+                        <span className="muted"> {t.chat.sendingState}</span>
+                      )}
+                      {own && sendingSeqs.has(message.seq) && message.failed && (
+                        <>
+                          <span className="error-text"> {t.chat.retrying}</span>{" "}
+                          <button
+                            type="button"
+                            className="msg__action"
+                            onClick={() => onCancelSend(message.seq)}
+                          >
+                            {t.chat.cancelSend}
+                          </button>
+                        </>
+                      )}
+                      {own && !sendingSeqs.has(message.seq) && message.failed && (
+                        <>
+                          <span className="error-text"> {t.chat.failed}</span>{" "}
+                          <button
+                            type="button"
+                            className="msg__action"
+                            onClick={() => onResend(message.seq)}
+                          >
+                            {t.chat.resend}
+                          </button>
+                        </>
                       )}
                     </span>
                   </span>

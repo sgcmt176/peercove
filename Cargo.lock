@@ -1222,6 +1222,7 @@ dependencies = [
  "peercove-core",
  "peercove-ipc",
  "peercove-ops",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",

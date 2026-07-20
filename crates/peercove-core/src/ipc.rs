@@ -103,6 +103,12 @@ pub enum IpcRequest {
         #[serde(default)]
         after_seq: u64,
     },
+    /// 送信待ち(または失敗した)チャットを再送する(E-E 3 のデスクトップ版)。
+    /// キューに居ればすぐ再試行、居なければ履歴から積み直す。応答は Done。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    ChatResend { config: PathBuf, seq: u64 },
+    /// 送信待ちチャットの自動再送をやめる(履歴には失敗の印を残す)。応答は Done。
+    ChatCancelSend { config: PathBuf, seq: u64 },
     /// グループを作る(ADR-0016、M3-13c)。`members` に自分は含めなくてよい
     /// (デーモンが必ず足す)。応答は [`IpcResponse::Group`]。
     GroupCreate {
@@ -345,6 +351,10 @@ pub struct TunnelInfo {
     /// UI/CLI はこれが進んだときだけ ChatFetch する。旧デーモンの応答には無い(0)。
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub chat_seq: u64,
+    /// 送信待ち(再送キューに残っている)チャットの seq(E-E 3)。
+    /// UI が「送信中 / 未送信(自動再送)」の表示に使う。旧デーモンには無い(空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat_sending: Vec<u64>,
     /// 既知のグループ(ADR-0016、M3-13c)。自分が抜けた/外されたグループも
     /// 含む(UI が履歴の表示名に使う — 会話リストからは隠す)。
     /// 旧デーモンの応答には無い(空)。

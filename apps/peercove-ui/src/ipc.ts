@@ -208,6 +208,8 @@ export interface Tunnel {
   transfers: Transfer[];
   /** チャット履歴の最新 seq（ADR-0016）。進んだら差分フェッチする。 */
   chatSeq: number;
+  /** 送信待ち（再送キューに残っている）チャットの seq（E-E 3）。 */
+  chatSending: number[];
   /** 既知のグループ（M3-13c）。自分が抜けたグループも含む。 */
   groups: Group[];
   /** 解決済みカスタム DNS レコード（ADR-0022）。member はここから一覧表示する。 */
@@ -487,6 +489,11 @@ export const api = {
   ) => invoke<ChatMessage>("chat_send", { configPath, peer, group, text }),
   chatFetch: (configPath: string, afterSeq: number) =>
     invoke<ChatPage>("chat_fetch", { configPath, afterSeq }),
+  // 送信キュー（E-E 3）。失敗した通の再送と、自動再送の取消
+  chatResend: (configPath: string, seq: number) =>
+    invoke<void>("chat_resend", { configPath, seq }),
+  chatCancelSend: (configPath: string, seq: number) =>
+    invoke<void>("chat_cancel_send", { configPath, seq }),
   // グループ（M3-13c）。members / add は相手の仮想 IP（自分は不要）
   groupCreate: (configPath: string, name: string, members: string[]) =>
     invoke<Group>("group_create", { configPath, name, members }),
