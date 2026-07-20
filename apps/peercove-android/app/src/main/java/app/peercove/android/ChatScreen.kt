@@ -552,7 +552,8 @@ private fun LinkPreviewCard(url: String, content: Color) {
         modifier = Modifier
             .padding(top = 6.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(Color.Black.copy(alpha = 0.08f))
+            // バブルの文字色ベースの薄い膜(ライト/ダークどちらでも馴染む)
+            .background(content.copy(alpha = 0.08f))
             .clickable {
                 try {
                     context.startActivity(

@@ -18,6 +18,13 @@ object Prefs {
         prefs(context).edit().putString("last_slug", slug).apply()
     }
 
+    /** 表示テーマ: "system"(既定)/ "light" / "dark"。 */
+    fun theme(context: Context): String = prefs(context).getString("theme", "system") ?: "system"
+
+    fun setTheme(context: Context, value: String) {
+        prefs(context).edit().putString("theme", value).apply()
+    }
+
     /** VPN を維持すべきか(明示的に切断するまで true)。プロセス再生成や
      *  OS 起動(Always-on)後の null Intent 起動時の復帰判断に使う。 */
     fun vpnShouldRun(context: Context): Boolean =

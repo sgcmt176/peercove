@@ -13,6 +13,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,24 +26,36 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.delay
@@ -71,8 +85,33 @@ class MainActivity : ComponentActivity() {
         initLogging()
         val shareUri = extractShareUri(intent)
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { App(shareUri) }
+            val context = LocalContext.current
+            var theme by remember { mutableStateOf(Prefs.theme(context)) }
+            val dark = when (theme) {
+                "light" -> false
+                "dark" -> true
+                else -> isSystemInDarkTheme()
+            }
+            MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
+                // ステータスバー・ナビバーのシステム文字色を背景に合わせる
+                // (ライト背景に白文字で時計・鍵アイコンが見えない実機報告)
+                val view = LocalView.current
+                SideEffect {
+                    WindowCompat.getInsetsController(window, view).apply {
+                        isAppearanceLightStatusBars = !dark
+                        isAppearanceLightNavigationBars = !dark
+                    }
+                }
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    App(
+                        shareUri = shareUri,
+                        theme = theme,
+                        onThemeChange = {
+                            theme = it
+                            Prefs.setTheme(context, it)
+                        },
+                    )
+                }
             }
         }
     }
@@ -109,7 +148,7 @@ private fun stopVpnService(context: Context) {
 }
 
 @Composable
-private fun App(shareUri: Uri?) {
+private fun App(shareUri: Uri?, theme: String, onThemeChange: (String) -> Unit) {
     var route by remember { mutableStateOf<Route>(Route.Home) }
     var notice by remember { mutableStateOf<String?>(null) }
     var noticeCount by remember { mutableStateOf(0) }
@@ -155,6 +194,8 @@ private fun App(shareUri: Uri?) {
         }
         when (val r = route) {
             is Route.Home -> HomeScreen(
+                theme = theme,
+                onThemeChange = onThemeChange,
                 onNotice = onNotice,
                 onOpen = { slug, name -> route = Route.Net(slug, name) },
             )
@@ -169,9 +210,15 @@ private fun App(shareUri: Uri?) {
 }
 
 @Composable
-private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> Unit) {
+private fun HomeScreen(
+    theme: String,
+    onThemeChange: (String) -> Unit,
+    onNotice: (String) -> Unit,
+    onOpen: (String, String) -> Unit,
+) {
     val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
+    var showThemeDialog by remember { mutableStateOf(false) }
 
     var networks by remember { mutableStateOf(listNetworks(baseDir)) }
     var statuses by remember { mutableStateOf(mapOf<String, TunnelStatus?>()) }
@@ -232,12 +279,34 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
         result.contents?.let { tokenInput = it }
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("PeerCove", style = MaterialTheme.typography.headlineMedium)
-        Text(
-            stringResource(R.string.mobile_core_version, remember { coreVersion() }),
-            style = MaterialTheme.typography.bodySmall,
+    if (showThemeDialog) {
+        ThemeDialog(
+            current = theme,
+            onSelect = {
+                onThemeChange(it)
+                showThemeDialog = false
+            },
+            onDismiss = { showThemeDialog = false },
         )
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("PeerCove", style = MaterialTheme.typography.headlineMedium)
+                Text(
+                    stringResource(R.string.mobile_core_version, remember { coreVersion() }),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            IconButton(onClick = { showThemeDialog = true }) {
+                Icon(
+                    Icons.Filled.Settings,
+                    contentDescription = stringResource(R.string.theme_open),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         Spacer(modifier = Modifier.padding(4.dp))
 
         JoinCard(
@@ -293,6 +362,42 @@ private fun HomeScreen(onNotice: (String) -> Unit, onOpen: (String, String) -> U
             }
         }
     }
+}
+
+/** 表示テーマの選択(システム / ライト / ダーク)。 */
+@Composable
+private fun ThemeDialog(
+    current: String,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val options = listOf(
+        "system" to stringResource(R.string.theme_system),
+        "light" to stringResource(R.string.theme_light),
+        "dark" to stringResource(R.string.theme_dark),
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.theme_title)) },
+        text = {
+            Column {
+                options.forEach { (value, label) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(value) },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = current == value, onClick = { onSelect(value) })
+                        Text(label)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
+        },
+    )
 }
 
 @Composable
