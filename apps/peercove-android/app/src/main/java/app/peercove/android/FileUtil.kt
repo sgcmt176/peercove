@@ -118,4 +118,19 @@ object FileUtil {
     } catch (e: Exception) {
         false
     }
+
+    /** ディレクトリ配下の合計サイズ(バイト)。無ければ 0。 */
+    fun dirSize(dir: File): Long = try {
+        dir.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
+    } catch (e: Exception) {
+        0L
+    }
+
+    /** ディレクトリの中身だけを消す(ディレクトリ自体は残す)。 */
+    fun clearDir(dir: File): Boolean = try {
+        dir.listFiles()?.forEach { it.deleteRecursively() }
+        true
+    } catch (e: Exception) {
+        false
+    }
 }

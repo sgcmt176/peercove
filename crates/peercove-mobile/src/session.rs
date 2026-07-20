@@ -1214,6 +1214,28 @@ impl SessionShared {
         self.save_chat_queue();
     }
 
+    /// チャット履歴を全消去する(E-E 10 のストレージ管理)。送信待ちも破棄。
+    /// seq を保つため、削除のお知らせ行を 1 行だけ残す(再起動でも巻き戻らない)。
+    pub fn clear_chat_history(&self) {
+        self.chat_queue.lock().unwrap().clear();
+        self.save_chat_queue();
+        let mut chat = self.chat.lock().unwrap();
+        chat.clear();
+        chat.append(ChatMessageInfo {
+            seq: 0,
+            id: new_transfer_id(),
+            scope: ChatScope::Network,
+            group_id: None,
+            from: self.cfg.own_ip,
+            to: None,
+            text: "チャット履歴を削除しました".to_string(),
+            sent_at: now_unix_ms(),
+            failed: false,
+            file: None,
+            system: true,
+        });
+    }
+
     fn chat_targets(
         &self,
         scope: ChatScope,

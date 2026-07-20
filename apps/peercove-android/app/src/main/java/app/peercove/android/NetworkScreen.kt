@@ -77,6 +77,7 @@ import uniffi.peercove_mobile.SessionState
 import uniffi.peercove_mobile.TunnelStatus
 import uniffi.peercove_mobile.chatFetch
 import uniffi.peercove_mobile.chatGroups
+import uniffi.peercove_mobile.clearChatHistory
 import uniffi.peercove_mobile.createGroup
 import uniffi.peercove_mobile.dnsEntries
 import uniffi.peercove_mobile.leaveGroup
@@ -120,6 +121,9 @@ fun NetworkScreen(
     var conv by remember { mutableStateOf<ConvKey?>(null) }
     var showGroupDialog by remember { mutableStateOf(false) }
     var showGroupManage by remember { mutableStateOf(false) }
+    var showFiles by remember { mutableStateOf(false) }
+    // チャット履歴の削除(ストレージ管理)後にポーリングを最初からやり直す
+    var chatEpoch by remember { mutableStateOf(0) }
     val clipboard = LocalClipboardManager.current
     val copiedFmt = stringResource(R.string.notice_copied)
 
@@ -189,8 +193,10 @@ fun NetworkScreen(
         }
     }
 
-    // 会話を開いているときのシステム戻る操作はトーク一覧へ(アプリを閉じない)
-    BackHandler(enabled = conv != null) { conv = null }
+    // 会話・ファイル一覧を開いているときのシステム戻る操作は一覧へ(アプリを閉じない)
+    BackHandler(enabled = conv != null || showFiles) {
+        if (conv != null) conv = null else showFiles = false
+    }
 
     fun copy(text: String) {
         clipboard.setText(AnnotatedString(text))
@@ -212,7 +218,8 @@ fun NetworkScreen(
     }
     // チャット履歴の差分ポーリング。新着が無いときは末尾 30 件を取り直して
     // 送信状態(送信中 → 送信済み / 失敗)の変化を反映する(E-E 3)
-    LaunchedEffect(slug) {
+    LaunchedEffect(slug, chatEpoch) {
+        if (chatEpoch > 0) messages = emptyList() // 履歴削除後の取り直し
         var after = 0uL
         while (true) {
             val batch = withContext(Dispatchers.IO) { chatFetch(slug, after, 500u) }
@@ -256,7 +263,13 @@ fun NetworkScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         // ヘッダ
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { if (conv != null) conv = null else onBack() }) {
+            IconButton(onClick = {
+                when {
+                    conv != null -> conv = null
+                    showFiles -> showFiles = false
+                    else -> onBack()
+                }
+            }) {
                 Icon(
                     Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = stringResource(R.string.action_back),
@@ -289,6 +302,10 @@ fun NetworkScreen(
             ConversationScreen(slug, currentConv, messages, memberList, onNotice)
             return@Column
         }
+        if (showFiles) {
+            FilesScreen(messages, onNotice)
+            return@Column
+        }
 
         TabRow(selectedTabIndex = tab) {
             listOf(
@@ -311,11 +328,12 @@ fun NetworkScreen(
                 onTogglePin = ::togglePin,
                 onToggleMute = ::toggleMute,
                 onNewGroup = { showGroupDialog = true },
+                onOpenFiles = { showFiles = true },
                 onOpen = { conv = it },
             )
             1 -> MemberList(memberList, onCopy = ::copy)
             2 -> DnsList(memberList, dnsList, onCopy = ::copy, onNotice = onNotice)
-            else -> SettingsTab(slug, state, tunnel, onNotice)
+            else -> SettingsTab(slug, state, tunnel, onNotice, onChatCleared = { chatEpoch++ })
         }
     }
 }
@@ -337,6 +355,79 @@ private fun statusColor(state: SessionState?): Color = when {
     state.removed || state.rejected != null -> MaterialTheme.colorScheme.error
     state.controlConnected -> MaterialTheme.colorScheme.primary
     else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+/** 送受信ファイルの一覧(E-E 10)。タップで開く/共有/保存の操作シート。 */
+@Composable
+private fun FilesScreen(
+    messages: List<ChatMessage>,
+    onNotice: (String) -> Unit,
+) {
+    var sheetFor by remember { mutableStateOf<ChatMessage?>(null) }
+    sheetFor?.let { message ->
+        if (message.filePath != null) {
+            FileActionSheet(message, onNotice) { sheetFor = null }
+        }
+    }
+    val files = messages.filter { it.fileName != null }.sortedByDescending { it.seq }
+    Text(
+        stringResource(R.string.talk_files),
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        style = MaterialTheme.typography.titleMedium,
+    )
+    if (files.isEmpty()) {
+        Text(
+            stringResource(R.string.files_empty),
+            modifier = Modifier.padding(16.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+    LazyColumn {
+        items(files, key = { it.seq.toLong() }) { message ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = message.filePath != null) { sheetFor = message }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("📎", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        message.fileName ?: "",
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                    )
+                    Text(
+                        formatBytesLong(message.fileSize ?: 0u) +
+                            " ・" +
+                            (
+                                if (message.outgoing) {
+                                    stringResource(R.string.files_sent_by_self)
+                                } else {
+                                    message.fromName
+                                }
+                                ) +
+                            " ・" +
+                            eventTimeFormat.format(java.util.Date(message.sentAt.toLong())),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (message.filePath == null) {
+                    Text(
+                        stringResource(R.string.files_missing),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+        }
+    }
 }
 
 /** 通信品質履歴(E-E 9)。10 秒ごとに読み直す。 */
@@ -664,9 +755,96 @@ private fun TalkList(
     onTogglePin: (ConvKey) -> Unit,
     onToggleMute: (ConvKey) -> Unit,
     onNewGroup: () -> Unit,
+    onOpenFiles: () -> Unit,
     onOpen: (ConvKey) -> Unit,
 ) {
     var menuFor by remember { mutableStateOf<String?>(null) }
+    var query by remember { mutableStateOf("") }
+
+    /** 検索結果からメッセージの属する会話を引く(名前は台帳/グループ由来)。 */
+    fun convOf(message: ChatMessage): ConvKey? = when (message.scope) {
+        "network" -> ConvKey.Network
+        "group" -> groupList.firstOrNull { it.id == message.groupId }
+            ?.let { ConvKey.Group(it.id, it.name) }
+        else -> {
+            val ip = if (message.outgoing) message.toIp else message.fromIp
+            ip?.let { addr ->
+                ConvKey.Direct(addr, memberList.firstOrNull { it.ip == addr }?.name ?: addr)
+            }
+        }
+    }
+
+    // 検索バー + ファイル一覧の入口(E-E 10)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            modifier = Modifier.weight(1f),
+            placeholder = { Text(stringResource(R.string.talk_search_placeholder)) },
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyMedium,
+        )
+        IconButton(onClick = onOpenFiles) {
+            Text("📎", style = MaterialTheme.typography.titleMedium)
+        }
+    }
+    if (query.isNotBlank()) {
+        // 本文・ファイル名の全会話横断検索(新しい順、最大 50 件)
+        val hits = messages.filter { message ->
+            !message.system &&
+                (
+                    message.text.contains(query, ignoreCase = true) ||
+                        message.fileName?.contains(query, ignoreCase = true) == true
+                    )
+        }.sortedByDescending { it.seq }.take(50)
+        if (hits.isEmpty()) {
+            Text(
+                stringResource(R.string.talk_search_empty),
+                modifier = Modifier.padding(16.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            return
+        }
+        LazyColumn {
+            items(hits, key = { it.seq.toLong() }) { message ->
+                val target = convOf(message)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = target != null) { target?.let(onOpen) }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            target?.title() ?: "?",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            eventTimeFormat.format(java.util.Date(message.sentAt.toLong())),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Text(
+                        message.fileName?.let { stringResource(R.string.chat_file_prefix, it) }
+                            ?: message.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 2,
+                    )
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+            }
+        }
+        return
+    }
     // 候補: 全体 → グループ → メンバー(この順は同順位時のフォールバック)
     val base = buildList {
         add(ConvKey.Network)
@@ -1096,6 +1274,7 @@ private fun SettingsTab(
     state: SessionState?,
     tunnel: TunnelStatus?,
     onNotice: (String) -> Unit,
+    onChatCleared: () -> Unit,
 ) {
     val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
@@ -1351,5 +1530,118 @@ private fun SettingsTab(
                 },
             )
         }
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+
+        // ストレージ管理(E-E 10)
+        Text(
+            stringResource(R.string.storage_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        var storageEpoch by remember { mutableStateOf(0) }
+        var inboxSize by remember { mutableStateOf(0L) }
+        var sendCacheSize by remember { mutableStateOf(0L) }
+        var chatSize by remember { mutableStateOf(0L) }
+        var qualitySize by remember { mutableStateOf(0L) }
+        var confirmClear by remember { mutableStateOf<String?>(null) }
+        val netDir = remember(slug) { java.io.File(context.filesDir, "networks/$slug") }
+        val inboxDir = remember(slug) { java.io.File(netDir, "member.inbox") }
+        val sendCacheDir = remember { java.io.File(context.cacheDir, "send") }
+        LaunchedEffect(slug, storageEpoch) {
+            withContext(Dispatchers.IO) {
+                inboxSize = FileUtil.dirSize(inboxDir)
+                sendCacheSize = FileUtil.dirSize(sendCacheDir)
+                chatSize = java.io.File(netDir, "member.chat.jsonl").length()
+                qualitySize =
+                    java.io.File(java.io.File(context.filesDir, "quality"), "$slug.jsonl").length()
+            }
+        }
+        val cleared = stringResource(R.string.storage_cleared)
+        fun clearAsync(action: suspend () -> Unit) {
+            scope.launch {
+                try {
+                    withContext(Dispatchers.IO) { action() }
+                    onNotice(cleared)
+                } catch (e: MobileException) {
+                    onNotice(e.message ?: failed)
+                } finally {
+                    storageEpoch++
+                }
+            }
+        }
+        StorageRow(
+            stringResource(R.string.storage_inbox),
+            inboxSize,
+            stringResource(R.string.storage_empty_action),
+        ) { confirmClear = "inbox" }
+        StorageRow(
+            stringResource(R.string.storage_send_cache),
+            sendCacheSize,
+            stringResource(R.string.storage_empty_action),
+        ) { clearAsync { FileUtil.clearDir(sendCacheDir) } }
+        StorageRow(
+            stringResource(R.string.storage_chat),
+            chatSize,
+            stringResource(R.string.storage_clear),
+        ) { confirmClear = "chat" }
+        StorageRow(
+            stringResource(R.string.storage_quality),
+            qualitySize,
+            stringResource(R.string.storage_clear),
+        ) { clearAsync { QualityLog.clear(context, slug) } }
+
+        confirmClear?.let { kind ->
+            AlertDialog(
+                onDismissRequest = { confirmClear = null },
+                text = {
+                    Text(
+                        stringResource(
+                            if (kind == "inbox") {
+                                R.string.storage_confirm_inbox
+                            } else {
+                                R.string.storage_confirm_chat
+                            },
+                        ),
+                    )
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        confirmClear = null
+                        if (kind == "inbox") {
+                            clearAsync { FileUtil.clearDir(inboxDir) }
+                        } else {
+                            clearAsync {
+                                clearChatHistory(slug)
+                                withContext(Dispatchers.Main) { onChatCleared() }
+                            }
+                        }
+                    }) { Text(stringResource(R.string.storage_clear)) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmClear = null }) {
+                        Text(stringResource(R.string.action_cancel))
+                    }
+                },
+            )
+        }
+    }
+}
+
+/** ストレージ管理の 1 行(名前 + サイズ + アクション)。 */
+@Composable
+private fun StorageRow(label: String, bytes: Long, action: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                formatBytesLong(bytes.coerceAtLeast(0L).toULong()),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        TextButton(onClick = onClick) { Text(action) }
     }
 }

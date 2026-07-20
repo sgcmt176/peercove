@@ -515,10 +515,11 @@ private fun Bubble(
     }
 }
 
-/** ファイルバブルのタップで出す操作シート: 開く / 共有 / 保存 / SHA-256。 */
+/** ファイルバブルのタップで出す操作シート: 開く / 共有 / 保存 / SHA-256。
+ *  ファイル一覧(E-E 10)からも使うため公開。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FileActionSheet(
+fun FileActionSheet(
     message: ChatMessage,
     onNotice: (String) -> Unit,
     onDismiss: () -> Unit,

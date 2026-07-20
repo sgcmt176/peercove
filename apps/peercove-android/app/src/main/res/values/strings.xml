@@ -60,6 +60,12 @@
     <string name="talk_all_avatar">全</string>
     <string name="talk_no_message">メッセージはまだありません</string>
     <string name="talk_new_group">新しいグループを作成</string>
+    <string name="talk_search_placeholder">メッセージを検索</string>
+    <string name="talk_search_empty">見つかりませんでした</string>
+    <string name="talk_files">ファイル一覧</string>
+    <string name="files_empty">送受信したファイルはまだありません</string>
+    <string name="files_missing">実体なし</string>
+    <string name="files_sent_by_self">自分</string>
     <string name="talk_pinned">ピン留めしました</string>
     <string name="talk_unpinned">ピン留めを解除しました</string>
     <string name="talk_muted">この会話の通知をミュートしました</string>
@@ -137,6 +143,18 @@
     <string name="quality_reason_send">送信失敗</string>
     <string name="notif_quality_channel">通信品質</string>
     <string name="notif_quality_degraded">通信品質が低下しています(%1$s)</string>
+
+    <!-- ストレージ管理(E-E 10) -->
+    <string name="storage_title">ストレージ管理</string>
+    <string name="storage_inbox">受信ボックス(受信ファイルの実体)</string>
+    <string name="storage_send_cache">送信キャッシュ</string>
+    <string name="storage_chat">チャット履歴</string>
+    <string name="storage_quality">品質履歴</string>
+    <string name="storage_clear">削除</string>
+    <string name="storage_empty_action">空にする</string>
+    <string name="storage_cleared">削除しました</string>
+    <string name="storage_confirm_inbox">受信ボックスを空にしますか？チャットのファイル/画像は開けなくなります(履歴の行は残ります)。</string>
+    <string name="storage_confirm_chat">チャット履歴をすべて削除しますか？(この端末のみ。相手側の履歴には影響しません)</string>
 
     <!-- 表示テーマ -->
     <string name="theme_title">表示テーマ</string>

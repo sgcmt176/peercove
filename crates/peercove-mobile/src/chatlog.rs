@@ -146,6 +146,15 @@ impl ChatLog {
     pub fn latest_seq(&self) -> u64 {
         self.next_seq - 1
     }
+
+    /// 履歴を全消去する(E-E 10 のストレージ管理)。seq は続きから振る
+    /// (ポーリングのカーソルや既読位置を壊さない)。呼び出し側は直後に
+    /// お知らせ行を 1 行 append して、再起動後も seq が巻き戻らないようにする。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.file_lines = 0;
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(test)]

@@ -799,6 +799,17 @@ pub fn leave_group(slug: String, id: String) -> Result<(), MobileError> {
     Ok(())
 }
 
+/// チャット履歴を全消去する(ストレージ管理)。接続中のみ。
+/// 送信待ちキューも破棄し、削除のお知らせ行を 1 行だけ残す。
+#[uniffi::export]
+pub fn clear_chat_history(slug: String) -> Result<(), MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません(接続中に削除してください)".to_string(),
+    })?;
+    s.clear_chat_history();
+    Ok(())
+}
+
 fn scope_to_str(scope: ChatScope) -> &'static str {
     match scope {
         ChatScope::Direct => "direct",
