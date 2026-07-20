@@ -93,7 +93,13 @@ private fun ConvKey.storageId(): String = when (this) {
  * 状態はすべて Rust 側が正本で、2 秒(チャットは 1.5 秒)のポーリングで映す。
  */
 @Composable
-fun NetworkScreen(slug: String, networkName: String, onBack: () -> Unit, onNotice: (String) -> Unit) {
+fun NetworkScreen(
+    slug: String,
+    networkName: String,
+    initialConvId: String? = null,
+    onBack: () -> Unit,
+    onNotice: (String) -> Unit,
+) {
     val context = LocalContext.current
     var tab by remember { mutableStateOf(0) }
     var state by remember { mutableStateOf<SessionState?>(null) }
@@ -136,6 +142,29 @@ fun NetworkScreen(slug: String, networkName: String, onBack: () -> Unit, onNotic
         pinMarks[id] = next
         Prefs.setPinned(context, slug, id, next)
         onNotice(if (next) pinnedNotice else unpinnedNotice)
+    }
+
+    // チャット通知のタップから来たとき、対象の会話を開く(メンバー・グループの
+    // 情報が届いてから名前を解決する)
+    var initialConsumed by remember { mutableStateOf(initialConvId == null) }
+    LaunchedEffect(memberList, groupList) {
+        if (initialConsumed || initialConvId == null) return@LaunchedEffect
+        val key = when {
+            initialConvId == "network" -> ConvKey.Network
+            initialConvId.startsWith("direct/") -> {
+                val ip = initialConvId.removePrefix("direct/")
+                memberList.firstOrNull { it.ip == ip }?.let { ConvKey.Direct(ip, it.name) }
+            }
+            initialConvId.startsWith("group/") -> {
+                val id = initialConvId.removePrefix("group/")
+                groupList.firstOrNull { it.id == id }?.let { ConvKey.Group(id, it.name) }
+            }
+            else -> null
+        }
+        if (key != null) {
+            conv = key
+            initialConsumed = true
+        }
     }
 
     // 会話を開いているときのシステム戻る操作はトーク一覧へ(アプリを閉じない)

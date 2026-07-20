@@ -16,6 +16,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import uniffi.peercove_mobile.SocketProtector
+import uniffi.peercove_mobile.chatFetch
+import uniffi.peercove_mobile.chatLatestSeq
 import uniffi.peercove_mobile.commitPendingKey
 import uniffi.peercove_mobile.listNetworks
 import uniffi.peercove_mobile.pendingKeyExists
@@ -72,6 +74,7 @@ class PeercoveVpnService : VpnService() {
             NotificationManager.IMPORTANCE_LOW, // 音を鳴らさない常駐通知
         )
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        ChatNotifier.ensureChannel(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -160,6 +163,7 @@ class PeercoveVpnService : VpnService() {
             usingPendingKey = usePendingKey
             watchNetworkChanges(slug)
             startKeyWatchdog(slug)
+            startChatWatcher(slug, watchGeneration)
             handler.removeCallbacks(notifyTick)
             handler.post(notifyTick)
             Log.i(TAG, "トンネル開始: $slug(pendingKey=$usePendingKey)")
@@ -247,6 +251,47 @@ class PeercoveVpnService : VpnService() {
                         break
                     }
                     lastHandshakeAt = now // 通常の未達はエンジンの自己回復に任せる
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * チャットの新着通知(E-E 2)。接続時点より後の受信メッセージを会話ごとに
+     * まとめて通知する(アプリを見ている間は通知しない = 画面のバッジで見える)。
+     * アプリ内で既読になったら通知も自動で消す。
+     */
+    private fun startChatWatcher(slug: String, gen: Int) {
+        Thread {
+            var after = chatLatestSeq(slug) // 接続時点までの履歴は通知しない
+            val active = HashMap<String, MutableList<uniffi.peercove_mobile.ChatMessage>>()
+            while (gen == watchGeneration && currentSlug == slug) {
+                Thread.sleep(3000)
+                if (gen != watchGeneration || currentSlug != slug) break
+                try {
+                    val batch = chatFetch(slug, after, 200u)
+                    if (batch.isNotEmpty()) after = batch.last().seq
+                    for (message in batch) {
+                        if (message.outgoing || message.system) continue
+                        val convId = ChatNotifier.convIdOf(message)
+                        active.getOrPut(convId) { mutableListOf() }.add(message)
+                    }
+                    val iterator = active.entries.iterator()
+                    while (iterator.hasNext()) {
+                        val (convId, list) = iterator.next()
+                        val read = Prefs.readSeq(this, slug, convId)
+                        list.removeAll { it.seq.toLong() <= read }
+                        if (list.isEmpty()) {
+                            ChatNotifier.cancel(this, convId)
+                            iterator.remove()
+                            continue
+                        }
+                        if (!AppState.visible) {
+                            ChatNotifier.show(this, slug, convId, list)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "チャット通知の更新に失敗", e)
                 }
             }
         }.start()

@@ -59,6 +59,9 @@
             </intent-filter>
         </service>
 
+        <!-- チャット通知のアクション(返信・既読)受け口 -->
+        <receiver android:name=".ChatActionReceiver" android:exported="false" />
+
         <!-- クイック設定タイル(通知シェードから 1 タップで接続/切断) -->
         <service
             android:name=".PeercoveTileService"

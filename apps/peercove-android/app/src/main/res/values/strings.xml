@@ -128,6 +128,11 @@
     <string name="notif_connected_rtt">接続中 ・RTT %1$dms ・↑%2$s ↓%3$s</string>
     <string name="notif_action_disconnect">切断</string>
 
+    <!-- チャット通知(E-E 2) -->
+    <string name="notif_chat_channel">チャット</string>
+    <string name="notif_reply">返信</string>
+    <string name="notif_mark_read">既読にする</string>
+
     <!-- チャット(ChatScreen) -->
     <string name="chat_placeholder">メッセージを入力</string>
     <string name="chat_send">送信</string>

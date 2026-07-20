@@ -84,6 +84,13 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         initLogging()
         val shareUri = extractShareUri(intent)
+        // チャット通知のタップ → 該当ネットワークの会話を開く
+        val openSlug = intent?.getStringExtra(ChatNotifier.EXTRA_SLUG)
+        val openConv = intent?.getStringExtra(ChatNotifier.EXTRA_CONV)
+        val openTarget = openSlug?.let { slug ->
+            listNetworks(filesDir.absolutePath).firstOrNull { it.slug == slug }
+                ?.let { Triple(slug, it.name, openConv) }
+        }
         setContent {
             val context = LocalContext.current
             var theme by remember { mutableStateOf(Prefs.theme(context)) }
@@ -105,6 +112,7 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     App(
                         shareUri = shareUri,
+                        openTarget = openTarget,
                         theme = theme,
                         onThemeChange = {
                             theme = it
@@ -114,6 +122,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        AppState.visible = true // 表示中はチャット通知を出さない(バッジで見える)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        AppState.visible = false
     }
 
     /** 共有シート(ACTION_SEND)で渡されたファイルの URI。 */
@@ -148,8 +166,18 @@ private fun stopVpnService(context: Context) {
 }
 
 @Composable
-private fun App(shareUri: Uri?, theme: String, onThemeChange: (String) -> Unit) {
-    var route by remember { mutableStateOf<Route>(Route.Home) }
+private fun App(
+    shareUri: Uri?,
+    openTarget: Triple<String, String, String?>?, // (slug, name, convId) 通知タップから
+    theme: String,
+    onThemeChange: (String) -> Unit,
+) {
+    var route by remember {
+        mutableStateOf<Route>(
+            if (openTarget != null) Route.Net(openTarget.first, openTarget.second) else Route.Home,
+        )
+    }
+    var pendingConv by remember { mutableStateOf(openTarget?.third) }
     var notice by remember { mutableStateOf<String?>(null) }
     var noticeCount by remember { mutableStateOf(0) }
     var pendingShare by remember { mutableStateOf(shareUri) }
@@ -202,7 +230,11 @@ private fun App(shareUri: Uri?, theme: String, onThemeChange: (String) -> Unit) 
             is Route.Net -> NetworkScreen(
                 slug = r.slug,
                 networkName = r.name,
-                onBack = { route = Route.Home },
+                initialConvId = pendingConv,
+                onBack = {
+                    pendingConv = null
+                    route = Route.Home
+                },
                 onNotice = onNotice,
             )
         }
