@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -180,11 +182,27 @@ class PeercoveVpnService : VpnService() {
             val base = filesDir.absolutePath
             var lastHandshakeAt = System.currentTimeMillis()
             var rotateAttempted = false
+            var lastRxBytes = -1L
+            var lastRxChangeAt = System.currentTimeMillis()
+            var lastPokeAt = 0L
             while (gen == watchGeneration && currentSlug == slug) {
                 Thread.sleep(5000)
                 if (gen != watchGeneration || currentSlug != slug) break
                 val status = tunnelStatus(slug) ?: continue
                 val now = System.currentTimeMillis()
+                // 保険の自己回復: 受信が 60 秒止まっていたら(健全なら keepalive で
+                // 30 秒程度ごとに必ず受信がある)、NetworkCallback に頼らず
+                // 30 秒間隔で UDP を張り直す。古い回線に固定されたソケットは
+                // 張り直さない限り復帰できない(実機で観測)
+                val rx = status.rxBytes.toLong()
+                if (rx != lastRxBytes) {
+                    lastRxBytes = rx
+                    lastRxChangeAt = now
+                } else if (now - lastRxChangeAt > 60_000 && now - lastPokeAt > 30_000) {
+                    lastPokeAt = now
+                    Log.i(TAG, "受信が止まっているため UDP を張り直します")
+                    pokeTunnel(slug)
+                }
                 if (status.handshakeAgeSecs != null) {
                     lastHandshakeAt = now
                     if (usingPendingKey) {
@@ -226,19 +244,33 @@ class PeercoveVpnService : VpnService() {
         }.start()
     }
 
-    /** 回線切替(Wi-Fi ↔ モバイル)の検知 → Rust へ UDP の張り直しを依頼。 */
+    /** 回線切替(Wi-Fi ↔ モバイル)の検知 → Rust へ UDP の張り直しを依頼。
+     *
+     *  注意: VPN アプリ自身の「既定ネットワーク」は VPN そのものになるため、
+     *  registerDefaultNetworkCallback では下回りの Wi-Fi ↔ モバイル切替が
+     *  見えない(実機で観測)。INTERNET 能力を持つ実ネットワーク
+     *  (NetworkRequest は既定で VPN を除外する)を監視する。 */
     private fun watchNetworkChanges(slug: String) {
         unwatchNetworkChanges()
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.i(TAG, "既定ネットワークが変わりました → 再バインド")
+                Log.i(TAG, "実ネットワークが利用可能になりました($network)→ 再バインド")
                 // メインスレッドを塞がない(pokeTunnel はソケット操作を含む)
+                Thread { pokeTunnel(slug) }.start()
+            }
+
+            override fun onLost(network: Network) {
+                // 使っていた回線が消えた → 残っている回線で張り直す
+                Log.i(TAG, "実ネットワークが失われました($network)→ 再バインド")
                 Thread { pokeTunnel(slug) }.start()
             }
         }
         try {
-            cm.registerDefaultNetworkCallback(callback)
+            cm.registerNetworkCallback(request, callback)
             networkCallback = callback
         } catch (e: Exception) {
             Log.w(TAG, "ネットワーク監視の登録に失敗", e)
