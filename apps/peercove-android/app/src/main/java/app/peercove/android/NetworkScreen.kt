@@ -25,6 +25,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -33,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -113,12 +116,14 @@ fun NetworkScreen(
     val clipboard = LocalClipboardManager.current
     val copiedFmt = stringResource(R.string.notice_copied)
 
-    // 既読位置(未読バッジ用)とピン留め。Prefs が正本、map は表示のための鏡
+    // 既読位置(未読バッジ用)・ピン留め・ミュート。Prefs が正本、map は表示のための鏡
     val readMarks = remember { mutableStateMapOf<String, Long>() }
     val pinMarks = remember { mutableStateMapOf<String, Boolean>() }
+    val muteMarks = remember { mutableStateMapOf<String, Boolean>() }
     LaunchedEffect(slug) {
         Prefs.allReadSeqs(context, slug).forEach { (convId, seq) -> readMarks[convId] = seq }
         Prefs.allPins(context, slug).forEach { convId -> pinMarks[convId] = true }
+        Prefs.allMutes(context, slug).forEach { convId -> muteMarks[convId] = true }
     }
     // 会話を開いている間はその会話の最新までを既読にする
     LaunchedEffect(conv, messages.size) {
@@ -142,6 +147,16 @@ fun NetworkScreen(
         pinMarks[id] = next
         Prefs.setPinned(context, slug, id, next)
         onNotice(if (next) pinnedNotice else unpinnedNotice)
+    }
+    val mutedNotice = stringResource(R.string.talk_muted)
+    val unmutedNotice = stringResource(R.string.talk_unmuted)
+    fun toggleMute(key: ConvKey) {
+        val id = key.storageId()
+        val next = !(muteMarks[id] ?: false)
+        muteMarks[id] = next
+        Prefs.setMuted(context, slug, id, next)
+        if (next) ChatNotifier.cancel(context, id) // 出ている通知も引っ込める
+        onNotice(if (next) mutedNotice else unmutedNotice)
     }
 
     // チャット通知のタップから来たとき、対象の会話を開く(メンバー・グループの
@@ -262,7 +277,9 @@ fun NetworkScreen(
                 messages = messages,
                 unreadOf = ::unreadOf,
                 pinnedOf = { pinMarks[it.storageId()] ?: false },
+                mutedOf = { muteMarks[it.storageId()] ?: false },
                 onTogglePin = ::togglePin,
+                onToggleMute = ::toggleMute,
                 onNewGroup = { showGroupDialog = true },
                 onOpen = { conv = it },
             )
@@ -384,7 +401,7 @@ private fun GroupCreateDialog(
 }
 
 /** LINE 風のトーク一覧: ピン留め → 直近のやり取り順。未読バッジ付き。
- *  行の長押しでピン留めの付け外し。 */
+ *  行の長押しでピン留め・通知ミュートのメニューを開く。 */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TalkList(
@@ -393,10 +410,13 @@ private fun TalkList(
     messages: List<ChatMessage>,
     unreadOf: (ConvKey) -> Int,
     pinnedOf: (ConvKey) -> Boolean,
+    mutedOf: (ConvKey) -> Boolean,
     onTogglePin: (ConvKey) -> Unit,
+    onToggleMute: (ConvKey) -> Unit,
     onNewGroup: () -> Unit,
     onOpen: (ConvKey) -> Unit,
 ) {
+    var menuFor by remember { mutableStateOf<String?>(null) }
     // 候補: 全体 → グループ → メンバー(この順は同順位時のフォールバック)
     val base = buildList {
         add(ConvKey.Network)
@@ -421,12 +441,44 @@ private fun TalkList(
                 is ConvKey.Direct -> memberList.firstOrNull { it.ip == key.ip }?.online == true
                 else -> true
             }
+            Box {
+                DropdownMenu(
+                    expanded = menuFor == key.storageId(),
+                    onDismissRequest = { menuFor = null },
+                ) {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                stringResource(
+                                    if (pinnedOf(key)) R.string.talk_menu_unpin else R.string.talk_menu_pin,
+                                ),
+                            )
+                        },
+                        onClick = {
+                            menuFor = null
+                            onTogglePin(key)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                stringResource(
+                                    if (mutedOf(key)) R.string.talk_menu_unmute else R.string.talk_menu_mute,
+                                ),
+                            )
+                        },
+                        onClick = {
+                            menuFor = null
+                            onToggleMute(key)
+                        },
+                    )
+                }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .combinedClickable(
                         onClick = { onOpen(key) },
-                        onLongClick = { onTogglePin(key) },
+                        onLongClick = { menuFor = key.storageId() },
                     )
                     .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -458,6 +510,10 @@ private fun TalkList(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (pinnedOf(key)) {
                             Text("📌", style = MaterialTheme.typography.labelSmall)
+                            Spacer(modifier = Modifier.width(4.dp))
+                        }
+                        if (mutedOf(key)) {
+                            Text("🔕", style = MaterialTheme.typography.labelSmall)
                             Spacer(modifier = Modifier.width(4.dp))
                         }
                         Text(key.title(), style = MaterialTheme.typography.titleSmall)
@@ -504,6 +560,7 @@ private fun TalkList(
                         }
                     }
                 }
+            }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
         }
@@ -1003,5 +1060,37 @@ private fun SettingsTab(
                 }
             },
         ) { Text(stringResource(R.string.settings_key_rotate)) }
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+
+        // 通知(全ネットワーク共通の設定)
+        Text(
+            stringResource(R.string.settings_notif_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        var hideContent by remember { mutableStateOf(Prefs.hideNotifContent(context)) }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.settings_notif_hide),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    stringResource(R.string.settings_notif_hide_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = hideContent,
+                onCheckedChange = {
+                    hideContent = it
+                    Prefs.setHideNotifContent(context, it)
+                },
+            )
+        }
     }
 }

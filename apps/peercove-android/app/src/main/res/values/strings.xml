@@ -60,8 +60,14 @@
     <string name="talk_all_avatar">全</string>
     <string name="talk_no_message">メッセージはまだありません</string>
     <string name="talk_new_group">新しいグループを作成</string>
-    <string name="talk_pinned">ピン留めしました(長押しで解除)</string>
+    <string name="talk_pinned">ピン留めしました</string>
     <string name="talk_unpinned">ピン留めを解除しました</string>
+    <string name="talk_muted">この会話の通知をミュートしました</string>
+    <string name="talk_unmuted">ミュートを解除しました</string>
+    <string name="talk_menu_pin">ピン留め</string>
+    <string name="talk_menu_unpin">ピン留めを解除</string>
+    <string name="talk_menu_mute">通知をミュート</string>
+    <string name="talk_menu_unmute">ミュートを解除</string>
     <string name="group_dialog_title">新しいグループ</string>
     <string name="group_name_label">グループ名</string>
     <string name="group_members_label">メンバー(オンラインの相手だけ選べます)</string>
@@ -132,6 +138,10 @@
     <string name="notif_chat_channel">チャット</string>
     <string name="notif_reply">返信</string>
     <string name="notif_mark_read">既読にする</string>
+    <string name="notif_chat_hidden">新着メッセージがあります</string>
+    <string name="settings_notif_title">通知</string>
+    <string name="settings_notif_hide">ロック画面で本文を隠す</string>
+    <string name="settings_notif_hide_hint">ロック中は「新着メッセージがあります」とだけ表示します</string>
 
     <!-- チャット(ChatScreen) -->
     <string name="chat_placeholder">メッセージを入力</string>

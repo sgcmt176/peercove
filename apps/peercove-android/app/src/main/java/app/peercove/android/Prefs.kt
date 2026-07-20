@@ -65,4 +65,29 @@ object Prefs {
             val convId = key.removePrefix("pin/$slug/")
             if (convId != key && value == true) convId else null
         }.toSet()
+
+    /** 会話単位の通知ミュート(バッジは出るが通知は出さない)。 */
+    fun setMuted(context: Context, slug: String, convId: String, muted: Boolean) {
+        val key = "mute/$slug/$convId"
+        prefs(context).edit().apply {
+            if (muted) putBoolean(key, true) else remove(key)
+        }.apply()
+    }
+
+    fun isMuted(context: Context, slug: String, convId: String): Boolean =
+        prefs(context).getBoolean("mute/$slug/$convId", false)
+
+    fun allMutes(context: Context, slug: String): Set<String> =
+        prefs(context).all.mapNotNull { (key, value) ->
+            val convId = key.removePrefix("mute/$slug/")
+            if (convId != key && value == true) convId else null
+        }.toSet()
+
+    /** チャット通知の本文をロック画面で隠す(全体設定)。 */
+    fun hideNotifContent(context: Context): Boolean =
+        prefs(context).getBoolean("notif_hide_content", false)
+
+    fun setHideNotifContent(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean("notif_hide_content", value).apply()
+    }
 }

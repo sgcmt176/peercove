@@ -70,6 +70,7 @@ object ChatNotifier {
 
     /** 会話 1 つぶんの通知を出す(未読メッセージの末尾 6 件)。 */
     fun show(context: Context, slug: String, convId: String, unread: List<ChatMessage>) {
+        if (Prefs.isMuted(context, slug, convId)) return
         val last = unread.last()
         val latestSeq = last.seq.toLong()
         val title = titleOf(context, slug, convId, last)
@@ -125,7 +126,7 @@ object ChatNotifier {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        val notification = Notification.Builder(context, CHANNEL_ID)
+        val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_tile)
             .setStyle(style)
             .setContentIntent(open)
@@ -133,7 +134,20 @@ object ChatNotifier {
             .setOnlyAlertOnce(false)
             .addAction(replyAction)
             .addAction(markReadAction)
-            .build()
+        if (Prefs.hideNotifContent(context)) {
+            // ロック画面では本文の代わりに件数だけの公開版を見せる
+            builder.setVisibility(Notification.VISIBILITY_PRIVATE)
+                .setPublicVersion(
+                    Notification.Builder(context, CHANNEL_ID)
+                        .setSmallIcon(R.drawable.ic_tile)
+                        .setContentTitle(context.getString(R.string.app_name))
+                        .setContentText(context.getString(R.string.notif_chat_hidden))
+                        .setContentIntent(open)
+                        .setAutoCancel(true)
+                        .build(),
+                )
+        }
+        val notification = builder.build()
         context.getSystemService(NotificationManager::class.java)
             .notify(notificationId(convId), notification)
     }
