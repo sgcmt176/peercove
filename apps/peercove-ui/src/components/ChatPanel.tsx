@@ -24,9 +24,12 @@ import {
   conversationOf,
   groupConversation,
   groupIdOf,
+  loadMutes,
   loadPins,
   markRead,
+  movePin,
   setActiveConversation,
+  toggleMute,
   togglePin,
   unreadCounts,
 } from "../chat";
@@ -96,7 +99,19 @@ export function ChatPanel({
   const memberByIp = new Map(tunnel.members.map((m) => [m.ip, m]));
   const groupById = new Map(tunnel.groups.map((g) => [g.id, g]));
 
-  const pins = loadPins(tunnel.config);
+  // ピン留めは順序付きリスト(手動順・新規は末尾)。ミュートは集合。
+  const pinOrder = loadPins(tunnel.config);
+  const pinIndex = new Map(pinOrder.map((key, i) => [key, i]));
+  const mutes = loadMutes(tunnel.config);
+
+  // チャット横断検索(本文・ファイル名)。空なら通常の会話リスト。
+  const [search, setSearch] = useState("");
+  // 会話行の右クリックメニュー(ピン/ミュート/並べ替え)。
+  const [menu, setMenu] = useState<{
+    key: ConversationKey;
+    x: number;
+    y: number;
+  } | null>(null);
 
   // 会話リストの候補: 全体 → 参加中のグループ → メンバー(台帳順)
   // → 履歴にだけ残っている会話(退出済みグループ・居なくなった相手)。
@@ -156,8 +171,9 @@ export function ChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tunnel.members, tunnel.groups, messages, selfIp]);
 
-  // 表示順: ピン留めが常に上、続いて直近のやり取り(最新メッセージ)順。
-  // メッセージが無い会話は元の並び(全体 → グループ → メンバー)のまま後ろへ
+  // 表示順: ピン留めが常に上(手動順のまま。送受信で入れ替えない)、
+  // 続いて直近のやり取り(最新メッセージ)順。メッセージが無い会話は
+  // 元の並び(全体 → グループ → メンバー)のまま後ろへ
   const orderedConversations = useMemo(() => {
     const lastSeq = new Map<ConversationKey, number>();
     for (const message of messages) {
@@ -166,18 +182,47 @@ export function ChatPanel({
     return conversations
       .map((item, index) => ({ item, index }))
       .sort((a, b) => {
-        const pinDiff =
-          Number(pins.has(b.item.key)) - Number(pins.has(a.item.key));
-        if (pinDiff !== 0) return pinDiff;
+        const aPin = pinIndex.get(a.item.key);
+        const bPin = pinIndex.get(b.item.key);
+        // ピン留めは常に上。ピン内は手動の並び順(pinIndex 昇順)で固定
+        if (aPin !== undefined || bPin !== undefined) {
+          if (aPin === undefined) return 1;
+          if (bPin === undefined) return -1;
+          return aPin - bPin;
+        }
         const seqDiff =
           (lastSeq.get(b.item.key) ?? 0) - (lastSeq.get(a.item.key) ?? 0);
         if (seqDiff !== 0) return seqDiff;
         return a.index - b.index;
       })
       .map(({ item }) => item);
-    // pins は localStorage 由来(togglePin 後は rerender で再計算される)
+    // pinIndex/mutes は localStorage 由来(操作後は rerender で再計算)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversations, messages, selfIp, pins]);
+  }, [conversations, messages, selfIp, pinOrder]);
+
+  // 検索ヒット(全会話横断、新しい順、最大 50 件)。会話名は conversations から引く
+  const searchHits = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return [];
+    const nameOf = (key: ConversationKey) =>
+      conversations.find((c) => c.key === key)?.name ?? key;
+    return messages
+      .filter(
+        (m) =>
+          !m.system &&
+          (m.text.toLowerCase().includes(q) ||
+            (m.file?.name.toLowerCase().includes(q) ?? false)),
+      )
+      .slice()
+      .sort((a, b) => b.seq - a.seq)
+      .slice(0, 50)
+      .map((m) => ({
+        message: m,
+        key: conversationOf(m, selfIp),
+        name: nameOf(conversationOf(m, selfIp)),
+      }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, messages, selfIp, conversations]);
 
   const current = messages.filter(
     (message) => conversationOf(message, selfIp) === conversation,
@@ -344,32 +389,90 @@ export function ChatPanel({
   const showNames =
     conversation === NETWORK_CONVERSATION || groupIdOf(conversation) !== null;
 
+  // 右クリックメニューはどこかをクリック/Esc で閉じる
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenu(null);
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
   return (
     <div className="chat">
       <div className="chat__list">
-        <button
-          type="button"
-          className="chat__new-group"
-          onClick={() => setCreating(true)}
-        >
-          ＋ {t.chat.groupCreate}
-        </button>
-        {orderedConversations.map((item) => {
-          const count = unread.get(item.key) ?? 0;
-          const last = lastMessageOf(messages, selfIp, item.key);
-          const pinned = pins.has(item.key);
-          return (
+        <input
+          type="search"
+          className="chat__search"
+          placeholder={t.chat.searchPlaceholder}
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+        />
+        {search.trim() !== "" ? (
+          searchHits.length === 0 ? (
+            <p className="muted small chat__search-empty">
+              {t.chat.searchEmpty}
+            </p>
+          ) : (
+            searchHits.map(({ message, key, name }) => (
+              <button
+                key={message.seq}
+                type="button"
+                className="chat__conv chat__hit"
+                onClick={() => {
+                  setConversation(key);
+                  setSearch("");
+                }}
+              >
+                <span className="chat__conv-text">
+                  <span className="chat__conv-name ellipsis">
+                    <span className="muted small">{name}</span>
+                  </span>
+                  <span className="chat__conv-preview ellipsis">
+                    {message.file
+                      ? t.chat.filePreview(message.file.name)
+                      : message.text}
+                  </span>
+                </span>
+              </button>
+            ))
+          )
+        ) : (
+          <>
             <button
-              key={item.key}
               type="button"
-              className={
-                item.key === conversation
-                  ? "chat__conv chat__conv--active"
-                  : "chat__conv"
-              }
-              onClick={() => setConversation(item.key)}
+              className="chat__new-group"
+              onClick={() => setCreating(true)}
             >
-              {item.member ? (
+              ＋ {t.chat.groupCreate}
+            </button>
+            {orderedConversations.map((item) => {
+              const count = unread.get(item.key) ?? 0;
+              const last = lastMessageOf(messages, selfIp, item.key);
+              const pinned = pinIndex.has(item.key);
+              const muted = mutes.has(item.key);
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  className={
+                    item.key === conversation
+                      ? "chat__conv chat__conv--active"
+                      : "chat__conv"
+                  }
+                  onClick={() => setConversation(item.key)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setMenu({ key: item.key, x: event.clientX, y: event.clientY });
+                  }}
+                >
+                  {item.member ? (
                 <Avatar
                   publicKey={item.member.publicKey}
                   name={item.member.name}
@@ -394,6 +497,11 @@ export function ChatPanel({
                   {pinned && (
                     <span className="chat__pin-mark" aria-hidden>
                       📌
+                    </span>
+                  )}
+                  {muted && (
+                    <span className="chat__pin-mark" aria-hidden>
+                      🔕
                     </span>
                   )}
                   {item.name}
@@ -423,9 +531,11 @@ export function ChatPanel({
               >
                 📌
               </span>
-            </button>
-          );
-        })}
+                </button>
+              );
+            })}
+          </>
+        )}
       </div>
 
       <div className="chat__main">
@@ -630,6 +740,64 @@ export function ChatPanel({
             }
           />
         ))}
+      {menu &&
+        (() => {
+          const key = menu.key;
+          const pinned = pinIndex.has(key);
+          const pos = pinIndex.get(key);
+          const muted = mutes.has(key);
+          const act = (fn: () => void) => {
+            fn();
+            setMenu(null);
+            rerender();
+          };
+          return (
+            <ul
+              className="chat__menu"
+              style={{ left: menu.x, top: menu.y }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <li>
+                <button
+                  type="button"
+                  onClick={() => act(() => togglePin(tunnel.config, key))}
+                >
+                  {pinned ? t.chat.unpin : t.chat.pin}
+                </button>
+              </li>
+              {pinned && (
+                <>
+                  <li>
+                    <button
+                      type="button"
+                      disabled={pos === 0}
+                      onClick={() => act(() => movePin(tunnel.config, key, -1))}
+                    >
+                      {t.chat.moveUp}
+                    </button>
+                  </li>
+                  <li>
+                    <button
+                      type="button"
+                      disabled={pos === pinOrder.length - 1}
+                      onClick={() => act(() => movePin(tunnel.config, key, 1))}
+                    >
+                      {t.chat.moveDown}
+                    </button>
+                  </li>
+                </>
+              )}
+              <li>
+                <button
+                  type="button"
+                  onClick={() => act(() => toggleMute(tunnel.config, key))}
+                >
+                  {muted ? t.chat.unmute : t.chat.mute}
+                </button>
+              </li>
+            </ul>
+          );
+        })()}
     </div>
   );
 }

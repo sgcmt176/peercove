@@ -9,7 +9,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { ChatMessage, Group, Member, Transfer, Tunnel, api } from "./ipc";
-import { conversationOf, isViewing } from "./chat";
+import { conversationOf, isMuted, isViewing } from "./chat";
 import { loadPrefs } from "./prefs";
 import { t } from "./i18n";
 
@@ -132,6 +132,7 @@ export async function notifyChatEvents(
     if (message.system) continue; // グループ操作のお知らせは鳴らさない
     const conversation = conversationOf(message, tunnel.address);
     if (isViewing(tunnel.config, conversation)) continue;
+    if (isMuted(tunnel.config, conversation)) continue; // ミュート会話は鳴らさない
     const from =
       members.find((m) => m.ip === message.from)?.name ?? message.from;
     // グループ宛はネットワーク名の代わりにグループ名を出す(LINE と同じ)

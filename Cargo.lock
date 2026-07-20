@@ -1209,7 +1209,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "peercove-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "boringtun",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "ipnet",
@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-mobile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-ops"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",

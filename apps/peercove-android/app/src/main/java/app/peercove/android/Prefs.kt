@@ -52,19 +52,17 @@ object Prefs {
             if (convId != key && value is Long) convId to value else null
         }.toMap()
 
-    /** トーク一覧のピン留め(常に上へ表示する会話)。 */
-    fun setPinned(context: Context, slug: String, convId: String, pinned: Boolean) {
-        val key = "pin/$slug/$convId"
-        prefs(context).edit().apply {
-            if (pinned) putBoolean(key, true) else remove(key)
-        }.apply()
-    }
+    /** トーク一覧のピン留め(常に上へ表示する会話)。**順序付き**で保存する
+     *  (リストの並び = ピン内の表示順。convId は改行を含まないので改行区切り)。 */
+    fun pinOrder(context: Context, slug: String): List<String> =
+        prefs(context).getString("pinorder/$slug", "")
+            ?.split("\n")
+            ?.filter { it.isNotEmpty() }
+            ?: emptyList()
 
-    fun allPins(context: Context, slug: String): Set<String> =
-        prefs(context).all.mapNotNull { (key, value) ->
-            val convId = key.removePrefix("pin/$slug/")
-            if (convId != key && value == true) convId else null
-        }.toSet()
+    fun setPinOrder(context: Context, slug: String, order: List<String>) {
+        prefs(context).edit().putString("pinorder/$slug", order.joinToString("\n")).apply()
+    }
 
     /** 会話単位の通知ミュート(バッジは出るが通知は出さない)。 */
     fun setMuted(context: Context, slug: String, convId: String, muted: Boolean) {

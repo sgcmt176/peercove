@@ -74,6 +74,8 @@
     <string name="talk_menu_unpin">ピン留めを解除</string>
     <string name="talk_menu_mute">通知をミュート</string>
     <string name="talk_menu_unmute">ミュートを解除</string>
+    <string name="talk_menu_move_up">上に移動</string>
+    <string name="talk_menu_move_down">下に移動</string>
     <string name="group_dialog_title">新しいグループ</string>
     <string name="group_name_label">グループ名</string>
     <string name="group_members_label">メンバー(オンラインの相手だけ選べます)</string>

@@ -1229,6 +1229,62 @@ select {
   border-right: 1px solid var(--border);
 }
 
+/* 会話リスト上部の検索ボックス(E-E 10 のデスクトップ版) */
+.chat__search {
+  width: calc(100% - 16px);
+  margin: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+
+.chat__search-empty {
+  padding: 8px 12px;
+}
+
+/* 検索ヒット行(会話名 + 本文スニペット) */
+.chat__hit .chat__conv-preview {
+  white-space: normal;
+}
+
+/* 会話行の右クリックメニュー(ピン/ミュート/並べ替え) */
+.chat__menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 160px;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.chat__menu button {
+  display: block;
+  width: 100%;
+  padding: 7px 14px;
+  text-align: left;
+  background: none;
+  border: none;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.chat__menu button:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.chat__menu button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .chat__conv {
   display: flex;
   align-items: center;

@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -127,13 +128,15 @@ fun NetworkScreen(
     val clipboard = LocalClipboardManager.current
     val copiedFmt = stringResource(R.string.notice_copied)
 
-    // 既読位置(未読バッジ用)・ピン留め・ミュート。Prefs が正本、map は表示のための鏡
+    // 既読位置(未読バッジ用)・ピン留め・ミュート。Prefs が正本、state は表示の鏡。
+    // ピン留めは順序付きリスト(並び = 表示順。送受信で入れ替えない)。
     val readMarks = remember { mutableStateMapOf<String, Long>() }
-    val pinMarks = remember { mutableStateMapOf<String, Boolean>() }
+    val pinOrder = remember { mutableStateListOf<String>() }
     val muteMarks = remember { mutableStateMapOf<String, Boolean>() }
     LaunchedEffect(slug) {
         Prefs.allReadSeqs(context, slug).forEach { (convId, seq) -> readMarks[convId] = seq }
-        Prefs.allPins(context, slug).forEach { convId -> pinMarks[convId] = true }
+        pinOrder.clear()
+        pinOrder.addAll(Prefs.pinOrder(context, slug))
         Prefs.allMutes(context, slug).forEach { convId -> muteMarks[convId] = true }
     }
     // 会話を開いている間はその会話の最新までを既読にする
@@ -154,10 +157,18 @@ fun NetworkScreen(
     val unpinnedNotice = stringResource(R.string.talk_unpinned)
     fun togglePin(key: ConvKey) {
         val id = key.storageId()
-        val next = !(pinMarks[id] ?: false)
-        pinMarks[id] = next
-        Prefs.setPinned(context, slug, id, next)
+        val next = !pinOrder.contains(id)
+        if (next) pinOrder.add(id) else pinOrder.remove(id) // 付けるときは末尾へ
+        Prefs.setPinOrder(context, slug, pinOrder.toList())
         onNotice(if (next) pinnedNotice else unpinnedNotice)
+    }
+    fun movePin(key: ConvKey, dir: Int) {
+        val id = key.storageId()
+        val at = pinOrder.indexOf(id)
+        val to = at + dir
+        if (at < 0 || to < 0 || to >= pinOrder.size) return
+        pinOrder[at] = pinOrder[to].also { pinOrder[to] = pinOrder[at] }
+        Prefs.setPinOrder(context, slug, pinOrder.toList())
     }
     val mutedNotice = stringResource(R.string.talk_muted)
     val unmutedNotice = stringResource(R.string.talk_unmuted)
@@ -323,9 +334,11 @@ fun NetworkScreen(
                 groupList = groupList,
                 messages = messages,
                 unreadOf = ::unreadOf,
-                pinnedOf = { pinMarks[it.storageId()] ?: false },
+                pinIndexOf = { pinOrder.indexOf(it.storageId()) },
+                pinCount = pinOrder.size,
                 mutedOf = { muteMarks[it.storageId()] ?: false },
                 onTogglePin = ::togglePin,
+                onMovePin = ::movePin,
                 onToggleMute = ::toggleMute,
                 onNewGroup = { showGroupDialog = true },
                 onOpenFiles = { showFiles = true },
@@ -750,9 +763,11 @@ private fun TalkList(
     groupList: List<GroupSummary>,
     messages: List<ChatMessage>,
     unreadOf: (ConvKey) -> Int,
-    pinnedOf: (ConvKey) -> Boolean,
+    pinIndexOf: (ConvKey) -> Int,
+    pinCount: Int,
     mutedOf: (ConvKey) -> Boolean,
     onTogglePin: (ConvKey) -> Unit,
+    onMovePin: (ConvKey, Int) -> Unit,
     onToggleMute: (ConvKey) -> Unit,
     onNewGroup: () -> Unit,
     onOpenFiles: () -> Unit,
@@ -760,6 +775,7 @@ private fun TalkList(
 ) {
     var menuFor by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
+    fun pinnedOf(key: ConvKey): Boolean = pinIndexOf(key) >= 0
 
     /** 検索結果からメッセージの属する会話を引く(名前は台帳/グループ由来)。 */
     fun convOf(message: ChatMessage): ConvKey? = when (message.scope) {
@@ -851,15 +867,17 @@ private fun TalkList(
         groupList.forEach { add(ConvKey.Group(it.id, it.name)) }
         memberList.filter { !it.isSelf }.forEach { add(ConvKey.Direct(it.ip, it.name)) }
     }
-    // 表示順: ピン留めが常に上、続いて最新メッセージの新しい順。
-    // メッセージが無い会話は元の並びのまま後ろへ
+    // 表示順: ピン留めが常に上(手動順のまま。送受信で入れ替えない)、続いて
+    // 最新メッセージの新しい順。メッセージが無い会話は元の並びのまま後ろへ
     val lastSeq = HashMap<String, Long>()
     messages.forEach { m ->
         base.forEach { key -> if (m.belongsTo(key)) lastSeq[key.storageId()] = m.seq.toLong() }
     }
     val conversations = base.withIndex().sortedWith(
-        compareByDescending<IndexedValue<ConvKey>> { pinnedOf(it.value) }
-            .thenByDescending { lastSeq[it.value.storageId()] ?: 0L }
+        // ピン留めは pinIndex 昇順で固定。非ピンは最新順 → 元の並び
+        compareBy<IndexedValue<ConvKey>> { if (pinnedOf(it.value)) 0 else 1 }
+            .thenBy { if (pinnedOf(it.value)) pinIndexOf(it.value) else 0 }
+            .thenByDescending { if (pinnedOf(it.value)) 0L else (lastSeq[it.value.storageId()] ?: 0L) }
             .thenBy { it.index },
     ).map { it.value }
     LazyColumn {
@@ -887,6 +905,26 @@ private fun TalkList(
                             onTogglePin(key)
                         },
                     )
+                    // ピン留め中だけ、ピン内の並べ替え(上へ / 下へ)を出す
+                    if (pinnedOf(key)) {
+                        val pos = pinIndexOf(key)
+                        DropdownMenuItem(
+                            enabled = pos > 0,
+                            text = { Text(stringResource(R.string.talk_menu_move_up)) },
+                            onClick = {
+                                menuFor = null
+                                onMovePin(key, -1)
+                            },
+                        )
+                        DropdownMenuItem(
+                            enabled = pos < pinCount - 1,
+                            text = { Text(stringResource(R.string.talk_menu_move_down)) },
+                            onClick = {
+                                menuFor = null
+                                onMovePin(key, 1)
+                            },
+                        )
+                    }
                     DropdownMenuItem(
                         text = {
                             Text(

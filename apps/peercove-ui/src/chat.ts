@@ -121,34 +121,94 @@ export function clearChat(config: string): void {
 }
 
 // ---- ピン留め(localStorage。このマシンだけの表示設定) ----
+//
+// **順序付き**リストで保存する(配列の並びがそのままピン内の表示順)。
+// 新しくピン留めした会話は末尾(下)に付き、送受信では並びが動かない。
+// 並べ替えは movePin(上へ / 下へ)で行う。
 
 function pinKey(config: string): string {
   return `peercove-chat-pins:${config}`;
 }
 
-/** ピン留め中の会話キーの集合。 */
-export function loadPins(config: string): Set<ConversationKey> {
+/** ピン留め中の会話キー(表示順)。 */
+export function loadPins(config: string): ConversationKey[] {
   try {
     const raw = localStorage.getItem(pinKey(config));
+    const list = raw ? (JSON.parse(raw) as ConversationKey[]) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePins(config: string, pins: ConversationKey[]): void {
+  try {
+    localStorage.setItem(pinKey(config), JSON.stringify(pins));
+  } catch {
+    // 保存できなくても並びが保たれないだけ
+  }
+}
+
+/** ピン留めの付け外し(付けるときは末尾へ)。 */
+export function togglePin(config: string, conversation: ConversationKey): void {
+  const pins = loadPins(config);
+  const at = pins.indexOf(conversation);
+  if (at >= 0) {
+    pins.splice(at, 1);
+  } else {
+    pins.push(conversation);
+  }
+  savePins(config, pins);
+}
+
+/** ピン内で 1 つ上(dir=-1)/下(dir=1)へ動かす。端なら何もしない。 */
+export function movePin(
+  config: string,
+  conversation: ConversationKey,
+  dir: -1 | 1,
+): void {
+  const pins = loadPins(config);
+  const at = pins.indexOf(conversation);
+  const to = at + dir;
+  if (at < 0 || to < 0 || to >= pins.length) return;
+  [pins[at], pins[to]] = [pins[to], pins[at]];
+  savePins(config, pins);
+}
+
+// ---- 会話単位のミュート(localStorage) ----
+
+function muteKey(config: string): string {
+  return `peercove-chat-mutes:${config}`;
+}
+
+/** ミュート中の会話キーの集合(OS 通知を出さない)。 */
+export function loadMutes(config: string): Set<ConversationKey> {
+  try {
+    const raw = localStorage.getItem(muteKey(config));
     return new Set(raw ? (JSON.parse(raw) as ConversationKey[]) : []);
   } catch {
     return new Set();
   }
 }
 
-/** ピン留めの付け外し。 */
-export function togglePin(config: string, conversation: ConversationKey): void {
-  const pins = loadPins(config);
-  if (pins.has(conversation)) {
-    pins.delete(conversation);
+/** ミュートの付け外し。 */
+export function toggleMute(config: string, conversation: ConversationKey): void {
+  const mutes = loadMutes(config);
+  if (mutes.has(conversation)) {
+    mutes.delete(conversation);
   } else {
-    pins.add(conversation);
+    mutes.add(conversation);
   }
   try {
-    localStorage.setItem(pinKey(config), JSON.stringify([...pins]));
+    localStorage.setItem(muteKey(config), JSON.stringify([...mutes]));
   } catch {
-    // 保存できなくても並びが保たれないだけ
+    // 保存できなくてもミュートが効かないだけ
   }
+}
+
+/** この会話はミュートされているか(通知抑止の判定用)。 */
+export function isMuted(config: string, conversation: ConversationKey): boolean {
+  return loadMutes(config).has(conversation);
 }
 
 // ---- 未読管理(localStorage) ----

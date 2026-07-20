@@ -1,5 +1,6 @@
 package app.peercove.android
 
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -46,6 +47,15 @@ object ChatNotifier {
 
     fun notificationId(convId: String): Int = convId.hashCode()
 
+    /** 直近に通知した (最新 seq, ロックで隠したか)。同じ内容の再表示で
+     *  音を鳴らし直さない(チャット監視は 3 秒ごとに show を呼ぶため)。
+     *  ロック状態が変わったら(解錠したら)本文入りへ差し替えて再表示する。
+     *  監視スレッドと通知アクション(別スレッド)から触るので並行対応。 */
+    private val lastShown = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Boolean>>()
+
+    private fun deviceLocked(context: Context): Boolean =
+        context.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+
     /** 会話 ID(NetworkScreen の storageId と同じ形式)。 */
     fun convIdOf(message: ChatMessage): String = when (message.scope) {
         "direct" -> "direct/${message.fromIp}"
@@ -73,8 +83,57 @@ object ChatNotifier {
         if (Prefs.isMuted(context, slug, convId)) return
         val last = unread.last()
         val latestSeq = last.seq.toLong()
-        val title = titleOf(context, slug, convId, last)
 
+        // 「ロック画面で本文を隠す」= 端末がロック中は本文を出さない。
+        // VISIBILITY_PRIVATE はシステムの「ロック画面: すべて表示」設定に
+        // 負けて隠れないため、KeyguardManager で自前に判定して差し替える。
+        val hidden = Prefs.hideNotifContent(context) && deviceLocked(context)
+
+        // 同じ (最新 seq, 隠す/隠さない) の再表示なら鳴らし直さない
+        // (チャット監視は 3 秒ごとに show を呼ぶ)。解錠すれば hidden が
+        // 変わるので、そのタイミングで本文入りへ差し替わる。
+        val key = latestSeq to hidden
+        if (lastShown[convId] == key) return
+        lastShown[convId] = key
+
+        val open = PendingIntent.getActivity(
+            context,
+            notificationId(convId),
+            Intent(context, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .putExtra(EXTRA_SLUG, slug)
+                .putExtra(EXTRA_CONV, convId),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val notification = if (hidden) {
+            // ロック中: 件名も本文も出さず「新着があること」だけ知らせる
+            Notification.Builder(context, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_tile)
+                .setContentTitle(context.getString(R.string.app_name))
+                .setContentText(context.getString(R.string.notif_chat_hidden))
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .setVisibility(Notification.VISIBILITY_PUBLIC) // これ自体は無害
+                .build()
+        } else {
+            buildFull(context, slug, convId, unread, latestSeq, open)
+        }
+        context.getSystemService(NotificationManager::class.java)
+            .notify(notificationId(convId), notification)
+    }
+
+    /** 本文入り(MessagingStyle + 返信・既読アクション)の通知。 */
+    private fun buildFull(
+        context: Context,
+        slug: String,
+        convId: String,
+        unread: List<ChatMessage>,
+        latestSeq: Long,
+        open: PendingIntent,
+    ): Notification {
+        val last = unread.last()
+        val title = titleOf(context, slug, convId, last)
         val style = Notification.MessagingStyle(
             Person.Builder().setName(context.getString(R.string.badge_self)).build(),
         )
@@ -116,17 +175,7 @@ object ChatNotifier {
             actionIntent(ACTION_MARK_READ),
         ).build()
 
-        val open = PendingIntent.getActivity(
-            context,
-            notificationId(convId),
-            Intent(context, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                .putExtra(EXTRA_SLUG, slug)
-                .putExtra(EXTRA_CONV, convId),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        val builder = Notification.Builder(context, CHANNEL_ID)
+        return Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_tile)
             .setStyle(style)
             .setContentIntent(open)
@@ -134,25 +183,11 @@ object ChatNotifier {
             .setOnlyAlertOnce(false)
             .addAction(replyAction)
             .addAction(markReadAction)
-        if (Prefs.hideNotifContent(context)) {
-            // ロック画面では本文の代わりに件数だけの公開版を見せる
-            builder.setVisibility(Notification.VISIBILITY_PRIVATE)
-                .setPublicVersion(
-                    Notification.Builder(context, CHANNEL_ID)
-                        .setSmallIcon(R.drawable.ic_tile)
-                        .setContentTitle(context.getString(R.string.app_name))
-                        .setContentText(context.getString(R.string.notif_chat_hidden))
-                        .setContentIntent(open)
-                        .setAutoCancel(true)
-                        .build(),
-                )
-        }
-        val notification = builder.build()
-        context.getSystemService(NotificationManager::class.java)
-            .notify(notificationId(convId), notification)
+            .build()
     }
 
     fun cancel(context: Context, convId: String) {
+        lastShown.remove(convId)
         context.getSystemService(NotificationManager::class.java)
             .cancel(notificationId(convId))
     }
