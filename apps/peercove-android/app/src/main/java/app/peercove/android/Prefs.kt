@@ -52,6 +52,23 @@ object Prefs {
             if (convId != key && value is Long) convId to value else null
         }.toMap()
 
+    /** 既読位置を現在の履歴の最新 seq まで切り詰める(自己修復)。
+     *  ネットワークの削除→再参加などで履歴の seq が 1 から振り直されると、
+     *  残った既読位置がすべての新着より大きくなり、通知が永久に抑止される
+     *  (2026-07-20 の「通知が全く来ない」障害の原因)。setReadSeq は単調増加
+     *  なので、接続時にここで一度だけ強制的に下げる。 */
+    fun clampReadSeqs(context: Context, slug: String, latestSeq: Long) {
+        val editor = prefs(context).edit()
+        var changed = false
+        for ((key, value) in prefs(context).all) {
+            if (key.startsWith("read/$slug/") && value is Long && value > latestSeq) {
+                editor.putLong(key, latestSeq)
+                changed = true
+            }
+        }
+        if (changed) editor.apply()
+    }
+
     /** トーク一覧のピン留め(常に上へ表示する会話)。**順序付き**で保存する
      *  (リストの並び = ピン内の表示順。convId は改行を含まないので改行区切り)。 */
     fun pinOrder(context: Context, slug: String): List<String> =

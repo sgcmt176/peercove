@@ -45,36 +45,97 @@ pub fn reconcile_identities(
     self_ip: Ipv4Addr,
     ledger: &[LedgerEntry],
     chat: &SharedChatLog,
-) {
+    queue: &SharedChatQueue,
+) -> ReconcileOutcome {
     let path = identity_path(config_path);
     let mut map: HashMap<String, String> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    let mut outcome = ReconcileOutcome::default();
     let mut changed = false;
     for entry in ledger {
         if entry.ip == self_ip || entry.is_host {
             continue;
         }
+        // 同一性はホストが振る member_id(invite_id)で判定する。公開鍵は
+        // 鍵ローテーション(ADR-0020。Android は参加直後に自動実行)でも
+        // 変わるため使えない。旧版ホスト等で ID が無ければ検知しない。
+        let Some(member_id) = entry.member_id.as_ref() else {
+            continue;
+        };
         let ip = entry.ip.to_string();
-        let key = entry.public_key.to_base64();
+        let id = format!("id:{member_id}");
         match map.get(&ip) {
-            Some(prev) if *prev == key => {} // 同一端末
+            Some(prev) if *prev == id => {} // 同一メンバー
+            // 旧形式(公開鍵を記録していた v0.1.1)からの移行: 記録し直す
+            // だけで消さない(鍵ローテーション誤検知を持ち越さない)
+            Some(prev) if !prev.starts_with("id:") => {
+                map.insert(ip, id);
+                changed = true;
+            }
             Some(_) => {
-                // 鍵が変わった = 別の端末に置き換わった。1:1 履歴を消す
+                // ID が変わった = 別のメンバーに置き換わった。1:1 履歴を消す
                 if chat.lock().unwrap().clear_direct(entry.ip) {
                     tracing::info!(
-                        "{} は別の端末に置き換わったため 1:1 履歴を消去しました",
+                        "{} は別のメンバーに置き換わったため 1:1 履歴を消去しました",
                         entry.ip
                     );
                 }
-                map.insert(ip, key);
+                append_system(
+                    chat,
+                    ChatScope::Direct,
+                    Some(entry.ip),
+                    self_ip,
+                    format!(
+                        "{} は新しい端末として参加しました(以前の履歴と送信待ちを破棄しました)",
+                        entry.name.as_deref().unwrap_or(&ip)
+                    ),
+                );
+                outcome.replaced.push(entry.ip);
+                map.insert(ip, id);
                 changed = true;
             }
             None => {
-                map.insert(ip, key);
+                map.insert(ip, id);
                 changed = true;
             }
+        }
+    }
+    // サイドカーに居るのに台帳から消えた IP = ネットワークから削除された。
+    // 記録を落として一度だけお知らせを出す(以後は「未知の IP」扱い)。
+    let departed: Vec<Ipv4Addr> = map
+        .keys()
+        .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+        .filter(|ip| !ledger.iter().any(|e| e.ip == *ip))
+        .collect();
+    for ip in &departed {
+        map.remove(&ip.to_string());
+        changed = true;
+        append_system(
+            chat,
+            ChatScope::Network,
+            None,
+            self_ip,
+            format!("{ip} がネットワークから削除されました"),
+        );
+        tracing::info!("{ip} が台帳から消えたため送信待ちを破棄します");
+    }
+    outcome.departed = departed;
+    // 置き換わった・居なくなった相手宛の送信待ち(1:1)は破棄する
+    // (再追加された別人へ旧メッセージを届けない — 2026-07-20 検証 FB)
+    let stale = outcome.all();
+    if !stale.is_empty() {
+        let pruned = {
+            let mut queue = queue.lock().unwrap();
+            let before = queue.len();
+            queue.retain(|p| {
+                !(p.scope == ChatScope::Direct && p.to.is_some_and(|to| stale.contains(&to)))
+            });
+            queue.len() != before
+        };
+        if pruned {
+            save_queue(config_path, queue);
         }
     }
     if changed {
@@ -85,6 +146,49 @@ pub fn reconcile_identities(
             }
         }
     }
+    outcome
+}
+
+/// [`reconcile_identities`] の結果: 鍵が変わった(= 別人に置き換わった)IP と
+/// 台帳から消えた IP。呼び出し側はグループからの自動除外に使う。
+#[derive(Default)]
+pub struct ReconcileOutcome {
+    pub replaced: Vec<Ipv4Addr>,
+    pub departed: Vec<Ipv4Addr>,
+}
+
+impl ReconcileOutcome {
+    /// グループから外すべき IP(置き換わった + 居なくなった)。
+    pub fn all(&self) -> Vec<Ipv4Addr> {
+        self.replaced
+            .iter()
+            .chain(self.departed.iter())
+            .copied()
+            .collect()
+    }
+}
+
+/// お知らせ行(system)を履歴へ 1 行足す。
+fn append_system(
+    chat: &SharedChatLog,
+    scope: ChatScope,
+    to: Option<Ipv4Addr>,
+    self_ip: Ipv4Addr,
+    text: String,
+) {
+    chat.lock().unwrap().append(ChatMessageInfo {
+        seq: 0, // append が振る
+        id: crate::msg::new_transfer_id(),
+        scope,
+        group_id: None,
+        from: self_ip,
+        to,
+        text,
+        sent_at: crate::msg::now_unix_ms(),
+        failed: false,
+        file: None,
+        system: true,
+    });
 }
 
 /// チャットの自動再送間隔(E-E 3。モバイルと同値)。
@@ -386,15 +490,18 @@ mod tests {
         }
     }
 
-    fn ledger_entry(ip: &str, key: peercove_core::keys::PublicKey) -> LedgerEntry {
+    fn ledger_entry(ip: &str, member_id: &str) -> LedgerEntry {
+        use peercove_core::keys::PrivateKey;
         LedgerEntry {
             name: Some("m".to_string()),
             dns_name: None,
             ip: ip.parse().unwrap(),
-            public_key: key,
+            // 鍵は毎回変わってもよい(同一性判定に使わないことのテストを兼ねる)
+            public_key: PrivateKey::generate().public_key(),
             app_version: None,
             platform: None,
             capabilities: vec![],
+            member_id: Some(member_id.to_string()),
             invite_status: None,
             invite_expires_at: None,
             online: true,
@@ -411,7 +518,6 @@ mod tests {
     /// clear_direct はその IP との 1:1 だけ消し、seq は続きから振る。
     #[test]
     fn clear_direct_removes_only_that_peer() {
-        use peercove_core::keys::PrivateKey;
         let config = temp_config("cleardirect");
         let log = ChatLog::load(&config);
         let mut log = log.lock().unwrap();
@@ -433,23 +539,80 @@ mod tests {
         assert_eq!(log.append(entry("next")).seq, 4);
         drop(log);
 
-        // reconcile: 鍵が変わったら 1:1 を消す。初回は消さない
+        // reconcile: member_id が変わったら(= 再追加)1:1 を消す。初回は
+        // 消さない。鍵の変化(ローテーション)だけでは何もしない
         let log = ChatLog::load(&config);
-        let k1 = PrivateKey::generate().public_key();
-        let k2 = PrivateKey::generate().public_key();
         let self_ip = "10.0.0.1".parse().unwrap();
-        // 初回: 記録するだけ(履歴は残る)
-        reconcile_identities(&config, self_ip, &[ledger_entry("10.0.0.2", k1)], &log);
+        let peer: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let pending = |to: &str| PendingChat {
+            seq: 1,
+            id: format!("p-{to}"),
+            scope: ChatScope::Direct,
+            to: Some(to.parse().unwrap()),
+            group_id: None,
+            text: "たまっていた".to_string(),
+            sent_at: 0,
+            delivered: HashSet::new(),
+            next_at: Instant::now(),
+        };
+        let queue: SharedChatQueue = Arc::new(Mutex::new(vec![pending("10.0.0.2")]));
+        // 初回: 記録するだけ(履歴・キューは残る)
+        let outcome = reconcile_identities(
+            &config,
+            self_ip,
+            &[ledger_entry("10.0.0.2", "inv-1")],
+            &log,
+            &queue,
+        );
+        assert!(outcome.all().is_empty());
         assert!(!log.lock().unwrap().fetch(0).1.is_empty());
-        // 鍵が変わる = 再追加。10.0.0.2 との 1:1 が消える
-        reconcile_identities(&config, self_ip, &[ledger_entry("10.0.0.2", k2)], &log);
+        assert_eq!(queue.lock().unwrap().len(), 1);
+        // 同じ member_id(鍵はローテーションで変わっている)= 何もしない
+        let outcome = reconcile_identities(
+            &config,
+            self_ip,
+            &[ledger_entry("10.0.0.2", "inv-1")],
+            &log,
+            &queue,
+        );
+        assert!(outcome.all().is_empty(), "鍵ローテーションでは消さない");
+        assert_eq!(queue.lock().unwrap().len(), 1);
+        // member_id が変わる = 再追加。10.0.0.2 との 1:1 が消え、送信待ちも破棄
+        let outcome = reconcile_identities(
+            &config,
+            self_ip,
+            &[ledger_entry("10.0.0.2", "inv-2")],
+            &log,
+            &queue,
+        );
+        assert_eq!(outcome.replaced, vec![peer]);
         let (_, after) = log.lock().unwrap().fetch(0);
         assert!(
             after
                 .iter()
-                .all(|m| m.to != Some("10.0.0.2".parse().unwrap())),
+                .filter(|m| !m.system)
+                .all(|m| m.to != Some(peer)),
             "再追加で 1:1 が消える: {after:?}"
         );
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "再追加でその相手宛の送信待ちを破棄する"
+        );
+        // 台帳から消えた = ネットワークから削除。送信待ちを破棄しお知らせが載る
+        queue.lock().unwrap().push(pending("10.0.0.2"));
+        let outcome = reconcile_identities(&config, self_ip, &[], &log, &queue);
+        assert_eq!(outcome.departed, vec![peer]);
+        assert!(queue.lock().unwrap().is_empty(), "削除でも送信待ちを破棄");
+        let (_, after) = log.lock().unwrap().fetch(0);
+        assert!(
+            after
+                .iter()
+                .any(|m| m.system && m.text.contains("ネットワークから削除")),
+            "削除のお知らせが載る: {after:?}"
+        );
+        // もう一度回しても何も起きない(記録は落ちている)
+        let outcome = reconcile_identities(&config, self_ip, &[], &log, &queue);
+        assert!(outcome.all().is_empty(), "検知は一度きり");
         let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 

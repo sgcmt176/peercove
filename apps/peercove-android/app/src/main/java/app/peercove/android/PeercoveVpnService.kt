@@ -284,6 +284,9 @@ class PeercoveVpnService : VpnService() {
     private fun startChatWatcher(slug: String, gen: Int) {
         Thread {
             var after = chatLatestSeq(slug) // 接続時点までの履歴は通知しない
+            // 履歴より先に進んでしまった既読位置を切り詰める(再参加などで
+            // seq が振り直されたときの通知抑止を自己修復する)
+            Prefs.clampReadSeqs(this, slug, after.toLong())
             val active = HashMap<String, MutableList<uniffi.peercove_mobile.ChatMessage>>()
             while (gen == watchGeneration && currentSlug == slug) {
                 Thread.sleep(3000)

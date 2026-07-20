@@ -92,9 +92,9 @@ object ChatNotifier {
         // 同じ (最新 seq, 隠す/隠さない) の再表示なら鳴らし直さない
         // (チャット監視は 3 秒ごとに show を呼ぶ)。解錠すれば hidden が
         // 変わるので、そのタイミングで本文入りへ差し替わる。
+        // 記録は notify() が成功してから(途中で例外が出ても次の周期で再試行)。
         val key = latestSeq to hidden
         if (lastShown[convId] == key) return
-        lastShown[convId] = key
 
         val open = PendingIntent.getActivity(
             context,
@@ -121,6 +121,7 @@ object ChatNotifier {
         }
         context.getSystemService(NotificationManager::class.java)
             .notify(notificationId(convId), notification)
+        lastShown[convId] = key
     }
 
     /** 本文入り(MessagingStyle + 返信・既読アクション)の通知。 */

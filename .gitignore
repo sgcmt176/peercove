@@ -1,5 +1,7 @@
 /target
 /target-smoke
+# サービス稼働中(exe ロック中)の更新ビルド先
+/target-v012
 *.key
 # 実環境の設定(例は examples/ に置く)
 /host.toml

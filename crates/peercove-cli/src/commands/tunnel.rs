@@ -835,6 +835,7 @@ fn build_ledger(
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         platform: Some(std::env::consts::OS.to_string()),
         capabilities: peercove_core::proto::current_capabilities(),
+        member_id: None,
         invite_status: None,
         invite_expires_at: None,
         online: true,
@@ -881,6 +882,8 @@ fn build_ledger(
             app_version: None,
             platform: None,
             capabilities: vec![],
+            // 同一性 ID(再追加検知用)。鍵ローテーションでは変わらない
+            member_id: peer.invite_id.clone(),
             invite_status: Some(invite_status.to_string()),
             invite_expires_at: peer.invite_expires_at,
             online,

@@ -495,7 +495,7 @@ export const ja = {
     searchEmpty: "見つかりませんでした",
     previewSelf: "自分: ",
     placeholder:
-      "メッセージを入力（Enter で送信、Shift+Enter で改行、画像は貼り付け可）",
+      "メッセージを入力（Enter で送信、Shift+Enter で改行、ファイルは貼り付け可）",
     offline: "オフラインのメンバーには送れません",
     blocked: "ホストの通信制御により、このメンバーには送れません",
     left: "このメンバーは現在ネットワークにいません（履歴のみ）",
@@ -514,6 +514,7 @@ export const ja = {
     groupNamePlaceholder: "例: 開発チーム",
     groupMembersLabel: "メンバーを選ぶ",
     groupAddLabel: "メンバーを追加",
+    groupRemoveLabel: "メンバーを外す",
     groupMembersHead: "メンバー",
     groupNoCandidates: "追加できるメンバーがいません。",
     groupCount: (n: number) => `${n} 人`,

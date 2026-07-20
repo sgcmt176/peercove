@@ -148,6 +148,13 @@ pub struct LedgerEntry {
     /// この端末が Hello で広告した追加機能。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// メンバーの同一性 ID(ホスト側 invite_id。2026-07-20 検証 FB)。
+    /// 「削除 → 同名・同 IP で再追加」の検知に使う。公開鍵は鍵ローテーション
+    /// (ADR-0020)でも変わるため同一性判定に使えない。旧版ホスト・
+    /// 招待 v3 以前のメンバー・ホスト自身は None(その場合は検知しない)。
+    /// 互換規則は endpoint と同じ(追加フィールド — 旧版とは互いに無視し合う)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
     /// ホスト正本の招待状態(M3-22)。旧版・ホスト自身は None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_status: Option<String>,
@@ -202,6 +209,7 @@ mod tests {
             app_version: None,
             platform: None,
             capabilities: vec![],
+            member_id: None,
             invite_status: None,
             invite_expires_at: None,
             online: true,

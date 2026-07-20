@@ -79,6 +79,37 @@ impl GroupStore {
         self.groups.get(id)
     }
 
+    /// 既知のグループ全部(id 順)。
+    pub fn list(&self) -> Vec<GroupInfo> {
+        let mut list: Vec<GroupInfo> = self.groups.values().cloned().collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
+    }
+
+    /// ネットワークから居なくなった(削除された・別人に置き換わった)IP を
+    /// グループから外す更新を作る(デスクトップと同じ規則 — 2026-07-20 検証 FB)。
+    /// 対象は自分がメンバーのグループのみ。返した更新は**未適用**。
+    pub fn prune_departed(&self, departed: &[Ipv4Addr], self_ip: Ipv4Addr) -> Vec<GroupInfo> {
+        if departed.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for group in self.groups.values() {
+            if !group.members.contains(&self_ip) {
+                continue;
+            }
+            if !group.members.iter().any(|ip| departed.contains(ip)) {
+                continue;
+            }
+            let mut next = group.clone();
+            next.members.retain(|ip| !departed.contains(ip));
+            next.revision += 1;
+            next.updated_by = self_ip;
+            out.push(next);
+        }
+        out
+    }
+
     /// 自分がメンバーのグループ一覧(トーク一覧用。名前順)。
     pub fn joined(&self, self_ip: Ipv4Addr) -> Vec<GroupInfo> {
         let mut list: Vec<GroupInfo> = self
@@ -125,8 +156,29 @@ pub fn system_messages(
             for added in group.members.iter().filter(|m| !prev.members.contains(m)) {
                 out.push(format!("{} が参加しました", name_of(*added)));
             }
-            for left in prev.members.iter().filter(|m| !group.members.contains(m)) {
-                out.push(format!("{} が退出しました", name_of(*left)));
+            // 「退出」(本人の操作 = updated_by が除かれた側)と「外れた」
+            // (キック・ネットワーク削除の自動整理)で文言を分ける
+            let removed: Vec<Ipv4Addr> = prev
+                .members
+                .iter()
+                .filter(|m| !group.members.contains(m))
+                .copied()
+                .collect();
+            for left in &removed {
+                if *left == self_ip {
+                    out.push(if group.updated_by == self_ip {
+                        "グループから退出しました".to_string()
+                    } else {
+                        "あなたはグループのメンバーから外れました".to_string()
+                    });
+                } else if removed.contains(&group.updated_by) {
+                    out.push(format!("{} が退出しました", name_of(*left)));
+                } else {
+                    out.push(format!(
+                        "{} がグループのメンバーから外れました",
+                        name_of(*left)
+                    ));
+                }
             }
         }
     }
@@ -181,6 +233,44 @@ mod tests {
             "10.0.0.2".parse::<Ipv4Addr>().unwrap()
         );
         assert!(s.apply(group("g1", 3, &["10.0.0.3"])).is_some());
+    }
+
+    /// prune_departed: 自分がメンバーのグループからだけ、居なくなった IP を
+    /// 外す更新(rev+1、未適用)を作る(デスクトップと同じ規則)。
+    #[test]
+    fn prune_departed_builds_updates() {
+        let mut s = store("prune");
+        let me: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let gone: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        s.apply(group("g1", 1, &["10.0.0.2", "10.0.0.5", "10.0.0.3"]));
+        s.apply(group("g2", 1, &["10.0.0.2", "10.0.0.3"])); // 自分が居ない → 対象外
+        let updates = s.prune_departed(&[gone], me);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id, "g1");
+        assert_eq!(updates[0].revision, 2);
+        assert!(!updates[0].members.contains(&gone));
+        assert!(s.prune_departed(&[], me).is_empty());
+    }
+
+    /// キック(他人による除外)と退出で文言が変わる。
+    #[test]
+    fn system_messages_distinguish_kick_from_leave() {
+        let name_of = |ip: Ipv4Addr| format!("m{}", ip.octets()[3]);
+        let self_ip: Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let before = group("g1", 1, &["10.0.0.2", "10.0.0.5", "10.0.0.3"]);
+        // m2(updated_by)が m3 を外した = キック
+        let kicked = group("g1", 2, &["10.0.0.2", "10.0.0.5"]);
+        let msgs = system_messages(Some(&before), &kicked, self_ip, &name_of);
+        assert_eq!(msgs, vec!["m3 がグループのメンバーから外れました"]);
+        // m3 自身が抜けた = 退出(updated_by = m3)
+        let mut left = kicked.clone();
+        left.updated_by = "10.0.0.3".parse().unwrap();
+        let msgs = system_messages(Some(&before), &left, self_ip, &name_of);
+        assert_eq!(msgs, vec!["m3 が退出しました"]);
+        // 自分が外された
+        let kicked_me = group("g1", 2, &["10.0.0.2", "10.0.0.3"]);
+        let msgs = system_messages(Some(&before), &kicked_me, self_ip, &name_of);
+        assert_eq!(msgs, vec!["あなたはグループのメンバーから外れました"]);
     }
 
     #[test]

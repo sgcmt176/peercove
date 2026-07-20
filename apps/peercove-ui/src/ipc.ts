@@ -506,7 +506,8 @@ export const api = {
     id: string,
     name: string | null,
     add: string[],
-  ) => invoke<Group>("group_update", { configPath, id, name, add }),
+    remove: string[] = [],
+  ) => invoke<Group>("group_update", { configPath, id, name, add, remove }),
   groupLeave: (configPath: string, id: string) =>
     invoke<void>("group_leave", { configPath, id }),
   // ファイル送信・受信ボックス（ADR-0015、M3-9b）。chat 付きはチャット内

@@ -1225,46 +1225,196 @@ impl SessionShared {
         self.save_chat_queue();
     }
 
-    /// メンバーの再追加(削除 → 同名・同 IP で再参加 = 別の鍵)を検知して
-    /// その相手との 1:1 履歴を消す(検証 FB 2026-07-20)。同一性は公開鍵で判定し、
-    /// `<config>.chatids.json` に IP → 公開鍵 を保存して台帳受信のたびに突き合わせる。
-    /// 初回(サイドカー無し)は記録するだけ(既存履歴は消さない)。
+    /// メンバーの再追加(削除 → 同名・同 IP で再参加)と削除(台帳から消えた)
+    /// を検知して後片付けをする(検証 FB 2026-07-20):
+    /// - 1:1 履歴の消去(お知らせ行を残す = seq を巻き戻さない)
+    /// - その相手宛の送信待ちの破棄
+    /// - 自分がメンバーのグループから該当 IP を外して配布(自動脱退)
+    ///
+    /// 同一性はホストが振る **member_id(invite_id)** で判定する。公開鍵は
+    /// 鍵ローテーション(ADR-0020/0044 — Android は参加直後に自動実行)でも
+    /// 変わるため使えない。`<config>.chatids.json` に IP → "id:<member_id>" を
+    /// 保存して台帳受信のたびに突き合わせる。初回・旧形式(公開鍵の記録)は
+    /// 記録し直すだけ(既存履歴は消さない)。
     fn reconcile_identities(&self, members: &[LedgerEntry]) {
         let path = self.cfg.config_path.with_extension("chatids.json");
         let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let mut replaced: Vec<Ipv4Addr> = Vec::new();
         let mut changed = false;
         for entry in members {
             if entry.ip == self.cfg.own_ip || entry.is_host {
                 continue;
             }
+            let Some(member_id) = entry.member_id.as_ref() else {
+                continue;
+            };
             let ip = entry.ip.to_string();
-            let key = entry.public_key.to_base64();
+            let id = format!("id:{member_id}");
             match map.get(&ip) {
-                Some(prev) if *prev == key => {}
+                Some(prev) if *prev == id => {} // 同一メンバー
+                // 旧形式(公開鍵)からの移行: 記録し直すだけで消さない
+                Some(prev) if !prev.starts_with("id:") => {
+                    map.insert(ip, id);
+                    changed = true;
+                }
                 Some(_) => {
                     if self.chat.lock().unwrap().clear_direct(entry.ip) {
                         tracing::info!(
-                            "{} は別の端末に置き換わったため 1:1 履歴を消去しました",
+                            "{} は別のメンバーに置き換わったため 1:1 履歴を消去しました",
                             entry.ip
                         );
                     }
-                    map.insert(ip, key);
+                    // お知らせ行(履歴の末尾を残して seq の巻き戻りも防ぐ)
+                    self.append_system_line(
+                        ChatScope::Direct,
+                        Some(entry.ip),
+                        None,
+                        format!(
+                            "{} は新しい端末として参加しました(以前の履歴と送信待ちを破棄しました)",
+                            entry.name.as_deref().unwrap_or(&ip)
+                        ),
+                    );
+                    replaced.push(entry.ip);
+                    map.insert(ip, id);
                     changed = true;
                 }
                 None => {
-                    map.insert(ip, key);
+                    map.insert(ip, id);
                     changed = true;
                 }
             }
         }
+        // サイドカーに居るのに台帳から消えた IP = ネットワークから削除された
+        let departed: Vec<Ipv4Addr> = map
+            .keys()
+            .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+            .filter(|ip| !members.iter().any(|e| e.ip == *ip))
+            .collect();
+        for ip in &departed {
+            map.remove(&ip.to_string());
+            changed = true;
+            self.append_system_line(
+                ChatScope::Network,
+                None,
+                None,
+                format!("{ip} がネットワークから削除されました"),
+            );
+        }
+        // 置き換わった・居なくなった相手宛の送信待ち(1:1)は破棄する
+        let stale: Vec<Ipv4Addr> = replaced.iter().chain(departed.iter()).copied().collect();
+        if !stale.is_empty() {
+            let pruned = {
+                let mut queue = self.chat_queue.lock().unwrap();
+                let before = queue.len();
+                queue.retain(|p| {
+                    !(p.scope == ChatScope::Direct && p.to.is_some_and(|to| stale.contains(&to)))
+                });
+                queue.len() != before
+            };
+            if pruned {
+                self.save_chat_queue();
+            }
+        }
+        self.prune_groups(&stale, members);
         if changed {
             if let Ok(json) = serde_json::to_string(&map) {
                 let tmp = path.with_extension("chatids.json.tmp");
                 if std::fs::write(&tmp, json).is_ok() {
                     let _ = std::fs::rename(&tmp, &path);
+                }
+            }
+        }
+    }
+
+    /// お知らせ行(system)を履歴へ 1 行足す。
+    fn append_system_line(
+        &self,
+        scope: ChatScope,
+        to: Option<Ipv4Addr>,
+        group_id: Option<String>,
+        text: String,
+    ) {
+        self.chat.lock().unwrap().append(ChatMessageInfo {
+            seq: 0,
+            id: new_transfer_id(),
+            scope,
+            group_id,
+            from: self.cfg.own_ip,
+            to,
+            text,
+            sent_at: now_unix_ms(),
+            failed: false,
+            file: None,
+            system: true,
+        });
+    }
+
+    /// ネットワークに居ない IP(置き換わった・台帳から消えた・過去の削除の
+    /// 取りこぼし)を、自分がメンバーのグループから外して残りへ配る
+    /// (デスクトップの reconcile と同じ規則。配布は best-effort — 各メンバーが
+    /// 独立に同じ更新を作るため、届かなくても収束する)。
+    fn prune_groups(&self, replaced: &[Ipv4Addr], members: &[LedgerEntry]) {
+        // 台帳が不完全(自分すら居ない)なら見送る
+        if !members.iter().any(|e| e.ip == self.cfg.own_ip) {
+            return;
+        }
+        let mut stale: Vec<Ipv4Addr> = replaced.to_vec();
+        for group in self.groups.lock().unwrap().list() {
+            if !group.members.contains(&self.cfg.own_ip) {
+                continue;
+            }
+            for ip in group.members {
+                if ip != self.cfg.own_ip
+                    && !members.iter().any(|e| e.ip == ip)
+                    && !stale.contains(&ip)
+                {
+                    stale.push(ip);
+                }
+            }
+        }
+        let updates = self
+            .groups
+            .lock()
+            .unwrap()
+            .prune_departed(&stale, self.cfg.own_ip);
+        for group in updates {
+            let name_of = |ip: Ipv4Addr| -> String {
+                if ip == self.cfg.own_ip {
+                    return "自分".to_string();
+                }
+                members
+                    .iter()
+                    .find(|e| e.ip == ip)
+                    .and_then(|e| e.name.clone())
+                    .unwrap_or_else(|| ip.to_string())
+            };
+            let applied = self.groups.lock().unwrap().apply(group.clone());
+            if let Some(update) = applied {
+                for text in groups::system_messages(
+                    update.previous.as_ref(),
+                    &group,
+                    self.cfg.own_ip,
+                    &name_of,
+                ) {
+                    self.append_system_line(ChatScope::Group, None, Some(group.id.clone()), text);
+                }
+            }
+            tracing::info!(
+                "ネットワークに居ないメンバーをグループから外しました(id={} rev={})",
+                group.id,
+                group.revision
+            );
+            for target in group.members.iter().filter(|ip| {
+                **ip != self.cfg.own_ip
+                    && members
+                        .iter()
+                        .any(|e| e.ip == **ip && e.online && !e.blocked)
+            }) {
+                if let Err(e) = self.deliver_group(*target, &group) {
+                    tracing::debug!("{target} へのグループ配布に失敗しました: {e:#}");
                 }
             }
         }
@@ -1438,14 +1588,15 @@ impl SessionShared {
         Ok(group)
     }
 
-    /// グループの改名・メンバー追加(デスクトップの GroupUpdate のモバイル版)。
-    /// create_group と同じ理由で、オンラインのメンバー 1 人以上に届いたとき
-    /// だけ成立する。
+    /// グループの改名・メンバー追加・メンバー除外(デスクトップの GroupUpdate
+    /// のモバイル版。remove = キックは 2026-07-20 検証 FB)。create_group と
+    /// 同じ理由で、オンラインのメンバー 1 人以上に届いたときだけ成立する。
     pub fn update_group(
         &self,
         id: &str,
         name: Option<String>,
         add: Vec<Ipv4Addr>,
+        remove: Vec<Ipv4Addr>,
     ) -> anyhow::Result<GroupInfo> {
         let previous = self
             .groups
@@ -1481,12 +1632,19 @@ impl SessionShared {
                 group.members.push(ip);
             }
         }
+        for ip in &remove {
+            if *ip == self.cfg.own_ip {
+                bail!("自分は外せません(「退出」を使ってください)");
+            }
+        }
+        group.members.retain(|ip| !remove.contains(ip));
         if group.members.len() > MAX_GROUP_MEMBERS {
             bail!("グループのメンバーが多すぎます(上限 {MAX_GROUP_MEMBERS} 人)");
         }
         group.revision += 1;
         group.updated_by = self.cfg.own_ip;
-        self.commit_group_change(&previous, group)
+        // 外した本人にも配る(本人の画面からグループを引っ込める)
+        self.commit_group_change(&previous, group, &remove)
     }
 
     /// 自分がグループから抜ける。ローカルには自分抜きの全量が残る
@@ -1506,16 +1664,18 @@ impl SessionShared {
         group.members.retain(|ip| *ip != self.cfg.own_ip);
         group.revision += 1;
         group.updated_by = self.cfg.own_ip;
-        self.commit_group_change(&previous, group)?;
+        self.commit_group_change(&previous, group, &[])?;
         Ok(())
     }
 
-    /// 変更後の全量を残りのオンラインメンバーへ配って取り込む(1 人以上に
-    /// 届いたときだけ成立 = create_group と同じ収束前提)。お知らせ行も足す。
+    /// 変更後の全量を残りのオンラインメンバー(+ `extra` = キックで外した
+    /// 本人)へ配って取り込む(1 人以上に届いたときだけ成立 = create_group と
+    /// 同じ収束前提)。お知らせ行も足す。
     fn commit_group_change(
         &self,
         previous: &GroupInfo,
         group: GroupInfo,
+        extra: &[Ipv4Addr],
     ) -> anyhow::Result<GroupInfo> {
         let (online, names): (Vec<Ipv4Addr>, Vec<(Ipv4Addr, String)>) = {
             let ledger = self.ledger.lock().unwrap();
@@ -1538,6 +1698,7 @@ impl SessionShared {
         for target in group
             .members
             .iter()
+            .chain(extra.iter())
             .filter(|ip| **ip != self.cfg.own_ip && online.contains(ip))
         {
             match self.deliver_group(*target, &group) {
@@ -1601,6 +1762,21 @@ impl SessionShared {
     /// ファイルを 1 人へ送る(チャット文脈付き = 会話にファイルバブルが出る)。
     /// 進捗は transfers に載る。完了時に自分のチャット履歴にも記録する。
     pub fn send_file(&self, target: Ipv4Addr, src: &Path) -> anyhow::Result<String> {
+        self.send_file_scoped(ChatScope::Direct, Some(target), None, src)
+    }
+
+    /// スコープ付きファイル送信(2026-07-20 検証 FB — スマホからも全体/
+    /// グループ宛を可能にする)。network / group はオンラインの対象メンバーへの
+    /// 個別転送で、履歴には 1 エントリだけ載る。1 人以上へ届けば成功
+    /// (デスクトップの send_file と同じ規則)。ブロッキング(全転送の完了まで
+    /// 待つ)なので Kotlin 側は IO ディスパッチャで呼ぶ。
+    pub fn send_file_scoped(
+        &self,
+        scope: ChatScope,
+        to: Option<Ipv4Addr>,
+        group_id: Option<String>,
+        src: &Path,
+    ) -> anyhow::Result<String> {
         let meta =
             std::fs::metadata(src).with_context(|| format!("{} を読めません", src.display()))?;
         if !meta.is_file() {
@@ -1611,11 +1787,121 @@ impl SessionShared {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .context("ファイル名がありません")?;
-        let id = new_transfer_id();
+
+        // 宛先の決定(チャットと同じ規則。オフライン宛は V1 非対応)
+        let targets: Vec<Ipv4Addr> = match scope {
+            ChatScope::Direct => vec![to.context("宛先がありません")?],
+            ChatScope::Network => {
+                let ledger = self.ledger.lock().unwrap();
+                let snapshot = ledger.as_ref().context("台帳が未受信です(接続直後?)")?;
+                snapshot
+                    .members
+                    .iter()
+                    .filter(|m| m.ip != self.cfg.own_ip && m.online && !m.blocked)
+                    .map(|m| m.ip)
+                    .collect()
+            }
+            ChatScope::Group => {
+                let gid = group_id
+                    .as_deref()
+                    .context("宛先グループ(group_id)がありません")?;
+                let members = {
+                    let groups = self.groups.lock().unwrap();
+                    let group = groups.get(gid).context(
+                        "このグループはありません(退出したか、まだ情報が届いていません)",
+                    )?;
+                    if !group.members.contains(&self.cfg.own_ip) {
+                        bail!("このグループのメンバーではありません");
+                    }
+                    group.members.clone()
+                };
+                let ledger = self.ledger.lock().unwrap();
+                let snapshot = ledger.as_ref().context("台帳が未受信です(接続直後?)")?;
+                snapshot
+                    .members
+                    .iter()
+                    .filter(|m| {
+                        m.ip != self.cfg.own_ip && m.online && !m.blocked && members.contains(&m.ip)
+                    })
+                    .map(|m| m.ip)
+                    .collect()
+            }
+        };
+        if targets.is_empty() {
+            bail!("オンラインの宛先がいません(あとでやり直してください)");
+        }
+        let ids: Vec<String> = targets.iter().map(|_| new_transfer_id()).collect();
+
+        // 履歴には 1 エントリ(先に載せ、全滅したら失敗の印を付ける)
+        let entry = self.chat.lock().unwrap().append(ChatMessageInfo {
+            seq: 0,
+            id: new_transfer_id(),
+            scope,
+            group_id: group_id.clone(),
+            from: self.cfg.own_ip,
+            to: match scope {
+                ChatScope::Direct => to,
+                _ => None,
+            },
+            text: String::new(),
+            sent_at: now_unix_ms(),
+            failed: false,
+            file: Some(ChatFileInfo {
+                name: name.clone(),
+                size,
+                transfers: ids.clone(),
+                path: Some(src.to_path_buf()),
+            }),
+            system: false,
+        });
+
+        let ctx = ChatContext { scope, group_id };
+        let mut results: Vec<anyhow::Result<()>> = Vec::new();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = targets
+                .iter()
+                .zip(ids.iter())
+                .map(|(target, id)| {
+                    let target = *target;
+                    let id = id.clone();
+                    let ctx = ctx.clone();
+                    let name = name.clone();
+                    s.spawn(move || self.send_file_one(target, src, &id, &ctx, &name, size))
+                })
+                .collect();
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("送信スレッドが異常終了しました"))),
+                );
+            }
+        });
+        if !results.iter().any(|r| r.is_ok()) {
+            self.chat.lock().unwrap().mark_failed(entry.seq);
+            // 1 宛先(direct)なら拒否理由をそのまま返す(UI に上限などが出る)
+            match results.into_iter().find_map(|r| r.err()) {
+                Some(e) => return Err(e),
+                None => bail!("どの宛先にも届きませんでした"),
+            }
+        }
+        Ok(ids.first().cloned().unwrap_or_default())
+    }
+
+    /// 1 宛先へのファイル転送(進捗は transfers に反映)。
+    fn send_file_one(
+        &self,
+        target: Ipv4Addr,
+        src: &Path,
+        id: &str,
+        ctx: &ChatContext,
+        name: &str,
+        size: u64,
+    ) -> anyhow::Result<()> {
         self.upsert_transfer(TransferInfo {
-            id: id.clone(),
+            id: id.to_string(),
             peer: target,
-            name: name.clone(),
+            name: name.to_string(),
             size,
             done: 0,
             outgoing: true,
@@ -1627,14 +1913,11 @@ impl SessionShared {
             send_json(
                 &mut writer,
                 &MsgFrame::FileOffer {
-                    id: id.clone(),
-                    name: name.clone(),
+                    id: id.to_string(),
+                    name: name.to_string(),
                     size,
-                    chat: Some(ChatContext {
-                        scope: ChatScope::Direct,
-                        group_id: None,
-                    }),
-                    // モバイル送信側も再開未対応(resume を立てないので相手は
+                    chat: Some(ctx.clone()),
+                    // モバイル送信側は再開未対応(resume を立てないので相手は
                     // 常に offset 0 を返す)
                     resume: false,
                 },
@@ -1662,7 +1945,7 @@ impl SessionShared {
                 writer.write_all(&buf[..n]).context("送信に失敗しました")?;
                 hasher.update(&buf[..n]);
                 sent += n as u64;
-                self.transfer_progress(&id, sent);
+                self.transfer_progress(id, sent);
             }
             if sent != size {
                 bail!("送信中にファイルサイズが変わりました({sent} / {size})");
@@ -1670,7 +1953,7 @@ impl SessionShared {
             send_json(
                 &mut writer,
                 &MsgFrame::FileHash {
-                    id: id.clone(),
+                    id: id.to_string(),
                     sha256: format!("{:x}", hasher.finalize()),
                 },
             )?;
@@ -1682,32 +1965,16 @@ impl SessionShared {
 
         match &result {
             Ok(()) => {
-                self.transfer_state(&id, "done");
-                self.chat.lock().unwrap().append(ChatMessageInfo {
-                    seq: 0,
-                    id: id.clone(),
-                    scope: ChatScope::Direct,
-                    group_id: None,
-                    from: self.cfg.own_ip,
-                    to: Some(target),
-                    text: String::new(),
-                    sent_at: now_unix_ms(),
-                    failed: false,
-                    file: Some(ChatFileInfo {
-                        name,
-                        size,
-                        transfers: vec![id.clone()],
-                        path: Some(src.to_path_buf()),
-                    }),
-                    system: false,
-                });
+                self.transfer_state(id, "done");
                 tracing::info!("{target} へファイルを送信しました({size} バイト、id={id})");
             }
             Err(e) => {
-                self.transfer_state(&id, &format!("failed: {e}"));
+                // ファイル名はログに出さない(秘匿ルール)
+                tracing::warn!("{target} へのファイル送信に失敗しました: {e:#}");
+                self.transfer_state(id, &format!("failed: {e}"));
             }
         }
-        result.map(|_| id)
+        result
     }
 }
 
@@ -1808,6 +2075,7 @@ mod tests {
             app_version: None,
             platform: None,
             capabilities: vec![],
+            member_id: None,
             invite_status: None,
             invite_expires_at: None,
             online,
@@ -2204,7 +2472,7 @@ mod tests {
         // 改名: 配布は同期(deliver → apply)なので、成功時点で相手にも届いている
         let renamed = b
             .shared
-            .update_group(&group.id, Some("新名".to_string()), vec![])
+            .update_group(&group.id, Some("新名".to_string()), vec![], vec![])
             .unwrap();
         assert_eq!(renamed.revision, 2);
         assert_eq!(
@@ -2223,7 +2491,7 @@ mod tests {
         // 台帳外メンバーの追加は拒否
         assert!(b
             .shared
-            .update_group(&group.id, None, vec!["10.9.9.9".parse().unwrap()])
+            .update_group(&group.id, None, vec!["10.9.9.9".parse().unwrap()], vec![])
             .is_err());
 
         // 退出: 相手側では自分抜きの全量になり、自分の一覧からは消える
@@ -2249,7 +2517,7 @@ mod tests {
         // 非メンバーになった後の更新は拒否される
         assert!(b
             .shared
-            .update_group(&group.id, Some("x".to_string()), vec![])
+            .update_group(&group.id, Some("x".to_string()), vec![], vec![])
             .is_err());
 
         a.stop();

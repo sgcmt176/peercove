@@ -302,7 +302,9 @@ fn save_pasted_file(name: String, data_base64: String) -> Result<String, String>
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join("peercove-paste").join(ms.to_string());
+    let dir = std::env::temp_dir()
+        .join("peercove-paste")
+        .join(ms.to_string());
     std::fs::create_dir_all(&dir).map_err(|e| format!("一時フォルダを作れません: {e}"))?;
     let path = dir.join(safe);
     std::fs::write(&path, &bytes).map_err(|e| format!("一時ファイルの書き出しに失敗: {e}"))?;
@@ -444,21 +446,24 @@ async fn group_create(
     }
 }
 
-/// グループの改名・メンバー追加(どちらも省略可)。
+/// グループの改名・メンバー追加・メンバー除外(すべて省略可)。
 #[tauri::command]
 async fn group_update(
     config_path: String,
     id: String,
     name: Option<String>,
     add: Vec<String>,
+    remove: Vec<String>,
 ) -> Result<dto::Group, String> {
     let config = canonical(&config_path)?;
     let add = parse_ips(add)?;
+    let remove = parse_ips(remove)?;
     match peercove_ipc::request_async(IpcRequest::GroupUpdate {
         config,
         id,
         name,
         add,
+        remove,
     })
     .await
     {

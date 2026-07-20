@@ -384,24 +384,22 @@ export function ChatPanel({
     }
   };
 
-  /** クリップボードの画像を貼り付けて送る(スクリーンショット等)。
+  /** クリップボードのファイルを貼り付けて送る(スクリーンショット等の画像に
+   *  加え、エクスプローラーで Ctrl+C したファイルも対象 — 2026-07-20 検証 FB)。
    *  一時ファイル化してから、ドロップと同じ送信確認モーダルへ渡す。 */
   const handlePaste = async (event: React.ClipboardEvent) => {
     if (!canSendFiles) return;
-    const items = Array.from(event.clipboardData?.items ?? []);
-    const images = items.filter(
-      (it) => it.kind === "file" && it.type.startsWith("image/"),
-    );
-    if (images.length === 0) return; // 画像でなければ通常のテキスト貼り付け
+    const files = Array.from(event.clipboardData?.files ?? []);
+    if (files.length === 0) return; // ファイルでなければ通常のテキスト貼り付け
     event.preventDefault();
     const paths: string[] = [];
-    for (const item of images) {
-      const file = item.getAsFile();
-      if (!file) continue;
+    for (const file of files) {
       try {
         const b64 = bytesToBase64(await file.arrayBuffer());
+        // コピー元がファイルなら元の名前を保つ。スクリーンショット等の
+        // 無名画像には拡張子付きの名前を振る
         const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
-        const name = `貼り付け-${Date.now()}.${ext}`;
+        const name = file.name || `貼り付け-${Date.now()}.${ext}`;
         paths.push(await api.savePastedFile(name, b64));
       } catch (e) {
         setError(errorMessage(e));
@@ -860,6 +858,7 @@ function GroupDialog({
 }) {
   const [name, setName] = useState(group?.name ?? "");
   const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [removeChecked, setRemoveChecked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmLeave, setConfirmLeave] = useState(false);
@@ -869,19 +868,30 @@ function GroupDialog({
     (member) =>
       !member.isSelf && (group === null || !group.members.includes(member.ip)),
   );
+  // 外せるのは自分以外の現メンバー(キック — 2026-07-20 検証 FB)
+  const removables =
+    group === null
+      ? []
+      : tunnel.members.filter(
+          (member) => !member.isSelf && group.members.includes(member.ip),
+        );
   const memberByIp = new Map(tunnel.members.map((m) => [m.ip, m]));
 
-  const toggle = (ip: string) => {
-    setChecked((prev) => {
-      const next = new Set(prev);
-      if (next.has(ip)) {
-        next.delete(ip);
-      } else {
-        next.add(ip);
-      }
-      return next;
-    });
-  };
+  const toggleIn =
+    (setter: React.Dispatch<React.SetStateAction<Set<string>>>) =>
+    (ip: string) => {
+      setter((prev) => {
+        const next = new Set(prev);
+        if (next.has(ip)) {
+          next.delete(ip);
+        } else {
+          next.add(ip);
+        }
+        return next;
+      });
+    };
+  const toggle = toggleIn(setChecked);
+  const toggleRemove = toggleIn(setRemoveChecked);
 
   const submit = async () => {
     setBusy(true);
@@ -895,6 +905,7 @@ function GroupDialog({
               group.id,
               name.trim() !== group.name ? name.trim() : null,
               [...checked],
+              [...removeChecked],
             );
       onDone(result);
     } catch (e) {
@@ -978,6 +989,35 @@ function GroupDialog({
             ))}
           </ul>
         )}
+        {removables.length > 0 && (
+          <>
+            <span className="field__label">{t.chat.groupRemoveLabel}</span>
+            <ul className="chat__pick">
+              {removables.map((member) => (
+                <li key={member.ip}>
+                  <label className="chat__pick-row">
+                    <input
+                      type="checkbox"
+                      checked={removeChecked.has(member.ip)}
+                      onChange={() => toggleRemove(member.ip)}
+                    />
+                    <Avatar
+                      publicKey={member.publicKey}
+                      name={member.name}
+                      online={member.online}
+                      onlineLabel={
+                        member.online
+                          ? t.tunnel.member.online
+                          : t.tunnel.member.offline
+                      }
+                    />
+                    <span className="ellipsis">{member.name ?? member.ip}</span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
         <p className="muted small">{t.chat.groupNote}</p>
         {error && <p className="error-text small">{error}</p>}
       </div>
@@ -1002,7 +1042,10 @@ function GroupDialog({
             busy ||
             name.trim() === "" ||
             (group === null && checked.size === 0) ||
-            (group !== null && checked.size === 0 && name.trim() === group.name)
+            (group !== null &&
+              checked.size === 0 &&
+              removeChecked.size === 0 &&
+              name.trim() === group.name)
           }
         >
           {group === null ? t.chat.create : t.chat.save}

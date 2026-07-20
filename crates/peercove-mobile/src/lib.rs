@@ -766,7 +766,7 @@ pub fn create_group(
     })
 }
 
-/// グループの改名・メンバー追加(スマホから)。どちらも省略可。
+/// グループの改名・メンバー追加・メンバー除外(スマホから)。すべて省略可。
 /// オンラインのメンバー 1 人以上へ届いたときだけ成立する(create_group と同じ)。
 /// ブロッキング(ネットワーク I/O)なので Kotlin 側は IO ディスパッチャで呼ぶ。
 #[uniffi::export]
@@ -775,17 +775,23 @@ pub fn update_group(
     id: String,
     name: Option<String>,
     add_member_ips: Vec<String>,
+    remove_member_ips: Vec<String>,
 ) -> Result<GroupSummary, MobileError> {
     let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
         msg: "接続していません".to_string(),
     })?;
-    let mut add = Vec::new();
-    for ip in add_member_ips {
-        add.push(ip.parse::<Ipv4Addr>().map_err(|_| MobileError::Failure {
-            msg: format!("メンバー IP が不正です: {ip}"),
-        })?);
-    }
-    let group = s.update_group(&id, name, add)?;
+    let parse_ips = |list: Vec<String>| -> Result<Vec<Ipv4Addr>, MobileError> {
+        list.into_iter()
+            .map(|ip| {
+                ip.parse::<Ipv4Addr>().map_err(|_| MobileError::Failure {
+                    msg: format!("メンバー IP が不正です: {ip}"),
+                })
+            })
+            .collect()
+    };
+    let add = parse_ips(add_member_ips)?;
+    let remove = parse_ips(remove_member_ips)?;
+    let group = s.update_group(&id, name, add, remove)?;
     Ok(GroupSummary {
         id: group.id,
         name: group.name,
@@ -941,6 +947,31 @@ pub fn send_file_to(slug: String, to_ip: String, src_path: String) -> Result<Str
         msg: "宛先 IP が不正です".to_string(),
     })?;
     s.send_file(target, Path::new(&src_path))
+        .map_err(Into::into)
+}
+
+/// スコープ付きファイル送信(scope: "direct" / "network" / "group")。
+/// 全体・グループ宛はオンラインの対象メンバーへの個別転送(履歴は 1 エントリ)。
+/// ブロッキング(全転送の完了まで待つ)なので Kotlin 側は IO ディスパッチャで呼ぶ。
+#[uniffi::export]
+pub fn send_file_scoped(
+    slug: String,
+    scope: String,
+    to_ip: Option<String>,
+    group_id: Option<String>,
+    src_path: String,
+) -> Result<String, MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    let scope = scope_from_str(&scope)?;
+    let to: Option<Ipv4Addr> = match to_ip {
+        Some(ip) => Some(ip.parse().map_err(|_| MobileError::Failure {
+            msg: "宛先 IP が不正です".to_string(),
+        })?),
+        None => None,
+    };
+    s.send_file_scoped(scope, to, group_id, Path::new(&src_path))
         .map_err(Into::into)
 }
 

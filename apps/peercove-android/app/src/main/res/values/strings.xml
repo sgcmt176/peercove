@@ -84,6 +84,7 @@
     <string name="group_manage">グループを管理</string>
     <string name="group_manage_title">グループの管理</string>
     <string name="group_add_label">メンバーを追加</string>
+    <string name="group_remove_label">メンバーを外す</string>
     <string name="group_updated">グループを更新しました</string>
     <string name="group_leave_action">このグループから退出する…</string>
     <string name="group_leave">退出</string>

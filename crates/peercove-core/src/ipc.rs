@@ -116,8 +116,9 @@ pub enum IpcRequest {
         name: String,
         members: Vec<Ipv4Addr>,
     },
-    /// グループの改名・メンバー追加(どちらも省略可。V1 に「他人の除外」はない
-    /// — 抜けるのは本人の GroupLeave だけ)。
+    /// グループの改名・メンバー追加・メンバー除外(すべて省略可)。
+    /// `remove`(キック)は 2026-07-20 検証フィードバックで追加
+    /// (旧デーモンへ送ると未知フィールドとして無視される点に注意)。
     GroupUpdate {
         config: PathBuf,
         id: String,
@@ -125,6 +126,8 @@ pub enum IpcRequest {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         add: Vec<Ipv4Addr>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remove: Vec<Ipv4Addr>,
     },
     /// 自分がグループから抜ける(履歴とグループ情報はローカルに残る)。
     GroupLeave { config: PathBuf, id: String },
@@ -837,12 +840,13 @@ mod tests {
                 id: "g1".to_string(),
                 name: None,
                 add: vec![],
+                remove: vec![],
             },
         })
         .unwrap();
         assert_eq!(
             json, r#"{"id":17,"req":{"method":"group_update","config":"host.toml","id":"g1"}}"#,
-            "name / add は省略可"
+            "name / add / remove は省略可(省略時は remove 追加前とワイヤ表現が同一)"
         );
         let json = serde_json::to_string(&IpcEnvelope {
             id: 18,

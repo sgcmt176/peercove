@@ -140,8 +140,11 @@ fun NetworkScreen(
         pinOrder.addAll(Prefs.pinOrder(context, slug))
         Prefs.allMutes(context, slug).forEach { convId -> muteMarks[convId] = true }
     }
-    // 会話を開いている間はその会話の最新までを既読にする
+    // 会話を開いている間はその会話の最新までを既読にする。
+    // アプリが背面のとき(会話を開いたまま画面を閉じた等)は既読にしない
+    // (背面で既読が進むと VPN サービスの新着通知が抑止されてしまう)
     LaunchedEffect(conv, messages.size) {
+        if (!AppState.visible) return@LaunchedEffect
         val current = conv ?: return@LaunchedEffect
         val latest = messages.filter { it.belongsTo(current) }
             .maxOfOrNull { it.seq.toLong() } ?: return@LaunchedEffect
@@ -530,7 +533,7 @@ private fun RttSparkline(samples: List<QualityLog.Entry>) {
     }
 }
 
-/** グループの管理ダイアログ(改名・メンバー追加・退出)。
+/** グループの管理ダイアログ(改名・メンバー追加・メンバーを外す・退出)。
  *  変更はオンラインのメンバー 1 人以上に届いたときだけ成立する(Rust 側の制約)。 */
 @Composable
 private fun GroupManageDialog(
@@ -545,6 +548,7 @@ private fun GroupManageDialog(
     val scope = rememberCoroutineScope()
     var name by remember(group.id) { mutableStateOf(group.name) }
     val checked = remember { mutableStateMapOf<String, Boolean>() }
+    val removeChecked = remember { mutableStateMapOf<String, Boolean>() }
     var busy by remember { mutableStateOf(false) }
     var confirmLeave by remember { mutableStateOf(false) }
     val failed = stringResource(R.string.failed_generic)
@@ -553,6 +557,8 @@ private fun GroupManageDialog(
     val candidates = memberList.filter {
         !it.isSelf && !it.blocked && !group.memberIps.contains(it.ip)
     }
+    // 外せるのは自分以外の現メンバー(キック — 2026-07-20 検証 FB)
+    val removables = memberList.filter { !it.isSelf && group.memberIps.contains(it.ip) }
 
     if (confirmLeave) {
         AlertDialog(
@@ -601,14 +607,14 @@ private fun GroupManageDialog(
                     label = { Text(stringResource(R.string.group_name_label)) },
                     singleLine = true,
                 )
-                if (candidates.isNotEmpty()) {
-                    Spacer(modifier = Modifier.padding(4.dp))
-                    Text(
-                        stringResource(R.string.group_add_label),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    if (candidates.isNotEmpty()) {
+                        Spacer(modifier = Modifier.padding(4.dp))
+                        Text(
+                            stringResource(R.string.group_add_label),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                         candidates.forEach { member ->
                             Row(
                                 modifier = Modifier
@@ -626,6 +632,31 @@ private fun GroupManageDialog(
                             }
                         }
                     }
+                    if (removables.isNotEmpty()) {
+                        Spacer(modifier = Modifier.padding(4.dp))
+                        Text(
+                            stringResource(R.string.group_remove_label),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        removables.forEach { member ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        removeChecked[member.ip] =
+                                            !(removeChecked[member.ip] ?: false)
+                                    },
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(
+                                    checked = removeChecked[member.ip] ?: false,
+                                    onCheckedChange = { removeChecked[member.ip] = it },
+                                )
+                                Text(member.name)
+                            }
+                        }
+                    }
                 }
                 Spacer(modifier = Modifier.padding(4.dp))
                 TextButton(onClick = { confirmLeave = true }) {
@@ -638,9 +669,11 @@ private fun GroupManageDialog(
         },
         confirmButton = {
             val selected = checked.filterValues { it }.keys.toList()
+            val removed = removeChecked.filterValues { it }.keys.toList()
             val renamed = name.trim() != group.name
             Button(
-                enabled = !busy && name.isNotBlank() && (renamed || selected.isNotEmpty()),
+                enabled = !busy && name.isNotBlank() &&
+                    (renamed || selected.isNotEmpty() || removed.isNotEmpty()),
                 onClick = {
                     busy = true
                     scope.launch {
@@ -651,6 +684,7 @@ private fun GroupManageDialog(
                                     group.id,
                                     if (renamed) name.trim() else null,
                                     selected,
+                                    removed,
                                 )
                             }
                             onNotice(updatedMsg)

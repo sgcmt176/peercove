@@ -376,6 +376,7 @@ mod tests {
             app_version: None,
             platform: None,
             capabilities: vec![],
+            member_id: None,
             invite_status: None,
             invite_expires_at: None,
             online: true,

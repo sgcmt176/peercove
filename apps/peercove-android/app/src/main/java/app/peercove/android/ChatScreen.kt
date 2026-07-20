@@ -76,7 +76,7 @@ import uniffi.peercove_mobile.MobileException
 import uniffi.peercove_mobile.cancelChatSend
 import uniffi.peercove_mobile.resendChat
 import uniffi.peercove_mobile.sendChatMessage
-import uniffi.peercove_mobile.sendFileTo
+import uniffi.peercove_mobile.sendFileScoped
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -168,11 +168,10 @@ fun ConversationScreen(
         }
     }
 
-    // 添付(1:1 のみ。ファイルは相手 1 人へ送る)
+    // 添付(全体・グループ宛も可 — 2026-07-20 検証 FB。宛先は会話に合わせる)
     val pickFile = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent(),
     ) { uri: Uri? ->
-        val target = conv as? ConvKey.Direct ?: return@rememberLauncherForActivityResult
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
             onNotice(fileSending)
@@ -180,7 +179,14 @@ fun ConversationScreen(
                 val cached = FileUtil.copyToCache(context, uri)
                     ?: return@withContext fileReadFailed
                 try {
-                    sendFileTo(slug, target.ip, cached.absolutePath)
+                    when (conv) {
+                        is ConvKey.Direct ->
+                            sendFileScoped(slug, "direct", conv.ip, null, cached.absolutePath)
+                        is ConvKey.Network ->
+                            sendFileScoped(slug, "network", null, null, cached.absolutePath)
+                        is ConvKey.Group ->
+                            sendFileScoped(slug, "group", null, conv.id, cached.absolutePath)
+                    }
                     null // 成功時は残す(自分の画像サムネイルが参照する)
                 } catch (e: MobileException) {
                     cached.delete()
@@ -216,13 +222,11 @@ fun ConversationScreen(
             modifier = Modifier.fillMaxWidth().padding(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (conv is ConvKey.Direct) {
-                IconButton(onClick = { pickFile.launch("*/*") }) {
-                    Icon(
-                        Icons.Filled.Add,
-                        contentDescription = stringResource(R.string.chat_attach),
-                    )
-                }
+            IconButton(onClick = { pickFile.launch("*/*") }) {
+                Icon(
+                    Icons.Filled.Add,
+                    contentDescription = stringResource(R.string.chat_attach),
+                )
             }
             OutlinedTextField(
                 value = input,

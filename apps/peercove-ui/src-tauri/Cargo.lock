@@ -2796,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-ipc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -2821,7 +2821,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-ops"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "peercove-ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
