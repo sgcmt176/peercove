@@ -33,6 +33,11 @@ use crate::commands::tunnel::{self, ActiveTunnel, Role, SharedSnapshot, StartLim
 type BringUp =
     Box<dyn Fn(&Path, Role, bool, &StartLimits) -> anyhow::Result<ActiveTunnel> + Send + Sync>;
 
+/// トンネル破棄(TUN/WG のクリーンアップ)の待ち上限。OS 側で稀に固まることが
+/// あるため、停止操作(UI の切断・サービス停止)を道連れにしない。上限を超えたら
+/// 諦めて次へ進む(残った OS 資源は次回起動時に掃除される)。
+const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// デーモンの共有状態。複数ネットワークを同時に張れる(ADR-0012)。
 /// キーは設定ファイルの絶対パス。
 pub struct DaemonShared {
@@ -1055,7 +1060,11 @@ impl DaemonShared {
             },
         );
         drop(active);
-        self.sync_os_dns().await;
+        // NRPT 同期の完了は待たない: Windows の PowerShell(CIM)が稀に
+        // 返ってこなくなり、接続の IPC 応答ごと道連れになった実機報告への対策。
+        // dnscfg 側にも打ち切り(10 秒)がある = 二重の保険
+        let shared = Arc::clone(self);
+        tokio::spawn(async move { shared.sync_os_dns().await });
         Ok(())
     }
 
@@ -1138,13 +1147,21 @@ impl DaemonShared {
         active.dns_task.abort();
         active.health.lock().unwrap().stop();
         let _ = active.stop_tx.send(true);
-        let stopped = active
-            .task
-            .await
-            .context("トンネルタスクの終了待ちに失敗しました")
-            .and_then(|r| r.context("トンネルの停止処理でエラーが発生しました"));
-        // DNS 側の後片付け(NRPT の同期)は停止の成否に関わらず行う
-        self.sync_os_dns().await;
+        // 破棄待ちに上限を設ける(stop_all と同じ理由: OS 側の TUN/WG 破棄が
+        // 固まっても、UI の切断操作を永久に待たせない)
+        let stopped = match tokio::time::timeout(TEARDOWN_TIMEOUT, active.task).await {
+            Ok(result) => result
+                .context("トンネルタスクの終了待ちに失敗しました")
+                .and_then(|r| r.context("トンネルの停止処理でエラーが発生しました")),
+            Err(_) => Err(anyhow::anyhow!(
+                "トンネルの停止が {} 秒で完了しませんでした(OS 側の残骸は次回起動時に掃除します)",
+                TEARDOWN_TIMEOUT.as_secs()
+            )),
+        };
+        // DNS 側の後片付け(NRPT の同期)は停止の成否に関わらず行う。
+        // 完了は待たない(start と同じ理由)
+        let shared = Arc::clone(self);
+        tokio::spawn(async move { shared.sync_os_dns().await });
         stopped?;
         tracing::info!("トンネルを停止しました(network={network})");
         Ok(())
@@ -1152,10 +1169,6 @@ impl DaemonShared {
 
     /// 全トンネルを停止する(shutdown・常駐終了時)。エラーはログに落として続行。
     async fn stop_all(self: &Arc<Self>) {
-        // トンネル破棄(TUN/WG のクリーンアップ)は OS 側で稀に固まることがある。
-        // その場合でもサービスが必ず停止できるよう、破棄待ちに上限を設ける。
-        // 上限を超えたら諦めて次へ進む(残った OS 資源は次回起動時に掃除される)。
-        const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
         let all: Vec<Active> = self.active.lock().await.drain().map(|(_, a)| a).collect();
         for active in all {
             let network = active.network.clone();
@@ -1531,6 +1544,12 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         .map(|entry| (entry.public_key.as_bytes(), entry.ip))
         .collect();
     let now = SystemTime::now();
+    // チャットのロックは 1 回で取り切る(下のフィールド初期化で 2 回 lock()
+    // すると、一時ガードの生存期間が式全体に及ぶため自己デッドロックする)
+    let chat_seq_and_generation = {
+        let chat = active.chat.lock().unwrap();
+        (chat.latest_seq(), chat.generation())
+    };
     TunnelInfo {
         config: active.config.clone(),
         network: active.network.clone(),
@@ -1566,8 +1585,11 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         direct,
         // 進捗はレジストリから直接読む(スナップショットの 5 秒周期より新しい)
         transfers: active.transfers.lock().unwrap().clone(),
-        chat_seq: active.chat.lock().unwrap().latest_seq(),
-        chat_generation: active.chat.lock().unwrap().generation(),
+        // 注意: 構造体リテラル内の一時ガードは式全体の終わりまで生きる。
+        // 同じ Mutex を 2 つのフィールドで別々に lock() すると自己デッドロック
+        // する(2026-07-20 の停止不能の原因)ため、必ず 1 回で取り切る
+        chat_seq: chat_seq_and_generation.0,
+        chat_generation: chat_seq_and_generation.1,
         chat_sending: active
             .chat_queue
             .lock()
@@ -1806,9 +1828,16 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
         zone_refresher.abort();
         result
     })?;
-    // 常駐終了時にトンネルが残っていれば必ず片付ける(NRPT の掃除も stop_all 内)
+    // 常駐終了時にトンネルが残っていれば必ず片付ける(NRPT の掃除も stop_all 内)。
+    // 停止処理全体にも上限を設ける: 個別の待ちは各所で打ち切るが、未知のハングが
+    // あってもサービスを必ず停止させる(SCM の待ち上限 30 秒より十分短く)
     runtime.block_on(async {
-        shared.stop_all().await;
+        if tokio::time::timeout(std::time::Duration::from_secs(20), shared.stop_all())
+            .await
+            .is_err()
+        {
+            tracing::warn!("停止処理が 20 秒で完了しなかったため打ち切ります");
+        }
     });
     // UDS のファイルは自動で消えないため、残骸を残さない(Windows のパイプは不要)
     #[cfg(unix)]

@@ -58,22 +58,62 @@ mod imp {
     pub fn register_link(_if_name: &str, _server: Ipv4Addr) {}
 
     fn run(command: &str) -> bool {
-        let result = std::process::Command::new("powershell")
+        use std::io::Read as _;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        // DnsClient 系コマンドレットは CIM/WMI 経由で、環境状態によっては
+        // **返ってこなくなる**ことがある(実機で観測: デーモンの開始・停止が
+        // 道連れでハングした)。名前解決は付加機能なので、上限を設けて
+        // 打ち切り、トンネル本体を止めない。
+        const TIMEOUT: Duration = Duration::from_secs(10);
+
+        let mut child = match std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", command])
-            .output();
-        match result {
-            Ok(output) if output.status.success() => true,
-            Ok(output) => {
-                tracing::debug!(
-                    "PowerShell 失敗({}): {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                false
-            }
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
             Err(e) => {
                 tracing::debug!("PowerShell を起動できません: {e}");
-                false
+                return false;
+            }
+        };
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        return true;
+                    }
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    tracing::debug!("PowerShell 失敗({status}): {}", stderr.trim());
+                    return false;
+                }
+                Ok(None) => {
+                    if Instant::now() > deadline {
+                        tracing::warn!(
+                            "PowerShell(NRPT 設定)が {} 秒応答しないため打ち切りました\
+                             ({NAMESPACE} の名前解決は使えません。トンネル自体は動作します)",
+                            TIMEOUT.as_secs()
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => {
+                    tracing::debug!("PowerShell の状態確認に失敗: {e}");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
             }
         }
     }
