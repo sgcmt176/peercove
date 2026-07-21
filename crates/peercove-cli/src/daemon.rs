@@ -89,6 +89,9 @@ struct Active {
     quality: crate::quality::SharedQuality,
     /// DNS サービスの直近ヘルス状態と手動再確認要求(M3-14e)。
     health: crate::health::SharedHealth,
+    /// 共有メモ(M5 F-2)。host = サービス(正本 + ロック + 配信)/
+    /// member = 読み取りキャッシュ。IPC の SharedMemo がここを使う
+    memo: crate::memoshare::MemoHandle,
 }
 
 impl DaemonShared {
@@ -320,6 +323,71 @@ impl DaemonShared {
                     Err(_) => bail!(
                         "ホストから応答がありません(ホストのバージョンが古い可能性があります)"
                     ),
+                }
+            }
+            IpcRequest::SharedMemo { config, op } => {
+                // 共有メモ(M5 F-2)。host は正本を直接、member は読み取りを
+                // キャッシュから、変更をコントロールチャネル経由で行う。
+                // メモの内容はログへ出さない(ADR-0049)
+                use peercove_core::memo::{SharedMemoOp, SharedMemoReply};
+                let (memo, link) = {
+                    let active = self.active.lock().await;
+                    let active = active.get(&Self::key_for(&config)).with_context(|| {
+                        format!("この設定のトンネルは動いていません({})", config.display())
+                    })?;
+                    (active.memo.clone(), Arc::clone(&active.member_link))
+                };
+                match memo {
+                    crate::memoshare::MemoHandle::Host(service) => {
+                        let reply = service.handle_for_host(op).await?;
+                        Ok(IpcResponse::SharedMemo { reply })
+                    }
+                    crate::memoshare::MemoHandle::Member(cache) => match op {
+                        // 読み取りはキャッシュから(イベントで常に最新。
+                        // オフラインでもここだけで閲覧できる — 要件 §3.2)
+                        SharedMemoOp::List { query } => {
+                            let (mut memos, folders) = cache.list(query).await?;
+                            let offline = link.session().is_none();
+                            if offline {
+                                // オフライン中は編集に入らせない(読み取り専用)
+                                for memo in &mut memos {
+                                    memo.can_edit = false;
+                                    memo.can_manage = false;
+                                }
+                            }
+                            Ok(IpcResponse::SharedMemo {
+                                reply: SharedMemoReply::Memos {
+                                    memos,
+                                    folders,
+                                    offline,
+                                },
+                            })
+                        }
+                        SharedMemoOp::Get { id } => {
+                            let memo = cache.get(id).await?;
+                            Ok(IpcResponse::SharedMemo {
+                                reply: SharedMemoReply::Memo { memo },
+                            })
+                        }
+                        op => {
+                            // 変更系はホストへ(権限・ロック・CAS はホスト正本で判定)
+                            let reply = link.request_memo(op).context(
+                                "ホストに接続していません(オフライン中の共有メモは読み取り専用です)",
+                            )?;
+                            match tokio::time::timeout(std::time::Duration::from_secs(15), reply)
+                                .await
+                            {
+                                Ok(Ok(SharedMemoReply::Err { message })) => bail!("{message}"),
+                                Ok(Ok(reply)) => Ok(IpcResponse::SharedMemo { reply }),
+                                Ok(Err(_)) => {
+                                    bail!("ホストとの接続が切れました。やり直してください")
+                                }
+                                Err(_) => bail!(
+                                    "ホストから応答がありません(ホストのバージョンが古い可能性があります)"
+                                ),
+                            }
+                        }
+                    },
                 }
             }
             IpcRequest::Memo { db, op } => {
@@ -1121,6 +1189,8 @@ impl DaemonShared {
         let groups = crate::groups::GroupStore::load(&config);
         let quality = crate::quality::QualityStore::load(&config);
         let health: crate::health::SharedHealth = Default::default();
+        // 共有メモ(M5 F-2)。supervisor と IPC で同じ実体を使う
+        let memo = crate::memoshare::MemoHandle::new(role, &config);
         let task_snapshot = Arc::clone(&snapshot);
         let task_transfers = Arc::clone(&transfers);
         let task_chat = Arc::clone(&chat);
@@ -1129,6 +1199,7 @@ impl DaemonShared {
         let task_link = Arc::clone(&member_link);
         let task_quality = Arc::clone(&quality);
         let task_health = Arc::clone(&health);
+        let task_memo = memo.clone();
         let task_config = config.clone();
         // Linux のスプリット DNS は per-link 設定のため、鍵ローテーションの
         // 入れ直し(インターフェース再作成)後に付け直す(ADR-0020)
@@ -1150,6 +1221,7 @@ impl DaemonShared {
                         Arc::clone(&task_link),
                         Arc::clone(&task_quality),
                         Arc::clone(&task_health),
+                        task_memo.clone(),
                     )
                     .await;
                 match result {
@@ -1218,6 +1290,7 @@ impl DaemonShared {
                 member_link,
                 quality,
                 health,
+                memo,
             },
         );
         drop(active);
@@ -1759,6 +1832,8 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
             .map(|p| p.seq)
             .collect(),
         groups: active.groups.lock().unwrap().list(),
+        shared_memo_seq: active.memo.seq(),
+        shared_memo: active.memo.supported(),
     }
 }
 

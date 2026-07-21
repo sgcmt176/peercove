@@ -339,6 +339,7 @@ fun NetworkScreen(
             listOf(
                 stringResource(R.string.tab_talk),
                 stringResource(R.string.tab_members),
+                stringResource(R.string.tab_memos),
                 stringResource(R.string.tab_dns),
                 stringResource(R.string.tab_settings),
             ).forEachIndexed { index, title ->
@@ -362,7 +363,8 @@ fun NetworkScreen(
                 onOpen = { conv = it },
             )
             1 -> MemberList(memberList, slug, onCopy = ::copy)
-            2 -> DnsList(memberList, dnsList, onCopy = ::copy, onNotice = onNotice)
+            2 -> SharedMemoTab(slug, onNotice)
+            3 -> DnsList(memberList, dnsList, onCopy = ::copy, onNotice = onNotice)
             else -> SettingsTab(slug, state, tunnel, onNotice, onChatCleared = { chatEpoch++ })
         }
     }

@@ -184,6 +184,7 @@ impl ActiveTunnel {
         member_link: Arc<control::MemberLink>,
         quality: crate::quality::SharedQuality,
         health: crate::health::SharedHealth,
+        memo: crate::memoshare::MemoHandle,
     ) -> anyhow::Result<SuperviseExit> {
         supervise(
             config_path,
@@ -200,6 +201,7 @@ impl ActiveTunnel {
             member_link,
             quality,
             health,
+            memo,
         )
         .await
     }
@@ -298,6 +300,7 @@ pub fn run_up(config_path: &Path, role: Role, upnp: bool) -> anyhow::Result<()> 
                 Default::default(),
                 crate::quality::QualityStore::load(config_path),
                 Default::default(),
+                crate::memoshare::MemoHandle::new(role, config_path),
             )
             .await;
             ctrl_c.abort();
@@ -398,6 +401,9 @@ pub async fn supervise(
     member_link: Arc<control::MemberLink>,
     quality: crate::quality::SharedQuality,
     health: crate::health::SharedHealth,
+    // 共有メモ(M5 F-2)。host = サービス / member = 読み取りキャッシュ。
+    // daemon の Active と共有され、IPC(UI)からも同じ実体が使われる
+    memo: crate::memoshare::MemoHandle,
 ) -> anyhow::Result<SuperviseExit> {
     // 登録済みピア(公開鍵 → 設定のフィンガープリント)。変更検知と
     // 削除通知の宛先解決に使う
@@ -460,6 +466,15 @@ pub async fn supervise(
         let mut rotation: Option<crate::rotate::Rotation> = None;
         match role {
             Role::Host => {
+                // 共有メモ(M5 F-2): サービスにこの周期の接続表を差し込み、
+                // メンバー依頼(MemoReq)とイベント配信を有効にする
+                let memo_service = match &memo {
+                    crate::memoshare::MemoHandle::Host(service) => Arc::clone(service),
+                    crate::memoshare::MemoHandle::Member(_) => {
+                        unreachable!("host には Host を渡す")
+                    }
+                };
+                memo_service.attach_connections(Arc::clone(&connections));
                 tasks.push(tokio::spawn(control::run_host_server(
                     spec.address.addr(),
                     ledger_rx,
@@ -469,6 +484,7 @@ pub async fn supervise(
                         config_path.to_path_buf(),
                         host_public_key,
                         external_endpoint,
+                        memo_service,
                     )),
                 )));
             }
@@ -482,6 +498,12 @@ pub async fn supervise(
                     .or_else(|| spec.address.trunc().hosts().next());
                 match host_ip {
                     Some(host_ip) if host_ip != spec.address.addr() => {
+                        let memo_cache = match &memo {
+                            crate::memoshare::MemoHandle::Member(cache) => Arc::clone(cache),
+                            crate::memoshare::MemoHandle::Host(_) => {
+                                unreachable!("member には Member を渡す")
+                            }
+                        };
                         tasks.push(tokio::spawn(control::run_member_client(
                             host_ip,
                             config.interface.display_name.clone(),
@@ -490,6 +512,7 @@ pub async fn supervise(
                             Arc::clone(&rtt),
                             Arc::clone(&removed),
                             Arc::clone(&member_link),
+                            memo_cache,
                         )));
                     }
                     _ => tracing::warn!(
@@ -520,6 +543,10 @@ pub async fn supervise(
                             None
                         }
                     };
+                    // 共有メモ(M5 F-2): 無操作の編集ロックを周期で解放する
+                    if let crate::memoshare::MemoHandle::Host(service) = &memo {
+                        service.sweep_expired_locks();
+                    }
                     // 受信サイズ上限(ADR-0015)を設定に追随させる(両ロール)
                     if let Some(config) = &config {
                         *msg_limit.lock().unwrap() =

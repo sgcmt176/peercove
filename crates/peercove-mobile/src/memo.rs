@@ -343,6 +343,246 @@ pub fn memo_export_name(title: String) -> String {
     peercove_core::memo::sanitize_filename(&title)
 }
 
+// ---- 共有メモ(M5 F-2、ADR-0049)-------------------------------------------
+//
+// 読み取りは常にキャッシュ(オフラインでも閲覧可)。変更は稼働中セッションの
+// コントロールチャネル経由でホストへ届き、権限・編集ロック・リビジョン(CAS)
+// はすべてホスト正本で判定される。
+
+use peercove_core::memo::{
+    SharedMemoDetail, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
+};
+
+#[derive(uniffi::Record)]
+pub struct SharedMemoSummaryInfo {
+    pub id: String,
+    pub title: String,
+    pub excerpt: String,
+    pub folder_id: Option<String>,
+    pub revision: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub updated_by: Option<String>,
+    pub owner_name: String,
+    pub can_edit: bool,
+    pub can_manage: bool,
+    pub locked_by: Option<String>,
+    pub checklist_done: u32,
+    pub checklist_total: u32,
+}
+
+impl From<SharedMemoSummary> for SharedMemoSummaryInfo {
+    fn from(memo: SharedMemoSummary) -> Self {
+        Self {
+            id: memo.id,
+            title: memo.title,
+            excerpt: memo.excerpt,
+            folder_id: memo.folder_id,
+            revision: memo.revision,
+            created_at: memo.created_at,
+            updated_at: memo.updated_at,
+            updated_by: memo.updated_by,
+            owner_name: memo.owner_name,
+            can_edit: memo.can_edit,
+            can_manage: memo.can_manage,
+            locked_by: memo.locked_by,
+            checklist_done: memo.checklist_done,
+            checklist_total: memo.checklist_total,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct SharedMemoDetailInfo {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub folder_id: Option<String>,
+    pub revision: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub updated_by: Option<String>,
+    pub owner_name: String,
+    pub can_edit: bool,
+    pub can_manage: bool,
+    pub locked_by: Option<String>,
+}
+
+impl From<SharedMemoDetail> for SharedMemoDetailInfo {
+    fn from(memo: SharedMemoDetail) -> Self {
+        Self {
+            id: memo.id,
+            title: memo.title,
+            body: memo.body,
+            folder_id: memo.folder_id,
+            revision: memo.revision,
+            created_at: memo.created_at,
+            updated_at: memo.updated_at,
+            updated_by: memo.updated_by,
+            owner_name: memo.owner_name,
+            can_edit: memo.can_edit,
+            can_manage: memo.can_manage,
+            locked_by: memo.locked_by,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct SharedMemoListResult {
+    pub memos: Vec<SharedMemoSummaryInfo>,
+    pub folders: Vec<MemoFolderInfo>,
+    /// セッション未接続(キャッシュ表示 = 読み取り専用)。
+    pub offline: bool,
+    /// ホストが共有メモに応答済みか(false = 未対応 or 未同期)。
+    pub supported: bool,
+    /// キャッシュの変更世代。進んだら再取得する。
+    pub generation: u64,
+}
+
+fn cache_path(base_dir: &str, slug: &str) -> std::path::PathBuf {
+    peercove_ops::networks::networks_dir(Path::new(base_dir))
+        .join(slug)
+        .join(peercove_ops::networks::MEMBER_FILE)
+        .with_extension("memocache.db")
+}
+
+fn open_cache(
+    base_dir: &str,
+    slug: &str,
+) -> Result<peercove_memo::shared::CacheStore, MobileError> {
+    Ok(peercove_memo::shared::CacheStore::open(&cache_path(
+        base_dir, slug,
+    ))?)
+}
+
+fn session_request(slug: &str, op: SharedMemoOp) -> Result<SharedMemoReply, MobileError> {
+    let session = crate::session_of(slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません(共有メモの変更には接続が必要です)".to_string(),
+    })?;
+    Ok(session.memo_request(op)?)
+}
+
+fn expect_shared_memo(reply: SharedMemoReply) -> Result<SharedMemoDetailInfo, MobileError> {
+    match reply {
+        SharedMemoReply::Memo { memo } => Ok(memo.into()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// 一覧(キャッシュから。オフラインでも使える)。
+#[uniffi::export]
+pub fn shared_memo_list(
+    base_dir: String,
+    slug: String,
+    folder_id: Option<String>,
+    search: Option<String>,
+) -> Result<SharedMemoListResult, MobileError> {
+    let cache = open_cache(&base_dir, &slug)?;
+    let (memos, folders) = cache.list(&SharedMemoQuery {
+        trash: false,
+        folder_id,
+        search: search.filter(|s| !s.trim().is_empty()),
+    })?;
+    let session = crate::session_of(&slug);
+    let online = session.as_ref().is_some_and(|s| {
+        s.control_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut memos: Vec<SharedMemoSummaryInfo> = memos.into_iter().map(Into::into).collect();
+    if !online {
+        // オフライン中は読み取り専用(要件 §3.2)
+        for memo in &mut memos {
+            memo.can_edit = false;
+            memo.can_manage = false;
+        }
+    }
+    Ok(SharedMemoListResult {
+        memos,
+        folders: folders.into_iter().map(Into::into).collect(),
+        offline: !online,
+        supported: session
+            .as_ref()
+            .is_some_and(|s| s.memo_supported.load(std::sync::atomic::Ordering::Relaxed)),
+        generation: session
+            .as_ref()
+            .map(|s| s.memo_generation.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
+    })
+}
+
+/// キャッシュの変更世代(UI のポーリング用。セッション無しは 0)。
+#[uniffi::export]
+pub fn shared_memo_generation(slug: String) -> u64 {
+    crate::session_of(&slug)
+        .map(|s| s.memo_generation.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// 1 件取得(キャッシュから)。
+#[uniffi::export]
+pub fn shared_memo_get(
+    base_dir: String,
+    slug: String,
+    id: String,
+) -> Result<SharedMemoDetailInfo, MobileError> {
+    Ok(open_cache(&base_dir, &slug)?.get(&id)?.into())
+}
+
+#[uniffi::export]
+pub fn shared_memo_create(
+    slug: String,
+    title: String,
+    body: String,
+) -> Result<SharedMemoDetailInfo, MobileError> {
+    expect_shared_memo(session_request(
+        &slug,
+        SharedMemoOp::Create {
+            title,
+            body,
+            folder_id: None,
+        },
+    )?)
+}
+
+/// 編集ロックの取得(応答が編集の土台になる最新内容)。
+#[uniffi::export]
+pub fn shared_memo_acquire(slug: String, id: String) -> Result<SharedMemoDetailInfo, MobileError> {
+    expect_shared_memo(session_request(&slug, SharedMemoOp::AcquireLock { id })?)
+}
+
+#[uniffi::export]
+pub fn shared_memo_release(slug: String, id: String) -> Result<(), MobileError> {
+    session_request(&slug, SharedMemoOp::ReleaseLock { id }).map(|_| ())
+}
+
+/// 保存(CAS)。`base_revision` が最新でなければ競合として拒否される。
+#[uniffi::export]
+pub fn shared_memo_save(
+    slug: String,
+    id: String,
+    base_revision: u64,
+    title: String,
+    body: String,
+) -> Result<SharedMemoDetailInfo, MobileError> {
+    expect_shared_memo(session_request(
+        &slug,
+        SharedMemoOp::Update {
+            id,
+            base_revision,
+            title,
+            body,
+        },
+    )?)
+}
+
+/// ゴミ箱へ(所有者のみ。復元・完全削除はホスト UI から)。
+#[uniffi::export]
+pub fn shared_memo_trash(slug: String, id: String) -> Result<(), MobileError> {
+    session_request(&slug, SharedMemoOp::Trash { id }).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

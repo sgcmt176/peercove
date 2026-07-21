@@ -67,6 +67,7 @@ export const ja = {
   sidebar: {
     networks: "ネットワーク",
     memos: "メモ",
+    sharedMemos: "メモ",
     members: "メンバー",
     chat: "チャット",
     stats: "品質",
@@ -982,5 +983,43 @@ export const ja = {
     fmtTable: "表",
     fmtLink: "リンク",
     fmtHr: "区切り線",
+  },
+
+  // 共有メモ(M5 F-2、ADR-0049)
+  sharedMemo: {
+    title: "共有メモ",
+    loadFailed:
+      "共有メモを読み込めません。デーモンが起動しているか、バージョンが古くないか確認してください",
+    offline: "オフライン(ホスト未接続)のため読み取り専用です",
+    unsupported:
+      "ホストと同期できていません(ホストのバージョンが古い可能性があります)",
+    scopeAll: "共有メモ",
+    folders: "共有フォルダー",
+    empty: "共有メモがありません",
+    selectPrompt: "左の一覧から共有メモを選ぶか、新規作成してください",
+    viewing: "閲覧中(リアルタイム更新)",
+    editingBy: (name: string) => `${name} が編集中`,
+    startEdit: "編集",
+    stopEdit: "編集を終了",
+    forceUnlock: "ロックを強制解除",
+    forceUnlockConfirm:
+      "編集ロックを強制解除しますか？(編集者に未保存の内容がある可能性があります)",
+    perms: "権限の設定",
+    permsTitle: "共有メモの権限",
+    permsNote:
+      "権限はメンバー識別子に紐付きます。個別指定は「全体」より優先されます(「見せない」で特定メンバーだけ除外できます)。",
+    everyoneLabel: "全体(ネットワークの全メンバー)",
+    levelViewer: "閲覧のみ",
+    levelEditor: "閲覧 + 編集",
+    levelNone: "見せない",
+    levelInherit: "全体に従う",
+    viewerBadge: "閲覧のみ",
+    copyToPersonal: "個人メモとしてコピー",
+    copiedToPersonal: "個人メモへコピーしました(メモタブで開けます)",
+    ownerLabel: (name: string) => `所有者: ${name}`,
+    hostName: "ホスト",
+    updatedBy: (name: string) => `更新者: ${name}`,
+    plaintextNote:
+      "共有メモはホスト端末へ平文で保存されます。パスワード、秘密鍵、招待トークンなどの保存には使用しないでください。",
   },
 };

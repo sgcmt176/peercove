@@ -21,12 +21,15 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
-/// 受信 **1 行** の上限。台帳が大きくても余裕を持てるサイズ。
+/// 受信 **1 行** の上限。台帳と共有メモ本文(最大 256 KiB + JSON エスケープ —
+/// M5 F-2)が収まるサイズ。メモ系メッセージは `shared_memo` capability を
+/// 名乗った新クライアントにしか送らないため、旧上限(64 KiB)のクライアントが
+/// 巨大行で切断されることはない。
 ///
 /// `AsyncReadExt::take` の上限は「その reader の累計」なので、1 行読むたびに
 /// `set_limit` で戻すこと(戻し忘れると、ping/pong の積み重ねで数時間後に
 /// EOF 扱いになって制御接続が落ちる)。
-const MAX_LINE_LEN: u64 = 64 * 1024;
+const MAX_LINE_LEN: u64 = 1024 * 1024;
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// RTT 計測 ping の間隔(M2-G5)。supervisor の周期と同じにして、
@@ -329,6 +332,11 @@ struct MemberLinkState {
     display_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
     /// メンバー招待の発行依頼(ADR-0048)の応答待ち。dns_reply と同じ仕組み。
     invite_reply: Option<tokio::sync::oneshot::Sender<InviteReply>>,
+    /// 共有メモ(M5 F-2)の応答待ち(seq → 受け口)。他の依頼と違い
+    /// 同時に複数飛ばせる(一覧 + 本文の取り直しなど)。
+    memo_pending: HashMap<u64, tokio::sync::oneshot::Sender<peercove_core::memo::SharedMemoReply>>,
+    /// MemoReq の連番(セッションをまたいで単調増加)。
+    memo_seq: u64,
     /// 自動再試行では回復しない、ホストからの参加拒否理由。
     connection_error: Option<String>,
 }
@@ -418,6 +426,30 @@ impl MemberLink {
         Some(rx)
     }
 
+    /// 共有メモの操作をホストへ送り、応答の受け口を返す(M5 F-2)。
+    /// 切断中なら `None`。他の依頼と違い同時に複数を待てる。
+    pub fn request_memo(
+        &self,
+        op: peercove_core::memo::SharedMemoOp,
+    ) -> Option<tokio::sync::oneshot::Receiver<peercove_core::memo::SharedMemoReply>> {
+        let mut state = self.inner.lock().unwrap();
+        state.memo_seq += 1;
+        let seq = state.memo_seq;
+        let outbox = state.outbox.as_ref()?;
+        if outbox.send(ControlMessage::MemoReq { seq, op }).is_err() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.memo_pending.insert(seq, tx);
+        Some(rx)
+    }
+
+    fn put_memo_result(&self, seq: u64, reply: peercove_core::memo::SharedMemoReply) {
+        if let Some(sender) = self.inner.lock().unwrap().memo_pending.remove(&seq) {
+            let _ = sender.send(reply);
+        }
+    }
+
     fn attach(&self, outbox: Outbox) {
         let mut state = self.inner.lock().unwrap();
         state.session += 1;
@@ -426,6 +458,7 @@ impl MemberLink {
         state.dns_reply = None; // 応答待ちの受け口は Err(切断)になる
         state.display_reply = None;
         state.invite_reply = None;
+        state.memo_pending.clear();
         state.connection_error = None;
     }
 
@@ -435,6 +468,7 @@ impl MemberLink {
         state.dns_reply = None;
         state.display_reply = None;
         state.invite_reply = None;
+        state.memo_pending.clear();
     }
 
     fn put_rotate_result(&self, accepted: bool, message: String) {
@@ -489,6 +523,8 @@ pub struct HostRequests {
     /// (host)UPnP で観測した外部エンドポイント。メンバー発行の招待
     /// (ADR-0048)のエンドポイント候補に自動で足す(ホスト UI 発行と同等)。
     external_endpoint: Option<std::net::SocketAddrV4>,
+    /// 共有メモのサービス(M5 F-2)。メンバーの MemoReq をここへ流す。
+    memo: Arc<crate::memoshare::MemoService>,
     /// host.toml の読み書きを直列化する(複数メンバーの同時依頼)。
     lock: tokio::sync::Mutex<()>,
 }
@@ -498,11 +534,13 @@ impl HostRequests {
         config_path: std::path::PathBuf,
         host_public_key: peercove_core::keys::PublicKey,
         external_endpoint: Option<std::net::SocketAddrV4>,
+        memo: Arc<crate::memoshare::MemoService>,
     ) -> Self {
         Self {
             config_path,
             host_public_key,
             external_endpoint,
+            memo,
             lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -962,7 +1000,7 @@ async fn handle_member(
         ping,
         Arc::clone(rtt),
         line,
-        requests,
+        Arc::clone(&requests),
         isolation,
     ));
 
@@ -984,6 +1022,8 @@ async fn handle_member(
     let removed_current = unregister_connection(connections, member_ip, connection_id);
     if removed_current {
         rtt.lock().unwrap().disconnected(member_ip);
+        // 切断したメンバーが握っていた共有メモの編集ロックを解放する(要件 §12)
+        requests.memo.release_locks_for_ip(member_ip);
     }
     result
 }
@@ -1078,7 +1118,8 @@ async fn host_reader(
             Ok(
                 ControlMessage::SetDnsName { .. }
                 | ControlMessage::SetDisplayName { .. }
-                | ControlMessage::CreateInvite { .. },
+                | ControlMessage::CreateInvite { .. }
+                | ControlMessage::MemoReq { .. },
             ) if isolation.load(Ordering::Relaxed) => {
                 tracing::debug!("承認待ち端末 {member_ip} からの設定変更依頼を拒否しました");
             }
@@ -1113,6 +1154,13 @@ async fn host_reader(
                     .await;
                 let _ = out.send(reply);
             }
+            Ok(ControlMessage::MemoReq { seq, op }) => {
+                // 共有メモの依頼(M5 F-2)。権限・ロック・リビジョンの判定は
+                // サービス層(ホスト正本)。応答は依頼が来たこの接続にだけ返す。
+                // メモの内容はログへ出さない(ADR-0049)
+                let reply = requests.memo.handle_for_member(member_ip, op).await;
+                let _ = out.send(ControlMessage::MemoResp { seq, reply });
+            }
             Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
         }
@@ -1125,6 +1173,7 @@ async fn host_reader(
 /// ホストから削除された(`Removed`)ら `removed` を立てて**再接続をやめる**。
 /// 削除後はホストが WG ピアも消すので再接続は成功しないうえ、UI に「削除された」
 /// と出したまま無駄なリトライを続けないため(M2-G6 のフィードバック)。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_member_client(
     host_ip: Ipv4Addr,
     display_name: Option<String>,
@@ -1133,6 +1182,7 @@ pub async fn run_member_client(
     rtt: RttMap,
     removed: Arc<AtomicBool>,
     link: Arc<MemberLink>,
+    memo_cache: Arc<crate::memoshare::MemberMemoCache>,
 ) {
     let target = SocketAddr::from((host_ip, CONTROL_PORT));
     let mut logged_wait = false;
@@ -1150,6 +1200,7 @@ pub async fn run_member_client(
                     &rtt,
                     &removed,
                     &link,
+                    &memo_cache,
                 );
                 let result = session.await;
                 let connection_error = link.connection_error();
@@ -1191,6 +1242,7 @@ async fn member_session(
     rtt: &RttMap,
     removed: &Arc<AtomicBool>,
     link: &Arc<MemberLink>,
+    memo_cache: &Arc<crate::memoshare::MemberMemoCache>,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
@@ -1224,7 +1276,10 @@ async fn member_session(
         Arc::clone(latest_ledger),
         Arc::clone(removed),
         Arc::clone(link),
+        Arc::clone(memo_cache),
     ));
+    // 共有メモの初回同期(M5 F-2)。応答は member_reader が pending へ流す
+    let sync_task = tokio::spawn(memo_sync(Arc::clone(link), Arc::clone(memo_cache)));
 
     // biased: 削除通知(Removed)を検知する読み側が「意味のある終了」なので先に見る。
     // (読み側が終わると Outbox が落ちて書き側も即 ready になり、順序が非決定になる)
@@ -1233,7 +1288,53 @@ async fn member_session(
         joined = &mut read_task => { writer.abort(); joined }
         joined = &mut writer => { read_task.abort(); joined }
     };
+    sync_task.abort();
     result.unwrap_or_else(|e| Err(anyhow::anyhow!("制御タスクが異常終了しました: {e}")))
+}
+
+/// 接続時の共有メモ同期(M5 F-2)。一覧を取り、リビジョンが進んでいる・
+/// 手元に無いメモだけ本文を取り直す。ホストが旧バージョンなら応答が無いまま
+/// タイムアウトし、「ホスト未対応」のままにする(キャッシュは温存)。
+async fn memo_sync(link: Arc<MemberLink>, cache: Arc<crate::memoshare::MemberMemoCache>) {
+    use peercove_core::memo::{SharedMemoOp, SharedMemoQuery, SharedMemoReply};
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
+    let Some(rx) = link.request_memo(SharedMemoOp::List {
+        query: SharedMemoQuery::default(),
+    }) else {
+        return;
+    };
+    let reply = match tokio::time::timeout(SYNC_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => reply,
+        _ => {
+            tracing::debug!("共有メモの同期応答がありません(ホスト未対応の可能性)");
+            return;
+        }
+    };
+    let SharedMemoReply::Memos { memos, folders, .. } = reply else {
+        return;
+    };
+    let total = memos.len();
+    let stale = match cache.sync_from_list(memos, folders).await {
+        Ok(stale) => stale,
+        Err(e) => {
+            tracing::warn!("共有メモの同期に失敗しました: {e:#}");
+            return;
+        }
+    };
+    cache.set_supported(true);
+    tracing::info!(
+        "共有メモを同期しました({total} 件、取り直し {} 件)",
+        stale.len()
+    );
+    for id in stale {
+        let Some(rx) = link.request_memo(SharedMemoOp::Get { id }) else {
+            return;
+        };
+        if let Ok(Ok(SharedMemoReply::Memo { memo })) = tokio::time::timeout(SYNC_TIMEOUT, rx).await
+        {
+            cache.upsert(memo).await;
+        }
+    }
 }
 
 /// 書き側。キューされたメッセージ(Hello / Pong)と定期 ping を送る。
@@ -1273,6 +1374,7 @@ async fn member_reader(
     latest_ledger: Arc<Mutex<Option<ReceivedDistribution>>>,
     removed: Arc<AtomicBool>,
     link: Arc<MemberLink>,
+    memo_cache: Arc<crate::memoshare::MemberMemoCache>,
 ) -> anyhow::Result<()> {
     let mut line = String::new();
     let mut last_digest: Option<LedgerDigest> = None;
@@ -1355,6 +1457,16 @@ async fn member_reader(
                     expires_at,
                 });
             }
+            Ok(ControlMessage::MemoResp { seq, reply }) => {
+                // 共有メモの応答(M5 F-2)。IPC ハンドラ・同期タスクの受け口へ渡す
+                link.put_memo_result(seq, reply);
+            }
+            Ok(ControlMessage::MemoEvent { event }) => {
+                // リアルタイム配信(M5 F-2)。キャッシュへ反映し、世代を進める
+                // (UI は status の shared_memo_seq で変化を検知する)
+                memo_cache.set_supported(true);
+                memo_cache.apply_event(event).await;
+            }
             Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
         }
@@ -1391,6 +1503,13 @@ mod tests {
         }
     }
 
+    /// テスト用のメンバー側メモキャッシュ(一時パス。DB は使われるまで作られない)。
+    fn test_memo_cache() -> Arc<crate::memoshare::MemberMemoCache> {
+        crate::memoshare::MemberMemoCache::new(
+            &std::env::temp_dir().join(format!("peercove-memo-test-{}.toml", std::process::id())),
+        )
+    }
+
     /// 鍵ローテーションを使わないテスト用の旧招待(v1/v2)設定。
     fn test_requests() -> Arc<HostRequests> {
         let path =
@@ -1404,9 +1523,10 @@ mod tests {
         )
         .unwrap();
         Arc::new(HostRequests::new(
-            path,
+            path.clone(),
             PrivateKey::generate().public_key(),
             None,
+            crate::memoshare::MemoService::new(&path),
         ))
     }
 
@@ -1523,6 +1643,7 @@ mod tests {
                 &client_rtt,
                 &Arc::new(AtomicBool::new(false)),
                 &Arc::new(MemberLink::default()),
+                &test_memo_cache(),
             )
             .await;
         });
@@ -1704,6 +1825,7 @@ mod tests {
                 &client_rtt,
                 &removed_flag,
                 &Arc::new(MemberLink::default()),
+                &test_memo_cache(),
             )
             .await
         });
@@ -1749,9 +1871,10 @@ mod tests {
         )
         .unwrap();
         let requests = Arc::new(HostRequests::new(
-            config_path,
+            config_path.clone(),
             PrivateKey::generate().public_key(),
             None,
+            crate::memoshare::MemoService::new(&config_path),
         ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1786,6 +1909,7 @@ mod tests {
             &Default::default(),
             &Arc::new(AtomicBool::new(false)),
             &link,
+            &test_memo_cache(),
         )
         .await;
 
@@ -1834,7 +1958,8 @@ mod tests {
     /// 積み重ねた数時間後に EOF 扱いになって制御接続が落ちる(実際に踏んだ)。
     #[tokio::test]
     async fn read_line_resets_the_cumulative_take_limit() {
-        const LINES: u64 = 3000;
+        // 上限(1 MiB — M5 F-2 で拡大)を累計で超える行数
+        const LINES: u64 = 40_000;
         let mut payload = Vec::new();
         for nonce in 0..LINES {
             payload.extend_from_slice(encode_line(&ControlMessage::Ping { nonce }).as_bytes());
@@ -1899,6 +2024,7 @@ mod tests {
             config_path.clone(),
             host_public_key,
             None,
+            crate::memoshare::MemoService::new(&config_path),
         ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1938,6 +2064,7 @@ mod tests {
                 &Default::default(),
                 &Arc::new(AtomicBool::new(false)),
                 &client_link,
+                &test_memo_cache(),
             )
             .await;
         });

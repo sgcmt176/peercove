@@ -174,6 +174,14 @@ pub enum IpcRequest {
         db: PathBuf,
         op: crate::memo::MemoOp,
     },
+    /// 共有メモの操作(M5 F-2、ADR-0049)。host = 正本を直接操作 /
+    /// member = 読み取りはキャッシュ、変更はコントロールチャネルでホストへ。
+    /// 応答は [`IpcResponse::SharedMemo`]。追加メソッドなので [`IPC_VERSION`] は
+    /// 上げない。
+    SharedMemo {
+        config: PathBuf,
+        op: crate::memo::SharedMemoOp,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +193,8 @@ pub struct IpcReply {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// メモ応答(M5 F-2)で Ok 側が大きくなった。短命のワイヤ型なので Box 化しない
+#[allow(clippy::large_enum_variant)]
 pub enum IpcResult {
     Ok(IpcResponse),
     Err(String),
@@ -229,6 +239,8 @@ pub enum IpcResponse {
     },
     /// Memo への応答(ADR-0049)。メモの内容はログへ出さないこと。
     Memo { reply: crate::memo::MemoReply },
+    /// SharedMemo への応答(M5 F-2)。
+    SharedMemo { reply: crate::memo::SharedMemoReply },
 }
 
 /// 1 応答で返すチャットの上限(IPC の 1 行上限 256 KiB に収めるため、
@@ -401,6 +413,14 @@ pub struct TunnelInfo {
     /// 旧デーモンの応答には無い(空)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupInfo>,
+    /// 共有メモの変更世代(M5 F-2)。UI はこれが進んだら再取得する。
+    /// 旧デーモンの応答には無い(0)。
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub shared_memo_seq: u64,
+    /// 共有メモが使える状態か(host = 常に true / member = 同期成功済み)。
+    /// false のときの member は「ホスト未対応 or 未同期」— キャッシュ表示のみ。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared_memo: bool,
 }
 
 fn u64_is_zero(value: &u64) -> bool {

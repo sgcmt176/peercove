@@ -28,6 +28,9 @@ pub const CURRENT_CAPABILITIES: &[&str] = &[
     "dns_service_url",
     "file_transfer",
     "key_rotation",
+    // 共有メモ(M5 F-2、ADR-0049)。ホストはこの capability を名乗った接続に
+    // だけメモイベントを配信する(旧クライアントの行長上限を守るため)
+    "shared_memo",
     "subnet_router",
 ];
 
@@ -151,6 +154,25 @@ pub enum ControlMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_at: Option<u64>,
     },
+    /// member → host: 共有メモへの操作(M5 F-2、ADR-0049)。`seq` は
+    /// メンバー側が応答([`ControlMessage::MemoResp`])と突き合わせる連番。
+    /// 権限・編集ロック・リビジョン(CAS)の判定はすべてホスト正本で行う。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
+    /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
+    MemoReq {
+        seq: u64,
+        op: crate::memo::SharedMemoOp,
+    },
+    /// host → member: [`ControlMessage::MemoReq`] への応答(依頼が来た接続にだけ)。
+    MemoResp {
+        seq: u64,
+        reply: crate::memo::SharedMemoReply,
+    },
+    /// host → member: 共有メモのリアルタイム配信(変更・削除・ロック状態)。
+    /// **閲覧権限があり、Hello で `shared_memo` capability を名乗った接続に
+    /// だけ**送る(旧クライアントには一切流れない)。
+    MemoEvent { event: crate::memo::SharedMemoEvent },
 }
 
 /// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。

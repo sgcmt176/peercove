@@ -2940,3 +2940,32 @@ select {
     min-height: 240px;
   }
 }
+
+/* ---- 共有メモ (M5 F-2) ---- */
+
+.memo__item-lock {
+  color: var(--accent);
+}
+
+.memo-perms__members {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 10px 0;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.memo-perms__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.memo-perms__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

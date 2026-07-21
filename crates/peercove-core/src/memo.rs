@@ -219,6 +219,232 @@ pub enum MemoReply {
     Done,
 }
 
+// ---- 共有メモ(M5 F-2、ADR-0049) ----
+//
+// ホスト正本の共有メモをコントロールチャネル(`MemoReq` / `MemoResp` /
+// `MemoEvent`)と IPC(`IpcRequest::SharedMemo`)の両方で操作するための型。
+// 権限は member_id(= invite_id、ADR-0047)へ紐付け、フィルタは**ホストの
+// 配信時**に行う(受信側フィルタに頼らない)。
+
+/// 共有メモの権限レベル。メンバー個別の指定は「全体」より優先される
+/// (`None` を個別指定すると、そのメンバーだけ除外できる)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedPermLevel {
+    /// 見えない。
+    None,
+    /// 閲覧のみ(既定)。
+    #[default]
+    Viewer,
+    /// 閲覧 + 編集。
+    Editor,
+}
+
+/// メンバー個別の権限指定。`name` は表示用スナップショット(正本は member_id)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemberPerm {
+    pub member_id: String,
+    #[serde(default)]
+    pub name: String,
+    pub level: SharedPermLevel,
+}
+
+/// 共有メモ一覧の絞り込み。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SharedMemoQuery {
+    /// ゴミ箱を見る(ホスト管理者と所有者のみ意味を持つ)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trash: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+/// 共有メモ一覧の 1 行。`can_edit` / `can_manage` / `locked_by` は
+/// **受信者視点**でホストが計算して詰める。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemoSummary {
+    pub id: String,
+    pub title: String,
+    pub excerpt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    /// 単調増加リビジョン(CAS 用)。
+    pub revision: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    /// 最終更新者の表示名(スナップショット)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    /// 所有者(作成者)の member_id。空 = ホスト。
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default)]
+    pub owner_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<u64>,
+    /// 受信者が編集できるか(所有者・編集者)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_edit: bool,
+    /// 受信者が権限変更・削除できるか(所有者・ホスト管理者)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_manage: bool,
+    /// いま編集ロックを握っている人の表示名(自分を含む)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_by: Option<String>,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub checklist_done: u32,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub checklist_total: u32,
+}
+
+/// 共有メモ 1 件の全体。`everyone` / `members` は can_manage のときだけ載る。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemoDetail {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    pub revision: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default)]
+    pub owner_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_edit: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_manage: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_by: Option<String>,
+    /// 全体(ネットワークの全メンバー)への権限。can_manage のときだけ載る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub everyone: Option<SharedPermLevel>,
+    /// メンバー個別の権限。can_manage のときだけ載る。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<SharedMemberPerm>,
+}
+
+/// 共有メモへの操作。メンバーは `MemoReq` に載せてホストへ送り、
+/// ホスト UI は IPC からそのままサービス層へ渡す。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SharedMemoOp {
+    List {
+        #[serde(default)]
+        query: SharedMemoQuery,
+    },
+    Get {
+        id: String,
+    },
+    Create {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<String>,
+    },
+    /// 本文・タイトルの更新(CAS)。編集ロックを握っていることが前提。
+    /// `base_revision` が現在と一致しない場合は競合として拒否される。
+    Update {
+        id: String,
+        base_revision: u64,
+        title: String,
+        body: String,
+    },
+    /// 編集ロックの取得。応答は最新の [`SharedMemoReply::Memo`]
+    /// (これを土台に編集を始める)。
+    AcquireLock {
+        id: String,
+    },
+    ReleaseLock {
+        id: String,
+    },
+    /// (ホスト管理者のみ)編集ロックの強制解除。
+    ForceUnlock {
+        id: String,
+    },
+    /// ゴミ箱へ(所有者・ホスト管理者)。
+    Trash {
+        id: String,
+    },
+    Restore {
+        id: String,
+    },
+    DeleteForever {
+        id: String,
+    },
+    /// 権限の設定(所有者・ホスト管理者)。`members` は全量置き換え。
+    SetPerms {
+        id: String,
+        everyone: SharedPermLevel,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<SharedMemberPerm>,
+    },
+    /// 共有フォルダーの管理(ホスト管理者のみ — 要件 §6)。
+    FolderCreate {
+        name: String,
+    },
+    FolderRename {
+        id: String,
+        name: String,
+    },
+    FolderDelete {
+        id: String,
+    },
+}
+
+/// [`SharedMemoOp`] への応答。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+// 短命のワイヤ型なので Box 化しない(ワイヤ表現を単純に保つ)
+#[allow(clippy::large_enum_variant)]
+pub enum SharedMemoReply {
+    Memos {
+        memos: Vec<SharedMemoSummary>,
+        folders: Vec<MemoFolder>,
+        /// (メンバーのみ)ホスト未接続のキャッシュ応答 = 読み取り専用。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        offline: bool,
+    },
+    Memo {
+        memo: SharedMemoDetail,
+    },
+    Done,
+    /// 拒否・競合など(コントロールチャネル経由の応答用)。
+    Err {
+        message: String,
+    },
+}
+
+/// ホスト → メンバーのリアルタイム配信。**閲覧権限のある接続にだけ**送る。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+// 短命のワイヤ型なので Box 化しない(ワイヤ表現を単純に保つ)
+#[allow(clippy::large_enum_variant)]
+pub enum SharedMemoEvent {
+    /// 作成・更新・権限変更(受信者視点で can_edit 等を計算済み)。
+    Changed { memo: SharedMemoDetail },
+    /// 削除、または権限を失って見えなくなった。キャッシュから消すこと。
+    Removed { id: String },
+    /// 編集ロックの変化。`holder` は表示名(None = 解放)。
+    Lock {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<String>,
+    },
+    /// 共有フォルダー一覧の変化。
+    Folders { folders: Vec<MemoFolder> },
+}
+
 /// チェックリスト(`- [ ]` / `- [x]`)の進捗を数える。戻り値は (完了, 総数)。
 /// Markdown のタスクリスト記法(`-` / `*` / `+` / 番号付き)に対応する。
 pub fn checklist_progress(body: &str) -> (u32, u32) {

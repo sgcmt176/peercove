@@ -36,6 +36,8 @@ export interface Member {
   route: "direct" | "trying" | "relay" | null;
   /** この行が自分自身か。 */
   isSelf: boolean;
+  /** member_id（= invite_id、ADR-0047）。共有メモの個別権限指定に使う。 */
+  memberId: string | null;
   /** このメンバーが広告する背後 LAN のサブネット（M3-7、ADR-0014）。 */
   subnets: string[];
   /** 自分とこのメンバーの間がホストの ACL で遮断されている（M3-10、ADR-0018）。 */
@@ -220,6 +222,10 @@ export interface Tunnel {
   chatSending: number[];
   /** 既知のグループ（M3-13c）。自分が抜けたグループも含む。 */
   groups: Group[];
+  /** 共有メモの変更世代（M5 F-2）。進んだら再取得する。 */
+  sharedMemoSeq: number;
+  /** 共有メモが使えるか（member で false = ホスト未対応 or 未同期）。 */
+  sharedMemo: boolean;
   /** 解決済みカスタム DNS レコード（ADR-0022）。member はここから一覧表示する。 */
   dnsRecords: DnsRecord[];
 }
@@ -527,6 +533,98 @@ export type MemoReply =
   | { kind: "folder"; folder: MemoFolder }
   | { kind: "done" };
 
+// ---- 共有メモ (M5 F-2, ADR-0049)。個人メモと同じく serde 表現(snake_case) ----
+
+export type SharedPermLevel = "none" | "viewer" | "editor";
+
+export interface SharedMemberPerm {
+  member_id: string;
+  name?: string;
+  level: SharedPermLevel;
+}
+
+export interface SharedMemoQuery {
+  trash?: boolean;
+  folder_id?: string;
+  search?: string;
+}
+
+export interface SharedMemoSummary {
+  id: string;
+  title: string;
+  excerpt: string;
+  folder_id?: string;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  updated_by?: string;
+  owner_id: string;
+  owner_name: string;
+  deleted_at?: number;
+  can_edit?: boolean;
+  can_manage?: boolean;
+  locked_by?: string;
+  checklist_done?: number;
+  checklist_total?: number;
+}
+
+export interface SharedMemoDetail {
+  id: string;
+  title: string;
+  body: string;
+  folder_id?: string;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  updated_by?: string;
+  owner_id: string;
+  owner_name: string;
+  deleted_at?: number;
+  can_edit?: boolean;
+  can_manage?: boolean;
+  locked_by?: string;
+  everyone?: SharedPermLevel;
+  members?: SharedMemberPerm[];
+}
+
+export type SharedMemoOp =
+  | { op: "list"; query: SharedMemoQuery }
+  | { op: "get"; id: string }
+  | { op: "create"; title: string; body: string; folder_id?: string }
+  | {
+      op: "update";
+      id: string;
+      base_revision: number;
+      title: string;
+      body: string;
+    }
+  | { op: "acquire_lock"; id: string }
+  | { op: "release_lock"; id: string }
+  | { op: "force_unlock"; id: string }
+  | { op: "trash"; id: string }
+  | { op: "restore"; id: string }
+  | { op: "delete_forever"; id: string }
+  | {
+      op: "set_perms";
+      id: string;
+      everyone: SharedPermLevel;
+      members?: SharedMemberPerm[];
+    }
+  | { op: "folder_create"; name: string }
+  | { op: "folder_rename"; id: string; name: string }
+  | { op: "folder_delete"; id: string };
+
+export type SharedMemoReply =
+  | {
+      kind: "memos";
+      memos: SharedMemoSummary[];
+      folders: MemoFolder[];
+      offline?: boolean;
+    }
+  | { kind: "memo"; memo: SharedMemoDetail }
+  | { kind: "done" }
+  | { kind: "err"; message: string };
+
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =
   | { kind: "connecting" }
@@ -713,6 +811,11 @@ export const api = {
   memoExport: (id: string) => invoke<string | null>("memo_export", { id }),
   memoImport: (folderId: string | null) =>
     invoke<number | null>("memo_import", { folderId }),
+  // 共有メモ(M5 F-2)。host = 正本 / member = キャッシュ + ホスト依頼
+  sharedMemoOp: (configPath: string, op: SharedMemoOp) =>
+    invoke<SharedMemoReply>("shared_memo_op", { configPath, op }),
+  sharedMemoExport: (configPath: string, id: string) =>
+    invoke<string | null>("shared_memo_export", { configPath, id }),
 };
 
 // ---- 表示ヘルパ ----

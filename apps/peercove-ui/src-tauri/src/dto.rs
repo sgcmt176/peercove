@@ -122,6 +122,9 @@ pub struct Member {
     pub can_invite: bool,
     /// このメンバーを招待した発行者の表示名(ADR-0048)。ホスト発行は null。
     pub invited_by: Option<String>,
+    /// member_id(= invite_id、ADR-0047)。共有メモの個別権限指定に使う
+    /// (M5 F-2)。旧形式の登録・ホストは null。
+    pub member_id: Option<String>,
 }
 
 impl Member {
@@ -151,6 +154,7 @@ impl Member {
             acl_rule_id: entry.acl_rule_id.clone(),
             can_invite: entry.can_invite,
             invited_by: entry.invited_by.clone(),
+            member_id: entry.member_id.clone(),
         }
     }
 }
@@ -369,6 +373,10 @@ pub struct Tunnel {
     /// 既知のグループ(ADR-0016、M3-13c)。自分が抜けたグループも含む
     /// (UI が履歴の表示名に使い、会話リストからは隠す)。
     pub groups: Vec<Group>,
+    /// 共有メモの変更世代(M5 F-2)。進んだら再取得する。
+    pub shared_memo_seq: u64,
+    /// 共有メモが使えるか(member で false = ホスト未対応 or 未同期)。
+    pub shared_memo: bool,
     /// 解決済みカスタム DNS レコード(ADR-0022)。member はここから一覧表示
     /// する(設定ファイルには無いため)。host の DNS 管理画面は編集情報つきの
     /// `list_dns_records` を使う。
@@ -425,6 +433,8 @@ impl From<&TunnelInfo> for Tunnel {
             chat_generation: info.chat_generation,
             chat_sending: info.chat_sending.clone(),
             groups: info.groups.iter().map(Group::from).collect(),
+            shared_memo_seq: info.shared_memo_seq,
+            shared_memo: info.shared_memo,
             // 配布形式は解決済み(A は {name, ip}、CNAME は {name, target})。
             // どちらもメンバー一覧に出す(参照情報は持たない)
             dns_records: info
@@ -903,6 +913,8 @@ mod tests {
             chat_generation: 0,
             chat_sending: vec![],
             groups: vec![],
+            shared_memo_seq: 0,
+            shared_memo: false,
             dns_records: vec![peercove_core::dns::DnsRecord {
                 name: "web.alice".to_string(),
                 ip: "10.100.42.2".parse().unwrap(),
@@ -1037,6 +1049,8 @@ mod tests {
             chat_generation: 0,
             chat_sending: vec![],
             groups: vec![],
+            shared_memo_seq: 0,
+            shared_memo: false,
             dns_records: vec![],
             cname_records: vec![],
         };

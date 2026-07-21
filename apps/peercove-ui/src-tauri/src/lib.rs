@@ -148,6 +148,70 @@ async fn memo_import(
     Ok(Some(imported))
 }
 
+// ---- 共有メモ (M5 F-2, ADR-0049) ----
+
+/// 共有メモの操作。host はデーモンが正本を直接、member は読み取りをキャッシュ、
+/// 変更をコントロールチャネル経由でホストへ届ける(判定はすべてホスト正本)。
+#[tauri::command]
+async fn shared_memo_op(
+    config_path: String,
+    op: peercove_core::memo::SharedMemoOp,
+) -> Result<peercove_core::memo::SharedMemoReply, String> {
+    match peercove_ipc::request_async(IpcRequest::SharedMemo {
+        config: PathBuf::from(&config_path),
+        op,
+    })
+    .await
+    {
+        Ok(IpcResponse::SharedMemo { reply }) => Ok(reply),
+        Ok(other) => Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => Err(to_message(e)),
+    }
+}
+
+/// 共有メモ 1 件を `.txt` へ保存する(個人メモの memo_export と同型)。
+#[tauri::command]
+async fn shared_memo_export(
+    app: tauri::AppHandle,
+    config_path: String,
+    id: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let reply = match peercove_ipc::request_async(IpcRequest::SharedMemo {
+        config: PathBuf::from(&config_path),
+        op: peercove_core::memo::SharedMemoOp::Get { id },
+    })
+    .await
+    {
+        Ok(IpcResponse::SharedMemo { reply }) => reply,
+        Ok(other) => return Err(format!("想定外の応答です: {other:?}")),
+        Err(e) => return Err(to_message(e)),
+    };
+    let peercove_core::memo::SharedMemoReply::Memo { memo } = reply else {
+        return Err("想定外の応答です".to_string());
+    };
+    let suggested = format!(
+        "{}.txt",
+        peercove_core::memo::sanitize_filename(&memo.title)
+    );
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("テキスト", &["txt"])
+            .set_file_name(&suggested)
+            .blocking_save_file()
+            .map(|path| path.to_string())
+    })
+    .await
+    .map_err(|e| format!("ダイアログの表示に失敗しました: {e}"))?;
+    let Some(output) = picked else {
+        return Ok(None);
+    };
+    std::fs::write(&output, memo.body.as_bytes())
+        .map_err(|e| format!("書き込みに失敗しました: {e}"))?;
+    Ok(Some(output))
+}
+
 // ---- 暗号化バックアップ / 復元 (M3-24, ADR-0034) ----
 
 #[tauri::command]
@@ -1526,6 +1590,8 @@ pub fn run() {
             memo_op,
             memo_export,
             memo_import,
+            shared_memo_op,
+            shared_memo_export,
             create_backup,
             pick_backup,
             inspect_backup,

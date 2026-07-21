@@ -13,7 +13,7 @@
 //! 秘匿ルール: チャット本文・グループ名・ファイル名の中身はログへ出さない
 //! (seq・id・IP・サイズは可)。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -46,7 +46,8 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// スマホがホストへ名乗る追加機能(実装済みのものだけ)。
-const MOBILE_CAPABILITIES: &[&str] = &["chat", "file_transfer"];
+/// shared_memo(M5 F-2): ホストはこれを名乗った接続にだけメモイベントを送る。
+const MOBILE_CAPABILITIES: &[&str] = &["chat", "file_transfer", "shared_memo"];
 /// スマホの受信ファイルサイズ上限の既定(MB)。デスクトップは 100 MB だが
 /// スマホはストレージが限られるため小さくする(2026-07-19 依頼者指定)。
 pub const MOBILE_DEFAULT_MAX_RECV_FILE_MB: u64 = 10;
@@ -180,6 +181,15 @@ pub struct SessionShared {
     /// CreateInvite(ADR-0048)の応答受け口。token は秘密情報 — ログへ
     /// 出さず、取り出したら永続化しない
     invite_result: Mutex<Option<(bool, String, Option<IssuedInvite>)>>,
+    /// 共有メモ(M5 F-2)。UI 依頼の応答(seq → reply)と、接続時同期が
+    /// 待っている seq の集合。イベント・同期はキャッシュ DB へ反映し
+    /// `memo_generation` を進める(UI はポーリングで検知する)
+    memo_results: Mutex<HashMap<u64, peercove_core::memo::SharedMemoReply>>,
+    memo_sync_pending: Mutex<std::collections::HashSet<u64>>,
+    memo_seq: std::sync::atomic::AtomicU64,
+    pub memo_generation: std::sync::atomic::AtomicU64,
+    /// ホストが共有メモに応答した(= 対応バージョン)。
+    pub memo_supported: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -214,6 +224,11 @@ impl NetSession {
             display_result: Mutex::new(None),
             rotate_result: Mutex::new(None),
             invite_result: Mutex::new(None),
+            memo_results: Mutex::new(HashMap::new()),
+            memo_sync_pending: Mutex::new(std::collections::HashSet::new()),
+            memo_seq: std::sync::atomic::AtomicU64::new(0),
+            memo_generation: std::sync::atomic::AtomicU64::new(1),
+            memo_supported: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             cfg,
         });
@@ -500,6 +515,10 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
         },
     )?;
 
+    // 共有メモの初回同期(M5 F-2)。一覧を頼み、応答は下の受信ループが
+    // memo_sync_pending 経由でキャッシュへ反映する
+    shared.start_memo_sync();
+
     let mut reader = line_reader(stream);
     let mut line = String::new();
     let mut fresh = true;
@@ -577,6 +596,14 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
                             expires_at,
                         });
                         *shared.invite_result.lock().unwrap() = Some((accepted, message, invite));
+                    }
+                    Ok(ControlMessage::MemoResp { seq, reply }) => {
+                        // 共有メモの応答(M5 F-2)。同期分はキャッシュへ、
+                        // UI 依頼分は受け口へ。内容はログへ出さない
+                        shared.handle_memo_resp(seq, reply);
+                    }
+                    Ok(ControlMessage::MemoEvent { event }) => {
+                        shared.handle_memo_event(event);
                     }
                     Ok(other) => tracing::debug!("未処理のメッセージ: {other:?}"),
                     Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
@@ -1057,6 +1084,146 @@ impl SessionShared {
             ControlMessage::RotateKey { new_public_key },
             &self.rotate_result,
         )
+    }
+}
+
+// ---- 共有メモ(M5 F-2、ADR-0049)-------------------------------------------
+//
+// 読み取りはキャッシュ(`<config>.memocache.db`)、変更はコントロールチャネル
+// でホストへ(権限・ロック・CAS はすべてホスト正本で判定)。イベントで
+// キャッシュを最新に保ち、`memo_generation` を UI がポーリングする。
+// **メモのタイトル・本文はログへ出さない。**
+
+impl SessionShared {
+    pub fn memo_cache_path(&self) -> PathBuf {
+        self.cfg.config_path.with_extension("memocache.db")
+    }
+
+    fn open_memo_cache(&self) -> anyhow::Result<peercove_memo::shared::CacheStore> {
+        peercove_memo::shared::CacheStore::open(&self.memo_cache_path())
+    }
+
+    fn bump_memo(&self) {
+        self.memo_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn next_memo_seq(&self) -> u64 {
+        self.memo_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// 接続時の同期開始(control_session が呼ぶ)。前セッションの残骸は捨てる。
+    fn start_memo_sync(&self) {
+        self.memo_results.lock().unwrap().clear();
+        let seq = self.next_memo_seq();
+        self.memo_sync_pending.lock().unwrap().insert(seq);
+        self.outbox.lock().unwrap().push(ControlMessage::MemoReq {
+            seq,
+            op: peercove_core::memo::SharedMemoOp::List {
+                query: Default::default(),
+            },
+        });
+    }
+
+    fn handle_memo_resp(&self, seq: u64, reply: peercove_core::memo::SharedMemoReply) {
+        use peercove_core::memo::{SharedMemoOp, SharedMemoReply};
+        let is_sync = self.memo_sync_pending.lock().unwrap().remove(&seq);
+        if !is_sync {
+            self.memo_results.lock().unwrap().insert(seq, reply);
+            return;
+        }
+        self.memo_supported.store(true, Ordering::Relaxed);
+        match reply {
+            SharedMemoReply::Memos { memos, folders, .. } => {
+                let result = (|| -> anyhow::Result<()> {
+                    let mut cache = self.open_memo_cache()?;
+                    let ids: Vec<String> = memos.iter().map(|memo| memo.id.clone()).collect();
+                    cache.retain(&ids)?;
+                    let mut stale = Vec::new();
+                    for memo in &memos {
+                        match cache.revision(&memo.id)? {
+                            Some(revision) if revision == memo.revision => {
+                                cache.set_lock(&memo.id, memo.locked_by.as_deref())?;
+                            }
+                            _ => stale.push(memo.id.clone()),
+                        }
+                    }
+                    cache.replace_folders(&folders)?;
+                    tracing::info!(
+                        "共有メモを同期しました({} 件、取り直し {} 件)",
+                        ids.len(),
+                        stale.len()
+                    );
+                    // リビジョンが進んだ・手元に無いメモは本文を取り直す
+                    let mut pending = self.memo_sync_pending.lock().unwrap();
+                    let mut outbox = self.outbox.lock().unwrap();
+                    for id in stale {
+                        let seq = self.next_memo_seq();
+                        pending.insert(seq);
+                        outbox.push(ControlMessage::MemoReq {
+                            seq,
+                            op: SharedMemoOp::Get { id },
+                        });
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    tracing::warn!("共有メモの同期に失敗しました: {e:#}");
+                }
+                self.bump_memo();
+            }
+            SharedMemoReply::Memo { memo } => {
+                if let Ok(mut cache) = self.open_memo_cache() {
+                    let _ = cache.upsert(&memo);
+                }
+                self.bump_memo();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_memo_event(&self, event: peercove_core::memo::SharedMemoEvent) {
+        use peercove_core::memo::SharedMemoEvent;
+        self.memo_supported.store(true, Ordering::Relaxed);
+        let result = (|| -> anyhow::Result<()> {
+            let mut cache = self.open_memo_cache()?;
+            match event {
+                SharedMemoEvent::Changed { memo } => cache.upsert(&memo),
+                SharedMemoEvent::Removed { id } => cache.remove(&id),
+                SharedMemoEvent::Lock { id, holder } => cache.set_lock(&id, holder.as_deref()),
+                SharedMemoEvent::Folders { folders } => cache.replace_folders(&folders),
+            }
+        })();
+        if let Err(e) = result {
+            tracing::warn!("共有メモのキャッシュ更新に失敗しました: {e:#}");
+        }
+        self.bump_memo();
+    }
+
+    /// UI からの共有メモ操作(変更系)。応答をポーリングで待つ。
+    pub fn memo_request(
+        &self,
+        op: peercove_core::memo::SharedMemoOp,
+    ) -> anyhow::Result<peercove_core::memo::SharedMemoReply> {
+        use peercove_core::memo::SharedMemoReply;
+        if !self.control_connected.load(Ordering::Relaxed) {
+            bail!("オフライン中の共有メモは読み取り専用です(ホスト接続後にやり直してください)");
+        }
+        let seq = self.next_memo_seq();
+        self.outbox
+            .lock()
+            .unwrap()
+            .push(ControlMessage::MemoReq { seq, op });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !self.stopped() {
+            if let Some(reply) = self.memo_results.lock().unwrap().remove(&seq) {
+                if let SharedMemoReply::Err { message } = reply {
+                    bail!("{message}");
+                }
+                return Ok(reply);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        bail!("ホストから応答がありません(ホストのバージョンが古い可能性があります)");
     }
 }
 
@@ -2309,7 +2476,7 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         assert!(line.contains(r#""type":"hello""#), "{line}");
         assert!(
-            line.contains(r#""capabilities":["chat","file_transfer"]"#),
+            line.contains(r#""capabilities":["chat","file_transfer","shared_memo"]"#),
             "{line}"
         );
         assert!(line.contains("test-control"), "表示名を名乗る: {line}");

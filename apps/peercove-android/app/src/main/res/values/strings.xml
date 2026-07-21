@@ -297,4 +297,19 @@
     <string name="memo_in_trash">ゴミ箱のメモ(読み取り専用)</string>
     <string name="memo_move_folder">フォルダーへ移動</string>
     <string name="memo_checklist">☑ %1$d/%2$d</string>
+
+    <!-- 共有メモ(M5 F-2、ADR-0049) -->
+    <string name="tab_memos">メモ</string>
+    <string name="shared_memo_empty">共有メモがありません</string>
+    <string name="shared_memo_offline">オフライン(ホスト未接続)のため読み取り専用です</string>
+    <string name="shared_memo_unsupported">ホストと同期できていません(ホストのバージョンが古い可能性があります)</string>
+    <string name="shared_memo_plaintext_note">共有メモはホスト端末へ平文で保存されます。パスワード、秘密鍵、招待トークンなどの保存には使用しないでください。</string>
+    <string name="shared_memo_viewing">閲覧中(リアルタイム更新)</string>
+    <string name="shared_memo_editing_by">%1$s が編集中</string>
+    <string name="shared_memo_edit">編集</string>
+    <string name="shared_memo_finish">編集を終了</string>
+    <string name="shared_memo_viewer">閲覧のみ</string>
+    <string name="shared_memo_owner">所有者: %1$s</string>
+    <string name="shared_memo_host">ホスト</string>
+    <string name="shared_memo_trash_confirm">このメモをゴミ箱へ移動しますか?(復元はホストの画面から行えます)</string>
 </resources>

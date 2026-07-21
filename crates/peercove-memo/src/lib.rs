@@ -10,6 +10,8 @@
 //!   このモジュールの anyhow エラーは呼び出し元経由で UI に表示されるだけで、
 //!   デーモンのログには載らない
 
+pub mod shared;
+
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -21,13 +23,17 @@ use peercove_core::memo::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// スキーマ世代。互換性のない変更で上げ、`migrate` に移行を足す。
-const SCHEMA_VERSION: i64 = 1;
+/// - 2: FTS をかな折り畳み済みテキストの通常表に変更(ひらがな/カタカナ同一視)
+const SCHEMA_VERSION: i64 = 2;
 
 /// 1 メモのタグ数の上限(異常な肥大を防ぐだけの緩い値)。
 const MAX_TAGS_PER_MEMO: usize = 30;
 
 /// タグ 1 つの長さ上限(文字)。
 const MAX_TAG_CHARS: usize = 50;
+
+/// ゴミ箱の保持期間(ミリ秒)。個人・共有とも同じ(要件 §13)。
+const TRASH_RETENTION_MS: i64 = TRASH_RETENTION_DAYS as i64 * 24 * 60 * 60 * 1000;
 
 pub struct MemoStore {
     conn: Connection,
@@ -49,6 +55,7 @@ impl MemoStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        register_kana_fold(&conn)?;
         let mut store = Self { conn };
         store.migrate()?;
         store.purge_expired_trash()?;
@@ -88,26 +95,36 @@ impl MemoStore {
                     tag TEXT NOT NULL,
                     PRIMARY KEY (memo_id, tag)
                 );
-                -- 全文検索(FTS5 外部コンテンツ表)。trigram は日本語の部分一致に
-                -- 分かち書きなしで対応できる(3 文字未満の検索は LIKE で代替)
-                CREATE VIRTUAL TABLE memo_fts USING fts5(
-                    title, body, content='memos', content_rowid='rowid',
-                    tokenize='trigram'
-                );
+                "#,
+            )?;
+        }
+        if version < 2 {
+            // v2: 全文検索(FTS5)。trigram は日本語の部分一致に分かち書きなしで
+            // 対応できる(3 文字未満の検索は LIKE で代替)。索引には
+            // kana_fold(カタカナ→ひらがな)済みのテキストを入れ、検索語も
+            // 同じく折り畳むことで、ひらがな/カタカナを同一視する。
+            // v1 の外部コンテンツ表 + 生テキストのトリガーは作り直す
+            tx.execute_batch(
+                r#"
+                DROP TRIGGER IF EXISTS memos_fts_insert;
+                DROP TRIGGER IF EXISTS memos_fts_delete;
+                DROP TRIGGER IF EXISTS memos_fts_update;
+                DROP TABLE IF EXISTS memo_fts;
+                CREATE VIRTUAL TABLE memo_fts USING fts5(title, body, tokenize='trigram');
                 CREATE TRIGGER memos_fts_insert AFTER INSERT ON memos BEGIN
                     INSERT INTO memo_fts(rowid, title, body)
-                        VALUES (new.rowid, new.title, new.body);
+                        VALUES (new.rowid, kana_fold(new.title), kana_fold(new.body));
                 END;
                 CREATE TRIGGER memos_fts_delete AFTER DELETE ON memos BEGIN
-                    INSERT INTO memo_fts(memo_fts, rowid, title, body)
-                        VALUES ('delete', old.rowid, old.title, old.body);
+                    DELETE FROM memo_fts WHERE rowid = old.rowid;
                 END;
                 CREATE TRIGGER memos_fts_update AFTER UPDATE OF title, body ON memos BEGIN
-                    INSERT INTO memo_fts(memo_fts, rowid, title, body)
-                        VALUES ('delete', old.rowid, old.title, old.body);
+                    DELETE FROM memo_fts WHERE rowid = old.rowid;
                     INSERT INTO memo_fts(rowid, title, body)
-                        VALUES (new.rowid, new.title, new.body);
+                        VALUES (new.rowid, kana_fold(new.title), kana_fold(new.body));
                 END;
+                INSERT INTO memo_fts(rowid, title, body)
+                    SELECT rowid, kana_fold(title), kana_fold(body) FROM memos;
                 "#,
             )?;
         }
@@ -118,7 +135,7 @@ impl MemoStore {
 
     /// 保持期限(30 日)を過ぎたゴミ箱のメモを完全削除する。
     fn purge_expired_trash(&mut self) -> anyhow::Result<()> {
-        let cutoff = unix_ms().saturating_sub(TRASH_RETENTION_DAYS as i64 * 24 * 60 * 60 * 1000);
+        let cutoff = unix_ms().saturating_sub(TRASH_RETENTION_MS);
         self.conn.execute(
             "DELETE FROM memos WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
             params![cutoff],
@@ -418,6 +435,9 @@ impl MemoStore {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            // 索引・列側は kana_fold 済みなので、検索語も折り畳んで比較する
+            // (ひらがな/カタカナ同一視)
+            let search = kana_fold(search);
             if search.chars().count() >= 3 {
                 // FTS5 trigram: 検索語をフレーズ(引用符)として渡す。内部の
                 // 引用符は 2 重化してエスケープする
@@ -438,7 +458,7 @@ impl MemoStore {
                 args.push(Box::new(pattern));
                 let n = args.len();
                 clauses.push(format!(
-                    "(m.title LIKE ?{n} ESCAPE '\\' OR m.body LIKE ?{n} ESCAPE '\\')"
+                    "(kana_fold(m.title) LIKE ?{n} ESCAPE '\\' OR kana_fold(m.body) LIKE ?{n} ESCAPE '\\')"
                 ));
             }
         }
@@ -602,6 +622,39 @@ fn normalize_tags(tags: &[String]) -> anyhow::Result<Vec<String>> {
         bail!("タグが多すぎます(1 メモにつき上限 {MAX_TAGS_PER_MEMO} 個)");
     }
     Ok(out)
+}
+
+/// 検索用のかな折り畳み: カタカナ(全角)をひらがなへ寄せる。
+/// 索引(トリガー経由)と検索語の両方に同じ変換をかけることで、
+/// 「めんて」でも「メンテ」でも同じメモに当たる。
+pub fn kana_fold(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let code = c as u32;
+            // U+30A1 ァ 〜 U+30F6 ヶ → 0x60 引くと対応するひらがな
+            if (0x30A1..=0x30F6).contains(&code) {
+                char::from_u32(code - 0x60).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `kana_fold` を SQL 関数として登録する(トリガーと LIKE 代替が使う)。
+/// 接続ごとに必要なので open() で必ず呼ぶ。
+fn register_kana_fold(conn: &Connection) -> anyhow::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "kana_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text: String = ctx.get(0)?;
+            Ok(kana_fold(&text))
+        },
+    )?;
+    Ok(())
 }
 
 /// SQLite の INTEGER(i64)に合わせる。core の型(u64)へは読み出し時に変換する。
@@ -890,6 +943,72 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    /// ひらがな/カタカナを同一視する(2026-07-21 実機検証フィードバック)。
+    #[test]
+    fn search_is_kana_insensitive() {
+        let (_dir, mut store) = open_temp();
+        create(&mut store, "サーバー情報", "本番環境のメンテナンス手順\n");
+        create(&mut store, "ひらがなめも", "らーめんの店を探す\n");
+
+        // ひらがな → カタカナ本文(FTS 経路: 3 文字以上)
+        let hits = list(
+            &mut store,
+            MemoQuery {
+                search: Some("めんてなんす".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "サーバー情報");
+
+        // カタカナ → ひらがな本文(FTS 経路)
+        let hits = list(
+            &mut store,
+            MemoQuery {
+                search: Some("ラーメン".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "ひらがなめも");
+
+        // 2 文字(LIKE 経路)でも同一視される
+        let hits = list(
+            &mut store,
+            MemoQuery {
+                search: Some("メモ".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "ひらがなめも");
+
+        assert_eq!(kana_fold("メンテナンス手順ヴヶ"), "めんてなんす手順ゔゖ");
+    }
+
+    /// v1(生テキスト索引)の DB を開くと v2 へ移行され、かな同一視が効く。
+    #[test]
+    fn v1_database_migrates_to_kana_folded_fts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memos.db");
+        {
+            let mut store = MemoStore::open(&path).unwrap();
+            create(&mut store, "移行前", "メンテナンスの記録\n");
+            // v1 相当に偽装(実際の v1 とはトリガー形が違うが、v2 移行が
+            // 索引を作り直すことの確認には十分)
+            store.conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let mut store = MemoStore::open(&path).unwrap();
+        let hits = list(
+            &mut store,
+            MemoQuery {
+                search: Some("めんてなんす".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
