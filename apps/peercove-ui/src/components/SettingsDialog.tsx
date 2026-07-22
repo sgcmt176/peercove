@@ -224,7 +224,7 @@ function SettingsForm({
         </label>
 
         {settings.isMember && (
-          <label className="field--check">
+          <label className="field field--check">
             <input
               type="checkbox"
               checked={direct}
@@ -238,7 +238,7 @@ function SettingsForm({
         )}
 
         {!settings.isMember && (
-          <label className="field--check">
+          <label className="field field--check">
             <input
               type="checkbox"
               checked={requireInviteApproval}
@@ -252,7 +252,7 @@ function SettingsForm({
         )}
 
         {!settings.isMember && (
-          <label className="field--check">
+          <label className="field field--check">
             <input
               type="checkbox"
               checked={memberInvites}
