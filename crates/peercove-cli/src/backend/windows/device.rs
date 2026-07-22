@@ -27,8 +27,10 @@ use super::super::PeerSpec;
 
 /// TUN デバイスの読み書き。wintun の他、テスト用モックを差し込めるようにする。
 pub trait TunIo: Send + Sync + 'static {
-    /// OS から出ていくパケットを 1 つ受け取る(ブロッキング)。Err はシャットダウン。
-    fn recv(&self) -> anyhow::Result<Vec<u8>>;
+    /// OS から出ていくパケットを 1 つ `buf` へ受け取り、長さを返す(ブロッキング)。
+    /// 毎パケットのヒープ確保を避けるため呼び出し側のバッファへ直接コピーする
+    /// (C-3)。`buf` に収まらないパケットは破棄してよい。Err はシャットダウン。
+    fn recv(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
     /// 復号済みパケットを OS へ渡す。
     fn send(&self, packet: &[u8]) -> anyhow::Result<()>;
     /// `recv` のブロックを解除する。
@@ -40,6 +42,10 @@ const BUF_SIZE: usize = 2048;
 const TIMER_TICK: Duration = Duration::from_millis(250);
 /// UDP 受信のタイムアウト。shutdown フラグの確認周期を兼ねる。
 const RECV_TIMEOUT: Duration = Duration::from_millis(500);
+/// UDP ソケットバッファ(SO_RCVBUF / SO_SNDBUF)。OS 既定(数十 KB)のままだと
+/// リレー時のバーストで受信あふれ → 取りこぼしが起きる(C-3 ベンチで欠落 30% を
+/// 観測)。パケット処理が瞬間的に追いつかなくてもカーネル側で吸収できる量にする。
+const SOCKET_BUF_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct DevicePeer {
     pub public_key: [u8; 32],
@@ -135,12 +141,28 @@ impl Device {
         tun: Box<dyn TunIo>,
     ) -> anyhow::Result<Arc<Self>> {
         let port = listen_port.unwrap_or(0);
-        let socket = UdpSocket::bind(("0.0.0.0", port)).with_context(|| {
-            format!(
-                "UDP ポート {port} の bind に失敗しました。\
+        // socket2 経由で作り、bind 前にソケットバッファを広げる(C-3)。
+        // バッファ設定の失敗は致命的ではないので警告に留める
+        let raw = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .context("UDP ソケットの作成に失敗しました")?;
+        if let Err(e) = raw.set_recv_buffer_size(SOCKET_BUF_BYTES) {
+            tracing::warn!("UDP 受信バッファの拡大に失敗しました(既定値で続行): {e}");
+        }
+        if let Err(e) = raw.set_send_buffer_size(SOCKET_BUF_BYTES) {
+            tracing::warn!("UDP 送信バッファの拡大に失敗しました(既定値で続行): {e}");
+        }
+        raw.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())
+            .with_context(|| {
+                format!(
+                    "UDP ポート {port} の bind に失敗しました。\
                 他のプロセス(WireGuard クライアント等)が使用していないか確認してください"
-            )
-        })?;
+                )
+            })?;
+        let socket = UdpSocket::from(raw);
         socket
             .set_read_timeout(Some(RECV_TIMEOUT))
             .context("UDP ソケットの設定に失敗しました")?;
@@ -488,10 +510,11 @@ impl Device {
 
     /// TUN 受信ループ(OS から出ていくパケットの暗号化)。
     pub fn tun_loop(self: &Arc<Self>) {
+        let mut recv_buf = [0u8; BUF_SIZE];
         let mut work_buf = [0u8; BUF_SIZE];
         while !self.is_shutdown() {
-            let packet = match self.tun.recv() {
-                Ok(packet) => packet,
+            let len = match self.tun.recv(&mut recv_buf) {
+                Ok(len) => len,
                 Err(e) => {
                     if !self.is_shutdown() {
                         tracing::warn!("TUN の読み取りが停止しました: {e:#}");
@@ -499,7 +522,7 @@ impl Device {
                     break;
                 }
             };
-            let bytes = packet.as_slice();
+            let bytes = &recv_buf[..len];
             let Some(IpAddr::V4(dst)) = Tunn::dst_address(bytes) else {
                 continue; // IPv6 等は M0 対象外
             };
@@ -598,7 +621,7 @@ mod tests {
     }
 
     impl TunIo for MockTun {
-        fn recv(&self) -> anyhow::Result<Vec<u8>> {
+        fn recv(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
             loop {
                 let packet = self
                     .os_out_rx
@@ -609,7 +632,13 @@ mod tests {
                     anyhow::bail!("shutdown");
                 }
                 match packet {
-                    Ok(packet) => return Ok(packet),
+                    Ok(packet) => {
+                        if packet.len() > buf.len() {
+                            continue; // 実装と同じく過大パケットは破棄
+                        }
+                        buf[..packet.len()].copy_from_slice(&packet);
+                        return Ok(packet.len());
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("closed"),
                 }
@@ -1157,5 +1186,173 @@ mod tests {
 
         host2.stop();
         member.stop();
+    }
+
+    // ---- スループット計測(C-3)。CI では走らせない(--ignored 指定時のみ)----
+    //
+    // 実行例(必ず --release で。debug は暗号処理が桁で遅く参考にならない):
+    //   cargo test -p peercove-cli --release -- --ignored bench_loopback --nocapture
+    //
+    // MockTun + localhost UDP なので絶対値は実環境より高く出るが、
+    // 同一マシンでの最適化前後の相対比較に使う。UDP なのでソケットバッファ
+    // あふれによる欠落があり得るため、送った数でなく「実際に届いたバイト数 ÷
+    // 最初と最後の受信の間隔」で算出し、欠落率も併記する。
+
+    /// 1400 バイト(実効 MTU 相当)のダミー IPv4 パケットを `count` 個流し、
+    /// 受信側で計測する。戻りは (Mbps, 受信数)。
+    fn pump_and_measure(
+        from: &TestNode,
+        to: &TestNode,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        count: usize,
+    ) -> (f64, usize) {
+        const PAYLOAD: usize = 1380; // IPv4 ヘッダ 20B と合わせ 1400B
+        let packet = ipv4_packet(src, dst, &vec![0xA5u8; PAYLOAD]);
+        // ハンドシェイクを済ませ、経路が温まっていることを確認
+        let warmup = ipv4_packet(src, dst, b"warmup");
+        expect_via_tunnel(from, to, warmup, "ウォームアップパケット");
+
+        let packet_len = packet.len();
+        let sender = {
+            let tx = from.tun.os_out_tx.clone();
+            let packet = packet.clone();
+            std::thread::spawn(move || {
+                for _ in 0..count {
+                    if tx.send(packet.clone()).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let mut received = 0usize;
+        let mut bytes = 0usize;
+        let mut first: Option<Instant> = None;
+        let mut last = Instant::now();
+        loop {
+            match to.tun.os_in_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(p) => {
+                    if p.len() != packet_len {
+                        continue; // keepalive 等ではなくサイズで対象パケットだけ数える
+                    }
+                    let now = Instant::now();
+                    first.get_or_insert(now);
+                    last = now;
+                    received += 1;
+                    bytes += p.len();
+                    if received == count {
+                        break;
+                    }
+                }
+                // 1 秒間何も来なければ「流し終わった(残りは欠落)」とみなす
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(e) => panic!("計測中に受信側が停止しました: {e}"),
+            }
+        }
+        sender.join().unwrap();
+        let elapsed = first.map(|f| last.duration_since(f)).unwrap_or_default();
+        let mbps = if elapsed.as_secs_f64() > 0.0 {
+            (bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0
+        } else {
+            0.0
+        };
+        (mbps, received)
+    }
+
+    /// member → host の 1 ホップ(暗号化 1 回 + 復号 1 回)。
+    #[test]
+    #[ignore = "スループット計測用。--release で明示実行する(C-3)"]
+    fn bench_loopback_throughput_direct() {
+        let host_ip: Ipv4Addr = "100.100.42.1".parse().unwrap();
+        let member_ip: Ipv4Addr = "100.100.42.2".parse().unwrap();
+        let host_key = PrivateKey::generate();
+        let member_key = PrivateKey::generate();
+
+        let host = TestNode::start(&host_key);
+        host.device
+            .add_peer(&peer_spec(
+                member_key.public_key(),
+                None,
+                &["100.100.42.2/32"],
+                None,
+            ))
+            .unwrap();
+        let member = TestNode::start(&member_key);
+        member
+            .device
+            .add_peer(&peer_spec(
+                host_key.public_key(),
+                Some(host.endpoint()),
+                &["100.100.42.0/24"],
+                Some(25),
+            ))
+            .unwrap();
+
+        const COUNT: usize = 50_000; // 1400B × 50k = 70MB
+        let (mbps, received) = pump_and_measure(&member, &host, member_ip, host_ip, COUNT);
+        println!(
+            "bench direct: {mbps:.0} Mbps({received}/{COUNT} 受信、欠落 {:.1}%)",
+            (COUNT - received) as f64 * 100.0 / COUNT as f64
+        );
+
+        host.stop();
+        member.stop();
+    }
+
+    /// member A → host(リレー)→ member B の 2 ホップ
+    /// (host は復号 + ACL 判定 + 再暗号化を 1 スレッドで行う最重量経路)。
+    #[test]
+    #[ignore = "スループット計測用。--release で明示実行する(C-3)"]
+    fn bench_loopback_throughput_relay() {
+        let a_ip: Ipv4Addr = "100.100.42.2".parse().unwrap();
+        let b_ip: Ipv4Addr = "100.100.42.3".parse().unwrap();
+        let host_key = PrivateKey::generate();
+        let a_key = PrivateKey::generate();
+        let b_key = PrivateKey::generate();
+
+        let host = TestNode::start_full(&host_key, None, true);
+        host.device
+            .add_peer(&peer_spec(
+                a_key.public_key(),
+                None,
+                &["100.100.42.2/32"],
+                None,
+            ))
+            .unwrap();
+        host.device
+            .add_peer(&peer_spec(
+                b_key.public_key(),
+                None,
+                &["100.100.42.3/32"],
+                None,
+            ))
+            .unwrap();
+        let host_peer = |node: &TestNode| {
+            peer_spec(
+                host_key.public_key(),
+                Some(node.endpoint()),
+                &["100.100.42.0/24"],
+                Some(25),
+            )
+        };
+        let a = TestNode::start(&a_key);
+        a.device.add_peer(&host_peer(&host)).unwrap();
+        let b = TestNode::start(&b_key);
+        b.device.add_peer(&host_peer(&host)).unwrap();
+
+        // B → host を先に温めて、host が B のエンドポイントを学習してから計測する
+        let warm_b = ipv4_packet(b_ip, "100.100.42.1".parse().unwrap(), b"warm b");
+        expect_via_tunnel(&b, &host, warm_b, "B→host ウォームアップ");
+
+        const COUNT: usize = 50_000;
+        let (mbps, received) = pump_and_measure(&a, &b, a_ip, b_ip, COUNT);
+        println!(
+            "bench relay: {mbps:.0} Mbps({received}/{COUNT} 受信、欠落 {:.1}%)",
+            (COUNT - received) as f64 * 100.0 / COUNT as f64
+        );
+
+        host.stop();
+        a.stop();
+        b.stop();
     }
 }

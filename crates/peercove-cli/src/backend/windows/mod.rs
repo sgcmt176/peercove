@@ -108,12 +108,26 @@ struct WintunIo {
 }
 
 impl TunIo for WintunIo {
-    fn recv(&self) -> anyhow::Result<Vec<u8>> {
-        let packet = self
-            .session
-            .receive_blocking()
-            .map_err(|e| anyhow::anyhow!("wintun セッションが停止しました: {e}"))?;
-        Ok(packet.bytes().to_vec())
+    fn recv(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
+        loop {
+            let packet = self
+                .session
+                .receive_blocking()
+                .map_err(|e| anyhow::anyhow!("wintun セッションが停止しました: {e}"))?;
+            let bytes = packet.bytes();
+            // 毎パケットの Vec 確保を避け、呼び出し側の固定バッファへ直接コピー
+            // する(C-3)。MTU 設定済みなので通常は収まる。収まらない異常サイズは
+            // 切り詰めると壊れたパケットになるため破棄して次を待つ
+            if bytes.len() > buf.len() {
+                tracing::warn!(
+                    "TUN から {} バイトの過大パケットを破棄しました",
+                    bytes.len()
+                );
+                continue;
+            }
+            buf[..bytes.len()].copy_from_slice(bytes);
+            return Ok(bytes.len());
+        }
     }
 
     fn send(&self, packet: &[u8]) -> anyhow::Result<()> {
