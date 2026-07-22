@@ -383,7 +383,8 @@ export type DiagnosticCategory =
   | "tunnel"
   | "internet"
   | "dns"
-  | "permissions";
+  | "permissions"
+  | "memo";
 
 export interface DiagnosticCheck {
   id: string;
@@ -587,6 +588,40 @@ export interface SharedMemoDetail {
   members?: SharedMemberPerm[];
 }
 
+/** 共有メモの容量・履歴の上限(ホスト設定可、M5 F-3)。 */
+export interface SharedMemoLimits {
+  max_body_bytes: number;
+  max_memo_count: number;
+  max_total_bytes: number;
+  max_versions: number;
+  history_days: number;
+  trash_days: number;
+}
+
+/** 変更履歴 1 版分の要約(本文は含まない)。 */
+export interface SharedMemoHistoryEntry {
+  hid: number;
+  revision: number;
+  kind: "auto" | "close" | "manual" | "restore";
+  saved_by_name: string;
+  created_at_unix_ms: number;
+  title: string;
+  body_bytes: number;
+}
+
+/** 変更履歴 1 版分の全体(本文込み)。 */
+export interface SharedMemoHistoryDetail {
+  entry: SharedMemoHistoryEntry;
+  body: string;
+}
+
+export type DiffLineKind = "same" | "added" | "removed";
+
+export interface DiffLine {
+  kind: DiffLineKind;
+  text: string;
+}
+
 export type SharedMemoOp =
   | { op: "list"; query: SharedMemoQuery }
   | { op: "get"; id: string }
@@ -612,7 +647,19 @@ export type SharedMemoOp =
     }
   | { op: "folder_create"; name: string }
   | { op: "folder_rename"; id: string; name: string }
-  | { op: "folder_delete"; id: string };
+  | { op: "folder_delete"; id: string }
+  | { op: "history_list"; id: string }
+  | { op: "history_get"; id: string; hid: number }
+  | {
+      op: "history_diff";
+      id: string;
+      from_hid: number;
+      to_hid?: number;
+    }
+  | { op: "history_restore"; id: string; hid: number }
+  | { op: "save_version"; id: string }
+  | { op: "get_limits" }
+  | { op: "set_limits"; limits: SharedMemoLimits };
 
 export type SharedMemoReply =
   | {
@@ -622,6 +669,10 @@ export type SharedMemoReply =
       offline?: boolean;
     }
   | { kind: "memo"; memo: SharedMemoDetail }
+  | { kind: "history"; entries: SharedMemoHistoryEntry[] }
+  | { kind: "history_detail"; detail: SharedMemoHistoryDetail }
+  | { kind: "diff"; lines: DiffLine[] }
+  | { kind: "limits"; limits: SharedMemoLimits }
   | { kind: "done" }
   | { kind: "err"; message: string };
 
@@ -634,8 +685,9 @@ export type Connection =
 // ---- コマンド ----
 
 export const api = {
-  createBackup: (configPath: string, passphrase: string) =>
-    invoke<string | null>("create_backup", { configPath, passphrase }),
+  // includeMemos は Option<bool> 側(未指定 = 同梱)。UI は常に明示して送る
+  createBackup: (configPath: string, passphrase: string, includeMemos: boolean) =>
+    invoke<string | null>("create_backup", { configPath, passphrase, includeMemos }),
   pickBackup: () => invoke<string | null>("pick_backup"),
   inspectBackup: (path: string, passphrase: string) =>
     invoke<BackupPreview>("inspect_backup", { path, passphrase }),

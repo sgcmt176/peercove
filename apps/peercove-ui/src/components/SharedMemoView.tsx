@@ -6,11 +6,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  DiffLine,
   MemoFolder,
   Member,
   SharedMemberPerm,
   SharedMemoDetail,
+  SharedMemoHistoryDetail,
+  SharedMemoHistoryEntry,
+  SharedMemoLimits,
   SharedMemoOp,
+  SharedMemoReply,
   SharedMemoSummary,
   SharedPermLevel,
   api,
@@ -55,6 +60,9 @@ export function SharedMemoView({
   );
   const [saveError, setSaveError] = useState("");
   const [permsFor, setPermsFor] = useState<SharedMemoDetail | null>(null);
+  /** 変更履歴パネルを開いているか(本文領域を置き換える)。 */
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [limitsOpen, setLimitsOpen] = useState(false);
 
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
   // 自動保存の土台(CAS 用リビジョンと保存済み内容)
@@ -163,6 +171,7 @@ export function SharedMemoView({
   const open = useCallback(
     async (id: string) => {
       await stopEditing();
+      setHistoryOpen(false);
       try {
         const reply = await op({ op: "get", id });
         if (reply.kind === "memo") {
@@ -180,6 +189,7 @@ export function SharedMemoView({
   /** 編集ロックを取得して編集を始める(最新内容が返る)。 */
   const startEditing = useCallback(
     async (id: string) => {
+      setHistoryOpen(false);
       try {
         const reply = await op({ op: "acquire_lock", id });
         if (reply.kind === "memo") {
@@ -281,7 +291,37 @@ export function SharedMemoView({
     setSelected(null);
     baseRef.current = null;
     setEditing(false);
+    setHistoryOpen(false);
   }, []);
+
+  /** 復元後: 最新内容を取り直して履歴パネルを閉じる。 */
+  const onHistoryRestored = useCallback(async () => {
+    setHistoryOpen(false);
+    if (selected) {
+      try {
+        const reply = await op({ op: "get", id: selected.id });
+        if (reply.kind === "memo") setSelected(reply.memo);
+      } catch {
+        // 配信(seq)側の再取得に任せる
+      }
+    }
+    setNotice(t.sharedMemo.historyRestored);
+    void refresh();
+  }, [op, selected, refresh]);
+
+  const saveVersion = useCallback(async () => {
+    if (!selected) return;
+    try {
+      const reply = await op({ op: "save_version", id: selected.id });
+      if (reply.kind === "err") {
+        setNotice(reply.message);
+      } else {
+        setNotice(t.sharedMemo.saveVersionDone);
+      }
+    } catch (error) {
+      setNotice(errorMessage(error));
+    }
+  }, [op, selected]);
 
   const copyToPersonal = useCallback(async () => {
     if (!selected) return;
@@ -342,6 +382,13 @@ export function SharedMemoView({
           }
         />
       )}
+      {limitsOpen && (
+        <LimitsDialog
+          op={op}
+          onClose={() => setLimitsOpen(false)}
+          onNotice={setNotice}
+        />
+      )}
       <aside className="memo__side card">
         <div className="memo__side-head">
           <button
@@ -351,6 +398,16 @@ export function SharedMemoView({
           >
             ＋ {t.memo.newMemo}
           </button>
+          {isHost && (
+            <button
+              type="button"
+              className="button--icon"
+              title={t.sharedMemo.limits}
+              onClick={() => setLimitsOpen(true)}
+            >
+              ⚙
+            </button>
+          )}
         </div>
         {readOnlyReason && (
           <p className="memo__notice small">{readOnlyReason}</p>
@@ -517,7 +574,29 @@ export function SharedMemoView({
                   <ModeBtn label={t.memo.modeEdit} value="edit" mode={mode} onMode={setMode} />
                   <ModeBtn label={t.memo.modeSplit} value="split" mode={mode} onMode={setMode} />
                   <ModeBtn label={t.memo.modePreview} value="preview" mode={mode} onMode={setMode} />
+                  <button
+                    type="button"
+                    className="button--icon"
+                    title={t.sharedMemo.saveVersion}
+                    onClick={() => void saveVersion()}
+                  >
+                    {t.sharedMemo.saveVersion}
+                  </button>
                 </>
+              )}
+              {!editing && (
+                <button
+                  type="button"
+                  className={
+                    historyOpen
+                      ? "button--icon button--icon--active"
+                      : "button--icon"
+                  }
+                  title={t.sharedMemo.history}
+                  onClick={() => setHistoryOpen((prev) => !prev)}
+                >
+                  🕘 {t.sharedMemo.history}
+                </button>
               )}
               {!trashView && selected.can_manage && (
                 <button
@@ -590,69 +669,81 @@ export function SharedMemoView({
               )}
             </div>
 
-            <div
-              className={
-                editing && mode === "split"
-                  ? "memo__panes memo__panes--split"
-                  : "memo__panes"
-              }
-            >
-              {editing && mode !== "preview" && (
-                <textarea
-                  ref={bodyRef}
-                  className="memo__body"
-                  value={draft.body}
-                  placeholder={t.memo.bodyPlaceholder}
-                  spellCheck={false}
-                  onChange={(event) =>
-                    setDraft({ ...draft, body: event.target.value })
+            {historyOpen ? (
+              <SharedMemoHistoryPanel
+                op={op}
+                memoId={selected.id}
+                canEdit={Boolean(selected.can_edit)}
+                onRestored={() => void onHistoryRestored()}
+                onNotice={setNotice}
+              />
+            ) : (
+              <>
+                <div
+                  className={
+                    editing && mode === "split"
+                      ? "memo__panes memo__panes--split"
+                      : "memo__panes"
                   }
-                />
-              )}
-              {(!editing || mode !== "edit") && (
-                <div className="memo__preview markdown">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    components={{
-                      a: ({ href, children }) => (
-                        <a
-                          href={href}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            if (href) void api.openLink(href);
-                          }}
-                        >
-                          {children}
-                        </a>
-                      ),
-                      input: ({ checked }) => (
-                        <input type="checkbox" checked={Boolean(checked)} disabled readOnly />
-                      ),
-                    }}
-                  >
-                    {editing ? draft.body : selected.body}
-                  </ReactMarkdown>
+                >
+                  {editing && mode !== "preview" && (
+                    <textarea
+                      ref={bodyRef}
+                      className="memo__body"
+                      value={draft.body}
+                      placeholder={t.memo.bodyPlaceholder}
+                      spellCheck={false}
+                      onChange={(event) =>
+                        setDraft({ ...draft, body: event.target.value })
+                      }
+                    />
+                  )}
+                  {(!editing || mode !== "edit") && (
+                    <div className="memo__preview markdown">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          a: ({ href, children }) => (
+                            <a
+                              href={href}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                if (href) void api.openLink(href);
+                              }}
+                            >
+                              {children}
+                            </a>
+                          ),
+                          input: ({ checked }) => (
+                            <input type="checkbox" checked={Boolean(checked)} disabled readOnly />
+                          ),
+                        }}
+                      >
+                        {editing ? draft.body : selected.body}
+                      </ReactMarkdown>
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
 
-            <div className="memo__meta">
-              <span className="muted small">
-                {t.sharedMemo.ownerLabel(
-                  selected.owner_name || t.sharedMemo.hostName,
-                )}
-              </span>
-              {selected.updated_by && (
-                <span className="muted small">
-                  {t.sharedMemo.updatedBy(selected.updated_by)}
-                </span>
-              )}
-              <span className="muted small">
-                {t.memo.updatedAt(formatDate(selected.updated_at))}
-              </span>
-              <span className="muted small">rev {selected.revision}</span>
-              {editing && <span className="muted small">{stats}</span>}
-            </div>
+                <div className="memo__meta">
+                  <span className="muted small">
+                    {t.sharedMemo.ownerLabel(
+                      selected.owner_name || t.sharedMemo.hostName,
+                    )}
+                  </span>
+                  {selected.updated_by && (
+                    <span className="muted small">
+                      {t.sharedMemo.updatedBy(selected.updated_by)}
+                    </span>
+                  )}
+                  <span className="muted small">
+                    {t.memo.updatedAt(formatDate(selected.updated_at))}
+                  </span>
+                  <span className="muted small">rev {selected.revision}</span>
+                  {editing && <span className="muted small">{stats}</span>}
+                </div>
+              </>
+            )}
           </div>
         )}
       </section>
@@ -904,6 +995,324 @@ function PermsDialog({
           {t.common.save}
         </button>
       </div>
+    </Modal>
+  );
+}
+
+/** 変更履歴パネル(閲覧時に本文領域を置き換える)。一覧 → 版の本文/差分 → 復元・個人メモへコピー。 */
+function SharedMemoHistoryPanel({
+  op,
+  memoId,
+  canEdit,
+  onRestored,
+  onNotice,
+}: {
+  op: (op: SharedMemoOp) => Promise<SharedMemoReply>;
+  memoId: string;
+  canEdit: boolean;
+  onRestored: () => void;
+  onNotice: (message: string) => void;
+}) {
+  const [entries, setEntries] = useState<SharedMemoHistoryEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState<SharedMemoHistoryEntry | null>(null);
+  const [detail, setDetail] = useState<SharedMemoHistoryDetail | null>(null);
+  const [diffLines, setDiffLines] = useState<DiffLine[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void op({ op: "history_list", id: memoId })
+      .then((reply) => {
+        if (!cancelled && reply.kind === "history") setEntries(reply.entries);
+      })
+      .catch((error) => onNotice(errorMessage(error)))
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [memoId]);
+
+  const openEntry = useCallback(
+    async (entry: SharedMemoHistoryEntry) => {
+      setSelected(entry);
+      setDetail(null);
+      setDiffLines(null);
+      try {
+        const reply = await op({ op: "history_get", id: memoId, hid: entry.hid });
+        if (reply.kind === "history_detail") setDetail(reply.detail);
+      } catch (error) {
+        onNotice(errorMessage(error));
+      }
+    },
+    [op, memoId, onNotice],
+  );
+
+  const toggleDiff = useCallback(async () => {
+    if (!selected) return;
+    if (diffLines !== null) {
+      setDiffLines(null);
+      return;
+    }
+    try {
+      const reply = await op({
+        op: "history_diff",
+        id: memoId,
+        from_hid: selected.hid,
+      });
+      if (reply.kind === "diff") setDiffLines(reply.lines);
+    } catch (error) {
+      onNotice(errorMessage(error));
+    }
+  }, [op, memoId, selected, diffLines, onNotice]);
+
+  const restore = useCallback(async () => {
+    if (!selected) return;
+    if (!window.confirm(t.sharedMemo.historyRestoreConfirm)) return;
+    setBusy(true);
+    try {
+      const reply = await op({ op: "history_restore", id: memoId, hid: selected.hid });
+      if (reply.kind === "err") {
+        onNotice(reply.message);
+      } else {
+        onRestored();
+      }
+    } catch (error) {
+      onNotice(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }, [op, memoId, selected, onRestored, onNotice]);
+
+  const copyToPersonal = useCallback(async () => {
+    if (!detail) return;
+    try {
+      await api.memoOp({
+        op: "create",
+        title: detail.entry.title,
+        body: detail.body,
+      });
+      onNotice(t.sharedMemo.copiedToPersonal);
+    } catch (error) {
+      onNotice(errorMessage(error));
+    }
+  }, [detail, onNotice]);
+
+  return (
+    <div className="memo__history">
+      <div className="memo__history-list">
+        {loading && <p className="muted small">{t.common.running}</p>}
+        {!loading && entries.length === 0 && (
+          <p className="muted small">{t.sharedMemo.historyEmpty}</p>
+        )}
+        <ul className="memo__history-entries">
+          {entries.map((entry) => (
+            <li key={entry.hid}>
+              <button
+                type="button"
+                className={
+                  selected?.hid === entry.hid
+                    ? "memo__history-entry memo__history-entry--active"
+                    : "memo__history-entry"
+                }
+                onClick={() => void openEntry(entry)}
+              >
+                <span
+                  className={`memo__history-kind memo__history-kind--${entry.kind}`}
+                >
+                  {t.sharedMemo.historyKind[entry.kind]}
+                </span>
+                <span className="small">{formatDate(entry.created_at_unix_ms)}</span>
+                <span className="muted small">{entry.saved_by_name}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="memo__history-detail">
+        {!selected && (
+          <p className="muted memo__placeholder">
+            {t.sharedMemo.historySelectPrompt}
+          </p>
+        )}
+        {selected && (
+          <>
+            <div className="memo__history-actions">
+              <button type="button" onClick={() => void toggleDiff()}>
+                {diffLines !== null
+                  ? t.sharedMemo.historyShowBody
+                  : t.sharedMemo.historyCompare}
+              </button>
+              {canEdit && (
+                <button type="button" disabled={busy} onClick={() => void restore()}>
+                  {t.sharedMemo.historyRestore}
+                </button>
+              )}
+              <button
+                type="button"
+                className="button--icon"
+                title={t.sharedMemo.copyToPersonal}
+                disabled={!detail}
+                onClick={() => void copyToPersonal()}
+              >
+                ⧉
+              </button>
+            </div>
+            {diffLines !== null ? (
+              <pre className="memo__diff">
+                {diffLines.map((line, index) => (
+                  <div
+                    key={index}
+                    className={`memo__diff-line memo__diff-line--${line.kind}`}
+                  >
+                    {line.kind === "added" ? "+ " : line.kind === "removed" ? "- " : "  "}
+                    {line.text}
+                  </div>
+                ))}
+              </pre>
+            ) : (
+              detail && (
+                <div className="memo__preview markdown">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {detail.body}
+                  </ReactMarkdown>
+                </div>
+              )
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** 共有メモの容量・履歴上限の設定(ホスト管理者のみ、M5 F-3)。 */
+function LimitsDialog({
+  op,
+  onClose,
+  onNotice,
+}: {
+  op: (op: SharedMemoOp) => Promise<SharedMemoReply>;
+  onClose: () => void;
+  onNotice: (message: string) => void;
+}) {
+  const [limits, setLimits] = useState<SharedMemoLimits | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void op({ op: "get_limits" })
+      .then((reply) => {
+        if (reply.kind === "limits") setLimits(reply.limits);
+      })
+      .catch((error) => setLoadError(errorMessage(error)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const field = (
+    key: keyof SharedMemoLimits,
+    label: string,
+    toDisplay: (bytes: number) => number,
+    fromDisplay: (value: number) => number,
+  ) => {
+    if (!limits) return null;
+    return (
+      <div className="field">
+        <label>{label}</label>
+        <input
+          type="number"
+          min={0}
+          value={toDisplay(limits[key])}
+          onChange={(event) => {
+            const value = Number(event.target.value);
+            if (Number.isNaN(value)) return;
+            setLimits({ ...limits, [key]: fromDisplay(value) });
+          }}
+        />
+      </div>
+    );
+  };
+
+  const save = async () => {
+    if (!limits) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const reply = await op({ op: "set_limits", limits });
+      if (reply.kind === "done") {
+        onNotice(t.sharedMemo.limitsSaved);
+        onClose();
+      } else if (reply.kind === "err") {
+        setSaveError(reply.message);
+      }
+    } catch (error) {
+      setSaveError(errorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title={t.sharedMemo.limitsTitle} onClose={onClose}>
+      <p className="muted small">{t.sharedMemo.limitsNote}</p>
+      {loadError && <p className="memo__notice small">{loadError}</p>}
+      {!limits && !loadError && (
+        <p className="muted small">{t.common.running}</p>
+      )}
+      {limits && (
+        <>
+          {field(
+            "max_body_bytes",
+            t.sharedMemo.limitsBodyLabel,
+            (bytes) => Math.round(bytes / 1024),
+            (kib) => kib * 1024,
+          )}
+          {field(
+            "max_total_bytes",
+            t.sharedMemo.limitsTotalLabel,
+            (bytes) => Math.round(bytes / (1024 * 1024)),
+            (mib) => mib * 1024 * 1024,
+          )}
+          {field(
+            "max_memo_count",
+            t.sharedMemo.limitsCountLabel,
+            (value) => value,
+            (value) => value,
+          )}
+          {field(
+            "max_versions",
+            t.sharedMemo.limitsVersionsLabel,
+            (value) => value,
+            (value) => value,
+          )}
+          {field(
+            "history_days",
+            t.sharedMemo.limitsHistoryDaysLabel,
+            (value) => value,
+            (value) => value,
+          )}
+          {field(
+            "trash_days",
+            t.sharedMemo.limitsTrashDaysLabel,
+            (value) => value,
+            (value) => value,
+          )}
+          {saveError && <p className="memo__notice small">{saveError}</p>}
+          <div className="modal__actions">
+            <button type="button" className="button--ghost" onClick={onClose}>
+              {t.common.cancel}
+            </button>
+            <button type="button" disabled={saving} onClick={() => void save()}>
+              {saving ? t.common.running : t.common.save}
+            </button>
+          </div>
+        </>
+      )}
     </Modal>
   );
 }

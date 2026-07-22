@@ -10,6 +10,7 @@ import android.provider.OpenableColumns
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -74,6 +75,8 @@ import uniffi.peercove_mobile.MemoScopeArg
 import uniffi.peercove_mobile.MemoSortArg
 import uniffi.peercove_mobile.MemoSummaryInfo
 import uniffi.peercove_mobile.MobileException
+import uniffi.peercove_mobile.NetworkInfo
+import uniffi.peercove_mobile.listNetworks
 import uniffi.peercove_mobile.memoCreate
 import uniffi.peercove_mobile.memoDeleteForever
 import uniffi.peercove_mobile.memoDuplicate
@@ -90,6 +93,7 @@ import uniffi.peercove_mobile.memoSetFlags
 import uniffi.peercove_mobile.memoSetFolder
 import uniffi.peercove_mobile.memoSetTags
 import uniffi.peercove_mobile.memoTrash
+import uniffi.peercove_mobile.sharedMemoCreate
 
 private val dateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
 
@@ -612,9 +616,13 @@ private fun MemoEditor(
     var folderMenuOpen by remember { mutableStateOf(false) }
     var tagsDialog by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var copyToSharedDialog by remember { mutableStateOf(false) }
+    // 共有メモへコピーの先のネットワーク一覧(0 件ならメニュー自体を出さない)
+    val networks: List<NetworkInfo> = remember { listNetworks(baseDir) }
 
     val exportDone = stringResource(R.string.memo_export_done)
     val exportFailed = stringResource(R.string.memo_export_failed)
+    val copiedToShared = stringResource(R.string.memo_copied_to_shared)
     val inTrash = detail?.deletedAt != null
 
     LaunchedEffect(id) {
@@ -754,6 +762,44 @@ private fun MemoEditor(
         )
     }
 
+    if (copyToSharedDialog) {
+        AlertDialog(
+            onDismissRequest = { copyToSharedDialog = false },
+            title = { Text(stringResource(R.string.memo_copy_to_shared_choose)) },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    networks.forEach { net ->
+                        Text(
+                            net.name,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    copyToSharedDialog = false
+                                    scope.launch {
+                                        try {
+                                            withContext(Dispatchers.IO) {
+                                                sharedMemoCreate(net.slug, title, body)
+                                            }
+                                            onNotice(copiedToShared)
+                                        } catch (e: MobileException) {
+                                            onNotice(e.message ?: "")
+                                        }
+                                    }
+                                }
+                                .padding(vertical = 12.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { copyToSharedDialog = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { flushAndClose() }) {
@@ -878,6 +924,15 @@ private fun MemoEditor(
                             exportLauncher.launch(memoExportName(title) + ".txt")
                         },
                     )
+                    if (networks.isNotEmpty()) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.memo_copy_to_shared)) },
+                            onClick = {
+                                menuOpen = false
+                                copyToSharedDialog = true
+                            },
+                        )
+                    }
                     DropdownMenuItem(
                         text = {
                             Text(

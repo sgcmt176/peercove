@@ -16,9 +16,9 @@ use std::path::Path;
 
 use anyhow::{bail, Context};
 use peercove_core::memo::{
-    checklist_progress, excerpt, MemoDetail, MemoFolder, MemoOp, MemoPatch, MemoQuery, MemoReply,
-    MemoScope, MemoSort, MemoSummary, MemoTagCount, EXCERPT_CHARS, MAX_BODY_BYTES, MAX_TITLE_CHARS,
-    TRASH_RETENTION_DAYS,
+    checklist_progress, excerpt, DiffLine, DiffLineKind, MemoDetail, MemoFolder, MemoOp, MemoPatch,
+    MemoQuery, MemoReply, MemoScope, MemoSort, MemoSummary, MemoTagCount, EXCERPT_CHARS,
+    MAX_BODY_BYTES, MAX_TITLE_CHARS, TRASH_RETENTION_DAYS,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -581,17 +581,151 @@ fn ensure_folder_exists(conn: &Connection, folder_id: &str) -> anyhow::Result<()
 }
 
 /// タイトル・本文の上限(要件 §14)。超過は黙って失敗させず理由を返す。
+/// 個人メモ(固定上限)から使う。共有メモは [`validate_title`] +
+/// [`validate_body_bytes`](上限はホスト設定可)を個別に呼ぶ。
 fn validate_text(title: &str, body: &str) -> anyhow::Result<()> {
+    validate_title(title)?;
+    validate_body_bytes(body, MAX_BODY_BYTES)
+}
+
+/// タイトルの上限(文字数)。個人・共有共通。
+fn validate_title(title: &str) -> anyhow::Result<()> {
     if title.chars().count() > MAX_TITLE_CHARS {
         bail!("タイトルが長すぎます(上限 {MAX_TITLE_CHARS} 文字)");
     }
-    if body.len() > MAX_BODY_BYTES {
+    Ok(())
+}
+
+/// 本文のバイト数上限(UTF-8)。共有メモはホスト設定可の上限を渡す。
+fn validate_body_bytes(body: &str, max_bytes: usize) -> anyhow::Result<()> {
+    if body.len() > max_bytes {
         bail!(
             "本文が大きすぎます(上限 {} KiB)。メモを分割してください",
-            MAX_BODY_BYTES / 1024
+            max_bytes / 1024
         );
     }
     Ok(())
+}
+
+/// 2 つの本文の行単位差分(unified diff 風)。LCS(最長共通部分列)で計算する。
+///
+/// 安全弁: 共通の接頭辞・接尾辞の行を先に取り除き、残りの行数の積が
+/// 4,000,000 を超える場合は LCS を諦め、残り全体を削除+追加として返す
+/// (巨大な本文同士の比較でメモリ・CPU を使い切らないため)。
+pub fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    let max_common = old_lines.len().min(new_lines.len());
+    let mut prefix = 0usize;
+    while prefix < max_common && old_lines[prefix] == new_lines[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < max_common - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_mid = &old_lines[prefix..old_lines.len() - suffix];
+    let new_mid = &new_lines[prefix..new_lines.len() - suffix];
+
+    let mut out = Vec::with_capacity(old_lines.len() + new_lines.len());
+    for line in &old_lines[..prefix] {
+        out.push(DiffLine {
+            kind: DiffLineKind::Same,
+            text: (*line).to_string(),
+        });
+    }
+
+    let m = old_mid.len();
+    let n = new_mid.len();
+    if (m as u64) * (n as u64) > 4_000_000 {
+        // 安全弁: LCS を諦め、丸ごと削除+追加として扱う
+        for line in old_mid {
+            out.push(DiffLine {
+                kind: DiffLineKind::Removed,
+                text: (*line).to_string(),
+            });
+        }
+        for line in new_mid {
+            out.push(DiffLine {
+                kind: DiffLineKind::Added,
+                text: (*line).to_string(),
+            });
+        }
+    } else {
+        out.extend(lcs_diff(old_mid, new_mid));
+    }
+
+    for line in &old_lines[old_lines.len() - suffix..] {
+        out.push(DiffLine {
+            kind: DiffLineKind::Same,
+            text: (*line).to_string(),
+        });
+    }
+    out
+}
+
+/// `old`/`new` の LCS を DP で求め、Same/Removed/Added の列へ復元する。
+/// 対応が付かない区間は Removed → Added の順で並べる(unified diff 風)。
+fn lcs_diff(old: &[&str], new: &[&str]) -> Vec<DiffLine> {
+    let m = old.len();
+    let n = new.len();
+    // dp[i][j] = old[i..] と new[j..] の LCS 長。呼び出し元で m*n の上限を
+    // 検査済みなので、ここでは素朴な O(m*n) 表で構わない
+    let width = n + 1;
+    let mut dp = vec![0u32; (m + 1) * width];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i * width + j] = if old[i] == new[j] {
+                dp[(i + 1) * width + (j + 1)] + 1
+            } else {
+                dp[(i + 1) * width + j].max(dp[i * width + (j + 1)])
+            };
+        }
+    }
+
+    let mut out = Vec::with_capacity(m + n);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < m && j < n {
+        if old[i] == new[j] {
+            out.push(DiffLine {
+                kind: DiffLineKind::Same,
+                text: old[i].to_string(),
+            });
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * width + j] >= dp[i * width + (j + 1)] {
+            out.push(DiffLine {
+                kind: DiffLineKind::Removed,
+                text: old[i].to_string(),
+            });
+            i += 1;
+        } else {
+            out.push(DiffLine {
+                kind: DiffLineKind::Added,
+                text: new[j].to_string(),
+            });
+            j += 1;
+        }
+    }
+    while i < m {
+        out.push(DiffLine {
+            kind: DiffLineKind::Removed,
+            text: old[i].to_string(),
+        });
+        i += 1;
+    }
+    while j < n {
+        out.push(DiffLine {
+            kind: DiffLineKind::Added,
+            text: new[j].to_string(),
+        });
+        j += 1;
+    }
+    out
 }
 
 fn validate_folder_name(name: &str) -> anyhow::Result<String> {
@@ -1090,5 +1224,77 @@ mod tests {
             .is_empty(),
             "30 日を過ぎたゴミ箱は開いたときに完全削除される"
         );
+    }
+
+    fn texts(lines: &[DiffLine]) -> Vec<(DiffLineKind, &str)> {
+        lines.iter().map(|l| (l.kind, l.text.as_str())).collect()
+    }
+
+    #[test]
+    fn diff_lines_identical_is_all_same() {
+        let body = "a\nb\nc";
+        let out = diff_lines(body, body);
+        assert!(out.iter().all(|l| l.kind == DiffLineKind::Same));
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn diff_lines_pure_addition() {
+        let out = diff_lines("a\nb", "a\nb\nc");
+        assert_eq!(
+            texts(&out),
+            vec![
+                (DiffLineKind::Same, "a"),
+                (DiffLineKind::Same, "b"),
+                (DiffLineKind::Added, "c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_lines_pure_removal() {
+        let out = diff_lines("a\nb\nc", "a\nc");
+        assert_eq!(
+            texts(&out),
+            vec![
+                (DiffLineKind::Same, "a"),
+                (DiffLineKind::Removed, "b"),
+                (DiffLineKind::Same, "c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_lines_replace_orders_removed_before_added() {
+        let out = diff_lines("a\nold\nz", "a\nnew1\nnew2\nz");
+        assert_eq!(
+            texts(&out),
+            vec![
+                (DiffLineKind::Same, "a"),
+                (DiffLineKind::Removed, "old"),
+                (DiffLineKind::Added, "new1"),
+                (DiffLineKind::Added, "new2"),
+                (DiffLineKind::Same, "z"),
+            ]
+        );
+    }
+
+    /// 安全弁: 共通の接頭辞・接尾辞を除いた行数の積が閾値を超えると
+    /// LCS を諦め、丸ごと削除+追加になる。
+    #[test]
+    fn diff_lines_huge_input_falls_back_to_whole_replace() {
+        // 接頭辞・接尾辞を作らないよう、全行を一意にする
+        let old: String = (0..2500)
+            .map(|i| format!("old-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new: String = (0..2500)
+            .map(|i| format!("new-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = diff_lines(&old, &new);
+        assert_eq!(out.len(), 5000);
+        assert!(out[..2500].iter().all(|l| l.kind == DiffLineKind::Removed));
+        assert!(out[2500..].iter().all(|l| l.kind == DiffLineKind::Added));
     }
 }

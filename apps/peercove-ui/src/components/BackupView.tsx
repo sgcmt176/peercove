@@ -10,6 +10,7 @@ export function BackupView({
   onChanged: () => void;
 }) {
   const [networkPath, setNetworkPath] = useState(networks[0]?.configPath ?? "");
+  const [includeMemos, setIncludeMemos] = useState(true);
   const [createPass, setCreatePass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [backupPath, setBackupPath] = useState("");
@@ -37,7 +38,7 @@ export function BackupView({
   const create = () => run(async () => {
     if (createPass.length < 12) throw new Error(t.backup.passphraseLength);
     if (createPass !== confirmPass) throw new Error(t.backup.passphraseMismatch);
-    const output = await api.createBackup(networkPath, createPass);
+    const output = await api.createBackup(networkPath, createPass, includeMemos);
     if (output) {
       setNotice(t.backup.created(output));
       setCreatePass("");
@@ -65,6 +66,8 @@ export function BackupView({
     onChanged();
   });
 
+  const selectedNetwork = networks.find((network) => network.configPath === networkPath);
+
   return (
     <section className="prefs__backup" aria-labelledby="backup-title">
       <h3 id="backup-title">{t.backup.title}</h3>
@@ -77,6 +80,16 @@ export function BackupView({
               {networks.map((network) => <option key={network.configPath} value={network.configPath}>{network.name}</option>)}
             </select>
           </label>
+          {selectedNetwork?.role === "hosting" && (
+            <label className="chat__pick-row">
+              <input
+                type="checkbox"
+                checked={includeMemos}
+                onChange={(event) => setIncludeMemos(event.target.checked)}
+              />
+              <span>{t.backup.includeMemos}</span>
+            </label>
+          )}
           <label>{t.backup.passphrase}<input type="password" autoComplete="new-password" value={createPass} onChange={(event) => setCreatePass(event.target.value)} /></label>
           <label>{t.backup.confirm}<input type="password" autoComplete="new-password" value={confirmPass} onChange={(event) => setConfirmPass(event.target.value)} /></label>
           <p className="muted small">{t.backup.passphraseHint}</p>
@@ -89,7 +102,7 @@ export function BackupView({
           <label>{t.backup.passphrase}<input type="password" autoComplete="current-password" value={restorePass} onChange={(event) => { setRestorePass(event.target.value); setPreview(null); }} /></label>
           <button type="button" className="button--ghost" disabled={busy || !backupPath || restorePass.length < 12} onClick={() => void inspect()}>{t.backup.preview}</button>
           {preview && <div className="backup__preview">
-            <dl className="facts"><dt>{t.backup.network}</dt><dd>{preview.networkName}</dd><dt>{t.backup.role}</dt><dd>{preview.role === "host" ? t.backup.host : t.backup.member}</dd><dt>{t.backup.sourceOs}</dt><dd>{preview.sourceOs}</dd><dt>{t.backup.categories}</dt><dd>{preview.categories.join(", ")}</dd></dl>
+            <dl className="facts"><dt>{t.backup.network}</dt><dd>{preview.networkName}</dd><dt>{t.backup.role}</dt><dd>{preview.role === "host" ? t.backup.host : t.backup.member}</dd><dt>{t.backup.sourceOs}</dt><dd>{preview.sourceOs}</dd><dt>{t.backup.categories}</dt><dd>{preview.categories.map(categoryLabel).join(", ")}</dd></dl>
             {preview.memberKeyRotationRecommended && <p className="notice">{t.backup.rotateRecommendation}</p>}
             <label>{t.backup.restoreName}<input value={slug} onChange={(event) => setSlug(event.target.value)} /></label>
             <label className="chat__pick-row"><input type="checkbox" checked={replace} onChange={(event) => setReplace(event.target.checked)} /><span>{t.backup.replace}</span></label>
@@ -102,4 +115,9 @@ export function BackupView({
       {notice && <p role="status" className="notice">{notice}</p>}
     </section>
   );
+}
+
+/** バックアップに含まれる項目(Rust 側 `crates/peercove-ops/src/backup.rs` の categories)の表示名。未知の値はそのまま表示する。 */
+function categoryLabel(category: string): string {
+  return (t.backup.category as Record<string, string>)[category] ?? category;
 }

@@ -350,7 +350,8 @@ pub fn memo_export_name(title: String) -> String {
 // はすべてホスト正本で判定される。
 
 use peercove_core::memo::{
-    SharedMemoDetail, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
+    DiffLine, DiffLineKind, SharedMemoDetail, SharedMemoHistoryDetail, SharedMemoHistoryEntry,
+    SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
 };
 
 #[derive(uniffi::Record)]
@@ -437,6 +438,70 @@ pub struct SharedMemoListResult {
     pub supported: bool,
     /// キャッシュの変更世代。進んだら再取得する。
     pub generation: u64,
+}
+
+/// 変更履歴 1 版分の要約(本文は含まない、M5 F-3)。
+#[derive(uniffi::Record)]
+pub struct SharedMemoHistoryEntryInfo {
+    pub hid: i64,
+    pub revision: u64,
+    /// "auto" | "close" | "manual" | "restore"。
+    pub kind: String,
+    pub saved_by_name: String,
+    pub created_at_unix_ms: u64,
+    pub title: String,
+    pub body_bytes: u64,
+}
+
+impl From<SharedMemoHistoryEntry> for SharedMemoHistoryEntryInfo {
+    fn from(entry: SharedMemoHistoryEntry) -> Self {
+        Self {
+            hid: entry.hid,
+            revision: entry.revision,
+            kind: entry.kind,
+            saved_by_name: entry.saved_by_name,
+            created_at_unix_ms: entry.created_at_unix_ms,
+            title: entry.title,
+            body_bytes: entry.body_bytes,
+        }
+    }
+}
+
+/// 変更履歴 1 版分の全体(本文込み)。
+#[derive(uniffi::Record)]
+pub struct SharedMemoHistoryDetailInfo {
+    pub entry: SharedMemoHistoryEntryInfo,
+    pub body: String,
+}
+
+impl From<SharedMemoHistoryDetail> for SharedMemoHistoryDetailInfo {
+    fn from(detail: SharedMemoHistoryDetail) -> Self {
+        Self {
+            entry: detail.entry.into(),
+            body: detail.body,
+        }
+    }
+}
+
+/// 差分の 1 行。`kind` は "same" | "added" | "removed"。
+#[derive(uniffi::Record)]
+pub struct DiffLineInfo {
+    pub kind: String,
+    pub text: String,
+}
+
+impl From<DiffLine> for DiffLineInfo {
+    fn from(line: DiffLine) -> Self {
+        Self {
+            kind: match line.kind {
+                DiffLineKind::Same => "same",
+                DiffLineKind::Added => "added",
+                DiffLineKind::Removed => "removed",
+            }
+            .to_string(),
+            text: line.text,
+        }
+    }
 }
 
 fn cache_path(base_dir: &str, slug: &str) -> std::path::PathBuf {
@@ -583,6 +648,85 @@ pub fn shared_memo_trash(slug: String, id: String) -> Result<(), MobileError> {
     session_request(&slug, SharedMemoOp::Trash { id }).map(|_| ())
 }
 
+// ---- 変更履歴(M5 F-3、ADR-0049)---------------------------------------------
+//
+// 履歴の閲覧は「そのメモが見えるメンバー」、復元・版保存は「編集権限のある
+// メンバー」にホスト側で検査される(権限エラーは message にホストの理由が
+// 入って返る)。
+
+/// 変更履歴の一覧(新しい順)。
+#[uniffi::export]
+pub fn shared_memo_history_list(
+    slug: String,
+    memo_id: String,
+) -> Result<Vec<SharedMemoHistoryEntryInfo>, MobileError> {
+    match session_request(&slug, SharedMemoOp::HistoryList { id: memo_id })? {
+        SharedMemoReply::History { entries } => Ok(entries.into_iter().map(Into::into).collect()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// 変更履歴 1 版の本文取得。
+#[uniffi::export]
+pub fn shared_memo_history_get(
+    slug: String,
+    memo_id: String,
+    hid: i64,
+) -> Result<SharedMemoHistoryDetailInfo, MobileError> {
+    match session_request(&slug, SharedMemoOp::HistoryGet { id: memo_id, hid })? {
+        SharedMemoReply::HistoryDetail { detail } => Ok(detail.into()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// 2 版間の差分。`to_hid = None` は「現在の本文と比較」。
+#[uniffi::export]
+pub fn shared_memo_history_diff(
+    slug: String,
+    memo_id: String,
+    from_hid: i64,
+    to_hid: Option<i64>,
+) -> Result<Vec<DiffLineInfo>, MobileError> {
+    match session_request(
+        &slug,
+        SharedMemoOp::HistoryDiff {
+            id: memo_id,
+            from_hid,
+            to_hid,
+        },
+    )? {
+        SharedMemoReply::Diff { lines } => Ok(lines.into_iter().map(Into::into).collect()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// 指定した版の内容へ復元する(編集権限が必要。他人が編集中なら拒否される)。
+#[uniffi::export]
+pub fn shared_memo_history_restore(
+    slug: String,
+    memo_id: String,
+    hid: i64,
+) -> Result<(), MobileError> {
+    match session_request(&slug, SharedMemoOp::HistoryRestore { id: memo_id, hid })? {
+        SharedMemoReply::Memo { .. } | SharedMemoReply::Done => Ok(()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// 現在の内容を手動で履歴に残す(編集権限が必要)。
+#[uniffi::export]
+pub fn shared_memo_save_version(slug: String, memo_id: String) -> Result<(), MobileError> {
+    session_request(&slug, SharedMemoOp::SaveVersion { id: memo_id }).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +753,55 @@ mod tests {
         memo_trash(base.clone(), memo.id.clone()).unwrap();
         memo_delete_forever(base.clone(), memo.id).unwrap();
         assert_eq!(memo_export_name("a/b".to_string()), "a_b");
+    }
+
+    /// 履歴・差分の wire → UniFFI Record 変換(M5 F-3)。ネットワークは使わない。
+    #[test]
+    fn history_and_diff_conversion_preserves_fields() {
+        let entry = SharedMemoHistoryEntry {
+            hid: 7,
+            revision: 3,
+            kind: "manual".to_string(),
+            saved_by_name: "太郎".to_string(),
+            created_at_unix_ms: 1_000,
+            title: "件名".to_string(),
+            body_bytes: 42,
+        };
+        let info: SharedMemoHistoryEntryInfo = entry.clone().into();
+        assert_eq!(info.hid, entry.hid);
+        assert_eq!(info.revision, entry.revision);
+        assert_eq!(info.kind, entry.kind);
+        assert_eq!(info.saved_by_name, entry.saved_by_name);
+        assert_eq!(info.created_at_unix_ms, entry.created_at_unix_ms);
+        assert_eq!(info.title, entry.title);
+        assert_eq!(info.body_bytes, entry.body_bytes);
+
+        let detail = SharedMemoHistoryDetail {
+            entry: entry.clone(),
+            body: "本文".to_string(),
+        };
+        let detail_info: SharedMemoHistoryDetailInfo = detail.into();
+        assert_eq!(detail_info.entry.hid, entry.hid);
+        assert_eq!(detail_info.body, "本文");
+
+        let added: DiffLineInfo = DiffLine {
+            kind: DiffLineKind::Added,
+            text: "x".to_string(),
+        }
+        .into();
+        assert_eq!(added.kind, "added");
+        assert_eq!(added.text, "x");
+        let removed: DiffLineInfo = DiffLine {
+            kind: DiffLineKind::Removed,
+            text: "y".to_string(),
+        }
+        .into();
+        assert_eq!(removed.kind, "removed");
+        let same: DiffLineInfo = DiffLine {
+            kind: DiffLineKind::Same,
+            text: "z".to_string(),
+        }
+        .into();
+        assert_eq!(same.kind, "same");
     }
 }

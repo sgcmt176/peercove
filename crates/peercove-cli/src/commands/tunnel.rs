@@ -544,8 +544,11 @@ pub async fn supervise(
                         }
                     };
                     // 共有メモ(M5 F-2): 無操作の編集ロックを周期で解放する
+                    // (M5 F-3): DB の定期メンテナンスも同じ周期に相乗り
+                    // (内部で 10 分ゲートされるので毎周期呼んでよい)
                     if let crate::memoshare::MemoHandle::Host(service) = &memo {
                         service.sweep_expired_locks();
+                        service.maintain();
                     }
                     // 受信サイズ上限(ADR-0015)を設定に追随させる(両ロール)
                     if let Some(config) = &config {

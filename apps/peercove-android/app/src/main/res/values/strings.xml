@@ -298,6 +298,11 @@
     <string name="memo_move_folder">フォルダーへ移動</string>
     <string name="memo_checklist">☑ %1$d/%2$d</string>
 
+    <!-- 個人メモ → 共有メモへコピー(M5 F-3、ADR-0049) -->
+    <string name="memo_copy_to_shared">共有メモへコピー</string>
+    <string name="memo_copy_to_shared_choose">コピー先のネットワークを選択</string>
+    <string name="memo_copied_to_shared">共有メモへコピーしました</string>
+
     <!-- 共有メモ(M5 F-2、ADR-0049) -->
     <string name="tab_memos">メモ</string>
     <string name="shared_memo_empty">共有メモがありません</string>
@@ -312,4 +317,21 @@
     <string name="shared_memo_owner">所有者: %1$s</string>
     <string name="shared_memo_host">ホスト</string>
     <string name="shared_memo_trash_confirm">このメモをゴミ箱へ移動しますか?(復元はホストの画面から行えます)</string>
+
+    <!-- 変更履歴(M5 F-3、ADR-0049) -->
+    <string name="shared_memo_history">履歴</string>
+    <string name="shared_memo_history_empty">変更履歴がありません</string>
+    <string name="shared_memo_history_kind_auto">自動</string>
+    <string name="shared_memo_history_kind_close">編集終了</string>
+    <string name="shared_memo_history_kind_manual">手動</string>
+    <string name="shared_memo_history_kind_restore">復元前</string>
+    <string name="shared_memo_history_compare">現在と比較</string>
+    <string name="shared_memo_history_show_body">本文を表示</string>
+    <string name="shared_memo_history_restore_action">この版へ復元</string>
+    <string name="shared_memo_history_restore_confirm">この版の内容で現在の本文を置き換えます。現在の内容は履歴に残ります。</string>
+    <string name="shared_memo_history_restored">この版の内容で復元しました</string>
+    <string name="shared_memo_copy_to_personal">個人メモへコピー</string>
+    <string name="shared_memo_copied_to_personal">個人メモへコピーしました(メモタブで開けます)</string>
+    <string name="shared_memo_save_version">版を保存</string>
+    <string name="shared_memo_save_version_done">版を保存しました</string>
 </resources>

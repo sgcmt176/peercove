@@ -5,6 +5,8 @@ package app.peercove.android
 // 判定される。閲覧中は世代ポーリングでリアルタイムに追随する。
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,7 +23,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
@@ -45,8 +49,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -56,16 +62,25 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import uniffi.peercove_mobile.DiffLineInfo
 import uniffi.peercove_mobile.MobileException
 import uniffi.peercove_mobile.SharedMemoDetailInfo
+import uniffi.peercove_mobile.SharedMemoHistoryDetailInfo
+import uniffi.peercove_mobile.SharedMemoHistoryEntryInfo
 import uniffi.peercove_mobile.SharedMemoListResult
+import uniffi.peercove_mobile.memoCreate
 import uniffi.peercove_mobile.sharedMemoAcquire
 import uniffi.peercove_mobile.sharedMemoCreate
 import uniffi.peercove_mobile.sharedMemoGeneration
 import uniffi.peercove_mobile.sharedMemoGet
+import uniffi.peercove_mobile.sharedMemoHistoryDiff
+import uniffi.peercove_mobile.sharedMemoHistoryGet
+import uniffi.peercove_mobile.sharedMemoHistoryList
+import uniffi.peercove_mobile.sharedMemoHistoryRestore
 import uniffi.peercove_mobile.sharedMemoList
 import uniffi.peercove_mobile.sharedMemoRelease
 import uniffi.peercove_mobile.sharedMemoSave
+import uniffi.peercove_mobile.sharedMemoSaveVersion
 import uniffi.peercove_mobile.sharedMemoTrash
 
 private val sharedDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
@@ -272,6 +287,8 @@ private fun SharedMemoEditor(
     var saveFailed by remember { mutableStateOf<String?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var confirmTrash by remember { mutableStateOf(false) }
+    var historyOpen by remember { mutableStateOf(false) }
+    val savedVersionMsg = stringResource(R.string.shared_memo_save_version_done)
 
     // 閲覧中はリアルタイム追随(編集中は上書きしない)
     LaunchedEffect(id, editing) {
@@ -340,6 +357,31 @@ private fun SharedMemoEditor(
             saved = null
             onDone()
         }
+    }
+
+    if (historyOpen) {
+        SharedMemoHistoryScreen(
+            baseDir = baseDir,
+            slug = slug,
+            memoId = id,
+            canEdit = detail?.canEdit == true,
+            onNotice = onNotice,
+            onClose = { historyOpen = false },
+            onRestored = {
+                historyOpen = false
+                scope.launch {
+                    try {
+                        val memo = withContext(Dispatchers.IO) { sharedMemoGet(baseDir, slug, id) }
+                        detail = memo
+                        title = memo.title
+                        body = memo.body
+                    } catch (e: MobileException) {
+                        onNotice(e.message ?: "")
+                    }
+                }
+            },
+        )
+        return
     }
 
     BackHandler { stopEditing { onClose() } }
@@ -413,6 +455,12 @@ private fun SharedMemoEditor(
                 }
             }
             if (!editing) {
+                IconButton(onClick = { historyOpen = true }) {
+                    Icon(
+                        Icons.Filled.History,
+                        contentDescription = stringResource(R.string.shared_memo_history),
+                    )
+                }
                 FilterChip(
                     selected = false,
                     enabled = detail?.canEdit == true && detail?.lockedBy == null,
@@ -437,6 +485,21 @@ private fun SharedMemoEditor(
                     label = { Text(stringResource(R.string.shared_memo_edit)) },
                 )
             } else {
+                IconButton(onClick = {
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) { sharedMemoSaveVersion(slug, id) }
+                            onNotice(savedVersionMsg)
+                        } catch (e: MobileException) {
+                            onNotice(e.message ?: "")
+                        }
+                    }
+                }) {
+                    Icon(
+                        Icons.Filled.Save,
+                        contentDescription = stringResource(R.string.shared_memo_save_version),
+                    )
+                }
                 FilterChip(
                     selected = true,
                     onClick = { stopEditing() },
@@ -507,4 +570,281 @@ private fun SharedMemoEditor(
         }
         Spacer(modifier = Modifier.height(8.dp))
     }
+}
+
+/** 変更履歴の一覧(全画面。M5 F-3、ADR-0049)。項目タップで詳細/差分/復元へ。 */
+@Composable
+private fun SharedMemoHistoryScreen(
+    baseDir: String,
+    slug: String,
+    memoId: String,
+    canEdit: Boolean,
+    onNotice: (String) -> Unit,
+    onClose: () -> Unit,
+    onRestored: () -> Unit,
+) {
+    var entries by remember { mutableStateOf<List<SharedMemoHistoryEntryInfo>>(emptyList()) }
+    var loaded by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf<SharedMemoHistoryEntryInfo?>(null) }
+
+    LaunchedEffect(memoId) {
+        try {
+            entries = withContext(Dispatchers.IO) { sharedMemoHistoryList(slug, memoId) }
+        } catch (e: MobileException) {
+            onNotice(e.message ?: "")
+        }
+        loaded = true
+    }
+
+    val sel = selected
+    if (sel != null) {
+        SharedMemoHistoryDetailScreen(
+            baseDir = baseDir,
+            slug = slug,
+            memoId = memoId,
+            entry = sel,
+            canEdit = canEdit,
+            onNotice = onNotice,
+            onBack = { selected = null },
+            onRestored = onRestored,
+        )
+        return
+    }
+
+    BackHandler { onClose() }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onClose) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = stringResource(R.string.action_back),
+                )
+            }
+            Text(
+                stringResource(R.string.shared_memo_history),
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        if (loaded && entries.isEmpty()) {
+            Text(
+                stringResource(R.string.shared_memo_history_empty),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 16.dp),
+            )
+        }
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.weight(1f).padding(top = 8.dp),
+        ) {
+            items(entries, key = { it.hid }) { entry ->
+                Card(onClick = { selected = entry }, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                sharedDateFmt.format(Date(entry.createdAtUnixMs.toLong())),
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                historyKindLabel(entry.kind),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        Text(
+                            entry.savedByName,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 変更履歴 1 版の詳細: 本文/差分の表示、復元、個人メモへコピー。 */
+@Composable
+private fun SharedMemoHistoryDetailScreen(
+    baseDir: String,
+    slug: String,
+    memoId: String,
+    entry: SharedMemoHistoryEntryInfo,
+    canEdit: Boolean,
+    onNotice: (String) -> Unit,
+    onBack: () -> Unit,
+    onRestored: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var detail by remember { mutableStateOf<SharedMemoHistoryDetailInfo?>(null) }
+    var diffLines by remember { mutableStateOf<List<DiffLineInfo>?>(null) }
+    var confirmRestore by remember { mutableStateOf(false) }
+    var restoring by remember { mutableStateOf(false) }
+    val restoredMsg = stringResource(R.string.shared_memo_history_restored)
+    val copiedMsg = stringResource(R.string.shared_memo_copied_to_personal)
+
+    LaunchedEffect(entry.hid) {
+        diffLines = null
+        try {
+            detail = withContext(Dispatchers.IO) { sharedMemoHistoryGet(slug, memoId, entry.hid) }
+        } catch (e: MobileException) {
+            onNotice(e.message ?: "")
+        }
+    }
+
+    fun toggleDiff() {
+        if (diffLines != null) {
+            diffLines = null
+            return
+        }
+        scope.launch {
+            try {
+                diffLines = withContext(Dispatchers.IO) {
+                    sharedMemoHistoryDiff(slug, memoId, entry.hid, null)
+                }
+            } catch (e: MobileException) {
+                onNotice(e.message ?: "")
+            }
+        }
+    }
+
+    BackHandler { onBack() }
+
+    if (confirmRestore) {
+        AlertDialog(
+            onDismissRequest = { confirmRestore = false },
+            title = { Text(stringResource(R.string.shared_memo_history_restore_action)) },
+            text = { Text(stringResource(R.string.shared_memo_history_restore_confirm)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRestore = false
+                    restoring = true
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                sharedMemoHistoryRestore(slug, memoId, entry.hid)
+                            }
+                            onNotice(restoredMsg)
+                            onRestored()
+                        } catch (e: MobileException) {
+                            onNotice(e.message ?: "")
+                        }
+                        restoring = false
+                    }
+                }) { Text(stringResource(R.string.shared_memo_history_restore_action)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRestore = false }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = stringResource(R.string.action_back),
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    sharedDateFmt.format(Date(entry.createdAtUnixMs.toLong())),
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Text(
+                    "${historyKindLabel(entry.kind)} ・ ${entry.savedByName}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier.padding(vertical = 4.dp),
+        ) {
+            TextButton(onClick = { toggleDiff() }) {
+                Text(
+                    if (diffLines != null) {
+                        stringResource(R.string.shared_memo_history_show_body)
+                    } else {
+                        stringResource(R.string.shared_memo_history_compare)
+                    },
+                )
+            }
+            if (canEdit) {
+                TextButton(enabled = !restoring, onClick = { confirmRestore = true }) {
+                    Text(stringResource(R.string.shared_memo_history_restore_action))
+                }
+            }
+            TextButton(onClick = {
+                val d = detail ?: return@TextButton
+                scope.launch {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            memoCreate(baseDir, d.entry.title, d.body, null)
+                        }
+                        onNotice(copiedMsg)
+                    } catch (e: MobileException) {
+                        onNotice(e.message ?: "")
+                    }
+                }
+            }) { Text(stringResource(R.string.shared_memo_copy_to_personal)) }
+        }
+        val lines = diffLines
+        if (lines != null) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .horizontalScroll(rememberScrollState())
+                    .padding(vertical = 8.dp),
+            ) {
+                lines.forEach { line ->
+                    val prefix = when (line.kind) {
+                        "added" -> "+ "
+                        "removed" -> "- "
+                        else -> "  "
+                    }
+                    val bg = when (line.kind) {
+                        "added" -> Color(0x1F4CAF50)
+                        "removed" -> Color(0x1FF44336)
+                        else -> Color.Transparent
+                    }
+                    Text(
+                        prefix + line.text,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        softWrap = false,
+                        modifier = Modifier.fillMaxWidth().background(bg),
+                    )
+                }
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 8.dp),
+            ) {
+                MarkdownPreview(detail?.body ?: "")
+            }
+        }
+    }
+}
+
+@Composable
+private fun historyKindLabel(kind: String): String = when (kind) {
+    "auto" -> stringResource(R.string.shared_memo_history_kind_auto)
+    "close" -> stringResource(R.string.shared_memo_history_kind_close)
+    "manual" -> stringResource(R.string.shared_memo_history_kind_manual)
+    "restore" -> stringResource(R.string.shared_memo_history_kind_restore)
+    else -> kind
 }

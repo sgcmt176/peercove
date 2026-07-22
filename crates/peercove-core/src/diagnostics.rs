@@ -31,6 +31,8 @@ pub enum DiagnosticCategory {
     Internet,
     Dns,
     Permissions,
+    /// 共有メモ(M5 F-3)。DB 容量・WAL サイズなどの健全性。
+    Memo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

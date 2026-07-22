@@ -23,13 +23,24 @@ import {
   errorMessage,
 } from "../ipc";
 import { t } from "../i18n";
+import { Modal } from "./Modal";
 
 type EditorMode = "edit" | "preview" | "split";
 type SaveState = "saved" | "saving" | "error";
 
 const AUTOSAVE_DELAY_MS = 600;
 
-export function MemoView() {
+/** 共有メモへコピーできる先(接続中かつ共有メモが使えるネットワーク)。 */
+export interface SharedMemoTarget {
+  configPath: string;
+  label: string;
+}
+
+export function MemoView({
+  sharedTargets = [],
+}: {
+  sharedTargets?: SharedMemoTarget[];
+}) {
   const [scope, setScope] = useState<MemoScope>("active");
   const [folderId, setFolderId] = useState<string | null>(null);
   const [tag, setTag] = useState<string | null>(null);
@@ -258,6 +269,34 @@ export function MemoView() {
     savedRef.current = null;
   }, []);
 
+  const [chooseSharedTarget, setChooseSharedTarget] = useState(false);
+
+  const copyToShared = useCallback(
+    async (target: SharedMemoTarget) => {
+      if (!selected) return;
+      try {
+        await api.sharedMemoOp(target.configPath, {
+          op: "create",
+          title: selected.title,
+          body: selected.body,
+        });
+        setNotice(t.memo.copiedToShared);
+      } catch (error) {
+        setNotice(errorMessage(error));
+      }
+    },
+    [selected],
+  );
+
+  const onCopyToShared = useCallback(() => {
+    if (sharedTargets.length === 0) return;
+    if (sharedTargets.length === 1) {
+      void copyToShared(sharedTargets[0]);
+    } else {
+      setChooseSharedTarget(true);
+    }
+  }, [sharedTargets, copyToShared]);
+
   const importTxt = useCallback(async () => {
     try {
       const count = await api.memoImport(folderId);
@@ -285,6 +324,29 @@ export function MemoView() {
 
   return (
     <div className="memo">
+      {chooseSharedTarget && (
+        <Modal
+          title={t.memo.copyToSharedChoose}
+          onClose={() => setChooseSharedTarget(false)}
+        >
+          <ul className="memo__list">
+            {sharedTargets.map((target) => (
+              <li key={target.configPath}>
+                <button
+                  type="button"
+                  className="memo__item"
+                  onClick={() => {
+                    setChooseSharedTarget(false);
+                    void copyToShared(target);
+                  }}
+                >
+                  <span className="memo__item-title">{target.label}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </Modal>
+      )}
       <aside className="memo__side card">
         <div className="memo__side-head">
           <button type="button" onClick={() => void createMemo()}>
@@ -434,6 +496,7 @@ export function MemoView() {
             onDraft={setDraft}
             onPatch={(update) => void patch(selected.id, update)}
             onDuplicate={() => void run({ op: "duplicate", id: selected.id })}
+            onCopyToShared={sharedTargets.length > 0 ? onCopyToShared : undefined}
             onTrash={() =>
               void run({ op: "trash", id: selected.id }, closeSelected)
             }
@@ -614,6 +677,7 @@ function Editor({
   onDraft,
   onPatch,
   onDuplicate,
+  onCopyToShared,
   onTrash,
   onRestore,
   onDeleteForever,
@@ -630,6 +694,8 @@ function Editor({
   onDraft: (draft: { title: string; body: string }) => void;
   onPatch: (patch: MemoPatch) => void;
   onDuplicate: () => void;
+  /** 共有メモへコピー(M5 F-3)。接続中で共有メモが使えるネットワークが無ければ undefined。 */
+  onCopyToShared?: () => void;
   onTrash: () => void;
   onRestore: () => void;
   onDeleteForever: () => void;
@@ -745,6 +811,16 @@ function Editor({
             >
               ⧉
             </button>
+            {onCopyToShared && (
+              <button
+                type="button"
+                className="button--icon"
+                title={t.memo.copyToShared}
+                onClick={onCopyToShared}
+              >
+                📤
+              </button>
+            )}
             <button
               type="button"
               className="button--icon"

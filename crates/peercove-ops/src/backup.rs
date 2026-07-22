@@ -13,6 +13,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use peercove_core::config::Config;
+use peercove_memo::shared::snapshot_db_bytes;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut};
@@ -28,7 +29,9 @@ const HEADER_LEN: usize = 8 + 2 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN + 8;
 const MEMORY_KIB: u32 = 64 * 1024;
 const ITERATIONS: u32 = 3;
 const PARALLELISM: u32 = 1;
-const MAX_BACKUP_BYTES: u64 = 32 * 1024 * 1024;
+// 共有メモ DB(既定上限 100MiB、ホスト設定で最大 1GiB まで拡張可 = M5 F-3)
+// を同梱できるよう、旧上限(32MiB)から拡大した
+const MAX_BACKUP_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +96,7 @@ pub fn create(
     config_path: &Path,
     output_path: &Path,
     passphrase: &str,
+    include_memos: bool,
 ) -> anyhow::Result<CreateResult> {
     validate_passphrase(passphrase)?;
     let config = Config::load(config_path).context("設定ファイルを読み込めません")?;
@@ -160,6 +164,26 @@ pub fn create(
         );
         add_file(&mut files, &groups_name, &groups_path, false)?;
         categories.push("groups".to_string());
+    }
+    // 共有メモ(M5 F-3、ADR-0034)。ホスト正本のみ。WAL 未反映分も含む
+    // 一貫スナップショットをメモリ上で取り、平文の一時ファイルは作らない
+    let memos_path = config_path.with_extension("memos.db");
+    if role == BackupRole::Host && include_memos && memos_path.exists() {
+        let memos_name = format!(
+            "{}.memos.db",
+            Path::new(config_file)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("network")
+        );
+        let snapshot =
+            snapshot_db_bytes(&memos_path).context("共有メモデータベースの取得に失敗しました")?;
+        files.push(BackupFile {
+            path: memos_name,
+            content_base64: encode(&snapshot),
+            secret: false,
+        });
+        categories.push("memos".to_string());
     }
     if !config.dns_records.is_empty() {
         categories.push("dns".to_string());
@@ -297,6 +321,12 @@ fn restore_to_stage(payload: &BackupPayload, stage: &Path, slug: &str) -> anyhow
             || file.path
                 == Path::new(allowed_config)
                     .with_extension("groups.json")
+                    .to_string_lossy()
+            // 共有メモ DB(M5 F-3)。groups.json と同じ「設定ファイル名の拡張子
+            // 差し替え」規約
+            || file.path
+                == Path::new(allowed_config)
+                    .with_extension("memos.db")
                     .to_string_lossy()
             || file.path.starts_with("secrets/") && !file.path["secrets/".len()..].contains('/');
         if !valid || file.path.contains("..") || Path::new(&file.path).is_absolute() {
@@ -477,7 +507,13 @@ mod tests {
         )
         .unwrap();
         let backup = source.join("test.pcvbackup");
-        let created = create(&initialized.config_path, &backup, "correct horse battery").unwrap();
+        let created = create(
+            &initialized.config_path,
+            &backup,
+            "correct horse battery",
+            false,
+        )
+        .unwrap();
         assert_eq!(created.preview.role, BackupRole::Host);
         assert!(inspect(&backup, "wrong password!!").is_err());
 
@@ -518,6 +554,7 @@ mod tests {
             &initialized.config_path,
             &backup,
             "a sufficiently long passphrase",
+            false,
         )
         .unwrap();
         assert!(restore(
@@ -536,5 +573,73 @@ mod tests {
             RestoreMode::Replace
         )
         .is_ok());
+    }
+
+    #[test]
+    fn includes_and_restores_shared_memo_db_only_when_requested() {
+        let source = base("memos-source");
+        let (_, network) = crate::networks::network_dir(&source, "memos-test").unwrap();
+        let initialized = crate::init::init_host(&network, "memos-test", 51820, false).unwrap();
+        let memos_path = initialized.config_path.with_extension("memos.db");
+        {
+            let mut store = peercove_memo::shared::SharedStore::open(&memos_path).unwrap();
+            let actor = peercove_memo::shared::Actor::host("ホスト".to_string());
+            store.create(&actor, "タイトル", "本文", None).unwrap();
+        }
+
+        // include_memos = true: 同梱され、復元先で読めること
+        let with_memos = source.join("with-memos.pcvbackup");
+        let created = create(
+            &initialized.config_path,
+            &with_memos,
+            "correct horse battery",
+            true,
+        )
+        .unwrap();
+        assert!(created.preview.categories.contains(&"memos".to_string()));
+        let destination = base("memos-destination-with");
+        let restored = restore(
+            &with_memos,
+            "correct horse battery",
+            &destination,
+            "restored-with-memos",
+            RestoreMode::New,
+        )
+        .unwrap();
+        let restored_memos_path = restored.config_path.with_extension("memos.db");
+        assert!(restored_memos_path.exists());
+        let store = peercove_memo::shared::SharedStore::open(&restored_memos_path).unwrap();
+        let actor = peercove_memo::shared::Actor::host("ホスト".to_string());
+        let (memos, _) = store
+            .list(&actor, &peercove_core::memo::SharedMemoQuery::default())
+            .unwrap();
+        assert_eq!(memos.len(), 1);
+
+        // include_memos = false: 同梱されないこと
+        let without_memos = source.join("without-memos.pcvbackup");
+        let created_without = create(
+            &initialized.config_path,
+            &without_memos,
+            "correct horse battery",
+            false,
+        )
+        .unwrap();
+        assert!(!created_without
+            .preview
+            .categories
+            .contains(&"memos".to_string()));
+        let destination_without = base("memos-destination-without");
+        let restored_without = restore(
+            &without_memos,
+            "correct horse battery",
+            &destination_without,
+            "restored-without-memos",
+            RestoreMode::New,
+        )
+        .unwrap();
+        assert!(!restored_without
+            .config_path
+            .with_extension("memos.db")
+            .exists());
     }
 }

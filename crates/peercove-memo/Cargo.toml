@@ -10,7 +10,8 @@ publish.workspace = true
 peercove-core = { workspace = true }
 # SQLite 同梱ビルド(ADR-0049。FTS5 は bundled で有効)。0.40.1 = 2026-06、MIT
 # functions: かな折り畳み(ひらがな/カタカナ同一視)の SQL 関数登録に使う
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+# serialize/backup: DB スナップショット取得(暗号化バックアップ用、M5 F-3)に使う
+rusqlite = { version = "0.40", features = ["bundled", "functions", "serialize", "backup"] }
 anyhow = { workspace = true }
 
 [dev-dependencies]

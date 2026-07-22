@@ -160,6 +160,15 @@ export const ja = {
         summary: "アクセス制御による遮断",
         action: "意図した遮断かホストの通信制御設定を確認してください。",
       },
+      // 共有メモ(M5 F-3、ADR-0049)。DB が無い(共有メモ未使用)場合はチェック自体が出ない
+      "memo.db_status": {
+        summary: "共有メモデータベースの健全性",
+        action: "容量・件数・WAL サイズが上限に近づいています。上限設定の見直しか、不要なメモの整理を検討してください。",
+      },
+      "memo.cache_status": {
+        summary: "共有メモのキャッシュ容量",
+        action: "ホストとの再接続時に自動で整理されます。改善しない場合はキャッシュファイルの削除を検討してください。",
+      },
     },
   },
 
@@ -837,6 +846,18 @@ export const ja = {
     member: "メンバー",
     sourceOs: "作成元OS",
     categories: "含まれる項目",
+    // 共有メモの同梱(M5 F-3、ADR-0049)。ホスト設定を選んでいるときだけ表示
+    includeMemos: "共有メモを含める",
+    // categories(Rust 側 crates/peercove-ops/src/backup.rs)の表示名
+    category: {
+      network_config: "ネットワーク設定",
+      keys: "鍵",
+      groups: "グループ",
+      memos: "共有メモ",
+      dns: "DNS レコード",
+      acl: "通信制御(ACL)",
+      invite_metadata: "招待の記録",
+    },
     restoreName: "復元後の名前",
     replace: "同名の既存ネットワークを置き換える",
     replaceHint: "置き換える場合も、復元内容の検証が完了してから切り替えます。稼働中のネットワークは先に切断してください。",
@@ -983,6 +1004,10 @@ export const ja = {
     fmtTable: "表",
     fmtLink: "リンク",
     fmtHr: "区切り線",
+    // 個人メモ → 共有メモへコピー(M5 F-3、ADR-0049)
+    copyToShared: "共有メモへコピー",
+    copyToSharedChoose: "コピー先のネットワークを選択",
+    copiedToShared: "共有メモへコピーしました",
   },
 
   // 共有メモ(M5 F-2、ADR-0049)
@@ -1021,5 +1046,37 @@ export const ja = {
     updatedBy: (name: string) => `更新者: ${name}`,
     plaintextNote:
       "共有メモはホスト端末へ平文で保存されます。パスワード、秘密鍵、招待トークンなどの保存には使用しないでください。",
+
+    // 変更履歴(M5 F-3、ADR-0049)
+    history: "履歴",
+    historyEmpty: "変更履歴がありません",
+    historySelectPrompt: "左の一覧から版を選んでください",
+    historyKind: {
+      auto: "自動保存",
+      close: "編集終了",
+      manual: "手動保存",
+      restore: "復元前",
+    },
+    historyCompare: "現在と比較",
+    historyShowBody: "本文を表示",
+    historyRestore: "この版へ復元",
+    historyRestoreConfirm:
+      "この版の内容で現在の本文を置き換えます。現在の内容は履歴に残ります。",
+    historyRestored: "この版の内容で復元しました",
+    saveVersion: "版を保存",
+    saveVersionDone: "版を保存しました",
+
+    // 容量・履歴上限(ホスト管理者のみ、M5 F-3)
+    limits: "上限設定",
+    limitsTitle: "共有メモの上限",
+    limitsNote:
+      "共有メモの容量・件数・履歴の保持上限を設定します。範囲外の値は保存時にエラーになります。",
+    limitsBodyLabel: "1メモの本文の上限(KiB)",
+    limitsTotalLabel: "全体容量の上限(MiB、本文+履歴)",
+    limitsCountLabel: "メモ件数の上限(ゴミ箱含む)",
+    limitsVersionsLabel: "メモごとの変更履歴の保持件数",
+    limitsHistoryDaysLabel: "変更履歴の保持日数",
+    limitsTrashDaysLabel: "ゴミ箱の保持日数",
+    limitsSaved: "上限を保存しました",
   },
 };

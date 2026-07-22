@@ -517,7 +517,11 @@ export default function App() {
             <LogsView />
           ) : !detail ? (
             view === "memos" ? (
-              <MemoView />
+              <MemoView
+                sharedTargets={tunnels
+                  .filter((tun) => tun.sharedMemo)
+                  .map((tun) => ({ configPath: tun.config, label: tun.network }))}
+              />
             ) : view === "app-settings" ? (
               <AppSettingsView
                 version={version}

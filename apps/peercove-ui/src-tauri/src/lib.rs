@@ -126,8 +126,7 @@ async fn memo_import(
     let mut imported = 0u32;
     for path in paths {
         let path = Path::new(&path);
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("ファイルを読み込めません: {e}"))?;
+        let bytes = std::fs::read(path).map_err(|e| format!("ファイルを読み込めません: {e}"))?;
         let body = String::from_utf8_lossy(&bytes).into_owned();
         let title = path
             .file_stem()
@@ -219,6 +218,9 @@ async fn create_backup(
     app: tauri::AppHandle,
     config_path: String,
     passphrase: String,
+    // 共有メモ(M5 F-3)を同梱するか。既存呼び出しを壊さないよう Option 化し
+    // 未指定時は同梱する(バックアップは網羅的である方が安全側)
+    include_memos: Option<bool>,
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let network = peercove_core::config::Config::load(Path::new(&config_path))
@@ -239,8 +241,13 @@ async fn create_backup(
     let Some(output) = picked else {
         return Ok(None);
     };
-    peercove_ops::backup::create(Path::new(&config_path), Path::new(&output), &passphrase)
-        .map_err(to_message)?;
+    peercove_ops::backup::create(
+        Path::new(&config_path),
+        Path::new(&output),
+        &passphrase,
+        include_memos.unwrap_or(true),
+    )
+    .map_err(to_message)?;
     Ok(Some(output))
 }
 

@@ -400,6 +400,37 @@ pub enum SharedMemoOp {
     FolderDelete {
         id: String,
     },
+    /// 変更履歴の一覧(新しい順)。
+    HistoryList {
+        id: String,
+    },
+    /// 変更履歴 1 版の本文取得。
+    HistoryGet {
+        id: String,
+        hid: i64,
+    },
+    /// 2 版間の差分。`to_hid = None` は「現在の本文と比較」。
+    HistoryDiff {
+        id: String,
+        from_hid: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_hid: Option<i64>,
+    },
+    /// 指定した版の内容へ復元する。
+    HistoryRestore {
+        id: String,
+        hid: i64,
+    },
+    /// 現在の内容を手動で履歴に残す。
+    SaveVersion {
+        id: String,
+    },
+    /// 共有メモの容量・履歴上限を取得する(秘匿情報ではないため誰でも可)。
+    GetLimits,
+    /// (ホスト管理者のみ)共有メモの容量・履歴上限を設定する。
+    SetLimits {
+        limits: SharedMemoLimits,
+    },
 }
 
 /// [`SharedMemoOp`] への応答。
@@ -418,11 +449,124 @@ pub enum SharedMemoReply {
     Memo {
         memo: SharedMemoDetail,
     },
+    /// HistoryList への応答。
+    History {
+        entries: Vec<SharedMemoHistoryEntry>,
+    },
+    /// HistoryGet への応答。
+    HistoryDetail {
+        detail: SharedMemoHistoryDetail,
+    },
+    /// HistoryDiff への応答。
+    Diff {
+        lines: Vec<DiffLine>,
+    },
+    /// GetLimits / SetLimits への応答。
+    Limits {
+        limits: SharedMemoLimits,
+    },
     Done,
     /// 拒否・競合など(コントロールチャネル経由の応答用)。
     Err {
         message: String,
     },
+}
+
+/// 共有メモの容量・履歴の上限(ホスト設定可、M5 F-3)。
+/// 既定値は要件 §14 相当(本文サイズ)+ 運用上妥当な値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemoLimits {
+    /// 1 メモの本文の上限(バイト)。既定 256 KiB。
+    pub max_body_bytes: u64,
+    /// 共有メモの件数上限(ゴミ箱含む)。既定 10,000 件。
+    pub max_memo_count: u32,
+    /// 本文 + 履歴本文の合計サイズ上限(バイト)。既定 100 MiB。
+    pub max_total_bytes: u64,
+    /// メモごとの変更履歴の保持件数上限。既定 100。
+    pub max_versions: u32,
+    /// 変更履歴の保持日数。既定 30 日。
+    pub history_days: u32,
+    /// ゴミ箱の保持日数。既定 30 日。
+    pub trash_days: u32,
+}
+
+impl Default for SharedMemoLimits {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: 256 * 1024,
+            max_memo_count: 10_000,
+            max_total_bytes: 100 * 1024 * 1024,
+            max_versions: 100,
+            history_days: 30,
+            trash_days: 30,
+        }
+    }
+}
+
+impl SharedMemoLimits {
+    /// 範囲外の設定を拒否する(コントロールチャネルの 1 行 1MiB 上限に
+    /// 収めるため本文サイズは 256KiB までしか許可しない)。
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1024..=256 * 1024).contains(&self.max_body_bytes) {
+            return Err("本文サイズの上限は 1KiB〜256KiB の範囲で指定してください".to_string());
+        }
+        if !(1..=100_000).contains(&self.max_memo_count) {
+            return Err("メモ件数の上限は 1〜100,000 件の範囲で指定してください".to_string());
+        }
+        if !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.max_total_bytes) {
+            return Err("全体容量の上限は 1MiB〜1GiB の範囲で指定してください".to_string());
+        }
+        if !(1..=1_000).contains(&self.max_versions) {
+            return Err("変更履歴の保持件数は 1〜1,000 の範囲で指定してください".to_string());
+        }
+        if !(1..=365).contains(&self.history_days) {
+            return Err("変更履歴の保持日数は 1〜365 日の範囲で指定してください".to_string());
+        }
+        if !(1..=365).contains(&self.trash_days) {
+            return Err("ゴミ箱の保持日数は 1〜365 日の範囲で指定してください".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// 変更履歴 1 版分の要約(本文は含まない)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemoHistoryEntry {
+    /// 履歴行 ID(単調増加、AUTOINCREMENT)。
+    pub hid: i64,
+    /// その版が保存された時点のメモ revision。
+    pub revision: u64,
+    /// "auto" | "close" | "manual" | "restore"。
+    pub kind: String,
+    /// その内容を書いた人の表示名(スナップショット)。
+    pub saved_by_name: String,
+    pub created_at_unix_ms: u64,
+    pub title: String,
+    /// 本文のバイト数(UTF-8)。一覧に本文全体は載せない。
+    pub body_bytes: u64,
+}
+
+/// 変更履歴 1 版分の全体(本文込み)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemoHistoryDetail {
+    pub entry: SharedMemoHistoryEntry,
+    pub body: String,
+}
+
+/// 差分の 1 行の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineKind {
+    Same,
+    Added,
+    Removed,
+}
+
+/// 差分の 1 行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub text: String,
 }
 
 /// ホスト → メンバーのリアルタイム配信。**閲覧権限のある接続にだけ**送る。

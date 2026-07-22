@@ -32,6 +32,9 @@ use crate::control::Connections;
 /// 編集ロックの無操作タイムアウト(要件 §12)。更新・取得で延長される。
 const LOCK_TTL: Duration = Duration::from_secs(120);
 
+/// 定期メンテナンス(ゴミ箱の完全削除 + WAL チェックポイント)の間隔(M5 F-3)。
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 /// 供給側のどちらか(daemon の Active が保持する)。
 #[derive(Clone)]
 pub enum MemoHandle {
@@ -73,6 +76,9 @@ struct LockInfo {
     /// 表示名(一覧の「〜が編集中」用)。
     name: String,
     last_activity: Instant,
+    /// ロック確立時点のメモ revision(M5 F-3)。解放時にここから変わって
+    /// いれば履歴へ "close" 版を残す(編集終了時に 1 版 = 要件)。
+    revision_at_acquire: u64,
 }
 
 /// ホスト側サービス。
@@ -83,6 +89,8 @@ pub struct MemoService {
     connections: Mutex<Option<Connections>>,
     locks: Mutex<HashMap<String, LockInfo>>,
     seq: AtomicU64,
+    /// 直近の定期メンテナンス実行時刻(M5 F-3。10 分に 1 回だけ動かす)。
+    last_maintenance: Mutex<Option<Instant>>,
 }
 
 impl MemoService {
@@ -93,6 +101,7 @@ impl MemoService {
             connections: Mutex::new(None),
             locks: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
+            last_maintenance: Mutex::new(None),
         })
     }
 
@@ -281,6 +290,7 @@ impl MemoService {
                             key,
                             name: actor.name.clone(),
                             last_activity: Instant::now(),
+                            revision_at_acquire: memo.revision,
                         },
                     );
                 }
@@ -290,17 +300,19 @@ impl MemoService {
                 Ok(SharedMemoReply::Memo { memo })
             }
             SharedMemoOp::ReleaseLock { id } => {
-                let released = {
+                let revision_at_acquire = {
                     let mut locks = self.locks.lock().unwrap();
                     match locks.get(&id) {
                         Some(lock) if lock.key == key => {
+                            let revision = lock.revision_at_acquire;
                             locks.remove(&id);
-                            true
+                            Some(revision)
                         }
-                        _ => false,
+                        _ => None,
                     }
                 };
-                if released {
+                if let Some(revision) = revision_at_acquire {
+                    self.snapshot_after_unlock(&id, revision).await;
                     self.broadcast_lock(&id, None);
                     self.bump();
                 }
@@ -310,8 +322,15 @@ impl MemoService {
                 if actor.member_id.is_some() {
                     bail!("編集ロックの強制解除はホスト管理者だけができます");
                 }
-                if self.locks.lock().unwrap().remove(&id).is_some() {
+                let revision_at_acquire = self
+                    .locks
+                    .lock()
+                    .unwrap()
+                    .remove(&id)
+                    .map(|lock| lock.revision_at_acquire);
+                if let Some(revision) = revision_at_acquire {
                     tracing::info!("共有メモの編集ロックを強制解除しました(memo={id})");
+                    self.snapshot_after_unlock(&id, revision).await;
                     self.broadcast_lock(&id, None);
                     self.bump();
                 }
@@ -400,6 +419,93 @@ impl MemoService {
                 self.bump();
                 Ok(SharedMemoReply::Done)
             }
+            SharedMemoOp::HistoryList { id } => {
+                let entries = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.history_list(&actor, &id)
+                    })
+                    .await?;
+                Ok(SharedMemoReply::History { entries })
+            }
+            SharedMemoOp::HistoryGet { id, hid } => {
+                let detail = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.history_get(&actor, &id, hid)
+                    })
+                    .await?;
+                Ok(SharedMemoReply::HistoryDetail { detail })
+            }
+            SharedMemoOp::HistoryDiff {
+                id,
+                from_hid,
+                to_hid,
+            } => {
+                let lines = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.history_diff(&actor, &id, from_hid, to_hid)
+                    })
+                    .await?;
+                Ok(SharedMemoReply::Diff { lines })
+            }
+            SharedMemoOp::SaveVersion { id } => {
+                self.blocking({
+                    let actor = actor.clone();
+                    move |store| store.save_version(&actor, &id)
+                })
+                .await?;
+                Ok(SharedMemoReply::Done)
+            }
+            SharedMemoOp::HistoryRestore { id, hid } => {
+                // 単一編集者ロック: 他人が編集中なら拒否。自分が保持中(または
+                // 誰も保持していない)なら許可する(要件はロック取得を強制しない)
+                {
+                    let mut locks = self.locks.lock().unwrap();
+                    prune_expired(&mut locks);
+                    if let Some(lock) = locks.get(&id) {
+                        if lock.key != key {
+                            bail!("「{}」が編集中です", lock.name);
+                        }
+                    }
+                }
+                let mut memo = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let id = id.clone();
+                        move |store| store.history_restore(&actor, &id, hid)
+                    })
+                    .await?;
+                memo.locked_by = self.lock_holder(&memo.id);
+                self.broadcast_changed(id);
+                self.bump();
+                Ok(SharedMemoReply::Memo { memo })
+            }
+            SharedMemoOp::GetLimits => {
+                // 誰でも可(秘匿情報ではない)
+                let limits = self.blocking(move |store| store.limits()).await?;
+                Ok(SharedMemoReply::Limits { limits })
+            }
+            SharedMemoOp::SetLimits { limits } => {
+                // ホスト検査は store 側(set_limits)で行う
+                self.blocking(move |store| store.set_limits(&actor, &limits))
+                    .await?;
+                Ok(SharedMemoReply::Done)
+            }
+        }
+    }
+
+    /// ロック解放時、確立時点から revision が変わっていれば履歴へ "close" 版を
+    /// 残す(要件: 編集終了時に 1 版)。失敗してもロック解放自体は妨げない
+    /// (memo_id のみ warn。内容は出さない — ADR-0049)。
+    async fn snapshot_after_unlock(self: &Arc<Self>, id: &str, revision_at_acquire: u64) {
+        let target = id.to_string();
+        let result = self
+            .blocking(move |store| store.snapshot_if_revision_changed(&target, revision_at_acquire))
+            .await;
+        if let Err(e) = result {
+            tracing::warn!("共有メモの履歴スナップショットに失敗しました(memo={id}): {e:#}");
         }
     }
 
@@ -414,20 +520,24 @@ impl MemoService {
                 return;
             };
             let key = actor.member_id.unwrap_or_default();
-            let released: Vec<String> = {
+            let released: Vec<(String, u64)> = {
                 let mut locks = service.locks.lock().unwrap();
-                let ids: Vec<String> = locks
+                let ids: Vec<(String, u64)> = locks
                     .iter()
                     .filter(|(_, lock)| lock.key == key)
-                    .map(|(id, _)| id.clone())
+                    .map(|(id, lock)| (id.clone(), lock.revision_at_acquire))
                     .collect();
-                for id in &ids {
+                for (id, _) in &ids {
                     locks.remove(id);
                 }
                 ids
             };
-            for id in released {
-                service.broadcast_lock(&id, None);
+            if released.is_empty() {
+                return;
+            }
+            snapshot_closed(&service.db_path, &released);
+            for (id, _) in &released {
+                service.broadcast_lock(id, None);
                 service.bump();
             }
         });
@@ -435,23 +545,71 @@ impl MemoService {
 
     /// 無操作タイムアウトのロックを解放する(supervisor の周期から呼ぶ)。
     pub fn sweep_expired_locks(self: &Arc<Self>) {
-        let expired: Vec<String> = {
+        let expired: Vec<(String, u64)> = {
             let mut locks = self.locks.lock().unwrap();
-            let ids: Vec<String> = locks
+            let ids: Vec<(String, u64)> = locks
                 .iter()
                 .filter(|(_, lock)| lock.last_activity.elapsed() > LOCK_TTL)
-                .map(|(id, _)| id.clone())
+                .map(|(id, lock)| (id.clone(), lock.revision_at_acquire))
                 .collect();
-            for id in &ids {
+            for (id, _) in &ids {
                 locks.remove(id);
             }
             ids
         };
-        for id in expired {
+        if expired.is_empty() {
+            return;
+        }
+        {
+            // DB IO なのでバックグラウンドで行う(ロック解放・配信は待たない)
+            let db_path = self.db_path.clone();
+            let released = expired.clone();
+            tokio::task::spawn_blocking(move || snapshot_closed(&db_path, &released));
+        }
+        for (id, _) in expired {
             tracing::debug!("共有メモの編集ロックを無操作で解放しました(memo={id})");
             self.broadcast_lock(&id, None);
             self.bump();
         }
+    }
+
+    /// 定期メンテナンス(M5 F-3)。10 分に 1 回だけ、ゴミ箱の完全削除と WAL
+    /// チェックポイントを行う。supervisor の tick(sweep_expired_locks と
+    /// 同じ場所)から毎回呼んでよい(呼び出し側でのゲートは不要)。
+    pub fn maintain(self: &Arc<Self>) {
+        // 共有メモが一度も使われていなければ DB を作ってまで掃除しない
+        if !self.db_path.exists() {
+            return;
+        }
+        {
+            let mut last = self.last_maintenance.lock().unwrap();
+            let due = match *last {
+                Some(instant) => instant.elapsed() >= MAINTENANCE_INTERVAL,
+                None => true,
+            };
+            if !due {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = match SharedStore::open(&db_path) {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::warn!("共有メモの定期メンテナンスに失敗しました: {e:#}");
+                    return;
+                }
+            };
+            match store.purge_expired() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("共有メモのゴミ箱から {n} 件を完全削除しました"),
+                Err(e) => tracing::warn!("共有メモのゴミ箱整理に失敗しました: {e:#}"),
+            }
+            if let Err(e) = store.checkpoint() {
+                tracing::warn!("共有メモの WAL チェックポイントに失敗しました: {e:#}");
+            }
+        });
     }
 
     fn lock_holder(&self, id: &str) -> Option<String> {
@@ -573,6 +731,24 @@ impl MemoService {
 
 fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
     locks.retain(|_, lock| lock.last_activity.elapsed() <= LOCK_TTL);
+}
+
+/// (同期文脈から)複数メモの編集終了時スナップショットをまとめて行う。
+/// DB を開けない・書けない場合も呼び出し元のロック解放は既に完了している
+/// ため warn に留める(memo_id のみ。内容は出さない — ADR-0049)。
+fn snapshot_closed(db_path: &Path, released: &[(String, u64)]) {
+    match SharedStore::open(db_path) {
+        Ok(store) => {
+            for (id, revision) in released {
+                if let Err(e) = store.snapshot_if_revision_changed(id, *revision) {
+                    tracing::warn!(
+                        "共有メモの履歴スナップショットに失敗しました(memo={id}): {e:#}"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!("共有メモの履歴スナップショットに失敗しました: {e:#}"),
+    }
 }
 
 /// メンバー側の読み取りキャッシュ + 同期状態。

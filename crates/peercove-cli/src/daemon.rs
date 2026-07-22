@@ -1660,6 +1660,37 @@ impl DaemonShared {
                     ("acl_rule_ids", rule_ids.join(",")),
                 ],
             ));
+
+            // 共有メモ(M5 F-3、ADR-0049)。DB が無い(共有メモ未使用)場合は
+            // チェック自体を出さない。内容(タイトル・本文)は evidence に含めない
+            match tunnel.role {
+                TunnelRole::Host => {
+                    let db_path = config_path.with_extension("memos.db");
+                    if db_path.exists() {
+                        checks.push(memo_db_status_check(&db_path));
+                    }
+                }
+                TunnelRole::Member => {
+                    let db_path = config_path.with_extension("memocache.db");
+                    if let Ok(metadata) = std::fs::metadata(&db_path) {
+                        let cache_bytes = metadata.len();
+                        let max_bytes = peercove_memo::shared::CACHE_MAX_BYTES;
+                        checks.push(diagnostic_check(
+                            "memo.cache_status",
+                            DiagnosticCategory::Memo,
+                            if cache_bytes > max_bytes {
+                                DiagnosticStatus::Warning
+                            } else {
+                                DiagnosticStatus::Pass
+                            },
+                            [
+                                ("cache_bytes", cache_bytes.to_string()),
+                                ("max_bytes", max_bytes.to_string()),
+                            ],
+                        ));
+                    }
+                }
+            }
         }
 
         let (logs, _) = crate::logbuf::ring().since(0);
@@ -1703,6 +1734,62 @@ where
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect::<BTreeMap<_, _>>(),
+    }
+}
+
+/// 共有メモ DB(ホスト役)の健全性チェック(M5 F-3)。DB が開けない場合は
+/// Fail、開けても容量・履歴・WAL が上限の 9 割を超えていれば Warning。
+/// evidence はすべて数値で、メモの内容は一切含まない(ADR-0049)。
+fn memo_db_status_check(db_path: &Path) -> DiagnosticCheck {
+    const WAL_WARNING_BYTES: u64 = 16 * 1024 * 1024;
+    let store = match peercove_memo::shared::SharedStore::open(db_path) {
+        Ok(store) => store,
+        Err(error) => {
+            return diagnostic_check(
+                "memo.db_status",
+                DiagnosticCategory::Memo,
+                DiagnosticStatus::Fail,
+                [
+                    ("error", error.to_string()),
+                    ("path", db_path.display().to_string()),
+                ],
+            );
+        }
+    };
+    match store.db_stats() {
+        Ok(stats) => {
+            let bytes_ratio_over = stats.limits.max_total_bytes > 0
+                && stats.total_body_bytes > stats.limits.max_total_bytes / 10 * 9;
+            let count_ratio_over = stats.limits.max_memo_count > 0
+                && stats.memo_count > (stats.limits.max_memo_count as u64) / 10 * 9;
+            let wal_over = stats.wal_bytes > WAL_WARNING_BYTES;
+            let status = if bytes_ratio_over || count_ratio_over || wal_over {
+                DiagnosticStatus::Warning
+            } else {
+                DiagnosticStatus::Pass
+            };
+            diagnostic_check(
+                "memo.db_status",
+                DiagnosticCategory::Memo,
+                status,
+                [
+                    ("db_bytes", stats.db_bytes.to_string()),
+                    ("wal_bytes", stats.wal_bytes.to_string()),
+                    ("memo_count", stats.memo_count.to_string()),
+                    ("trashed_count", stats.trashed_count.to_string()),
+                    ("history_count", stats.history_count.to_string()),
+                    ("total_body_bytes", stats.total_body_bytes.to_string()),
+                    ("max_total_bytes", stats.limits.max_total_bytes.to_string()),
+                    ("max_memo_count", stats.limits.max_memo_count.to_string()),
+                ],
+            )
+        }
+        Err(error) => diagnostic_check(
+            "memo.db_status",
+            DiagnosticCategory::Memo,
+            DiagnosticStatus::Fail,
+            [("error", error.to_string())],
+        ),
     }
 }
 
