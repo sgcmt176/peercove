@@ -211,7 +211,7 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 | # | タスク | 概要 | 難易度 | 担当目安 |
 |---|---|---|---|---|
 | C-1 | GitHub リポジトリ + CI | ✅ **完了(2026-07-09)**。公開前クリーニング(履歴書き換え)+ https://github.com/sgcmt176/peercove へ push。CI は `.github/workflows/ci.yml`: rust ジョブ(Ubuntu/Windows で fmt・clippy -D warnings・test)+ ui ジョブ(npm build + src-tauri test)。Linux は実ランナーで検証するため zigbuild は手元確認用に降格 | ★★ | 完了 |
-| C-2 | スループット実機計測 | VM でなく実機で iperf3 再計測(verification.md 手順 100)。**Phase 2 着手判断の材料として依頼中(2026-07-23)** | — | 依頼者(検証) |
+| C-2 | スループット実機計測 | **実測済み(2026-07-23、ADR-0050 に記録)**: 実機間直接 306 Mbps・リレー 350 Mbps・同一 PC 内 958 Mbps。リレーはボトルネックでないと判明。残タスク = 素の LAN 速度との比較で Phase 2 要否を確定 | — | 依頼者(検証) |
 | C-3 | Windows デバイス性能改善 | **Phase 1 実装済み(2026-07-23、ADR-0050)**: 常設ベンチ + SO_RCVBUF/SNDBUF 4MiB + TUN 読みのヒープ確保除去。Phase 2(並列化・wireguard-nt 数値比較)は C-2 の実測次第 | ★★★★ | Fable |
 | C-4 | 鍵ローテーション | ADR-0005 の将来課題。コントロールチャネル経由でメンバー鍵を更新 | ★★★★ | Fable |
 | C-5 | status のリアルタイム化 | ✅ A-2 に合流(IPC の `Status` / `Logs` で取得。ステータスファイルは CLI 互換のため残置) | ★★★ | 完了 |
