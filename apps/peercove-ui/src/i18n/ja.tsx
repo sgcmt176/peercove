@@ -870,7 +870,7 @@ export const ja = {
     title: "設定",
     mtuInteger: "MTU には整数を入力してください",
     portInteger: "待受ポートには整数を入力してください",
-    savedRestart: "保存しました。切断して接続し直すと反映されます。",
+    savedRestart: "保存しました。数秒以内に自動で再接続して反映します。",
     savedLive: "保存しました。数秒でトンネルに反映されます。",
     interface: "インターフェース",
     // 表示名・DNS 名の変更はメンバー一覧へ一元化した(ADR-0027、M3-19)
@@ -903,7 +903,7 @@ export const ja = {
     restartHint: (isMember: boolean) =>
       `待受ポート・MTU${
         isMember ? "・ホストのエンドポイント" : ""
-      }は、トンネルを作り直すまで反映されません（切断 → 接続で反映されます）。`,
+      }は、保存すると自動でトンネルを作り直して反映されます（数秒以内）。`,
     // デバイス鍵ローテーション(ADR-0020、M3-11)
     rotateKeyLabel: "デバイス鍵",
     rotateKeyHint:

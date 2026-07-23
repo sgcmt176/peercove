@@ -206,9 +206,11 @@ impl ActiveTunnel {
         .await
     }
 
-    /// 鍵ローテーション後の入れ直し(ADR-0020)。同じインターフェース名で
-    /// down → up し直す(メンバー専用。UPnP リースはメンバーには無い)。
-    /// `use_pending` なら設定の鍵の代わりに更新待ちの鍵(`<key>.new`)で起動する。
+    /// 同じインターフェース名で down → up し直す。鍵ローテーション(ADR-0020、
+    /// member 専用)と、listen_port / mtu /(member)host_endpoint の設定変更
+    /// (host も対象)の両方の入れ直し経路として使う。
+    /// `use_pending` なら設定の鍵の代わりに更新待ちの鍵(`<key>.new`)で起動する
+    /// (鍵ローテーションでのみ true。設定変更の入れ直しでは false)。
     pub fn restart_in_place(
         &mut self,
         config_path: &Path,
@@ -220,13 +222,42 @@ impl ActiveTunnel {
             spec.private_key = crate::rotate::load_pending(&config.interface.private_key_file)
                 .context("更新待ちの鍵(.new)が読めません")?;
         }
+        // (host)UPnP: 待受ポートが変わる場合、古いリース(旧ポート宛て)は
+        // 無意味になるので張り直す。UPnP が無効/未使用(リース無し)なら何もしない
+        let listen_port_changed = spec.listen_port != self.spec.listen_port;
         self.backend.down()?;
         let mut backend = crate::backend::create_backend(&self.if_name)?;
         backend.up(&spec)?;
         self.backend = backend;
         self.spec = spec;
+        if self.role == Role::Host && listen_port_changed {
+            if let Some(old_lease) = self.upnp_lease.take() {
+                old_lease.release();
+                let new_port = self.spec.listen_port.unwrap_or(DEFAULT_LISTEN_PORT);
+                match crate::upnp::setup(new_port) {
+                    Ok(report) => {
+                        tracing::info!(
+                            "UPnP ポート開放を新しい待受ポートへ張り直しました(UDP {new_port})"
+                        );
+                        self.external_endpoint = match report.external_ip {
+                            std::net::IpAddr::V4(v4) => {
+                                Some(std::net::SocketAddrV4::new(v4, report.external_port))
+                            }
+                            std::net::IpAddr::V6(_) => None,
+                        };
+                        self.upnp_lease = Some(report.lease);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "UPnP の張り直しに失敗しました(手動ポートフォワードで代替可能): {e:#}"
+                        );
+                        self.external_endpoint = None;
+                    }
+                }
+            }
+        }
         tracing::info!(
-            "トンネル {} を入れ直しました(鍵ローテーション、peers={})",
+            "トンネル {} を入れ直しました(peers={})",
             self.if_name,
             self.spec.peers.len()
         );
@@ -378,6 +409,34 @@ pub struct Snapshot {
 }
 
 pub type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
+
+/// トンネル生成時に固定される設定(listen_port / mtu /(member)host_endpoint)の
+/// 変更を検知する(UI 設定の restart_required — settings.rs)。host は
+/// listen_port と mtu のみ、member はホストの endpoint も対象。
+/// 変更があれば人間向けの説明(ログ用)を返す。
+fn detect_reconfig_restart(role: Role, spec: &TunnelSpec, config: &Config) -> Option<String> {
+    let new_listen_port = match role {
+        Role::Host => Some(config.interface.listen_port.unwrap_or(DEFAULT_LISTEN_PORT)),
+        Role::Member => config.interface.listen_port,
+    };
+    if new_listen_port != spec.listen_port {
+        return Some(format!(
+            "待受ポート {:?} → {new_listen_port:?}",
+            spec.listen_port
+        ));
+    }
+    if config.interface.mtu != spec.mtu {
+        return Some(format!("MTU {} → {}", spec.mtu, config.interface.mtu));
+    }
+    if role == Role::Member {
+        let applied_endpoint = spec.peers.first().and_then(|p| p.endpoint);
+        let new_endpoint = config.peers.first().and_then(|p| p.endpoint);
+        if new_endpoint != applied_endpoint {
+            return Some(format!("接続先 {applied_endpoint:?} → {new_endpoint:?}"));
+        }
+    }
+    None
+}
 
 /// 停止シグナルまで 5 秒周期で以下を行う(CLI = Ctrl+C / daemon = stop 要求):
 /// - (host のみ)設定を再読込し、ピアの追加・変更・削除を同期(ADR-0002 / M1-G3/7)
@@ -543,6 +602,17 @@ pub async fn supervise(
                             None
                         }
                     };
+                    // 生成時に固定される設定(listen_port / mtu /(member)接続先)の
+                    // 変更を検知したら、鍵ローテーションと同じ経路(Restart)で
+                    // トンネルを作り直す(settings.rs の restart_required に対応)
+                    if let Some(config) = &config {
+                        if let Some(reason) = detect_reconfig_restart(role, spec, config) {
+                            tracing::info!(
+                                "設定変更({reason})を検知したためトンネルを作り直します"
+                            );
+                            break Ok(SuperviseExit::Restart { use_pending: false });
+                        }
+                    }
                     // 共有メモ(M5 F-2): 無操作の編集ロックを周期で解放する
                     // (M5 F-3): DB の定期メンテナンスも同じ周期に相乗り
                     // (内部で 10 分ゲートされるので毎周期呼んでよい)
@@ -1363,6 +1433,63 @@ mod tests {
             .iter()
             .all(|operation| !operation.starts_with("add:")));
         assert!(known.is_empty());
+    }
+
+    /// listen_port / mtu /(member)host_endpoint の変更検知(再作成必須設定の
+    /// 自動反映)。host は host_endpoint の変更を無視する。
+    #[test]
+    fn detect_reconfig_restart_flags_listen_port_mtu_and_host_endpoint() {
+        let peer_key = PrivateKey::generate().public_key();
+        let member_spec = TunnelSpec {
+            private_key: PrivateKey::generate(),
+            address: "10.100.42.2/24".parse().unwrap(),
+            listen_port: None,
+            mtu: 1420,
+            forwarding: false,
+            peers: vec![PeerSpec {
+                public_key: peer_key,
+                endpoint: Some("203.0.113.1:51820".parse().unwrap()),
+                allowed_ips: vec![],
+                persistent_keepalive: None,
+                preshared_key: None,
+            }],
+        };
+        let base_toml = format!(
+            "[interface]\nprivate_key_file = \"member.key\"\naddress = \"10.100.42.2/24\"\nmtu = 1420\n\
+             [[peer]]\npublic_key = \"{peer_key}\"\nendpoint = \"203.0.113.1:51820\"\nallowed_ips = [\"10.100.42.1/32\"]\n"
+        );
+        let unchanged: Config = toml::from_str(&base_toml).unwrap();
+        assert!(detect_reconfig_restart(Role::Member, &member_spec, &unchanged).is_none());
+
+        let mut mtu_changed = unchanged.clone();
+        mtu_changed.interface.mtu = 1350;
+        assert!(detect_reconfig_restart(Role::Member, &member_spec, &mtu_changed).is_some());
+
+        let mut port_changed = unchanged.clone();
+        port_changed.interface.listen_port = Some(51821);
+        assert!(detect_reconfig_restart(Role::Member, &member_spec, &port_changed).is_some());
+
+        let mut endpoint_changed = unchanged.clone();
+        endpoint_changed.peers[0].endpoint = Some("203.0.113.2:51820".parse().unwrap());
+        assert!(detect_reconfig_restart(Role::Member, &member_spec, &endpoint_changed).is_some());
+
+        // host は host_endpoint(peers[0].endpoint)の変更を対象にしない
+        let host_spec = TunnelSpec {
+            private_key: PrivateKey::generate(),
+            address: "10.100.42.1/24".parse().unwrap(),
+            listen_port: Some(51820),
+            mtu: 1420,
+            forwarding: true,
+            peers: vec![],
+        };
+        let host_toml = "[interface]\nprivate_key_file = \"host.key\"\naddress = \"10.100.42.1/24\"\nlisten_port = 51820\nmtu = 1420\n";
+        let host_unchanged: Config = toml::from_str(host_toml).unwrap();
+        assert!(detect_reconfig_restart(Role::Host, &host_spec, &host_unchanged).is_none());
+        assert!(detect_reconfig_restart(Role::Host, &host_spec, &endpoint_changed).is_none());
+
+        let mut host_port_changed = host_unchanged.clone();
+        host_port_changed.interface.listen_port = Some(51821);
+        assert!(detect_reconfig_restart(Role::Host, &host_spec, &host_port_changed).is_some());
     }
 
     fn host_config(peers_toml: &str) -> Config {

@@ -6,10 +6,11 @@
 //! | 項目 | 反映タイミング |
 //! |---|---|
 //! | `display_name` | 次の supervisor 周期(約 5 秒)で台帳に載る |
-//! | `listen_port` / `mtu` | **トンネルの再起動が必要**(インターフェース生成時に決まる) |
-//! | ホストの `endpoint`(メンバー設定) | **トンネルの再起動が必要**(自分のピア設定は再読込しない) |
+//! | `listen_port` / `mtu` | インターフェース生成時に決まるため、保存すると supervisor が
+//! 変更を検知して**約 5 秒以内に自動でトンネルを作り直して**反映する(手動の切断→接続は不要) |
+//! | ホストの `endpoint`(メンバー設定) | 同上。自動でトンネルを作り直して反映する |
 //!
-//! 呼び出し側は [`Settings::restart_required`] を見て、その旨を利用者に伝えること。
+//! 呼び出し側は [`Settings::restart_required`] を見て、その旨(自動で再接続する)を利用者に伝えること。
 //! コメントと整形を保つため書き換えは `toml_edit` で行う。
 
 use std::net::SocketAddr;
@@ -58,7 +59,11 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// この設定を変えたときトンネルの再起動が必要か(`display_name` 以外は必要)。
+    /// この設定を変えたとき、supervisor が自動でトンネルを作り直す(約 5 秒以内)か。
+    /// `display_name` 以外(listen_port / mtu /(member)host_endpoint)は
+    /// インターフェース生成時に固定されるため、変更を保存すると supervisor が
+    /// 検知して自動的に作り直す。呼び出し側は「手動の切断→接続が要る」旨ではなく、
+    /// 「保存すると自動で再接続する」旨を利用者に伝えること。
     pub fn restart_required(&self, update: &Update) -> bool {
         self.listen_port != update.listen_port
             || self.mtu != update.mtu
