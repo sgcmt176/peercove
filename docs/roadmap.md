@@ -211,8 +211,8 @@ C はどのトラックとも並行でき、着手判断を待たずに進めら
 | # | タスク | 概要 | 難易度 | 担当目安 |
 |---|---|---|---|---|
 | C-1 | GitHub リポジトリ + CI | ✅ **完了(2026-07-09)**。公開前クリーニング(履歴書き換え)+ https://github.com/sgcmt176/peercove へ push。CI は `.github/workflows/ci.yml`: rust ジョブ(Ubuntu/Windows で fmt・clippy -D warnings・test)+ ui ジョブ(npm build + src-tauri test)。Linux は実ランナーで検証するため zigbuild は手元確認用に降格 | ★★ | 完了 |
-| C-2 | スループット実機計測 | **実測済み(2026-07-23、ADR-0050 に記録)**: 実機間直接 306 Mbps・リレー 350 Mbps・同一 PC 内 958 Mbps。リレーはボトルネックでないと判明。残タスク = 素の LAN 速度との比較で Phase 2 要否を確定 | — | 依頼者(検証) |
-| C-3 | Windows デバイス性能改善 | **Phase 1 実装済み(2026-07-23、ADR-0050)**: 常設ベンチ + SO_RCVBUF/SNDBUF 4MiB + TUN 読みのヒープ確保除去。Phase 2(並列化・wireguard-nt 数値比較)は C-2 の実測次第 | ★★★★ | Fable |
+| C-2 | スループット実機計測 | ✅ **完了(2026-07-23、ADR-0050 に記録)**: 実機間直接 306 Mbps・リレー 350 Mbps・同一 PC 内 958 Mbps・素の LAN(Wi-Fi)514 Mbps。律速は物理リンクと端末側で、リレーはボトルネックでないと確認 | — | 完了 |
+| C-3 | Windows デバイス性能改善 | ✅ **完了(2026-07-23、ADR-0050)**: Phase 1(常設ベンチ + SO_RCVBUF/SNDBUF 4MiB + TUN 読みのヒープ確保除去)を実装。Phase 2(並列化・wireguard-nt 比較)は実測にもとづき**見送り**(再訪条件は ADR-0050) | ★★★★ | 完了 |
 | C-4 | 鍵ローテーション | ADR-0005 の将来課題。コントロールチャネル経由でメンバー鍵を更新 | ★★★★ | Fable |
 | C-5 | status のリアルタイム化 | ✅ A-2 に合流(IPC の `Status` / `Logs` で取得。ステータスファイルは CLI 互換のため残置) | ★★★ | 完了 |
 
@@ -349,11 +349,9 @@ ADR-0049(SQLite 採用・`peercove-memo` crate に一本化・単一編集者ロ
 
 ## 8. 既知の技術的負債・メモ
 
-- **スループット**: VM + Windows ユーザー空間実装で TCP ~30 Mbps
-  (history/m0-report-template.md)。C-3 Phase 1(ADR-0050)で計測ベンチ常設 +
-  ソケットバッファ 4MiB + TUN 読みのヒープ確保除去を実施。開発機ラボ値は
-  direct ~1.7 Gbps / relay ~1.4 Gbps で、次のボトルネックはリレーの単一
-  スレッド処理上限(Phase 2 = 並列化は C-2 実機計測の結果待ち)
+- **スループット**: 解決済み扱い(2026-07-23、ADR-0050)。M0 の ~30 Mbps は
+  VM 環境要因で、現在は実機間 306 Mbps(素の Wi-Fi リンクの 6 割)・同一 PC
+  内 ~1 Gbps。Phase 2(並列化)は見送り、再訪条件と常設ベンチは ADR-0050
 - **メンバー側の設定変更**: member.toml の変更は再起動が必要(host 側のみ動的反映)
 - **udp-ping の統計未取得**(m0 レポート §5)。次回の実機検証時についでに埋める
 - boringtun はフォーク群(NepTUN 等)が活発。メジャーバージョン更新時は
