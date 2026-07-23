@@ -2960,6 +2960,19 @@ select {
   overflow-y: auto;
 }
 
+.memo-perms__group-section {
+  margin-top: 10px;
+}
+
+.memo-perms__groups {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 10px;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
 .memo-perms__row {
   display: flex;
   align-items: center;

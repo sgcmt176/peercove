@@ -562,6 +562,7 @@ export default function App() {
               supported={openTunnel.sharedMemo}
               seq={openTunnel.sharedMemoSeq}
               members={openTunnel.members}
+              permGroups={openTunnel.permGroups ?? []}
             />
           ) : openTunnel !== null ? (
             <TunnelView

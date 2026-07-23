@@ -1032,8 +1032,11 @@ export const ja = {
     perms: "権限の設定",
     permsTitle: "共有メモの権限",
     permsNote:
-      "権限はメンバー識別子に紐付きます。個別指定は「全体」より優先されます(「見せない」で特定メンバーだけ除外できます)。",
+      "権限はメンバー識別子・グループに紐付きます。優先順位は「メンバー個別 > グループ > 全体」です(「見せない」で特定のメンバー/グループだけ除外できます)。",
     everyoneLabel: "全体(ネットワークの全メンバー)",
+    groupsLabel: "グループ",
+    groupLevelInherit: "指定なし",
+    unknownGroupBadge: "(不明なグループ)",
     levelViewer: "閲覧のみ",
     levelEditor: "閲覧 + 編集",
     levelNone: "見せない",

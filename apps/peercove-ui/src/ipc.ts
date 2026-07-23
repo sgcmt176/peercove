@@ -226,6 +226,8 @@ export interface Tunnel {
   sharedMemoSeq: number;
   /** 共有メモが使えるか（member で false = ホスト未対応 or 未同期）。 */
   sharedMemo: boolean;
+  /** 共有メモの権限ダイアログで選べるグループ（ADR-0051）。host は既知の全グループ、member は自分の所属グループだけ。 */
+  permGroups?: PermGroup[];
   /** 解決済みカスタム DNS レコード（ADR-0022）。member はここから一覧表示する。 */
   dnsRecords: DnsRecord[];
 }
@@ -544,6 +546,19 @@ export interface SharedMemberPerm {
   level: SharedPermLevel;
 }
 
+/** グループ単位の権限指定(ADR-0051)。 */
+export interface SharedGroupPerm {
+  group_id: string;
+  name?: string;
+  level: SharedPermLevel;
+}
+
+/** 共有メモの権限ダイアログで選べるグループ(ADR-0051)。id + 現在名だけ。 */
+export interface PermGroup {
+  id: string;
+  name: string;
+}
+
 export interface SharedMemoQuery {
   trash?: boolean;
   folder_id?: string;
@@ -586,6 +601,7 @@ export interface SharedMemoDetail {
   locked_by?: string;
   everyone?: SharedPermLevel;
   members?: SharedMemberPerm[];
+  groups?: SharedGroupPerm[];
 }
 
 /** 共有メモの容量・履歴の上限(ホスト設定可、M5 F-3)。 */
@@ -644,6 +660,7 @@ export type SharedMemoOp =
       id: string;
       everyone: SharedPermLevel;
       members?: SharedMemberPerm[];
+      groups?: SharedGroupPerm[] | null;
     }
   | { op: "folder_create"; name: string }
   | { op: "folder_rename"; id: string; name: string }

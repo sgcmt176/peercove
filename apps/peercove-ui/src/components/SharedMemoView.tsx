@@ -9,6 +9,8 @@ import {
   DiffLine,
   MemoFolder,
   Member,
+  PermGroup,
+  SharedGroupPerm,
   SharedMemberPerm,
   SharedMemoDetail,
   SharedMemoHistoryDetail,
@@ -32,6 +34,7 @@ export function SharedMemoView({
   supported,
   seq,
   members,
+  permGroups,
 }: {
   configPath: string;
   isHost: boolean;
@@ -40,6 +43,8 @@ export function SharedMemoView({
   /** 変更世代。進んだら再取得する。 */
   seq: number;
   members: Member[];
+  /** 権限ダイアログで選べるグループ(ADR-0051)。host は既知の全グループ、member は自分の所属グループだけ。 */
+  permGroups: PermGroup[];
 }) {
   const [folderId, setFolderId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -368,14 +373,16 @@ export function SharedMemoView({
         <PermsDialog
           memo={permsFor}
           members={members}
+          permGroups={permGroups}
           onClose={() => setPermsFor(null)}
-          onSave={(everyone, memberPerms) =>
+          onSave={(everyone, memberPerms, groupPerms) =>
             void run(
               {
                 op: "set_perms",
                 id: permsFor.id,
                 everyone,
                 members: memberPerms,
+                groups: groupPerms,
               },
               () => setPermsFor(null),
             )
@@ -897,13 +904,20 @@ function SharedFolderList({
 function PermsDialog({
   memo,
   members,
+  permGroups,
   onClose,
   onSave,
 }: {
   memo: SharedMemoDetail;
   members: Member[];
+  /** 権限ダイアログで選べるグループ(ADR-0051)。 */
+  permGroups: PermGroup[];
   onClose: () => void;
-  onSave: (everyone: SharedPermLevel, members: SharedMemberPerm[]) => void;
+  onSave: (
+    everyone: SharedPermLevel,
+    members: SharedMemberPerm[],
+    groups: SharedGroupPerm[],
+  ) => void;
 }) {
   const [everyone, setEveryone] = useState<SharedPermLevel>(
     memo.everyone ?? "viewer",
@@ -911,6 +925,12 @@ function PermsDialog({
   // member_id → 個別レベル("inherit" = 全体に従う)
   const [overrides, setOverrides] = useState<Map<string, SharedPermLevel>>(
     () => new Map((memo.members ?? []).map((perm) => [perm.member_id, perm.level])),
+  );
+  // group_id → 個別レベル("inherit" = 指定なし。全体/メンバー個別に従う)
+  const [groupOverrides, setGroupOverrides] = useState<
+    Map<string, SharedPermLevel>
+  >(
+    () => new Map((memo.groups ?? []).map((perm) => [perm.group_id, perm.level])),
   );
 
   const candidates = members.filter(
@@ -920,6 +940,26 @@ function PermsDialog({
     candidates.find((member) => member.memberId === memberId)?.name ??
     (memo.members ?? []).find((perm) => perm.member_id === memberId)?.name ??
     memberId;
+
+  // 選択肢(permGroups)+ 既存指定はあるが現存しないグループ(削除済み等)を統合。
+  const groupRows = useMemo(() => {
+    const known = new Set(permGroups.map((group) => group.id));
+    const rows = permGroups.map((group) => ({
+      id: group.id,
+      name: group.name,
+      known: true,
+    }));
+    for (const perm of memo.groups ?? []) {
+      if (!known.has(perm.group_id)) {
+        rows.push({ id: perm.group_id, name: perm.name ?? "", known: false });
+      }
+    }
+    return rows;
+  }, [permGroups, memo.groups]);
+  const groupNameOf = (groupId: string) =>
+    permGroups.find((group) => group.id === groupId)?.name ??
+    (memo.groups ?? []).find((perm) => perm.group_id === groupId)?.name ??
+    "";
 
   return (
     <Modal title={t.sharedMemo.permsTitle} onClose={onClose}>
@@ -937,6 +977,51 @@ function PermsDialog({
           <option value="none">{t.sharedMemo.levelNone}</option>
         </select>
       </div>
+      {groupRows.length > 0 && (
+        <div className="memo-perms__group-section">
+          <label>{t.sharedMemo.groupsLabel}</label>
+          <div className="memo-perms__groups">
+            {groupRows.map((group) => {
+              const value = groupOverrides.get(group.id) ?? "inherit";
+              return (
+                <div key={group.id} className="memo-perms__row">
+                  <span className="memo-perms__name">
+                    {group.name}
+                    {!group.known && (
+                      <span className="muted small">
+                        {" "}
+                        {t.sharedMemo.unknownGroupBadge}
+                      </span>
+                    )}
+                  </span>
+                  <select
+                    value={value}
+                    onChange={(event) => {
+                      const next = new Map(groupOverrides);
+                      if (event.target.value === "inherit") {
+                        next.delete(group.id);
+                      } else {
+                        next.set(
+                          group.id,
+                          event.target.value as SharedPermLevel,
+                        );
+                      }
+                      setGroupOverrides(next);
+                    }}
+                  >
+                    <option value="inherit">
+                      {t.sharedMemo.groupLevelInherit}
+                    </option>
+                    <option value="viewer">{t.sharedMemo.levelViewer}</option>
+                    <option value="editor">{t.sharedMemo.levelEditor}</option>
+                    <option value="none">{t.sharedMemo.levelNone}</option>
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {candidates.length > 0 && (
         <div className="memo-perms__members">
           {candidates.map((member) => {
@@ -987,6 +1072,11 @@ function PermsDialog({
               [...overrides.entries()].map(([memberId, level]) => ({
                 member_id: memberId,
                 name: nameOf(memberId) ?? "",
+                level,
+              })),
+              [...groupOverrides.entries()].map(([groupId, level]) => ({
+                group_id: groupId,
+                name: groupNameOf(groupId),
                 level,
               })),
             )
