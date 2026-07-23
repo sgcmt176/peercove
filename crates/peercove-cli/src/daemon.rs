@@ -673,7 +673,7 @@ impl DaemonShared {
             // 外す対象 = 置き換わった/消えた IP + 自己修復として
             // 「グループに居るのに台帳に居ない」IP(過去の削除の取りこぼし)
             let mut stale = outcome.all();
-            for group in groups.lock().unwrap().list() {
+            for group in groups.lock().unwrap().all() {
                 if !group.members.contains(&address) {
                     continue;
                 }
@@ -761,13 +761,14 @@ impl DaemonShared {
             group.id,
             group.members.len()
         );
-        Self::propagate_group(
-            &group,
-            &group.members.clone(),
-            &ledger,
-            active.address,
-            &active.groups,
-        );
+        // ホストにも配る(M5 F-4、ADR-0051。host 役は None なので追加なし)
+        let mut recipients = group.members.clone();
+        if let Some(host_ip) = Self::host_ip_of(active, &ledger) {
+            if !recipients.contains(&host_ip) {
+                recipients.push(host_ip);
+            }
+        }
+        Self::propagate_group(&group, &recipients, &ledger, active.address, &active.groups);
         Ok(IpcResponse::Group { group })
     }
 
@@ -836,9 +837,15 @@ impl DaemonShared {
             group.id,
             group.revision
         );
-        // 外した本人にも配る(本人の画面からグループを引っ込める)
+        // 外した本人にも配る(本人の画面からグループを引っ込める)。
+        // ホストにも配る(M5 F-4、ADR-0051。host 役は None なので追加なし)
         let mut recipients = group.members.clone();
         recipients.extend(remove);
+        if let Some(host_ip) = Self::host_ip_of(active, &ledger) {
+            if !recipients.contains(&host_ip) {
+                recipients.push(host_ip);
+            }
+        }
         Self::propagate_group(&group, &recipients, &ledger, active.address, &active.groups);
         Ok(IpcResponse::Group { group })
     }
@@ -874,13 +881,14 @@ impl DaemonShared {
             );
         }
         tracing::info!("グループから退出しました(id={})", group.id);
-        Self::propagate_group(
-            &group,
-            &group.members.clone(),
-            &ledger,
-            active.address,
-            &active.groups,
-        );
+        // ホストにも配る(M5 F-4、ADR-0051。host 役は None なので追加なし)
+        let mut recipients = group.members.clone();
+        if let Some(host_ip) = Self::host_ip_of(active, &ledger) {
+            if !recipients.contains(&host_ip) {
+                recipients.push(host_ip);
+            }
+        }
+        Self::propagate_group(&group, &recipients, &ledger, active.address, &active.groups);
         Ok(IpcResponse::Done)
     }
 
@@ -895,6 +903,19 @@ impl DaemonShared {
             bail!("グループ名が長すぎます");
         }
         Ok(name.to_string())
+    }
+
+    /// ホストの仮想 IP(台帳の `is_host` エントリ)。M5 F-4(ADR-0051)で
+    /// member 役がグループ更新の配布先にホストを加えるために使う。
+    /// host 役は自分自身なので呼び出し側で `None` 扱い(role で分岐)。
+    fn host_ip_of(
+        active: &Active,
+        ledger: &[peercove_core::proto::LedgerEntry],
+    ) -> Option<Ipv4Addr> {
+        if active.role != Role::Member {
+            return None;
+        }
+        ledger.iter().find(|e| e.is_host).map(|e| e.ip)
     }
 
     /// 台帳スナップショットの複製(宛先検証用)。
@@ -1918,7 +1939,9 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
             .iter()
             .map(|p| p.seq)
             .collect(),
-        groups: active.groups.lock().unwrap().list(),
+        // チャット UI 向け(ADR-0051): ホストが保存した非メンバーの
+        // グループを混ぜない。全件が要るところ(メモ権限)は GroupStore::all
+        groups: active.groups.lock().unwrap().joined(active.address),
         shared_memo_seq: active.memo.seq(),
         shared_memo: active.memo.supported(),
     }

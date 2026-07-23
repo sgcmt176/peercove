@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -523,6 +524,9 @@ pub async fn supervise(
         // 差し込み口(member_link)は呼び出し側と共有(IPC の DNS 名変更 —
         // ADR-0021 — がここを通ってホストへ届く)
         let mut rotation: Option<crate::rotate::Rotation> = None;
+        // (member)ホストの仮想 IP。グループ更新の配布先にホストを加える
+        // (ADR-0051)。host_ip は下の Role::Member 分岐で埋める
+        let mut member_host_ip: Option<Ipv4Addr> = None;
         match role {
             Role::Host => {
                 // 共有メモ(M5 F-2): サービスにこの周期の接続表を差し込み、
@@ -555,6 +559,7 @@ pub async fn supervise(
                     .first()
                     .and_then(|p| p.control_host)
                     .or_else(|| spec.address.trunc().hosts().next());
+                member_host_ip = host_ip;
                 match host_ip {
                     Some(host_ip) if host_ip != spec.address.addr() => {
                         let memo_cache = match &memo {
@@ -869,10 +874,14 @@ pub async fn supervise(
                             })
                             .map(|e| e.ip)
                             .collect();
+                        // グループ更新の配布先にホストを加える(M5 F-4
+                        // Stage 1、ADR-0051)。host は Role::Member のみ
+                        // (host 自身は None のため自己送信にならない)
                         let pending = groups.lock().unwrap().pending_sync(
                             spec.address.addr(),
                             &online,
                             Duration::from_secs(30),
+                            member_host_ip,
                         );
                         for (ip, group) in pending {
                             let groups = Arc::clone(&groups);

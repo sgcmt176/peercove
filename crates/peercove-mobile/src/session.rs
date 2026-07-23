@@ -137,6 +137,18 @@ pub struct SessionConfig {
     pub peer_msg_port: u16,
 }
 
+impl SessionConfig {
+    /// ホストの仮想 IP(コントロールチャネルの接続先 = `control_addr` の
+    /// IP)。グループ更新の配布先にホストを加える(M5 F-4、ADR-0051)のに使う。
+    /// PeerCove は IPv4 前提(IPv6 は対象外)なので V6 は来ない想定。
+    fn host_ip(&self) -> Ipv4Addr {
+        match self.control_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            std::net::IpAddr::V6(_) => unreachable!("PeerCove は IPv4 前提"),
+        }
+    }
+}
+
 /// 台帳のスナップショット(コントロールチャネルの受信で更新)。
 #[derive(Default)]
 pub struct LedgerSnapshot {
@@ -1844,8 +1856,15 @@ impl SessionShared {
             revision: 1,
             updated_by: self.cfg.own_ip,
         };
+        // ホストにも配る(M5 F-4、ADR-0051)。ホストが全グループを知る
+        // ことで、次工程の共有メモのグループ権限判定に使える
+        let mut targets = group_members.clone();
+        let host_ip = self.cfg.host_ip();
+        if !targets.contains(&host_ip) {
+            targets.push(host_ip);
+        }
         let mut delivered = 0usize;
-        for target in group_members.iter().filter(|ip| **ip != self.cfg.own_ip) {
+        for target in targets.iter().filter(|ip| **ip != self.cfg.own_ip) {
             let online = member_states.iter().any(|(ip, ok)| ip == target && *ok);
             if !online {
                 continue;
@@ -1987,11 +2006,17 @@ impl SessionShared {
                     .collect(),
             )
         };
+        // ホストにも配る(M5 F-4、ADR-0051)。既にグループメンバー/extra
+        // (キックで外した本人)なら重複させない
+        let mut targets: Vec<Ipv4Addr> = group.members.clone();
+        targets.extend(extra.iter().copied());
+        let host_ip = self.cfg.host_ip();
+        if !targets.contains(&host_ip) {
+            targets.push(host_ip);
+        }
         let mut delivered = 0usize;
-        for target in group
-            .members
+        for target in targets
             .iter()
-            .chain(extra.iter())
             .filter(|ip| **ip != self.cfg.own_ip && online.contains(ip))
         {
             match self.deliver_group(*target, &group) {
@@ -2744,6 +2769,60 @@ mod tests {
 
         a.stop();
         b.stop();
+    }
+
+    /// M5 F-4(ADR-0051): グループ更新は実メンバーに加えてホストにも送る。
+    /// ホストは自分が非メンバーのグループでも**保存だけ**する(会話一覧
+    /// = joined には出さない)。ここでは「もう 1 台の NetSession」を
+    /// ホストの受信端末に見立てる(受信経路 accepts_update/apply は desktop
+    /// と共通のため、送信側の配布先追加ロジックの検証として十分)。
+    #[test]
+    fn create_group_also_reaches_host_even_if_not_member() {
+        let host_ip: Ipv4Addr = "127.0.0.3".parse().unwrap();
+        let host = test_session_at("group-host", "127.0.0.3", "127.0.0.1:1".parse().unwrap(), 1);
+        seed_ledger(&host, vec![ledger_entry("127.0.0.1", "creator", true)]);
+        let host_addr = bound_addr(&host);
+
+        // 送り手 B。control_addr の IP がホストの仮想 IP、peer_msg_port は
+        // ホストの実ポート(テストのエフェメラルポート事情のため)
+        let b = test_session_at(
+            "group-b-host",
+            "127.0.0.1",
+            SocketAddr::from((host_ip, 1)),
+            host_addr.port(),
+        );
+        seed_ledger(
+            &b,
+            vec![
+                ledger_entry("127.0.0.1", "creator", true),
+                ledger_entry("127.0.0.2", "offline-member", false),
+                ledger_entry("127.0.0.3", "host", true),
+            ],
+        );
+
+        let group = b
+            .shared
+            .create_group("チーム", vec!["127.0.0.2".parse().unwrap()])
+            .unwrap();
+        assert!(
+            !group.members.contains(&host_ip),
+            "ホストはこのグループのメンバーではない"
+        );
+
+        // ホストは非メンバーでも保存する
+        let received = host.shared.groups.lock().unwrap().get(&group.id).cloned();
+        assert_eq!(received.map(|g| g.name).as_deref(), Some("チーム"));
+        // だが会話一覧(joined)には出さない
+        assert!(host
+            .shared
+            .groups
+            .lock()
+            .unwrap()
+            .joined(host_ip)
+            .is_empty());
+
+        b.stop();
+        host.stop();
     }
 
     /// グループの改名・メンバー追加・退出がスマホから配布される(E-E 8)。

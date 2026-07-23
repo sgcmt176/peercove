@@ -123,23 +123,47 @@ impl GroupStore {
         }
     }
 
-    /// いま送るべき (相手, グループ全量) の一覧。オンラインのグループメンバーの
-    /// うち、最新 revision の ack が無く、直近 `retry_after` 以内に試行して
+    /// いま送るべき (相手, グループ全量) の一覧。**自分がメンバーのグループ
+    /// だけ**を対象に(ADR-0051)、オンラインのグループメンバー(自分以外)と
+    /// `host_ip`(渡されればホストの仮想 IP。既にメンバーなら重複させない)
+    /// のうち、最新 revision の ack が無く、直近 `retry_after` 以内に試行して
     /// いない相手を返す(返した分は試行済みとして記録する)。
+    ///
+    /// 「自分がメンバーのグループだけ」のガードは、ホストが M5 F-4 で
+    /// 非メンバーのグループも保存するようになったため必須: ガードが無いと
+    /// ホストが保存した他人のグループをその実メンバーへ再配布しようとし、
+    /// 相手の受信認可(`accepts_update` = 送信元がメンバー)で必ず拒否される
+    /// 無駄な再送になる。`host_ip` は member 役が自分の接続先ホストを渡す
+    /// 想定(host 役は `None` を渡す — 自分がホストなので不要)。
     pub fn pending_sync(
         &mut self,
         self_ip: Ipv4Addr,
         online: &HashSet<Ipv4Addr>,
         retry_after: Duration,
+        host_ip: Option<Ipv4Addr>,
     ) -> Vec<(Ipv4Addr, GroupInfo)> {
         let now = Instant::now();
         let mut out = Vec::new();
         for group in self.groups.values() {
-            for peer in &group.members {
-                if *peer == self_ip || !online.contains(peer) {
+            if !group.members.contains(&self_ip) {
+                continue;
+            }
+            let mut targets: Vec<Ipv4Addr> = group
+                .members
+                .iter()
+                .copied()
+                .filter(|ip| *ip != self_ip)
+                .collect();
+            if let Some(host) = host_ip {
+                if host != self_ip && !targets.contains(&host) {
+                    targets.push(host);
+                }
+            }
+            for peer in targets {
+                if !online.contains(&peer) {
                     continue;
                 }
-                let key = (group.id.clone(), *peer);
+                let key = (group.id.clone(), peer);
                 if self.acked.get(&key).copied().unwrap_or(0) >= group.revision {
                     continue;
                 }
@@ -150,7 +174,7 @@ impl GroupStore {
                 {
                     continue;
                 }
-                out.push((*peer, group.clone()));
+                out.push((peer, group.clone()));
             }
         }
         for (peer, group) in &out {
@@ -204,8 +228,26 @@ impl GroupStore {
     }
 
     /// 既知のグループ全部(id 順 — status 応答の表示が揺れないように)。
-    pub fn list(&self) -> Vec<GroupInfo> {
+    /// M5 F-4(ADR-0051)でホストは自分が属さないグループも保存するため、
+    /// **UI 表示にはこれを直接使わない**([`Self::joined`] を使うこと)。
+    /// 内部処理(削除メンバーの整理 `reconcile` など)やメモ権限(次工程)の
+    /// 対象選択のような、非メンバーのグループも扱う必要がある場面向け。
+    pub fn all(&self) -> Vec<GroupInfo> {
         let mut list: Vec<GroupInfo> = self.groups.values().cloned().collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
+    }
+
+    /// `self_ip` がメンバーであるグループだけ(id 順)。チャット UI の会話
+    /// 一覧など、**自分視点の表示**に使う(ADR-0051: ホストが保存した
+    /// 他人のグループを混ぜない)。
+    pub fn joined(&self, self_ip: Ipv4Addr) -> Vec<GroupInfo> {
+        let mut list: Vec<GroupInfo> = self
+            .groups
+            .values()
+            .filter(|g| g.members.contains(&self_ip))
+            .cloned()
+            .collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }
@@ -343,7 +385,7 @@ mod tests {
         }
         let store = GroupStore::load(&config);
         let store = store.lock().unwrap();
-        let listed = store.list();
+        let listed = store.all();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "g1");
         assert_eq!(listed[0].revision, 2);
@@ -462,7 +504,7 @@ mod tests {
         let config = temp_config("corrupt");
         std::fs::write(GroupStore::path_for(&config), "{壊れた JSON").unwrap();
         let store = GroupStore::load(&config);
-        assert!(store.lock().unwrap().list().is_empty());
+        assert!(store.lock().unwrap().all().is_empty());
         let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 
@@ -484,20 +526,25 @@ mod tests {
         ));
 
         let online: HashSet<Ipv4Addr> = [peer].into_iter().collect();
-        let pending = store.pending_sync(me, &online, Duration::from_secs(30));
+        let pending = store.pending_sync(me, &online, Duration::from_secs(30), None);
         assert_eq!(pending.len(), 1, "オンラインの未達メンバーだけ");
         assert_eq!(pending[0].0, peer);
 
         // 直後の再問い合わせは間隔内なので出てこない(失敗の連打防止)
         assert!(store
-            .pending_sync(me, &online, Duration::from_secs(30))
+            .pending_sync(me, &online, Duration::from_secs(30), None)
             .is_empty());
         // 間隔ゼロなら再試行として出てくる(まだ ack が無いため)
-        assert_eq!(store.pending_sync(me, &online, Duration::ZERO).len(), 1);
+        assert_eq!(
+            store.pending_sync(me, &online, Duration::ZERO, None).len(),
+            1
+        );
 
         // ack が付いたら出てこない
         store.mark_acked("g1", peer, 1);
-        assert!(store.pending_sync(me, &online, Duration::ZERO).is_empty());
+        assert!(store
+            .pending_sync(me, &online, Duration::ZERO, None)
+            .is_empty());
         // revision が進んだらまた対象になる
         store.apply(group(
             "g1",
@@ -505,14 +552,74 @@ mod tests {
             "10.0.0.1",
             &["10.0.0.1", "10.0.0.2", "10.0.0.3"],
         ));
-        assert_eq!(store.pending_sync(me, &online, Duration::ZERO).len(), 1);
+        assert_eq!(
+            store.pending_sync(me, &online, Duration::ZERO, None).len(),
+            1
+        );
 
         // オフラインだったメンバーがオンラインになれば対象になる(追いつき)
         let online: HashSet<Ipv4Addr> = [peer, offline].into_iter().collect();
         store.mark_acked("g1", peer, 2);
-        let pending = store.pending_sync(me, &online, Duration::ZERO);
+        let pending = store.pending_sync(me, &online, Duration::ZERO, None);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, offline);
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    /// M5 F-4(ADR-0051): メンバーが `host_ip` を渡すと、グループの実
+    /// メンバーに加えてホストも配布対象になる。ホストが既にメンバーなら
+    /// 重複させない。
+    #[test]
+    fn pending_sync_includes_host_target() {
+        let config = temp_config("sync-host");
+        let me: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let peer: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let host: Ipv4Addr = "10.0.0.9".parse().unwrap();
+        let store = GroupStore::load(&config);
+        let mut store = store.lock().unwrap();
+        // ホストはこのグループのメンバーではない
+        store.apply(group("g1", 1, "10.0.0.1", &["10.0.0.1", "10.0.0.2"]));
+
+        let online: HashSet<Ipv4Addr> = [peer, host].into_iter().collect();
+        let mut pending = store.pending_sync(me, &online, Duration::ZERO, Some(host));
+        pending.sort_by_key(|(ip, _)| *ip);
+        assert_eq!(pending.len(), 2, "実メンバー + ホストへ配る");
+        assert_eq!(pending[0].0, peer);
+        assert_eq!(pending[1].0, host);
+
+        // ホストが既にグループメンバーなら重複させない
+        store.mark_acked("g1", peer, 1);
+        store.mark_acked("g1", host, 1);
+        store.apply(group("g2", 1, "10.0.0.1", &["10.0.0.1", "10.0.0.9"]));
+        let pending = store.pending_sync(me, &online, Duration::ZERO, Some(host));
+        let g2_targets: Vec<Ipv4Addr> = pending
+            .iter()
+            .filter(|(_, g)| g.id == "g2")
+            .map(|(ip, _)| *ip)
+            .collect();
+        assert_eq!(g2_targets, vec![host], "重複せず 1 件だけ");
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    /// M5 F-4(ADR-0051): 自分がメンバーでないグループは配布対象に
+    /// ならない(ホストが保存した他人のグループを再配布しない)。
+    #[test]
+    fn pending_sync_skips_non_member_groups() {
+        let config = temp_config("sync-nonmember");
+        let host: Ipv4Addr = "10.0.0.9".parse().unwrap();
+        let a: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let b: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let store = GroupStore::load(&config);
+        let mut store = store.lock().unwrap();
+        // ホストは自分がメンバーでないグループを保存している
+        store.apply(group("g1", 1, "10.0.0.1", &["10.0.0.1", "10.0.0.2"]));
+
+        let online: HashSet<Ipv4Addr> = [a, b].into_iter().collect();
+        let pending = store.pending_sync(host, &online, Duration::ZERO, None);
+        assert!(
+            pending.is_empty(),
+            "ホストは非メンバーのグループを再配布しない"
+        );
         let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 
