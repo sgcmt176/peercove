@@ -421,6 +421,18 @@ pub struct TunnelInfo {
     /// false のときの member は「ホスト未対応 or 未同期」— キャッシュ表示のみ。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared_memo: bool,
+    /// 共有メモの権限ダイアログで選べるグループの一覧(ADR-0051)。
+    /// host は既知の全グループ(自分が属さないものも)、member は自分が
+    /// 属するグループだけ。旧デーモンの応答には無い(空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perm_groups: Vec<PermGroup>,
+}
+
+/// 共有メモの権限指定 UI 向けのグループ 1 件(id + 現在名だけ。ADR-0051)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermGroup {
+    pub id: String,
+    pub name: String,
 }
 
 fn u64_is_zero(value: &u64) -> bool {

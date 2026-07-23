@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use peercove_core::memo::{
-    checklist_progress, excerpt, DiffLine, MemoFolder, SharedMemberPerm, SharedMemoDetail,
-    SharedMemoHistoryDetail, SharedMemoHistoryEntry, SharedMemoLimits, SharedMemoQuery,
-    SharedMemoSummary, SharedPermLevel, EXCERPT_CHARS,
+    checklist_progress, excerpt, DiffLine, MemoFolder, SharedGroupPerm, SharedMemberPerm,
+    SharedMemoDetail, SharedMemoHistoryDetail, SharedMemoHistoryEntry, SharedMemoLimits,
+    SharedMemoQuery, SharedMemoSummary, SharedPermLevel, EXCERPT_CHARS,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -43,6 +43,11 @@ pub struct Actor {
     pub member_id: Option<String>,
     /// 表示名(更新者・所有者のスナップショットに使う)。
     pub name: String,
+    /// 現在この操作主体が属しているグループの id 一覧(ADR-0051)。
+    /// 解決はサービス層(ホスト)が「対象メンバーの現在の仮想 IP が
+    /// GroupInfo.members に含まれるか」で行い、ここには解決済みの
+    /// id を渡す(ストア層はグループの実体を知らない)。
+    pub group_ids: Vec<String>,
 }
 
 impl Actor {
@@ -50,6 +55,7 @@ impl Actor {
         Self {
             member_id: None,
             name: name.into(),
+            group_ids: Vec::new(),
         }
     }
 
@@ -57,7 +63,14 @@ impl Actor {
         Self {
             member_id: Some(id.into()),
             name: name.into(),
+            group_ids: Vec::new(),
         }
+    }
+
+    /// 所属グループの id 一覧を付与する(ホスト側サービス層が解決して渡す)。
+    pub fn with_groups(mut self, ids: Vec<String>) -> Self {
+        self.group_ids = ids;
+        self
     }
 
     fn is_host(&self) -> bool {
@@ -70,7 +83,7 @@ impl Actor {
     }
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 2;
+const SHARED_SCHEMA_VERSION: i64 = 3;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -104,42 +117,65 @@ struct Row {
     deleted_at: Option<i64>,
 }
 
+/// 1 メモ分の権限計算に要る材料(メンバー個別 + グループ)。ホスト 1 回の
+/// 問い合わせで両方まとめて取るための入れ物(`SharedStore::perm_context`)。
+struct PermContext {
+    /// member_id → 個別権限。
+    levels: HashMap<String, SharedPermLevel>,
+    /// member_id → 表示名スナップショット。
+    names: HashMap<String, String>,
+    /// group_id → グループ権限。
+    group_levels: HashMap<String, SharedPermLevel>,
+    /// グループ権限の全量(表示用。名前順)。
+    groups: Vec<SharedGroupPerm>,
+}
+
 impl Row {
-    fn visible_to(&self, actor: &Actor, perms: &HashMap<String, SharedPermLevel>) -> bool {
+    /// 判定の優先順位は**メンバー個別 > グループ(該当する複数グループの
+    /// 最大)> 全体**(ADR-0051)。個別指定があれば(None も含めて)それを
+    /// 使い切る。個別指定が無く、所属グループに 1 つでも明示的な権限が
+    /// あれば(None を含む)その最大値を使う。どちらも無ければ全体権限。
+    fn effective_level(&self, actor: &Actor, ctx: &PermContext) -> SharedPermLevel {
+        if let Some(level) = ctx.levels.get(actor.owner_id()) {
+            return *level;
+        }
+        let group_max = actor
+            .group_ids
+            .iter()
+            .filter_map(|id| ctx.group_levels.get(id))
+            .copied()
+            .max();
+        if let Some(level) = group_max {
+            return level;
+        }
+        self.everyone
+    }
+
+    fn visible_to(&self, actor: &Actor, ctx: &PermContext) -> bool {
         if actor.is_host() || self.owner_id == actor.owner_id() {
             return true;
         }
         if self.deleted_at.is_some() {
             return false; // ゴミ箱は所有者・ホストのみ
         }
-        match perms.get(actor.owner_id()) {
-            Some(level) => *level != SharedPermLevel::None,
-            None => self.everyone != SharedPermLevel::None,
-        }
+        self.effective_level(actor, ctx) != SharedPermLevel::None
     }
 
-    fn can_edit(&self, actor: &Actor, perms: &HashMap<String, SharedPermLevel>) -> bool {
+    fn can_edit(&self, actor: &Actor, ctx: &PermContext) -> bool {
         if self.deleted_at.is_some() {
             return false; // ゴミ箱は読み取り専用
         }
         if actor.is_host() || self.owner_id == actor.owner_id() {
             return true;
         }
-        match perms.get(actor.owner_id()) {
-            Some(level) => *level == SharedPermLevel::Editor,
-            None => self.everyone == SharedPermLevel::Editor,
-        }
+        self.effective_level(actor, ctx) == SharedPermLevel::Editor
     }
 
     fn can_manage(&self, actor: &Actor) -> bool {
         actor.is_host() || self.owner_id == actor.owner_id()
     }
 
-    fn summary(
-        &self,
-        actor: &Actor,
-        perms: &HashMap<String, SharedPermLevel>,
-    ) -> SharedMemoSummary {
+    fn summary(&self, actor: &Actor, ctx: &PermContext) -> SharedMemoSummary {
         let (done, total) = checklist_progress(&self.body);
         SharedMemoSummary {
             id: self.id.clone(),
@@ -153,7 +189,7 @@ impl Row {
             owner_id: self.owner_id.clone(),
             owner_name: self.owner_name.clone(),
             deleted_at: self.deleted_at.map(|v| v as u64),
-            can_edit: self.can_edit(actor, perms),
+            can_edit: self.can_edit(actor, ctx),
             can_manage: self.can_manage(actor),
             locked_by: None, // サービス層(ロック保持者)が詰める
             checklist_done: done,
@@ -161,12 +197,7 @@ impl Row {
         }
     }
 
-    fn detail(
-        &self,
-        actor: &Actor,
-        perms: &HashMap<String, SharedPermLevel>,
-        perm_names: &HashMap<String, String>,
-    ) -> SharedMemoDetail {
+    fn detail(&self, actor: &Actor, ctx: &PermContext) -> SharedMemoDetail {
         let manage = self.can_manage(actor);
         SharedMemoDetail {
             id: self.id.clone(),
@@ -180,21 +211,27 @@ impl Row {
             owner_id: self.owner_id.clone(),
             owner_name: self.owner_name.clone(),
             deleted_at: self.deleted_at.map(|v| v as u64),
-            can_edit: self.can_edit(actor, perms),
+            can_edit: self.can_edit(actor, ctx),
             can_manage: manage,
             locked_by: None,
             everyone: manage.then_some(self.everyone),
             members: if manage {
-                let mut members: Vec<SharedMemberPerm> = perms
+                let mut members: Vec<SharedMemberPerm> = ctx
+                    .levels
                     .iter()
                     .map(|(member_id, level)| SharedMemberPerm {
                         member_id: member_id.clone(),
-                        name: perm_names.get(member_id).cloned().unwrap_or_default(),
+                        name: ctx.names.get(member_id).cloned().unwrap_or_default(),
                         level: *level,
                     })
                     .collect();
                 members.sort_by(|a, b| a.name.cmp(&b.name).then(a.member_id.cmp(&b.member_id)));
                 members
+            } else {
+                Vec::new()
+            },
+            groups: if manage {
+                ctx.groups.clone()
             } else {
                 Vec::new()
             },
@@ -316,6 +353,22 @@ impl SharedStore {
                 "#,
             )?;
         }
+        if version < 3 {
+            // v3(M5 F-4、ADR-0051): グループ単位の権限。既存テーブルは
+            // そのまま、追加のみ(FK は memo_perms と違って持たない —
+            // 完全削除は purge_memo が手動で対で消す)
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS memo_group_perms (
+                    memo_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    PRIMARY KEY (memo_id, group_id)
+                );
+                "#,
+            )?;
+        }
         tx.pragma_update(None, "user_version", SHARED_SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -356,6 +409,60 @@ impl SharedStore {
             names.insert(member_id, name);
         }
         Ok((levels, names))
+    }
+
+    /// グループ権限(group_id → level、名前順の全量)。
+    fn group_perms_of(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<(HashMap<String, SharedPermLevel>, Vec<SharedGroupPerm>)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_id, name, level FROM memo_group_perms WHERE memo_id = ?1")?;
+        let mut levels = HashMap::new();
+        let mut list = Vec::new();
+        let rows = stmt.query_map(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (group_id, name, level) = row?;
+            let level = level_from_str(&level);
+            levels.insert(group_id.clone(), level);
+            list.push(SharedGroupPerm {
+                group_id,
+                name,
+                level,
+            });
+        }
+        list.sort_by(|a, b| a.name.cmp(&b.name).then(a.group_id.cmp(&b.group_id)));
+        Ok((levels, list))
+    }
+
+    /// メンバー個別 + グループの権限材料を 1 か所で取得する。
+    fn perm_context(&self, id: &str) -> anyhow::Result<PermContext> {
+        let (levels, names) = self.perms_of(id)?;
+        let (group_levels, groups) = self.group_perms_of(id)?;
+        Ok(PermContext {
+            levels,
+            names,
+            group_levels,
+            groups,
+        })
+    }
+
+    /// グループ権限を持つメモの id 一覧(重複なし)。グループの改名・
+    /// メンバー増減・削除に追従した再配信の対象探索に使う(ADR-0051、
+    /// `MemoService::watch_groups`)。
+    pub fn memo_ids_with_group_perms(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT memo_id FROM memo_group_perms")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// 一覧(受信者視点)。ゴミ箱は所有者・ホストの分だけ。
@@ -402,9 +509,9 @@ impl SharedStore {
 
         let mut memos = Vec::new();
         for row in rows {
-            let (perms, _) = self.perms_of(&row.id)?;
-            if row.visible_to(actor, &perms) {
-                memos.push(row.summary(actor, &perms));
+            let ctx = self.perm_context(&row.id)?;
+            if row.visible_to(actor, &ctx) {
+                memos.push(row.summary(actor, &ctx));
             }
         }
         Ok((memos, self.folders()?))
@@ -413,11 +520,11 @@ impl SharedStore {
     /// 1 件取得(受信者視点)。見えないメモはエラー。
     pub fn get(&self, actor: &Actor, id: &str) -> anyhow::Result<SharedMemoDetail> {
         let row = self.row(id)?;
-        let (perms, names) = self.perms_of(id)?;
-        if !row.visible_to(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
             bail!("このメモを閲覧する権限がありません");
         }
-        Ok(row.detail(actor, &perms, &names))
+        Ok(row.detail(actor, &ctx))
     }
 
     /// 受信者視点の詳細(見えなければ None)。イベント配信のフィルタ用。
@@ -443,11 +550,11 @@ impl SharedStore {
         if row.deleted_at.is_some() {
             return Ok(None);
         }
-        let (perms, names) = self.perms_of(id)?;
-        if !row.visible_to(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
             return Ok(None);
         }
-        Ok(Some(row.detail(actor, &perms, &names)))
+        Ok(Some(row.detail(actor, &ctx)))
     }
 
     pub fn create(
@@ -519,11 +626,11 @@ impl SharedStore {
         let limits = self.limits()?;
         validate_body_bytes(body, limits.max_body_bytes as usize)?;
         let row = self.row(id)?;
-        let (perms, _) = self.perms_of(id)?;
-        if !row.visible_to(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
             bail!("このメモを閲覧する権限がありません");
         }
-        if !row.can_edit(actor, &perms) {
+        if !row.can_edit(actor, &ctx) {
             bail!("このメモを編集する権限がありません(閲覧のみ)");
         }
         if row.revision as u64 != base_revision {
@@ -617,8 +724,8 @@ impl SharedStore {
     /// revision と同じなら何もしない(重複防止)。
     pub fn save_version(&self, actor: &Actor, id: &str) -> anyhow::Result<()> {
         let row = self.row(id)?;
-        let (perms, _) = self.perms_of(id)?;
-        if !row.can_edit(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.can_edit(actor, &ctx) {
             bail!("このメモを編集する権限がありません(閲覧のみ)");
         }
         let latest_revision: Option<i64> = self
@@ -643,8 +750,8 @@ impl SharedStore {
         id: &str,
     ) -> anyhow::Result<Vec<SharedMemoHistoryEntry>> {
         let row = self.row(id)?;
-        let (perms, _) = self.perms_of(id)?;
-        if !row.visible_to(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
             bail!("このメモを閲覧する権限がありません");
         }
         let mut stmt = self.conn.prepare(
@@ -676,8 +783,8 @@ impl SharedStore {
         hid: i64,
     ) -> anyhow::Result<SharedMemoHistoryDetail> {
         let row = self.row(id)?;
-        let (perms, _) = self.perms_of(id)?;
-        if !row.visible_to(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
             bail!("このメモを閲覧する権限がありません");
         }
         let (entry, body) = self
@@ -716,8 +823,8 @@ impl SharedStore {
         to_hid: Option<i64>,
     ) -> anyhow::Result<Vec<DiffLine>> {
         let row = self.row(id)?;
-        let (perms, _) = self.perms_of(id)?;
-        if !row.visible_to(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
             bail!("このメモを閲覧する権限がありません");
         }
         let from_body: String = self
@@ -754,11 +861,11 @@ impl SharedStore {
         hid: i64,
     ) -> anyhow::Result<SharedMemoDetail> {
         let row = self.row(id)?;
-        let (perms, _) = self.perms_of(id)?;
-        if !row.visible_to(actor, &perms) {
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
             bail!("このメモを閲覧する権限がありません");
         }
-        if !row.can_edit(actor, &perms) {
+        if !row.can_edit(actor, &ctx) {
             bail!("このメモを編集する権限がありません(閲覧のみ)");
         }
         let (hist_title, hist_body): (String, String) = self
@@ -922,6 +1029,12 @@ impl SharedStore {
     fn purge_memo(&self, id: &str, now: i64) -> anyhow::Result<()> {
         self.conn
             .execute("DELETE FROM memo_history WHERE memo_id = ?1", params![id])?;
+        // memo_group_perms は memo_perms と違って FK CASCADE を持たないため
+        // (v3 マイグレーション、ADR-0051)手動で対で消す
+        self.conn.execute(
+            "DELETE FROM memo_group_perms WHERE memo_id = ?1",
+            params![id],
+        )?;
         self.conn
             .execute("DELETE FROM memos WHERE id = ?1", params![id])?;
         self.conn.execute(
@@ -1007,12 +1120,16 @@ impl SharedStore {
     }
 
     /// 権限の設定(所有者・ホスト管理者)。`members` は全量置き換え。
+    /// `groups` は `None` = グループ権限を変更しない(旧クライアントの
+    /// SetPerms が既存のグループ権限を消さないための互換仕様、ADR-0051)。
+    /// `Some` は全量置き換え。
     pub fn set_perms(
         &mut self,
         actor: &Actor,
         id: &str,
         everyone: SharedPermLevel,
         members: &[SharedMemberPerm],
+        groups: Option<&[SharedGroupPerm]>,
     ) -> anyhow::Result<SharedMemoDetail> {
         let row = self.row(id)?;
         if !row.can_manage(actor) {
@@ -1038,6 +1155,22 @@ impl SharedStore {
                     level_to_str(member.level)
                 ],
             )?;
+        }
+        if let Some(groups) = groups {
+            tx.execute(
+                "DELETE FROM memo_group_perms WHERE memo_id = ?1",
+                params![id],
+            )?;
+            for group in groups {
+                if group.group_id.is_empty() {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO memo_group_perms (memo_id, group_id, name, level)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id, group.group_id, group.name, level_to_str(group.level)],
+                )?;
+            }
         }
         tx.commit()?;
         self.get(actor, id)
@@ -1500,6 +1633,7 @@ impl CacheStore {
                         deleted_at: None,
                         everyone: None,
                         members: Vec::new(),
+                        groups: Vec::new(),
                     })
                 },
             )
@@ -1584,13 +1718,14 @@ mod tests {
                     name: "ボブ".to_string(),
                     level: SharedPermLevel::Editor,
                 }],
+                None,
             )
             .unwrap();
         assert!(store.get(&bob, &memo.id).unwrap().can_edit);
 
         // 全体 none + 個別なし = 第三者には見えない
         store
-            .set_perms(&alice, &memo.id, SharedPermLevel::None, &[])
+            .set_perms(&alice, &memo.id, SharedPermLevel::None, &[], None)
             .unwrap();
         assert!(store.get(&bob, &memo.id).is_err());
         assert!(store.detail_if_visible(&bob, &memo.id).unwrap().is_none());
@@ -1602,8 +1737,149 @@ mod tests {
         assert!(memos.is_empty());
         // 権限変更はボブにはできない
         assert!(store
-            .set_perms(&bob, &memo.id, SharedPermLevel::Editor, &[])
+            .set_perms(&bob, &memo.id, SharedPermLevel::Editor, &[], None)
             .is_err());
+    }
+
+    /// グループ権限(ADR-0051): 優先順位「メンバー個別 > グループ(該当する
+    /// 複数グループの最大)> 全体」と、複数グループ該当時の最大採用を確認する。
+    #[test]
+    fn group_permissions_resolve_priority_and_max() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        // キャロルは g1(viewer)だけ、デイブは g1(viewer)+g2(editor)、
+        // イブは g3(none)だけに所属
+        let carol = Actor::member("id-carol", "キャロル").with_groups(vec!["g1".to_string()]);
+        let dave = Actor::member("id-dave", "デイブ")
+            .with_groups(vec!["g1".to_string(), "g2".to_string()]);
+        let eve = Actor::member("id-eve", "イブ").with_groups(vec!["g3".to_string()]);
+
+        let memo = store.create(&alice, "共有", "本文", None).unwrap();
+        // 全体を none にし、グループ権限だけで可視性を決める
+        store
+            .set_perms(
+                &alice,
+                &memo.id,
+                SharedPermLevel::None,
+                &[],
+                Some(&[
+                    SharedGroupPerm {
+                        group_id: "g1".to_string(),
+                        name: "チームA".to_string(),
+                        level: SharedPermLevel::Viewer,
+                    },
+                    SharedGroupPerm {
+                        group_id: "g2".to_string(),
+                        name: "チームB".to_string(),
+                        level: SharedPermLevel::Editor,
+                    },
+                    SharedGroupPerm {
+                        group_id: "g3".to_string(),
+                        name: "チームC".to_string(),
+                        level: SharedPermLevel::None,
+                    },
+                ]),
+            )
+            .unwrap();
+
+        // g1(viewer)だけの所属: 見えるが編集不可
+        let seen = store.get(&carol, &memo.id).unwrap();
+        assert!(!seen.can_edit, "viewer のグループでは編集できない");
+
+        // g1(viewer) + g2(editor)所属: 複数該当は最大(editor)を採る
+        assert!(
+            store.get(&dave, &memo.id).unwrap().can_edit,
+            "複数グループ該当時は最も高い権限になる"
+        );
+
+        // g3(none)だけの所属: 見えない
+        assert!(store.get(&eve, &memo.id).is_err());
+
+        // 個別指定はグループより優先: キャロルへ個別 none を追加する
+        // (groups は None なので直前のグループ権限は維持される)
+        store
+            .set_perms(
+                &alice,
+                &memo.id,
+                SharedPermLevel::None,
+                &[SharedMemberPerm {
+                    member_id: "id-carol".to_string(),
+                    name: "キャロル".to_string(),
+                    level: SharedPermLevel::None,
+                }],
+                None,
+            )
+            .unwrap();
+        assert!(
+            store.get(&carol, &memo.id).is_err(),
+            "個別 none がグループ viewer に勝つ"
+        );
+        // デイブ(グループ editor のまま)には影響しない
+        assert!(store.get(&dave, &memo.id).unwrap().can_edit);
+    }
+
+    /// グループの明示的な none は、全体(everyone)が viewer のままでも
+    /// 優先される(判定は「個別 > グループ > 全体」の段階評価)。
+    #[test]
+    fn group_none_overrides_everyone_viewer() {
+        let (_dir, mut store) = open_temp();
+        let host = Actor::host("ホスト");
+        let bob = Actor::member("id-bob", "ボブ").with_groups(vec!["g1".to_string()]);
+        let memo = store.create(&host, "t", "v", None).unwrap();
+        // everyone は既定の viewer のまま。ボブの所属グループだけ none にする
+        store
+            .set_perms(
+                &host,
+                &memo.id,
+                SharedPermLevel::Viewer,
+                &[],
+                Some(&[SharedGroupPerm {
+                    group_id: "g1".to_string(),
+                    name: "チームA".to_string(),
+                    level: SharedPermLevel::None,
+                }]),
+            )
+            .unwrap();
+        assert!(
+            store.get(&bob, &memo.id).is_err(),
+            "所属グループの明示的 none は全体 viewer より優先される"
+        );
+    }
+
+    /// SetPerms の groups: None は既存のグループ権限を変更しない
+    /// (旧クライアント互換、ADR-0051)。
+    #[test]
+    fn set_perms_groups_none_keeps_existing() {
+        let (_dir, mut store) = open_temp();
+        let host = Actor::host("ホスト");
+        let carol = Actor::member("id-carol", "キャロル").with_groups(vec!["g1".to_string()]);
+        let memo = store.create(&host, "t", "v", None).unwrap();
+        store
+            .set_perms(
+                &host,
+                &memo.id,
+                SharedPermLevel::None,
+                &[],
+                Some(&[SharedGroupPerm {
+                    group_id: "g1".to_string(),
+                    name: "チームA".to_string(),
+                    level: SharedPermLevel::Viewer,
+                }]),
+            )
+            .unwrap();
+        assert!(store.get(&carol, &memo.id).is_ok());
+        // 旧クライアント相当の SetPerms(groups なし)を送っても既存は残る
+        store
+            .set_perms(&host, &memo.id, SharedPermLevel::None, &[], None)
+            .unwrap();
+        assert!(
+            store.get(&carol, &memo.id).is_ok(),
+            "groups: None は既存のグループ権限を変更しない"
+        );
+        // can_manage の受信者(host)には detail.groups が引き続き載る
+        let detail = store.get(&host, &memo.id).unwrap();
+        assert_eq!(detail.groups.len(), 1);
+        assert_eq!(detail.groups[0].group_id, "g1");
     }
 
     #[test]
@@ -1629,7 +1905,7 @@ mod tests {
 
         // everyone = editor なら編集はできるが削除・権限変更は不可
         store
-            .set_perms(&host, &memo.id, SharedPermLevel::Editor, &[])
+            .set_perms(&host, &memo.id, SharedPermLevel::Editor, &[], None)
             .unwrap();
         assert!(store.update(&bob, &memo.id, 1, "t", "x").is_ok());
         assert!(store.trash(&bob, &memo.id).is_err());
@@ -1992,6 +2268,39 @@ mod tests {
         assert_eq!(store.get(&host, &memo_id).unwrap().title, "移行前");
     }
 
+    /// v2 → v3(M5 F-4、ADR-0051): memo_group_perms テーブルが追加され、
+    /// 既存メモも読め、グループ権限を新規に設定できる。
+    #[test]
+    fn v2_database_migrates_to_v3_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        let memo_id = {
+            let mut store = SharedStore::open(&path).unwrap();
+            let host = Actor::host("ホスト");
+            let memo = store.create(&host, "移行前", "本文", None).unwrap();
+            // v2 相当に偽装
+            store.conn.pragma_update(None, "user_version", 2).unwrap();
+            memo.id
+        };
+        let mut store = SharedStore::open(&path).unwrap();
+        let host = Actor::host("ホスト");
+        assert_eq!(store.get(&host, &memo_id).unwrap().title, "移行前");
+        store
+            .set_perms(
+                &host,
+                &memo_id,
+                SharedPermLevel::Viewer,
+                &[],
+                Some(&[SharedGroupPerm {
+                    group_id: "g1".to_string(),
+                    name: "チーム".to_string(),
+                    level: SharedPermLevel::Editor,
+                }]),
+            )
+            .unwrap();
+        assert_eq!(store.memo_ids_with_group_perms().unwrap(), vec![memo_id]);
+    }
+
     #[test]
     fn cache_roundtrip_and_search() {
         let dir = tempfile::tempdir().unwrap();
@@ -2013,6 +2322,7 @@ mod tests {
             locked_by: None,
             everyone: None,
             members: vec![],
+            groups: vec![],
         };
         cache.upsert(&detail).unwrap();
         assert_eq!(cache.revision("m1").unwrap(), Some(3));
@@ -2055,6 +2365,7 @@ mod tests {
             locked_by: None,
             everyone: None,
             members: vec![],
+            groups: vec![],
         };
         cache.upsert(&make("m1", 1, "a".repeat(1000))).unwrap();
         cache.upsert(&make("m2", 2, "b".repeat(1000))).unwrap();

@@ -87,6 +87,12 @@ pub struct MemoService {
     db_path: PathBuf,
     /// 接続中メンバー(supervisor が周期ごとに差し込む)。
     connections: Mutex<Option<Connections>>,
+    /// 既知グループ全量(ADR-0051)。IP → 所属グループの解決と、グループ
+    /// 権限を持つメモの再配信(`watch_groups`)に使う。
+    groups: Mutex<Option<crate::groups::SharedGroups>>,
+    /// 直近に見た「全グループの (id, revision)」の署名(`watch_groups`)。
+    /// 変化を検知したときだけ再配信を行う。
+    last_group_sig: Mutex<Option<Vec<(String, u64)>>>,
     locks: Mutex<HashMap<String, LockInfo>>,
     seq: AtomicU64,
     /// 直近の定期メンテナンス実行時刻(M5 F-3。10 分に 1 回だけ動かす)。
@@ -99,6 +105,8 @@ impl MemoService {
             config_path: config_path.to_path_buf(),
             db_path: config_path.with_extension("memos.db"),
             connections: Mutex::new(None),
+            groups: Mutex::new(None),
+            last_group_sig: Mutex::new(None),
             locks: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
             last_maintenance: Mutex::new(None),
@@ -108,6 +116,46 @@ impl MemoService {
     /// supervisor 起動時に接続表を差し込む(入れ直しをまたいで使い回す)。
     pub fn attach_connections(&self, connections: Connections) {
         *self.connections.lock().unwrap() = Some(connections);
+    }
+
+    /// supervisor 起動時にグループ表を差し込む(ADR-0051。attach_connections
+    /// と同じパターン。入れ直しをまたいで使い回す)。
+    pub fn attach_groups(&self, groups: crate::groups::SharedGroups) {
+        *self.groups.lock().unwrap() = Some(groups);
+    }
+
+    /// `ip` が現在属しているグループの id 一覧(ADR-0051)。GroupStore は
+    /// 全グループ(自分が非メンバーのものも)を持つため、ここで
+    /// 「members に ip を含むか」で絞り込む。未 attach なら空。
+    fn group_ids_for(&self, ip: Ipv4Addr) -> Vec<String> {
+        let Some(groups) = self.groups.lock().unwrap().clone() else {
+            return Vec::new();
+        };
+        let store = groups.lock().unwrap();
+        store
+            .all()
+            .into_iter()
+            .filter(|g| g.members.contains(&ip))
+            .map(|g| g.id)
+            .collect()
+    }
+
+    /// detail に載るグループ権限の表示名を、GroupStore に現存するグループ
+    /// なら現在名で上書きする(改名追従)。ストアの保存値はスナップショット
+    /// のままなので、返す直前にサービス層で行う。
+    fn refresh_group_names(&self, memo: &mut SharedMemoDetail) {
+        if memo.groups.is_empty() {
+            return;
+        }
+        let Some(groups) = self.groups.lock().unwrap().clone() else {
+            return;
+        };
+        let store = groups.lock().unwrap();
+        for perm in &mut memo.groups {
+            if let Some(group) = store.get(&perm.group_id) {
+                perm.name = group.name;
+            }
+        }
     }
 
     pub fn seq(&self) -> u64 {
@@ -160,7 +208,7 @@ impl MemoService {
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("内部エラー: {e}")));
         let actor = match actor {
-            Ok(actor) => actor,
+            Ok(actor) => actor.with_groups(self.group_ids_for(member_ip)),
             Err(e) => {
                 return SharedMemoReply::Err {
                     message: format!("{e:#}"),
@@ -219,6 +267,7 @@ impl MemoService {
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
+                self.refresh_group_names(&mut memo);
                 Ok(SharedMemoReply::Memo { memo })
             }
             SharedMemoOp::Create {
@@ -260,6 +309,7 @@ impl MemoService {
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
+                self.refresh_group_names(&mut memo);
                 self.broadcast_changed(id);
                 self.bump();
                 Ok(SharedMemoReply::Memo { memo })
@@ -295,6 +345,7 @@ impl MemoService {
                     );
                 }
                 memo.locked_by = Some(actor.name.clone());
+                self.refresh_group_names(&mut memo);
                 self.broadcast_lock(&id, Some(actor.name.clone()));
                 self.bump();
                 Ok(SharedMemoReply::Memo { memo })
@@ -374,15 +425,19 @@ impl MemoService {
                 id,
                 everyone,
                 members,
+                groups,
             } => {
                 let mut memo = self
                     .blocking({
                         let actor = actor.clone();
                         let id = id.clone();
-                        move |store| store.set_perms(&actor, &id, everyone, &members)
+                        move |store| {
+                            store.set_perms(&actor, &id, everyone, &members, groups.as_deref())
+                        }
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
+                self.refresh_group_names(&mut memo);
                 // 権限を失ったメンバーには Removed が届く(broadcast_changed が
                 // 受信者ごとに可視判定して振り分ける)
                 self.broadcast_changed(id);
@@ -478,6 +533,7 @@ impl MemoService {
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
+                self.refresh_group_names(&mut memo);
                 self.broadcast_changed(id);
                 self.bump();
                 Ok(SharedMemoReply::Memo { memo })
@@ -612,6 +668,56 @@ impl MemoService {
         });
     }
 
+    /// グループの改名・メンバー増減・削除への追従(ADR-0051)。全グループの
+    /// (id, revision) から作った署名を前回と比較し、**変化した時だけ**
+    /// グループ権限を持つメモを受信者ごとに可視判定し直して再配信する
+    /// (見える人には Changed、見えなくなった人には Removed —
+    /// `broadcast_changed` がそのまま面倒を見る)。supervisor の tick から
+    /// (sweep_expired_locks / maintain と同じ場所で)毎周期呼んでよい。
+    pub fn watch_groups(self: &Arc<Self>) {
+        let Some(groups) = self.groups.lock().unwrap().clone() else {
+            return;
+        };
+        let sig: Vec<(String, u64)> = {
+            let store = groups.lock().unwrap();
+            let mut sig: Vec<(String, u64)> = store
+                .all()
+                .into_iter()
+                .map(|g| (g.id, g.revision))
+                .collect();
+            sig.sort();
+            sig
+        };
+        let changed = {
+            let mut last = self.last_group_sig.lock().unwrap();
+            let changed = last.as_ref() != Some(&sig);
+            *last = Some(sig);
+            changed
+        };
+        if !changed || !self.db_path.exists() {
+            return;
+        }
+        let service = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let store = match SharedStore::open(&service.db_path) {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::warn!("共有メモのグループ権限再配信に失敗しました: {e:#}");
+                    return;
+                }
+            };
+            match store.memo_ids_with_group_perms() {
+                Ok(ids) => {
+                    for id in ids {
+                        service.broadcast_changed(id);
+                        service.bump();
+                    }
+                }
+                Err(e) => tracing::warn!("共有メモのグループ権限再配信に失敗しました: {e:#}"),
+            }
+        });
+    }
+
     fn lock_holder(&self, id: &str) -> Option<String> {
         let mut locks = self.locks.lock().unwrap();
         prune_expired(&mut locks);
@@ -672,9 +778,13 @@ impl MemoService {
                 let Ok(actor) = Self::actor_for_ip(&config, ip) else {
                     continue;
                 };
+                // グループ権限のメモをリアルタイム配信するには、受信者ごとの
+                // Actor に所属グループを付けておく必要がある(ADR-0051)
+                let actor = actor.with_groups(service.group_ids_for(ip));
                 let event = match store.detail_if_visible(&actor, &id) {
                     Ok(Some(mut memo)) => {
                         memo.locked_by = holder.clone();
+                        service.refresh_group_names(&mut memo);
                         SharedMemoEvent::Changed { memo }
                     }
                     Ok(None) => SharedMemoEvent::Removed { id: id.clone() },

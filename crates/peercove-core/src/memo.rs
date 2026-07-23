@@ -228,7 +228,10 @@ pub enum MemoReply {
 
 /// 共有メモの権限レベル。メンバー個別の指定は「全体」より優先される
 /// (`None` を個別指定すると、そのメンバーだけ除外できる)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// 宣言順(None < Viewer < Editor)が強さの順序と一致するため
+/// `PartialOrd`/`Ord` を導出できる(複数グループ該当時の最大値判定に使う。
+/// ADR-0051)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedPermLevel {
     /// 見えない。
@@ -244,6 +247,16 @@ pub enum SharedPermLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedMemberPerm {
     pub member_id: String,
+    #[serde(default)]
+    pub name: String,
+    pub level: SharedPermLevel,
+}
+
+/// グループ単位の権限指定(ADR-0051)。`name` は表示用スナップショット
+/// (正本は group_id。現存するグループなら detail 生成時に現在名で上書きする)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedGroupPerm {
+    pub group_id: String,
     #[serde(default)]
     pub name: String,
     pub level: SharedPermLevel,
@@ -330,6 +343,9 @@ pub struct SharedMemoDetail {
     /// メンバー個別の権限。can_manage のときだけ載る。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<SharedMemberPerm>,
+    /// グループ単位の権限(ADR-0051)。can_manage のときだけ載る。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<SharedGroupPerm>,
 }
 
 /// 共有メモへの操作。メンバーは `MemoReq` に載せてホストへ送り、
@@ -383,11 +399,16 @@ pub enum SharedMemoOp {
         id: String,
     },
     /// 権限の設定(所有者・ホスト管理者)。`members` は全量置き換え。
+    /// `groups` は `None` = グループ権限を変更しない(旧クライアントの
+    /// SetPerms が既存のグループ権限を消さないための互換仕様)。
+    /// `Some` は全量置き換え。
     SetPerms {
         id: String,
         everyone: SharedPermLevel,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         members: Vec<SharedMemberPerm>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<SharedGroupPerm>>,
     },
     /// 共有フォルダーの管理(ホスト管理者のみ — 要件 §6)。
     FolderCreate {

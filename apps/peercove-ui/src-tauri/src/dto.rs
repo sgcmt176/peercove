@@ -334,6 +334,23 @@ impl From<&peercove_core::msg::GroupInfo> for Group {
     }
 }
 
+/// 共有メモの権限ダイアログで選べるグループ(ADR-0051)。id + 現在名だけ。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermGroup {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<&peercove_core::ipc::PermGroup> for PermGroup {
+    fn from(info: &peercove_core::ipc::PermGroup) -> Self {
+        Self {
+            id: info.id.clone(),
+            name: info.name.clone(),
+        }
+    }
+}
+
 /// ChatFetch の 1 ページ(ADR-0016)。`seq` は履歴全体の最新 seq。
 /// `messages` の末尾がそこへ届くまで繰り返し取る。
 #[derive(Debug, Serialize)]
@@ -377,6 +394,9 @@ pub struct Tunnel {
     pub shared_memo_seq: u64,
     /// 共有メモが使えるか(member で false = ホスト未対応 or 未同期)。
     pub shared_memo: bool,
+    /// 共有メモの権限ダイアログで選べるグループ(ADR-0051)。host は既知の
+    /// 全グループ、member は自分が属するグループだけ。
+    pub perm_groups: Vec<PermGroup>,
     /// 解決済みカスタム DNS レコード(ADR-0022)。member はここから一覧表示
     /// する(設定ファイルには無いため)。host の DNS 管理画面は編集情報つきの
     /// `list_dns_records` を使う。
@@ -435,6 +455,7 @@ impl From<&TunnelInfo> for Tunnel {
             groups: info.groups.iter().map(Group::from).collect(),
             shared_memo_seq: info.shared_memo_seq,
             shared_memo: info.shared_memo,
+            perm_groups: info.perm_groups.iter().map(PermGroup::from).collect(),
             // 配布形式は解決済み(A は {name, ip}、CNAME は {name, target})。
             // どちらもメンバー一覧に出す(参照情報は持たない)
             dns_records: info
@@ -915,6 +936,7 @@ mod tests {
             groups: vec![],
             shared_memo_seq: 0,
             shared_memo: false,
+            perm_groups: vec![],
             dns_records: vec![peercove_core::dns::DnsRecord {
                 name: "web.alice".to_string(),
                 ip: "10.100.42.2".parse().unwrap(),
@@ -1051,6 +1073,7 @@ mod tests {
             groups: vec![],
             shared_memo_seq: 0,
             shared_memo: false,
+            perm_groups: vec![],
             dns_records: vec![],
             cname_records: vec![],
         };

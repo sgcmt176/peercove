@@ -538,6 +538,7 @@ pub async fn supervise(
                     }
                 };
                 memo_service.attach_connections(Arc::clone(&connections));
+                memo_service.attach_groups(Arc::clone(&groups));
                 tasks.push(tokio::spawn(control::run_host_server(
                     spec.address.addr(),
                     ledger_rx,
@@ -624,6 +625,10 @@ pub async fn supervise(
                     if let crate::memoshare::MemoHandle::Host(service) = &memo {
                         service.sweep_expired_locks();
                         service.maintain();
+                        // グループ改名・メンバー増減・削除への追従(ADR-0051)。
+                        // リビジョン変化を検知したときだけ DB を開くので、
+                        // 毎周期呼んでも軽い
+                        service.watch_groups();
                     }
                     // 受信サイズ上限(ADR-0015)を設定に追随させる(両ロール)
                     if let Some(config) = &config {
