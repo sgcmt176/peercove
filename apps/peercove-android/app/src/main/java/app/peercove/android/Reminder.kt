@@ -11,6 +11,12 @@ package app.peercove.android
 //
 // 端末再起動後は BOOT_COMPLETED で memoReminderList から未発火分を
 // 再登録する(AlarmManager の登録は再起動で消えるため)。
+//
+// ADR-0055 決定 3: メモ側の ⏰ 設定メニュー・アイコン(MemoScreen.kt /
+// SharedMemoScreen.kt からの呼び出し)は撤去した。この基盤(発火処理・
+// pickReminderDateTime/applyReminder/clearReminder/fetchReminder)自体は
+// あえて残してある。スケジュールの予定リマインダー(実装順 H-3)で流用する
+// ため。既に設定済みのメモリマインダーは引き続き発火する(害はない)。
 
 import android.app.AlarmManager
 import android.app.DatePickerDialog

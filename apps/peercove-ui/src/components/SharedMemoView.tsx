@@ -11,7 +11,6 @@ import {
   DiffLine,
   MemoFolder,
   Member,
-  MemoReminder,
   PermGroup,
   SharedGroupPerm,
   SharedMemberPerm,
@@ -29,7 +28,10 @@ import {
 } from "../ipc";
 import { t } from "../i18n";
 import { Modal } from "./Modal";
-import { ReminderButton } from "./ReminderButton";
+// ReminderButton はここでは使わない(ADR-0055 決定 3: メモのリマインダー UI
+// は撤去し、スケジュールの予定リマインダー(H-3)へ移設する)。
+// ReminderButton.tsx 自体と notify.ts の発火処理・ストアはそちらで流用する
+// ため、あえて残してある。
 import {
   useResolvedWikiLinks,
   wikiLinkify,
@@ -82,8 +84,6 @@ export function SharedMemoView({
   const [permsFor, setPermsFor] = useState<SharedMemoDetail | null>(null);
   // メモ間リンクのバックリンク欄(M5 F-5 Stage 2、ADR-0052 決定 2)。
   const [backlinks, setBacklinks] = useState<SharedMemoSummary[]>([]);
-  // このメモの自分用リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)。
-  const [reminder, setReminder] = useState<MemoReminder | null>(null);
   /** 変更履歴パネルを開いているか(本文領域を置き換える)。 */
   const [historyOpen, setHistoryOpen] = useState(false);
   const [limitsOpen, setLimitsOpen] = useState(false);
@@ -169,26 +169,6 @@ export function SharedMemoView({
     [op],
   );
 
-  // リマインダー(ADR-0052 決定 6): 保存先は個人メモ DB(このネットワークの
-  // 設定パスを network として識別)。専用の 1 件取得 op は無いので一覧から絞る
-  const fetchReminder = useCallback(
-    async (id: string) => {
-      try {
-        const reply = await api.memoOp({ op: "reminder_list" });
-        setReminder(
-          reply.kind === "reminders"
-            ? (reply.reminders.find(
-                (r) => r.scope === "shared" && r.network === configPath && r.memo_id === id,
-              ) ?? null)
-            : null,
-        );
-      } catch {
-        setReminder(null);
-      }
-    },
-    [configPath],
-  );
-
   // 選択中メモも配信に追随する(編集中は上書きしない)
   useEffect(() => {
     const current = selected?.id;
@@ -260,13 +240,12 @@ export function SharedMemoView({
           setDraft({ title: reply.memo.title, body: reply.memo.body });
           setMode("edit");
           void fetchBacklinks(id);
-          void fetchReminder(id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [op, stopEditing, fetchBacklinks, fetchReminder],
+    [op, stopEditing, fetchBacklinks],
   );
 
   // チャットの `@memo:id` カード(ADR-0052 決定 1)から開く。反映したら
@@ -297,13 +276,12 @@ export function SharedMemoView({
           setSaveState("saved");
           setSaveError("");
           void fetchBacklinks(id);
-          void fetchReminder(id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [op, fetchBacklinks, fetchReminder],
+    [op, fetchBacklinks],
   );
 
   // 自動保存(CAS)。編集中のみ
@@ -364,7 +342,6 @@ export function SharedMemoView({
         setSelected(reply.memo);
         setDraft({ title: "", body: "" });
         setBacklinks([]);
-        setReminder(null);
         await startEditing(reply.memo.id);
       }
     } catch (error) {
@@ -391,7 +368,6 @@ export function SharedMemoView({
     setEditing(false);
     setHistoryOpen(false);
     setBacklinks([]);
-    setReminder(null);
   }, []);
 
   /** 復元後: 最新内容を取り直して履歴パネルを閉じる。 */
@@ -738,14 +714,8 @@ export function SharedMemoView({
               >
                 ⧉
               </button>
-              <ReminderButton
-                scope="shared"
-                network={configPath}
-                memoId={selected.id}
-                reminder={reminder}
-                onChanged={setReminder}
-                onNotice={setNotice}
-              />
+              {/* ⏰ リマインダーはここから撤去(ADR-0055 決定 3)。スケジュールの
+                  予定リマインダー(H-3)で ReminderButton / notify.ts を流用する。 */}
               <button
                 type="button"
                 className="button--icon"
@@ -955,6 +925,16 @@ export function SharedMemoView({
  * メンション補助: 入力中に `@` に続く文字列でメンバー名を絞り込むだけの
  * 簡易サジェスト(カーソル追従のポップアップは持たない)。
  */
+/** メンションサジェストの候補行(通常メンバー、または先頭の @All)。 */
+type MentionCandidate = {
+  key: string;
+  /** 表示ラベル(通常はメンバー名、@All は専用ラベル)。 */
+  label: string;
+  /** insertMention へ渡す `@` の後ろの文字列。 */
+  insertName: string;
+  isAll: boolean;
+};
+
 function CommentsPanel({
   memoId,
   op,
@@ -1010,13 +990,38 @@ function CommentsPanel({
     setMentionQuery(match ? match[1] : null);
   };
 
-  const mentionCandidates = useMemo(() => {
+  const mentionCandidates = useMemo<MentionCandidate[]>(() => {
     if (mentionQuery === null) return [];
     const query = mentionQuery.trim();
-    return members
-      .filter((m) => !m.isSelf && (m.name ?? "").length > 0)
-      .filter((m) => query === "" || (m.name ?? "").includes(query))
-      .slice(0, 6);
+    const candidates: MentionCandidate[] = [];
+    // 先頭に @All(ネットワーク全員宛)候補(ADR-0055 決定 1b・1c)。通知の
+    // 実配線(全員へ届ける挙動)は H-2 で実装、ここでは候補提示のみ。
+    const allLabel = t.sharedMemo.mentionAllLabel;
+    if (
+      query === "" ||
+      "all".startsWith(query.toLowerCase()) ||
+      allLabel.toLowerCase().includes(query.toLowerCase())
+    ) {
+      candidates.push({
+        key: "__all__",
+        label: `@${allLabel}`,
+        insertName: "All",
+        isAll: true,
+      });
+    }
+    // 6 件制限は撤廃し、全メンバーを出す(ポップアップ側でスクロール)。
+    // 前方一致ではなく部分一致で絞り込む従来の挙動は維持。
+    for (const m of members) {
+      if (m.isSelf || (m.name ?? "").length === 0) continue;
+      if (query !== "" && !(m.name ?? "").includes(query)) continue;
+      candidates.push({
+        key: m.publicKey,
+        label: m.name ?? "",
+        insertName: m.name ?? "",
+        isAll: false,
+      });
+    }
+    return candidates;
   }, [mentionQuery, members]);
 
   const insertMention = (name: string) => {
@@ -1108,10 +1113,14 @@ function CommentsPanel({
         />
         {mentionCandidates.length > 0 && (
           <ul className="memo__mention-suggest">
-            {mentionCandidates.map((member) => (
-              <li key={member.publicKey}>
-                <button type="button" onClick={() => insertMention(member.name ?? "")}>
-                  {member.name}
+            {mentionCandidates.map((candidate) => (
+              <li key={candidate.key}>
+                <button
+                  type="button"
+                  className={candidate.isAll ? "memo__mention-suggest-all" : undefined}
+                  onClick={() => insertMention(candidate.insertName)}
+                >
+                  {candidate.label}
                 </button>
               </li>
             ))}

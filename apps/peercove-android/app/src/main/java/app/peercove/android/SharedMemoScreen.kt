@@ -27,9 +27,6 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.NotificationsActive
-import androidx.compose.material.icons.filled.NotificationsNone
-import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -71,9 +68,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import uniffi.peercove_mobile.DiffLineInfo
-import uniffi.peercove_mobile.MemoReminderInfo
 import uniffi.peercove_mobile.MobileException
-import uniffi.peercove_mobile.ReminderScopeArg
 import uniffi.peercove_mobile.SharedMemoCommentInfo
 import uniffi.peercove_mobile.SharedMemoDetailInfo
 import uniffi.peercove_mobile.SharedMemoHistoryDetailInfo
@@ -409,7 +404,6 @@ private fun SharedMemoEditor(
     onOpenMemo: (String) -> Unit,
     onNotice: (String) -> Unit,
 ) {
-    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var detail by remember { mutableStateOf<SharedMemoDetailInfo?>(null) }
     var editing by remember { mutableStateOf(false) }
@@ -430,14 +424,11 @@ private fun SharedMemoEditor(
     var wikiLinks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var backlinks by remember { mutableStateOf<List<SharedMemoSummaryInfo>>(emptyList()) }
     val wikilinkMissing = stringResource(R.string.memo_wikilink_missing)
-    // このメモの自分用リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)
-    var reminder by remember { mutableStateOf<MemoReminderInfo?>(null) }
-    val reminderSavedMsg = stringResource(R.string.memo_reminder_saved)
-    val reminderClearedMsg = stringResource(R.string.memo_reminder_cleared)
-
-    LaunchedEffect(id) {
-        reminder = fetchReminder(baseDir, ReminderScopeArg.SHARED, slug, id)
-    }
+    // ⏰ リマインダーのメニュー・アイコンはここから撤去(ADR-0055 決定 3)。
+    // Reminder.kt の基盤(fetchReminder/applyReminder/clearReminder/
+    // pickReminderDateTime)自体はスケジュールの予定リマインダー(H-3)で
+    // 流用するため残してある。既に設定済みのリマインダーは(このメニューを
+    // 経由せず)引き続き発火する。
 
     suspend fun refreshBacklinks() {
         backlinks = try {
@@ -646,45 +637,7 @@ private fun SharedMemoEditor(
                         contentDescription = stringResource(R.string.shared_memo_history),
                     )
                 }
-                IconButton(onClick = {
-                    pickReminderDateTime(
-                        context,
-                        reminder?.remindAt?.toLong() ?: (System.currentTimeMillis() + 3_600_000L),
-                    ) { picked ->
-                        scope.launch {
-                            try {
-                                applyReminder(context, baseDir, ReminderScopeArg.SHARED, slug, id, picked)
-                                reminder = fetchReminder(baseDir, ReminderScopeArg.SHARED, slug, id)
-                                onNotice(reminderSavedMsg)
-                            } catch (e: MobileException) {
-                                onNotice(e.message ?: "")
-                            }
-                        }
-                    }
-                }) {
-                    Icon(
-                        if (reminder != null) Icons.Filled.NotificationsActive else Icons.Filled.NotificationsNone,
-                        contentDescription = stringResource(R.string.memo_reminder),
-                    )
-                }
-                if (reminder != null) {
-                    IconButton(onClick = {
-                        scope.launch {
-                            try {
-                                clearReminder(context, baseDir, ReminderScopeArg.SHARED, slug, id)
-                                reminder = null
-                                onNotice(reminderClearedMsg)
-                            } catch (e: MobileException) {
-                                onNotice(e.message ?: "")
-                            }
-                        }
-                    }) {
-                        Icon(
-                            Icons.Filled.NotificationsOff,
-                            contentDescription = stringResource(R.string.memo_reminder_clear),
-                        )
-                    }
-                }
+                // ⏰ リマインダーの設定・解除アイコンはここから撤去(ADR-0055 決定 3)。
                 FilterChip(
                     selected = false,
                     enabled = detail?.canEdit == true && detail?.lockedBy == null,

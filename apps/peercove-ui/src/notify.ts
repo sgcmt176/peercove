@@ -336,6 +336,12 @@ export async function notifyCommentEvents(tunnel: Tunnel): Promise<void> {
 // 呼ぶ必要はない — App.tsx の status ポーリング(2 秒)から毎回呼んでよいが、
 // ここで 30 秒に抑える(reminder_take_due はサーバー側で fired へ遷移する
 // 副作用があるため、呼びすぎても実害は無いが間隔を空けて負荷を抑える)。
+//
+// ADR-0055 決定 3: メモ側の ⏰ 設定 UI(ReminderButton の呼び出し)は
+// MemoView.tsx / SharedMemoView.tsx から撤去したが、この発火処理自体は
+// あえてそのまま残してある。理由は 2 つ: (1) 既に設定済みのメモリマインダー
+// が引き続き発火しても害はない、(2) スケジュールの予定リマインダー
+// (実装順 H-3)でこの仕組み(ポーリング + OS 通知)を流用する。
 
 const REMINDER_POLL_MS = 30_000;
 let reminderCheckedAt = 0;

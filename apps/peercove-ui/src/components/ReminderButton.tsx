@@ -2,6 +2,12 @@
 // 個人メモ(MemoView)・共有メモ(SharedMemoView)の両方から使う共通部品
 // (保存先はどちらも個人メモ DB。t.memo.reminder* のキーも共通で使う —
 // t.memo.toTrash 等を SharedMemoView が使い回すのと同じ流儀)。
+//
+// ADR-0055 決定 3: メモの ⏰ リマインダー UI は MemoView.tsx /
+// SharedMemoView.tsx から撤去し、スケジュールの予定リマインダー(実装順
+// H-3)へ移設する。この部品自体(ダイアログ・IPC 呼び出し)と notify.ts
+// の発火処理・ストアは H-3 で流用するため、あえて未使用のまま残してある。
+// 消さないこと。
 import { useState } from "react";
 import { MemoReminder, ReminderScope, api, errorMessage } from "../ipc";
 import { t } from "../i18n";

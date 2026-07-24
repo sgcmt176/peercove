@@ -72,13 +72,11 @@ import java.util.Locale
 import uniffi.peercove_mobile.MemoDetailInfo
 import uniffi.peercove_mobile.MemoFolderInfo
 import uniffi.peercove_mobile.MemoListResult
-import uniffi.peercove_mobile.MemoReminderInfo
 import uniffi.peercove_mobile.MemoScopeArg
 import uniffi.peercove_mobile.MemoSortArg
 import uniffi.peercove_mobile.MemoSummaryInfo
 import uniffi.peercove_mobile.MobileException
 import uniffi.peercove_mobile.NetworkInfo
-import uniffi.peercove_mobile.ReminderScopeArg
 import uniffi.peercove_mobile.listNetworks
 import uniffi.peercove_mobile.memoCreate
 import uniffi.peercove_mobile.memoDeleteForever
@@ -636,15 +634,16 @@ private fun MemoEditor(
     // メモ間リンク(ADR-0052 決定 2): タイトル → memo_id(見つかったものだけ)
     var wikiLinks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var backlinks by remember { mutableStateOf<List<MemoSummaryInfo>>(emptyList()) }
-    // リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)
-    var reminder by remember { mutableStateOf<MemoReminderInfo?>(null) }
+    // ⏰ リマインダーのメニュー・アイコンはここから撤去(ADR-0055 決定 3)。
+    // Reminder.kt の基盤(fetchReminder/applyReminder/clearReminder/
+    // pickReminderDateTime)自体はスケジュールの予定リマインダー(H-3)で
+    // 流用するため残してある。既に設定済みのリマインダーは(このメニューを
+    // 経由せず)引き続き発火する。
 
     val exportDone = stringResource(R.string.memo_export_done)
     val exportFailed = stringResource(R.string.memo_export_failed)
     val copiedToShared = stringResource(R.string.memo_copied_to_shared)
     val wikilinkMissing = stringResource(R.string.memo_wikilink_missing)
-    val reminderSavedMsg = stringResource(R.string.memo_reminder_saved)
-    val reminderClearedMsg = stringResource(R.string.memo_reminder_cleared)
     val inTrash = detail?.deletedAt != null
 
     suspend fun refreshBacklinks() {
@@ -672,7 +671,6 @@ private fun MemoEditor(
             return@LaunchedEffect
         }
         refreshBacklinks()
-        reminder = fetchReminder(baseDir, ReminderScopeArg.PERSONAL, "", id)
     }
 
     // メモ間リンクの解決(本文のデバウンス、ADR-0052 決定 2)
@@ -984,54 +982,7 @@ private fun MemoEditor(
                             }
                         },
                     )
-                    DropdownMenuItem(
-                        text = {
-                            Text(
-                                reminder?.let {
-                                    stringResource(
-                                        R.string.memo_reminder_set_at,
-                                        dateFmt.format(Date(it.remindAt.toLong())),
-                                    )
-                                } ?: stringResource(R.string.memo_reminder),
-                            )
-                        },
-                        onClick = {
-                            menuOpen = false
-                            pickReminderDateTime(
-                                context,
-                                reminder?.remindAt?.toLong() ?: (System.currentTimeMillis() + 3_600_000L),
-                            ) { picked ->
-                                scope.launch {
-                                    try {
-                                        applyReminder(
-                                            context, baseDir, ReminderScopeArg.PERSONAL, "", id, picked,
-                                        )
-                                        reminder = fetchReminder(baseDir, ReminderScopeArg.PERSONAL, "", id)
-                                        onNotice(reminderSavedMsg)
-                                    } catch (e: MobileException) {
-                                        onNotice(e.message ?: "")
-                                    }
-                                }
-                            }
-                        },
-                    )
-                    if (reminder != null) {
-                        DropdownMenuItem(
-                            text = { Text(stringResource(R.string.memo_reminder_clear)) },
-                            onClick = {
-                                menuOpen = false
-                                scope.launch {
-                                    try {
-                                        clearReminder(context, baseDir, ReminderScopeArg.PERSONAL, "", id)
-                                        reminder = null
-                                        onNotice(reminderClearedMsg)
-                                    } catch (e: MobileException) {
-                                        onNotice(e.message ?: "")
-                                    }
-                                }
-                            },
-                        )
-                    }
+                    // ⏰ リマインダーの設定・解除メニューはここから撤去(ADR-0055 決定 3)。
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.memo_export)) },
                         onClick = {

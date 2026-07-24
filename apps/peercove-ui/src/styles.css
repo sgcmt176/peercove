@@ -2943,17 +2943,30 @@ button.msg__ref:hover {
   background: var(--accent-soft);
 }
 
-/* コメント欄(M5 F-5 Stage 3、ADR-0052 決定 4)。 */
+/* コメント欄(M5 F-5 Stage 3、ADR-0052 決定 4)。
+   開いたときにメモ本文(.memo__panes、flex:1)を押し出して見えなくして
+   いたバグの修正(ADR-0055 決定 2): このセクション自体の高さを本文の
+   独立スクロール領域とは別に最大 40% へ制限し、コメント一覧だけを内部で
+   スクロールさせる(入力欄と開閉トグルは常に見える位置に残す)。 */
 .memo__comments {
   border-top: 1px solid var(--border);
   padding-top: 8px;
   font-size: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  min-height: 0;
+}
+
+.memo__comments[open] {
+  max-height: 40%;
 }
 
 .memo__comments summary {
   cursor: pointer;
   color: var(--muted);
   font-weight: 600;
+  flex: none;
 }
 
 .memo__comments-list {
@@ -2963,6 +2976,9 @@ button.msg__ref:hover {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .memo__comment {
@@ -3005,6 +3021,7 @@ button.msg__ref:hover {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  flex: none;
 }
 
 .memo__comment-input textarea {
@@ -3041,6 +3058,9 @@ button.msg__ref:hover {
   border-radius: 8px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
   max-width: 220px;
+  /* 全メンバー表示(6 件制限を撤廃、ADR-0055 決定 1c)。多いときはスクロール */
+  max-height: 260px;
+  overflow-y: auto;
 }
 
 .memo__mention-suggest button {
@@ -3049,6 +3069,10 @@ button.msg__ref:hover {
   text-align: left;
   border: none;
   background: none;
+  /* ボタンの既定色(color: #fff、常時アクセント背景前提)を継承すると、
+     ライトモードで --card がほぼ白のため白地に白文字になり見えなくなる
+     バグがあった。ここは明示的にテーマの本文色を使う(ADR-0055 決定 1c)。 */
+  color: var(--text);
   padding: 4px 8px;
   cursor: pointer;
   border-radius: 4px;
@@ -3056,6 +3080,16 @@ button.msg__ref:hover {
 
 .memo__mention-suggest button:hover {
   background: var(--accent-soft);
+}
+
+/* @All(全員)候補。通常メンバーと区別できるよう太字 + 下に区切り線
+   (ADR-0055 決定 1b・1c)。 */
+.memo__mention-suggest-all {
+  font-weight: 600;
+  color: var(--accent) !important;
+  border-bottom: 1px solid var(--border);
+  border-radius: 4px 4px 0 0 !important;
+  margin-bottom: 2px;
 }
 
 /* Markdown プレビューの整形(メモ)。チャットと違い文書向けの余白 */
@@ -3219,6 +3253,11 @@ button.msg__ref:hover {
 .shared-hub__body {
   flex: 1;
   min-height: 0;
+  /* シート表示を残り全高いっぱいに使わせるための flex 列コンテナ
+     (ADR-0055 決定 6)。メモ・スケジュールは自前で明示的な高さを
+     持っているので影響を受けない。 */
+  display: flex;
+  flex-direction: column;
 }
 
 /* ---- 共有メモ (M5 F-2) ---- */
@@ -3603,7 +3642,9 @@ button.msg__ref:hover {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  height: calc(100vh - 120px);
+  /* 表示エリアの全面化(ADR-0055 決定 6): 固定 calc() ではなく、
+     .shared-hub__body が用意する残り全高を flex で使い切る */
+  flex: 1;
   min-height: 420px;
 }
 
@@ -3707,6 +3748,11 @@ button.msg__ref:hover {
   min-height: 0;
   overflow: auto;
   padding: 0;
+  /* グリッドは Excel の紙面という扱い。ダークモードでもテーマに関わらず
+     白地・黒文字に固定する(ADR-0055 決定 6)。周辺のタブバー・ツールバー
+     は従来どおりテーマ追従(上の .sheet__tab* 系は var(--text) 等のまま)。 */
+  background: #ffffff;
+  border-color: #d0d0d0;
 }
 
 .sheet__table {
@@ -3714,14 +3760,15 @@ button.msg__ref:hover {
   border-spacing: 0;
   width: max-content;
   font-size: 0.85rem;
+  color: #1a1a1a;
 }
 
 .sheet__corner,
 .sheet__col-head,
 .sheet__row-head,
 .sheet__cell {
-  border-right: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
+  border-right: 1px solid #d0d0d0;
+  border-bottom: 1px solid #d0d0d0;
 }
 
 .sheet__col-head,
@@ -3729,8 +3776,8 @@ button.msg__ref:hover {
   position: sticky;
   top: 0;
   z-index: 2;
-  background: var(--card);
-  color: var(--muted);
+  background: #f3f3f3;
+  color: #3c3c3c;
   font-weight: 600;
   padding: 4px 8px;
   min-width: 90px;
@@ -3746,8 +3793,8 @@ button.msg__ref:hover {
   position: sticky;
   left: 0;
   z-index: 1;
-  background: var(--card);
-  color: var(--muted);
+  background: #f3f3f3;
+  color: #3c3c3c;
   text-align: right;
   padding: 4px 8px;
   font-weight: 400;
@@ -3762,6 +3809,8 @@ button.msg__ref:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  background: #ffffff;
+  color: #1a1a1a;
 }
 
 .sheet__cell:focus {
@@ -3769,7 +3818,7 @@ button.msg__ref:hover {
 }
 
 .sheet__cell--selected {
-  box-shadow: inset 0 0 0 2px var(--accent);
+  box-shadow: inset 0 0 0 2px #1a73e8;
 }
 
 .sheet__cell--numeric .sheet__cell-value {
@@ -3778,7 +3827,7 @@ button.msg__ref:hover {
 }
 
 .sheet__cell--conflict {
-  background: rgba(230, 180, 20, 0.28);
+  background: #ffe58a;
 }
 
 .sheet__cell-value {
@@ -3794,7 +3843,7 @@ button.msg__ref:hover {
   padding: 0;
   margin: 0;
   background: transparent;
-  color: var(--text);
+  color: #1a1a1a;
   font: inherit;
 }
 
@@ -3804,7 +3853,7 @@ button.msg__ref:hover {
 
 @media (max-width: 900px) {
   .sheet {
-    height: auto;
+    flex: none;
   }
 
   .sheet__table-wrap {

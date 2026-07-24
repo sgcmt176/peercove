@@ -1138,6 +1138,9 @@ export const ja = {
     commentLoadFailed: "コメントを読み込めません",
     commentTooLong: (kib: number) => `コメントが長すぎます(上限 ${kib}KiB)`,
     commentBadge: (n: number) => `💬${n}`,
+    // @All サジェスト候補(ADR-0055 決定 1b・1c)。通知動作(全員へ届く)は
+    // H-2 で実装。この工程では候補として出すだけ。
+    mentionAllLabel: "All(全員)",
   },
 
   // 共有スケジュール表(M6 G-1、ADR-0053)

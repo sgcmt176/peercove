@@ -21,8 +21,8 @@ import { sharedRefToken } from "../sharedRefs";
 const MAX_SHEET_ROWS = 1000;
 const MAX_SHEET_COLS = 200;
 
-const MIN_DISPLAY_ROWS = 20;
-const MIN_DISPLAY_COLS = 8;
+const MIN_DISPLAY_ROWS = 30;
+const MIN_DISPLAY_COLS = 12;
 const DISPLAY_MARGIN = 2;
 
 const NUMERIC_RE = /^-?\d+(\.\d+)?$/;
@@ -90,6 +90,11 @@ export function SheetView({
   const cellRefs = useRef<Map<string, HTMLTableCellElement>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
   const skipNextBlurCommit = useRef(false);
+  // IME 変換中フラグ(ADR-0055 決定 6: バグ修正)。変換中は Enter/Tab/Escape
+  // をセル操作(確定・移動)に横取りしない。event.nativeEvent.isComposing に
+  // 加えて保持しておく(compositionend 直後の keydown で isComposing が
+  // 既に false になっている実装差を吸収するため)。
+  const isComposingRef = useRef(false);
 
   useEffect(() => {
     activeSheetIdRef.current = activeSheetId;
@@ -213,6 +218,12 @@ export function SheetView({
       usedRows = Math.max(usedRows, cell.row + 1);
       usedCols = Math.max(usedCols, cell.col + 1);
     }
+    // 編集中セルは(seq ポーリングで cells が変わっても)必ず表示範囲に
+    // 含める。範囲外に落ちて input が消える = 事実上の再マウントになるのを防ぐ。
+    if (editing) {
+      usedRows = Math.max(usedRows, editing.row + 1);
+      usedCols = Math.max(usedCols, editing.col + 1);
+    }
     return {
       displayRows: Math.min(
         Math.max(usedRows + DISPLAY_MARGIN, MIN_DISPLAY_ROWS),
@@ -223,7 +234,9 @@ export function SheetView({
         MAX_SHEET_COLS,
       ),
     };
-  }, [cells]);
+    // editing.value(打鍵ごと)は範囲計算に無関係なので row/col だけを見る
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cells, editing?.row, editing?.col]);
 
   const applyConflicts = useCallback((conflicts: SheetCell[]) => {
     setCells((prev) => {
@@ -316,6 +329,16 @@ export function SheetView({
     (event: KeyboardEvent<HTMLTableCellElement>, row: number, col: number) => {
       const isEditingThis = editing && editing.row === row && editing.col === col;
       if (isEditingThis) {
+        // IME 変換中の Enter/Tab/Escape はセルの確定・移動に横取りしない
+        // (ADR-0055 決定 6: バグ修正)。isComposing の他に keyCode 229 も
+        // 見て古い挙動のブラウザを吸収する。
+        if (
+          isComposingRef.current ||
+          event.nativeEvent.isComposing ||
+          event.keyCode === 229
+        ) {
+          return;
+        }
         if (event.key === "Enter") {
           event.preventDefault();
           skipNextBlurCommit.current = true;
@@ -370,7 +393,18 @@ export function SheetView({
     [editing, readOnlyReason, cellsByKey, commitEdit, cancelEdit, moveSelection, startEdit, writeCells],
   );
 
-  const handleGridBlur = useCallback(
+  // 入力バグの根本原因(ADR-0055 決定 6): このハンドラは以前 <td> に付けて
+  // いた。フォーカスが <td> からその子である <input> へ移ると、ブラウザは
+  // (子孫であっても)<td> 自身の blur/focusout を発火させる。編集開始時に
+  // input へ focus() する実装と組み合わさり、「1 文字入力 → 即座に
+  // handleGridBlur が発火 → commitEdit でその 1 文字だけを書き込んで
+  // 編集終了 → 選択セルの focus 復帰で <td> にフォーカスが戻る」というサイ
+  // クルが**打鍵のたびに**回っていた。結果、複数文字(IME 変換中の文字列も
+  // 含む)を打っても直前の内容が毎回上書きされ、最後の 1 文字しか残らない
+  // (日本語 IME は変換確定の Enter でも同じ経路から即終了するため入力不可
+  // だった)。<input> 自身に付け替えることで、フォーカスが本当にセルの外へ
+  // 出たときだけ blur が発火するようにする。
+  const handleInputBlur = useCallback(
     (row: number, col: number) => {
       if (!(editing && editing.row === row && editing.col === col)) return;
       if (skipNextBlurCommit.current) {
@@ -641,7 +675,6 @@ export function SheetView({
                         onClick={() => setSelected({ row: r, col: c })}
                         onDoubleClick={() => startEdit(r, c, value)}
                         onKeyDown={(event) => handleGridKeyDown(event, r, c)}
-                        onBlur={() => handleGridBlur(r, c)}
                         onCopy={(event) => handleGridCopy(event, r, c)}
                         onPaste={(event) => handleGridPaste(event, r, c)}
                       >
@@ -655,6 +688,15 @@ export function SheetView({
                                 prev ? { ...prev, value: event.target.value } : prev,
                               )
                             }
+                            // blur は <td> ではなく <input> 自身に付ける(理由は
+                            // handleInputBlur 定義側のコメント参照)
+                            onBlur={() => handleInputBlur(r, c)}
+                            onCompositionStart={() => {
+                              isComposingRef.current = true;
+                            }}
+                            onCompositionEnd={() => {
+                              isComposingRef.current = false;
+                            }}
                           />
                         ) : (
                           <span className="sheet__cell-value">{value}</span>
