@@ -24,8 +24,9 @@ use peercove_core::schedule::{
     MAX_SCHEDULE_PARTICIPANTS, MAX_SCHEDULE_TITLE_CHARS,
 };
 use peercove_core::sheet::{
-    CellWrite, SheetCell, SheetMeta, MAX_CELL_VALUE_BYTES, MAX_SHEETS, MAX_SHEET_CELLS,
-    MAX_SHEET_COLS, MAX_SHEET_NAME_CHARS, MAX_SHEET_ROWS,
+    CellFormat, CellWrite, SheetCell, SheetLayout, SheetMeta, MAX_CELL_VALUE_BYTES, MAX_COL_WIDTH,
+    MAX_FONT_SIZE, MAX_ROW_HEIGHT, MAX_SHEETS, MAX_SHEET_CELLS, MAX_SHEET_COLS,
+    MAX_SHEET_NAME_CHARS, MAX_SHEET_ROWS, MIN_COL_WIDTH, MIN_FONT_SIZE, MIN_ROW_HEIGHT,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -104,7 +105,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Res
     Ok(has_column)
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 7;
+const SHARED_SCHEMA_VERSION: i64 = 8;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -478,6 +479,27 @@ impl SharedStore {
                     "ALTER TABLE schedule_events ADD COLUMN participants TEXT NOT NULL DEFAULT '[]';",
                 )?;
             }
+        }
+        if version < 8 {
+            // v8(M6 H-4、ADR-0055 決定 6): セル書式・列幅/行高。format は
+            // JSON 文字列(空文字 = 既定、CellFormat::is_default())。
+            // ALTER TABLE の非冪等対策は既存の schedule_events と同じ。
+            if !table_has_column(&tx, "sheet_cells", "format")? {
+                tx.execute_batch(
+                    "ALTER TABLE sheet_cells ADD COLUMN format TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sheet_layout (
+                    sheet_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    PRIMARY KEY (sheet_id, kind, idx)
+                );
+                "#,
+            )?;
         }
         tx.pragma_update(None, "user_version", SHARED_SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1779,9 +1801,79 @@ impl SharedStore {
         }
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM sheet_cells WHERE sheet_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sheet_layout WHERE sheet_id = ?1", params![id])?;
         tx.execute("DELETE FROM sheets WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// 列幅の変更(誰でも可。シート全体の見た目 = 共有、ADR-0055 決定 6)。
+    /// `width` = `None` で既定に戻す(行を削除)。
+    pub fn sheet_set_col_width(
+        &mut self,
+        id: &str,
+        col: u32,
+        width: Option<u16>,
+    ) -> anyhow::Result<()> {
+        self.sheet_row(id)?; // シートの存在確認
+        if col >= MAX_SHEET_COLS {
+            bail!("列の位置が上限を超えています(列は {MAX_SHEET_COLS} 未満にしてください)");
+        }
+        match width {
+            Some(width) => {
+                validate_col_width(width)?;
+                self.conn.execute(
+                    "INSERT INTO sheet_layout (sheet_id, kind, idx, size)
+                     VALUES (?1, 'col', ?2, ?3)
+                     ON CONFLICT(sheet_id, kind, idx) DO UPDATE SET size = ?3",
+                    params![id, col, width],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM sheet_layout WHERE sheet_id = ?1 AND kind = 'col' AND idx = ?2",
+                    params![id, col],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 行高の変更(誰でも可)。`height` = `None` で既定に戻す。
+    pub fn sheet_set_row_height(
+        &mut self,
+        id: &str,
+        row: u32,
+        height: Option<u16>,
+    ) -> anyhow::Result<()> {
+        self.sheet_row(id)?; // シートの存在確認
+        if row >= MAX_SHEET_ROWS {
+            bail!("行の位置が上限を超えています(行は {MAX_SHEET_ROWS} 未満にしてください)");
+        }
+        match height {
+            Some(height) => {
+                validate_row_height(height)?;
+                self.conn.execute(
+                    "INSERT INTO sheet_layout (sheet_id, kind, idx, size)
+                     VALUES (?1, 'row', ?2, ?3)
+                     ON CONFLICT(sheet_id, kind, idx) DO UPDATE SET size = ?3",
+                    params![id, row, height],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM sheet_layout WHERE sheet_id = ?1 AND kind = 'row' AND idx = ?2",
+                    params![id, row],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 1 シートの列幅・行高(既定でない分だけ、ADR-0055 決定 6)。
+    pub fn sheet_layout(&self, id: &str) -> anyhow::Result<SheetLayout> {
+        self.sheet_row(id)?; // シートの存在確認
+        read_sheet_layout(&self.conn, id)
     }
 
     /// セルのバッチ書き込み(全員可、決定 5)。競合セルは部分失敗として
@@ -1821,16 +1913,27 @@ impl SharedStore {
                     MAX_CELL_VALUE_BYTES / 1024
                 );
             }
-            let existing: Option<(i64, String, String, i64)> = tx
+            if let Some(format) = &write.format {
+                validate_cell_format(format)?;
+            }
+            let existing: Option<(i64, String, String, i64, String)> = tx
                 .query_row(
-                    "SELECT revision, value, updated_by, updated_at FROM sheet_cells
+                    "SELECT revision, value, updated_by, updated_at, format FROM sheet_cells
                      WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
                     params![id, write.row, write.col],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()?;
             match existing {
-                Some((revision, value, updated_by, updated_at)) => {
+                Some((revision, value, updated_by, updated_at, format_text)) => {
                     if revision as u64 != write.base_revision {
                         conflicts.push(SheetCell {
                             row: write.row,
@@ -1839,11 +1942,17 @@ impl SharedStore {
                             revision: revision as u64,
                             updated_by,
                             updated_at: updated_at as u64,
+                            format: format_from_db(&format_text),
                         });
                         continue;
                     }
                     let new_revision = revision as u64 + 1;
-                    if write.value.is_empty() {
+                    let new_format = match &write.format {
+                        Some(format) => format.clone(),
+                        None => format_from_db(&format_text),
+                    };
+                    if write.value.is_empty() && new_format.is_default() {
+                        // 値・書式ともに既定 = セル削除(ADR-0055 決定 6)
                         tx.execute(
                             "DELETE FROM sheet_cells WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
                             params![id, write.row, write.col],
@@ -1852,13 +1961,14 @@ impl SharedStore {
                     } else {
                         tx.execute(
                             "UPDATE sheet_cells SET value = ?1, revision = ?2, updated_by = ?3,
-                                    updated_at = ?4
-                             WHERE sheet_id = ?5 AND row = ?6 AND col = ?7",
+                                    updated_at = ?4, format = ?5
+                             WHERE sheet_id = ?6 AND row = ?7 AND col = ?8",
                             params![
                                 write.value,
                                 new_revision as i64,
                                 actor.name,
                                 now,
+                                format_to_db(&new_format)?,
                                 id,
                                 write.row,
                                 write.col
@@ -1872,6 +1982,7 @@ impl SharedStore {
                         revision: new_revision,
                         updated_by: actor.name.clone(),
                         updated_at: now as u64,
+                        format: new_format,
                     });
                     applied += 1;
                 }
@@ -1886,11 +1997,14 @@ impl SharedStore {
                             revision: 0,
                             updated_by: String::new(),
                             updated_at: 0,
+                            format: CellFormat::default(),
                         });
                         continue;
                     }
-                    if write.value.is_empty() {
-                        // 存在しないセルへの削除要求は無害な no-op
+                    let new_format = write.format.clone().unwrap_or_default();
+                    if write.value.is_empty() && new_format.is_default() {
+                        // 存在しないセルへの削除要求(かつ書式指定もなし)は
+                        // 無害な no-op
                         applied += 1;
                         continue;
                     }
@@ -1902,9 +2016,17 @@ impl SharedStore {
                     }
                     tx.execute(
                         "INSERT INTO sheet_cells
-                            (sheet_id, row, col, value, revision, updated_by, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
-                        params![id, write.row, write.col, write.value, actor.name, now],
+                            (sheet_id, row, col, value, revision, updated_by, updated_at, format)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+                        params![
+                            id,
+                            write.row,
+                            write.col,
+                            write.value,
+                            actor.name,
+                            now,
+                            format_to_db(&new_format)?
+                        ],
                     )?;
                     current_count += 1;
                     changed.push(SheetCell {
@@ -1914,6 +2036,7 @@ impl SharedStore {
                         revision: 1,
                         updated_by: actor.name.clone(),
                         updated_at: now as u64,
+                        format: new_format,
                     });
                     applied += 1;
                 }
@@ -2078,7 +2201,7 @@ fn sheet_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetRow> {
 }
 
 /// [`SheetCell`] の共通 SELECT 列(ホスト正本・キャッシュ両方で使う)。
-const SHEET_CELL_COLUMNS: &str = "row, col, value, revision, updated_by, updated_at";
+const SHEET_CELL_COLUMNS: &str = "row, col, value, revision, updated_by, updated_at, format";
 
 fn sheet_cell_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetCell> {
     Ok(SheetCell {
@@ -2088,7 +2211,27 @@ fn sheet_cell_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetCell> {
         revision: row.get::<_, i64>(3)? as u64,
         updated_by: row.get(4)?,
         updated_at: row.get::<_, i64>(5)? as u64,
+        format: format_from_db(&row.get::<_, String>(6)?),
     })
+}
+
+/// DB の format 列(空文字 = 既定)を [`CellFormat`] に変換する。解析失敗は
+/// 既定扱い(壊れたデータで表示が完全に止まらないように)。
+fn format_from_db(text: &str) -> CellFormat {
+    if text.is_empty() {
+        CellFormat::default()
+    } else {
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
+/// [`CellFormat`] を DB の format 列(空文字 = 既定)へ変換する。
+fn format_to_db(format: &CellFormat) -> anyhow::Result<String> {
+    if format.is_default() {
+        Ok(String::new())
+    } else {
+        Ok(serde_json::to_string(format).context("セル書式の直列化に失敗しました")?)
+    }
 }
 
 /// シート名の検証(必須 + 上限文字数、ADR-0054 決定 7)。
@@ -2098,6 +2241,106 @@ fn validate_sheet_name(name: &str) -> anyhow::Result<()> {
     }
     if name.chars().count() > MAX_SHEET_NAME_CHARS {
         bail!("シート名が長すぎます(上限 {MAX_SHEET_NAME_CHARS} 文字)");
+    }
+    Ok(())
+}
+
+/// セル書式の検証(ADR-0055 決定 6)。フォントサイズの範囲・色の形式
+/// (`#rrggbb`)・配置の値を確認する。
+fn validate_cell_format(format: &CellFormat) -> anyhow::Result<()> {
+    if let Some(size) = format.font_size {
+        if !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&size) {
+            bail!("フォントサイズは {MIN_FONT_SIZE}〜{MAX_FONT_SIZE} の範囲で指定してください");
+        }
+    }
+    if let Some(color) = &format.color {
+        validate_hex_color(color).context("文字色")?;
+    }
+    if let Some(bg) = &format.bg {
+        validate_hex_color(bg).context("背景色")?;
+    }
+    if let Some(align) = &format.align {
+        if !matches!(align.as_str(), "left" | "center" | "right") {
+            bail!("配置は left / center / right のいずれかで指定してください");
+        }
+    }
+    Ok(())
+}
+
+/// `#rrggbb` 形式(小文字・大文字どちらも可)のみ受理する。
+fn validate_hex_color(value: &str) -> anyhow::Result<()> {
+    let ok = value.len() == 7
+        && value.starts_with('#')
+        && value[1..].chars().all(|c| c.is_ascii_hexdigit());
+    if !ok {
+        bail!("色は #rrggbb 形式で指定してください(例: #336699)");
+    }
+    Ok(())
+}
+
+/// 列幅・行高の検証(ADR-0055 決定 6)。
+fn validate_col_width(width: u16) -> anyhow::Result<()> {
+    if !(MIN_COL_WIDTH..=MAX_COL_WIDTH).contains(&width) {
+        bail!("列幅は {MIN_COL_WIDTH}〜{MAX_COL_WIDTH}px の範囲で指定してください");
+    }
+    Ok(())
+}
+
+fn validate_row_height(height: u16) -> anyhow::Result<()> {
+    if !(MIN_ROW_HEIGHT..=MAX_ROW_HEIGHT).contains(&height) {
+        bail!("行高は {MIN_ROW_HEIGHT}〜{MAX_ROW_HEIGHT}px の範囲で指定してください");
+    }
+    Ok(())
+}
+
+/// `sheet_layout` テーブルの読み取り(ホスト正本・キャッシュ共通のスキーマ)。
+/// 戻り値は (col_widths, row_heights)、idx 昇順。
+fn read_sheet_layout(conn: &Connection, sheet_id: &str) -> anyhow::Result<SheetLayout> {
+    Ok((
+        read_sheet_layout_kind(conn, sheet_id, "col")?,
+        read_sheet_layout_kind(conn, sheet_id, "row")?,
+    ))
+}
+
+fn read_sheet_layout_kind(
+    conn: &Connection,
+    sheet_id: &str,
+    kind: &str,
+) -> anyhow::Result<Vec<(u32, u16)>> {
+    let mut stmt = conn.prepare(
+        "SELECT idx, size FROM sheet_layout WHERE sheet_id = ?1 AND kind = ?2 ORDER BY idx ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![sheet_id, kind], |row| {
+            Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u16))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `sheet_layout` の全量置き換え(1 シート分。キャッシュの同期・イベント
+/// 反映の両方で使う — Layout イベントは全量配信のため)。
+fn replace_sheet_layout(
+    conn: &Connection,
+    sheet_id: &str,
+    col_widths: &[(u32, u16)],
+    row_heights: &[(u32, u16)],
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM sheet_layout WHERE sheet_id = ?1",
+        params![sheet_id],
+    )?;
+    for (idx, size) in col_widths {
+        conn.execute(
+            "INSERT INTO sheet_layout (sheet_id, kind, idx, size) VALUES (?1, 'col', ?2, ?3)",
+            params![sheet_id, idx, size],
+        )?;
+    }
+    for (idx, size) in row_heights {
+        conn.execute(
+            "INSERT INTO sheet_layout (sheet_id, kind, idx, size) VALUES (?1, 'row', ?2, ?3)",
+            params![sheet_id, idx, size],
+        )?;
     }
     Ok(())
 }
@@ -2212,7 +2455,7 @@ pub struct CacheStore {
     conn: Connection,
 }
 
-const CACHE_SCHEMA_VERSION: i64 = 5;
+const CACHE_SCHEMA_VERSION: i64 = 6;
 
 impl CacheStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -2337,6 +2580,26 @@ impl CacheStore {
                     "ALTER TABLE schedule_events ADD COLUMN participants TEXT NOT NULL DEFAULT '[]';",
                 )?;
             }
+        }
+        if version < 6 {
+            // v6(M6 H-4、ADR-0055 決定 6): セル書式・列幅/行高のキャッシュ
+            // (ホスト正本と同じ形。理由は SharedStore 側と同じ)。
+            if !table_has_column(&tx, "sheet_cells", "format")? {
+                tx.execute_batch(
+                    "ALTER TABLE sheet_cells ADD COLUMN format TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sheet_layout (
+                    sheet_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    PRIMARY KEY (sheet_id, kind, idx)
+                );
+                "#,
+            )?;
         }
         tx.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
         tx.commit()?;
@@ -2701,6 +2964,10 @@ impl CacheStore {
             "DELETE FROM sheet_cells WHERE sheet_id NOT IN (SELECT id FROM sheets)",
             [],
         )?;
+        tx.execute(
+            "DELETE FROM sheet_layout WHERE sheet_id NOT IN (SELECT id FROM sheets)",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2710,10 +2977,11 @@ impl CacheStore {
         insert_cache_sheet(&self.conn, sheet)
     }
 
-    /// 単発のメタ反映(SheetRemoved = 削除)。セルもまとめて消す。
+    /// 単発のメタ反映(SheetRemoved = 削除)。セル・レイアウトもまとめて消す。
     pub fn sheet_remove(&mut self, id: &str) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM sheet_cells WHERE sheet_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sheet_layout WHERE sheet_id = ?1", params![id])?;
         tx.execute("DELETE FROM sheets WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
@@ -2748,11 +3016,12 @@ impl CacheStore {
         Ok(())
     }
 
-    /// イベント反映(CellsChanged)。value = "" のセルは削除。
+    /// イベント反映(CellsChanged)。値・書式ともに既定のセルは削除
+    /// (ADR-0055 決定 6。ホスト正本の判定と同じ条件)。
     pub fn sheet_cells_apply(&mut self, sheet_id: &str, cells: &[SheetCell]) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
         for cell in cells {
-            if cell.value.is_empty() {
+            if cell.value.is_empty() && cell.format.is_default() {
                 tx.execute(
                     "DELETE FROM sheet_cells WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
                     params![sheet_id, cell.row, cell.col],
@@ -2775,6 +3044,22 @@ impl CacheStore {
             .query_map(params![sheet_id], sheet_cell_from_sql)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(cells)
+    }
+
+    /// 1 シートの列幅・行高(既定でない分だけ、ADR-0055 決定 6)。
+    pub fn sheet_layout(&self, sheet_id: &str) -> anyhow::Result<SheetLayout> {
+        read_sheet_layout(&self.conn, sheet_id)
+    }
+
+    /// 列幅・行高の全量置き換え(接続時同期の Cells 応答、および Layout
+    /// イベント〔全量配信〕の両方で使う)。
+    pub fn sheet_layout_replace_all(
+        &mut self,
+        sheet_id: &str,
+        col_widths: &[(u32, u16)],
+        row_heights: &[(u32, u16)],
+    ) -> anyhow::Result<()> {
+        replace_sheet_layout(&self.conn, sheet_id, col_widths, row_heights)
     }
 }
 
@@ -2872,10 +3157,11 @@ fn cache_sheet_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetMeta> 
 
 fn insert_cache_cell(conn: &Connection, sheet_id: &str, cell: &SheetCell) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO sheet_cells (sheet_id, row, col, value, revision, updated_by, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO sheet_cells
+            (sheet_id, row, col, value, revision, updated_by, updated_at, format)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(sheet_id, row, col) DO UPDATE SET
-            value = ?4, revision = ?5, updated_by = ?6, updated_at = ?7",
+            value = ?4, revision = ?5, updated_by = ?6, updated_at = ?7, format = ?8",
         params![
             sheet_id,
             cell.row,
@@ -2884,6 +3170,7 @@ fn insert_cache_cell(conn: &Connection, sheet_id: &str, cell: &SheetCell) -> any
             cell.revision as i64,
             cell.updated_by,
             cell.updated_at as i64,
+            format_to_db(&cell.format)?,
         ],
     )?;
     Ok(())
@@ -4335,6 +4622,7 @@ mod tests {
                     col: 0,
                     value: "10".to_string(),
                     base_revision: 0,
+                    format: None,
                 }],
             )
             .unwrap();
@@ -4357,6 +4645,7 @@ mod tests {
                     col: 0,
                     value: "20".to_string(),
                     base_revision: 1,
+                    format: None,
                 }],
             )
             .unwrap();
@@ -4375,6 +4664,7 @@ mod tests {
                     col: 0,
                     value: String::new(),
                     base_revision: 2,
+                    format: None,
                 }],
             )
             .unwrap();
@@ -4400,12 +4690,14 @@ mod tests {
                         col: 0,
                         value: "A".to_string(),
                         base_revision: 0,
+                        format: None,
                     },
                     CellWrite {
                         row: 0,
                         col: 1,
                         value: "B".to_string(),
                         base_revision: 0,
+                        format: None,
                     },
                 ],
             )
@@ -4423,18 +4715,21 @@ mod tests {
                         col: 0,
                         value: "A2".to_string(),
                         base_revision: 0, // 本当は 1 のはずが古いまま
+                        format: None,
                     },
                     CellWrite {
                         row: 0,
                         col: 1,
                         value: "B2".to_string(),
                         base_revision: 1,
+                        format: None,
                     },
                     CellWrite {
                         row: 1,
                         col: 0,
                         value: "C".to_string(),
                         base_revision: 0,
+                        format: None,
                     },
                 ],
             )
@@ -4467,6 +4762,7 @@ mod tests {
                     col: 0,
                     value: "X".to_string(),
                     base_revision: 5,
+                    format: None,
                 }],
             )
             .unwrap();
@@ -4499,6 +4795,7 @@ mod tests {
                         col: 0,
                         value: "x".repeat(4 * 1024 + 1),
                         base_revision: 0,
+                        format: None,
                     }],
                 )
                 .is_err(),
@@ -4514,6 +4811,7 @@ mod tests {
                         col: 0,
                         value: "x".to_string(),
                         base_revision: 0,
+                        format: None,
                     }],
                 )
                 .is_err(),
@@ -4529,6 +4827,7 @@ mod tests {
                         col: MAX_SHEET_COLS,
                         value: "x".to_string(),
                         base_revision: 0,
+                        format: None,
                     }],
                 )
                 .is_err(),
@@ -4584,6 +4883,7 @@ mod tests {
                     col: 1,
                     value: "溢れるセル".to_string(),
                     base_revision: 0,
+                    format: None,
                 }],
             )
             .unwrap_err();
@@ -4605,6 +4905,7 @@ mod tests {
                     col: 0,
                     value: "10".to_string(),
                     base_revision: 0,
+                    format: None,
                 }],
             )
             .unwrap();
@@ -4614,6 +4915,155 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sheet_cells", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "削除したシートのセルは残らない");
+    }
+
+    /// セル書式(M6 H-4、ADR-0055 決定 6): 値が空でも書式が既定でなければ
+    /// セルは存続し、値・書式ともに既定になって初めて削除される。CAS は
+    /// 書式変更にも及ぶ(competing writer は conflicts で現在の書式を得る)。
+    #[test]
+    fn sheet_write_format_only_persists_and_deletes() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+
+        // 値なし・書式のみの新規セルは存続する
+        let (applied, conflicts, changed) = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: String::new(),
+                    base_revision: 0,
+                    format: Some(CellFormat {
+                        bold: true,
+                        color: Some("#ff0000".to_string()),
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(conflicts.is_empty());
+        assert_eq!(changed[0].revision, 1);
+        let cells = store.sheet_cells(&sheet.id).unwrap();
+        assert_eq!(cells.len(), 1, "書式だけのセルも存続する");
+        assert_eq!(cells[0].value, "");
+        assert!(cells[0].format.bold);
+        assert_eq!(cells[0].format.color.as_deref(), Some("#ff0000"));
+
+        // format: None(書式変更なし)は既存の書式を維持したまま値だけ更新する
+        let (applied, _, changed) = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: "10".to_string(),
+                    base_revision: 1,
+                    format: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(changed[0].format.bold, "format: None は既存の書式を維持");
+        assert_eq!(store.sheet_cells(&sheet.id).unwrap()[0].value, "10");
+
+        // 値・書式ともに既定に戻すとセルは削除される
+        let (applied, _, changed) = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: String::new(),
+                    base_revision: 2,
+                    format: Some(CellFormat::default()),
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(changed[0].format.is_default());
+        assert!(store.sheet_cells(&sheet.id).unwrap().is_empty());
+
+        // 不正な書式(範囲外フォントサイズ)は拒否される
+        let err = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 1,
+                    col: 1,
+                    value: "x".to_string(),
+                    base_revision: 0,
+                    format: Some(CellFormat {
+                        font_size: Some(2),
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("フォントサイズ"));
+
+        // 不正な色は拒否される
+        let err = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 1,
+                    col: 1,
+                    value: "x".to_string(),
+                    base_revision: 0,
+                    format: Some(CellFormat {
+                        color: Some("red".to_string()),
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("色"));
+    }
+
+    /// 列幅・行高(M6 H-4、ADR-0055 決定 6): 設定・取得・既定へ戻す・範囲外拒否・
+    /// シート削除でのカスケード削除。
+    #[test]
+    fn sheet_layout_set_get_and_bounds() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+
+        store.sheet_set_col_width(&sheet.id, 2, Some(120)).unwrap();
+        store.sheet_set_row_height(&sheet.id, 3, Some(40)).unwrap();
+        let (col_widths, row_heights) = store.sheet_layout(&sheet.id).unwrap();
+        assert_eq!(col_widths, vec![(2, 120)]);
+        assert_eq!(row_heights, vec![(3, 40)]);
+
+        // 上書き
+        store.sheet_set_col_width(&sheet.id, 2, Some(200)).unwrap();
+        assert_eq!(store.sheet_layout(&sheet.id).unwrap().0, vec![(2, 200)]);
+
+        // None = 既定へ戻す(行削除)
+        store.sheet_set_col_width(&sheet.id, 2, None).unwrap();
+        assert!(store.sheet_layout(&sheet.id).unwrap().0.is_empty());
+
+        // 範囲外は拒否
+        assert!(store.sheet_set_col_width(&sheet.id, 0, Some(1)).is_err());
+        assert!(store
+            .sheet_set_row_height(&sheet.id, 0, Some(1_000))
+            .is_err());
+
+        // シート削除でレイアウトも消える(素の SQL で確認)
+        store.sheet_set_col_width(&sheet.id, 5, Some(100)).unwrap();
+        store.sheet_delete(&alice, &sheet.id).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM sheet_layout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "削除したシートのレイアウトは残らない");
     }
 
     /// v5 → v6 移行(ADR-0054): 既存の memos.db に sheets / sheet_cells が
@@ -4637,6 +5087,63 @@ mod tests {
         assert_eq!(store.sheet_list(&host).unwrap().len(), 1);
         assert_eq!(store.db_stats().unwrap().sheet_count, 1);
         store.sheet_delete(&host, &sheet.id).unwrap();
+    }
+
+    /// v7 → v8 移行(M6 H-4、ADR-0055 決定 6): 既存の sheet_cells に format
+    /// 列が additive に足され、sheet_layout テーブルが追加される。旧行は
+    /// format = '' として読める(= 既定書式)。
+    #[test]
+    fn v7_database_migrates_to_v8_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        let host = Actor::host("ホスト");
+        let (sheet_id, cell_row, cell_col) = {
+            let mut store = SharedStore::open(&path).unwrap();
+            let sheet = store.sheet_create(&host, "移行前の表").unwrap();
+            store
+                .sheet_write(
+                    &host,
+                    &sheet.id,
+                    &[CellWrite {
+                        row: 0,
+                        col: 0,
+                        value: "10".to_string(),
+                        base_revision: 0,
+                        format: None,
+                    }],
+                )
+                .unwrap();
+            // v7 相当に偽装(format 列・sheet_layout が無かった頃)
+            store.conn.pragma_update(None, "user_version", 7).unwrap();
+            (sheet.id, 0u32, 0u32)
+        };
+        let mut store = SharedStore::open(&path).unwrap();
+        let cells = store.sheet_cells(&sheet_id).unwrap();
+        assert_eq!(cells.len(), 1);
+        assert!(cells[0].format.is_default(), "旧行は既定書式として読める");
+
+        // 移行後も書式付き書き込み・列幅設定が問題なく行える
+        let (applied, _, changed) = store
+            .sheet_write(
+                &host,
+                &sheet_id,
+                &[CellWrite {
+                    row: cell_row,
+                    col: cell_col,
+                    value: "20".to_string(),
+                    base_revision: 1,
+                    format: Some(CellFormat {
+                        bold: true,
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(changed[0].format.bold);
+        store.sheet_set_col_width(&sheet_id, 0, Some(150)).unwrap();
+        assert_eq!(store.sheet_layout(&sheet_id).unwrap().0, vec![(0, 150)]);
+        store.sheet_delete(&host, &sheet_id).unwrap();
     }
 
     /// キャッシュ往復(メンバー側): メタの replace_all・upsert・remove・list、
@@ -4668,6 +5175,7 @@ mod tests {
             revision: 1,
             updated_by: "ホスト".to_string(),
             updated_at: 1,
+            format: CellFormat::default(),
         };
         cache
             .sheet_cells_replace_all("s1", std::slice::from_ref(&cell))
@@ -4699,6 +5207,7 @@ mod tests {
                     revision: 1,
                     updated_by: "ホスト".to_string(),
                     updated_at: 1,
+                    format: CellFormat::default(),
                 }],
             )
             .unwrap();
@@ -4723,6 +5232,7 @@ mod tests {
                     revision: 1,
                     updated_by: "ホスト".to_string(),
                     updated_at: 1,
+                    format: CellFormat::default(),
                 }],
             )
             .unwrap();
@@ -4732,5 +5242,52 @@ mod tests {
             cache.sheet_cells("s1").unwrap().is_empty(),
             "孤児セルは掃除される"
         );
+    }
+
+    /// キャッシュの列幅・行高(M6 H-4、ADR-0055 決定 6): 全量置き換え・
+    /// 取得、シート削除・全量置き換えでの孤児レイアウトの掃除。
+    #[test]
+    fn sheet_cache_layout_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(&dir.path().join("m.memocache.db")).unwrap();
+        let make_sheet = |id: &str, created: u64| SheetMeta {
+            id: id.to_string(),
+            name: format!("表{id}"),
+            owner_id: String::new(),
+            owner_name: "ホスト".to_string(),
+            created_at: created,
+            updated_at: created,
+            can_manage: true,
+        };
+        cache.sheet_replace_all(&[make_sheet("s1", 1_000)]).unwrap();
+
+        cache
+            .sheet_layout_replace_all("s1", &[(0, 150), (2, 80)], &[(1, 40)])
+            .unwrap();
+        let (col_widths, row_heights) = cache.sheet_layout("s1").unwrap();
+        assert_eq!(col_widths, vec![(0, 150), (2, 80)]);
+        assert_eq!(row_heights, vec![(1, 40)]);
+
+        // 全量置き換え(Layout イベント相当) — 縮小もそのまま反映される
+        cache
+            .sheet_layout_replace_all("s1", &[(0, 200)], &[])
+            .unwrap();
+        let (col_widths, row_heights) = cache.sheet_layout("s1").unwrap();
+        assert_eq!(col_widths, vec![(0, 200)]);
+        assert!(row_heights.is_empty());
+
+        // シート削除でレイアウトも消える
+        cache.sheet_remove("s1").unwrap();
+        let (col_widths, row_heights) = cache.sheet_layout("s1").unwrap();
+        assert!(col_widths.is_empty() && row_heights.is_empty());
+
+        // replace_all で消えたシートの孤児レイアウトも掃除される
+        cache.sheet_replace_all(&[make_sheet("s1", 1_000)]).unwrap();
+        cache
+            .sheet_layout_replace_all("s1", &[(0, 150)], &[])
+            .unwrap();
+        cache.sheet_replace_all(&[]).unwrap();
+        let (col_widths, _) = cache.sheet_layout("s1").unwrap();
+        assert!(col_widths.is_empty(), "孤児レイアウトは掃除される");
     }
 }

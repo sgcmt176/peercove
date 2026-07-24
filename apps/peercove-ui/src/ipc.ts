@@ -769,6 +769,27 @@ export interface SheetMeta {
   can_manage?: boolean;
 }
 
+/** セル書式(すべて省略可 = 既定、ADR-0055 決定 6)。crates/peercove-core/
+ * src/sheet.rs の CellFormat と同期。 */
+export interface CellFormat {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strike?: boolean;
+  /** pt。未指定 = 既定(11 相当)。8..=36。 */
+  font_size?: number;
+  /** 文字色("#rrggbb")。 */
+  color?: string;
+  /** 背景色("#rrggbb")。 */
+  bg?: string;
+  /** 水平配置。 */
+  align?: "left" | "center" | "right";
+  border_top?: boolean;
+  border_bottom?: boolean;
+  border_left?: boolean;
+  border_right?: boolean;
+}
+
 export interface SheetCell {
   row: number;
   col: number;
@@ -777,14 +798,21 @@ export interface SheetCell {
   revision: number;
   updated_by: string;
   updated_at: number;
+  /** 既定なら省略される(ワイヤ表現に合わせる)。 */
+  format?: CellFormat;
 }
 
-/** セル書き込み 1 件分。base_revision 0 = 新規セル想定。値が空文字ならセル削除。 */
+/**
+ * セル書き込み 1 件分。base_revision 0 = 新規セル想定。値が空文字 + 書式が
+ * 既定(省略)ならセル削除。format は undefined = 書式変更なし、指定時は
+ * そのセルの書式を丸ごと置き換える。
+ */
 export interface CellWrite {
   row: number;
   col: number;
   value: string;
   base_revision?: number;
+  format?: CellFormat;
 }
 
 export type SheetOp =
@@ -793,11 +821,24 @@ export type SheetOp =
   | { op: "create"; name?: string }
   | { op: "rename"; sheet_id: string; name?: string }
   | { op: "delete"; sheet_id: string }
-  | { op: "write"; sheet_id: string; cells: CellWrite[] };
+  | { op: "write"; sheet_id: string; cells: CellWrite[] }
+  // 列幅・行高(誰でも可。シート全体の見た目 = 共有、ADR-0055 決定 6)。
+  // width/height 未指定(undefined)は既定へ戻す。
+  | { op: "set_col_width"; sheet_id: string; col: number; width?: number }
+  | { op: "set_row_height"; sheet_id: string; row: number; height?: number };
 
 export type SheetReply =
   | { kind: "sheets"; sheets: SheetMeta[]; offline?: boolean }
-  | { kind: "cells_data"; sheet_id: string; cells: SheetCell[]; offline?: boolean }
+  | {
+      kind: "cells_data";
+      sheet_id: string;
+      cells: SheetCell[];
+      /** 既定でない列幅(ADR-0055 決定 6)。[col, width] の組。 */
+      col_widths?: [number, number][];
+      /** 既定でない行高。[row, height] の組。 */
+      row_heights?: [number, number][];
+      offline?: boolean;
+    }
   | { kind: "sheet"; sheet: SheetMeta }
   | { kind: "write_result"; applied: number; conflicts: SheetCell[] }
   | { kind: "done" }

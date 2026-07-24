@@ -461,12 +461,16 @@ impl DaemonShared {
                             sheet: SheetOp::Cells { sheet_id },
                         } => {
                             let cells = cache.sheet_cells(sheet_id.clone()).await?;
+                            let (col_widths, row_heights) =
+                                cache.sheet_layout(sheet_id.clone()).await?;
                             let offline = link.session().is_none();
                             Ok(IpcResponse::SharedMemo {
                                 reply: SharedMemoReply::Sheet {
                                     reply: SheetReply::CellsData {
                                         sheet_id,
                                         cells,
+                                        col_widths,
+                                        row_heights,
                                         offline,
                                     },
                                 },

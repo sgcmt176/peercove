@@ -11,7 +11,13 @@
 //! 互換モデル、ADR-0054 決定 6)。
 //!
 //! **アドレスは固定**(行・列の挿入/削除による繰り上げは V1 では持たない、
-//! ADR-0054 決定 3)。セルの値は空文字への更新でセル削除を表す。
+//! ADR-0054 決定 3)。セルの値は空文字への更新でセル削除を表す(ただし
+//! 書式が既定でない場合はセルが存続する、ADR-0055 決定 6)。
+//!
+//! セル書式([`CellFormat`])・列幅/行高(`SheetOp::SetColWidth` /
+//! `SetRowHeight`)は M6 H-4(ADR-0055 決定 6)で追加した additive な拡張。
+//! 旧クライアントは `format` フィールドを知らないため無視するだけで壊れない
+//! (`CellWrite.format` は `None` 既定 = 書式変更なし)。
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +39,81 @@ pub const MAX_SHEET_ROWS: u32 = 1_000;
 /// 列番号の上限(0-indexed。この値未満のみ許可)。
 pub const MAX_SHEET_COLS: u32 = 200;
 
+/// 列幅・行高(既定でない分だけ、`(idx, size)` の組)。ADR-0055 決定 6。
+/// `(col_widths, row_heights)`。
+pub type SheetLayout = (Vec<(u32, u16)>, Vec<(u32, u16)>);
+
+/// セル書式のフォントサイズ下限(pt、ADR-0055 決定 6)。
+pub const MIN_FONT_SIZE: u8 = 8;
+
+/// セル書式のフォントサイズ上限(pt)。
+pub const MAX_FONT_SIZE: u8 = 36;
+
+/// 列幅の下限(px)。
+pub const MIN_COL_WIDTH: u16 = 20;
+
+/// 列幅の上限(px)。
+pub const MAX_COL_WIDTH: u16 = 600;
+
+/// 行高の下限(px)。
+pub const MIN_ROW_HEIGHT: u16 = 16;
+
+/// 行高の上限(px)。
+pub const MAX_ROW_HEIGHT: u16 = 400;
+
+/// セル書式(すべて省略可 = 既定、ADR-0055 決定 6)。`is_default()` が
+/// 真の間はワイヤ上でも省略される(既存セル・旧クライアントとの互換)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellFormat {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strike: bool,
+    /// pt。None = 既定(11 相当)。[`MIN_FONT_SIZE`]..=[`MAX_FONT_SIZE`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<u8>,
+    /// 文字色("#rrggbb")。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// 背景色("#rrggbb")。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    /// 水平配置("left" | "center" | "right")。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub border_top: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub border_bottom: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub border_left: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub border_right: bool,
+}
+
+impl CellFormat {
+    /// すべて既定値(未装飾)か。真なら「値が空ならセルも消える」判定に使う
+    /// (ADR-0055 決定 6)。
+    pub fn is_default(&self) -> bool {
+        !self.bold
+            && !self.italic
+            && !self.underline
+            && !self.strike
+            && self.font_size.is_none()
+            && self.color.is_none()
+            && self.bg.is_none()
+            && self.align.is_none()
+            && !self.border_top
+            && !self.border_bottom
+            && !self.border_left
+            && !self.border_right
+    }
+}
+
 /// 共有シートのメタ情報(セルは含まない)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SheetMeta {
@@ -50,20 +131,25 @@ pub struct SheetMeta {
     pub can_manage: bool,
 }
 
-/// 1 セル分(疎な格納。非空セルだけが存在する)。
+/// 1 セル分(疎な格納。非空セルだけが存在する。値が空でも書式が既定でなければ
+/// セルは存続する、ADR-0055 決定 6)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SheetCell {
     pub row: u32,
     pub col: u32,
     pub value: String,
-    /// 単調増加リビジョン(CAS 用、ADR-0054 決定 4)。
+    /// 単調増加リビジョン(CAS 用、ADR-0054 決定 4)。書式の変更もここに含む。
     pub revision: u64,
     pub updated_by: String,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "CellFormat::is_default")]
+    pub format: CellFormat,
 }
 
 /// セル書き込み 1 件分(バッチの要素)。`base_revision` = 0 は新規セル想定
-/// (既存セルに対して 0 を送ると競合扱いになる)。値が空文字ならセル削除。
+/// (既存セルに対して 0 を送ると競合扱いになる)。値が空文字 + 書式が既定
+/// (省略)ならセル削除。`format` は `None` = 書式変更なし(値のみ更新)、
+/// `Some` = そのセルの書式を丸ごと置き換える。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellWrite {
     pub row: u32,
@@ -71,6 +157,8 @@ pub struct CellWrite {
     pub value: String,
     #[serde(default)]
     pub base_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<CellFormat>,
 }
 
 /// 共有シートへの操作。全員が閲覧・セル編集できる。シートの作成・改名・
@@ -101,6 +189,22 @@ pub enum SheetOp {
         sheet_id: String,
         cells: Vec<CellWrite>,
     },
+    /// 列幅の変更(誰でも可。シート全体の見た目 = 共有、ADR-0055 決定 6)。
+    /// `width` = `None` は既定幅へ戻す。応答は [`SheetReply::Done`]。
+    SetColWidth {
+        sheet_id: String,
+        col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u16>,
+    },
+    /// 行高の変更(誰でも可)。`height` = `None` は既定高へ戻す。
+    /// 応答は [`SheetReply::Done`]。
+    SetRowHeight {
+        sheet_id: String,
+        row: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u16>,
+    },
 }
 
 /// [`SheetOp`] への応答。
@@ -118,6 +222,12 @@ pub enum SheetReply {
     CellsData {
         sheet_id: String,
         cells: Vec<SheetCell>,
+        /// 列幅(既定でない列のみ、ADR-0055 決定 6)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        col_widths: Vec<(u32, u16)>,
+        /// 行高(既定でない行のみ)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        row_heights: Vec<(u32, u16)>,
         /// (メンバーのみ)ホスト未接続のキャッシュ応答 = 読み取り専用。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         offline: bool,
@@ -147,10 +257,16 @@ pub enum SheetEventMsg {
     SheetChanged { sheet: SheetMeta },
     /// シートの削除。キャッシュから(セルも)消すこと。
     SheetRemoved { sheet_id: String },
-    /// セルのバッチ変更(削除セルは value = "" で表現)。
+    /// セルのバッチ変更(削除セルは value = "" かつ format 既定で表現)。
     CellsChanged {
         sheet_id: String,
         cells: Vec<SheetCell>,
+    },
+    /// 列幅・行高の変更(全量、ADR-0055 決定 6)。
+    Layout {
+        sheet_id: String,
+        col_widths: Vec<(u32, u16)>,
+        row_heights: Vec<(u32, u16)>,
     },
 }
 
@@ -214,9 +330,50 @@ mod tests {
                 col: 0,
                 value: "10".to_string(),
                 base_revision: 0,
+                format: None,
             }],
         };
         let json = serde_json::to_string(&op).unwrap();
+        // format: None は省略される(旧ワイヤ互換)
+        assert!(!json.contains("format"));
+        assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
+
+        let op = SheetOp::Write {
+            sheet_id: "s1".to_string(),
+            cells: vec![CellWrite {
+                row: 0,
+                col: 0,
+                value: String::new(),
+                base_revision: 1,
+                format: Some(CellFormat {
+                    bold: true,
+                    color: Some("#ff0000".to_string()),
+                    ..Default::default()
+                }),
+            }],
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
+
+        let op = SheetOp::SetColWidth {
+            sheet_id: "s1".to_string(),
+            col: 2,
+            width: Some(120),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"set_col_width","sheet_id":"s1","col":2,"width":120}"#
+        );
+        assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
+
+        let op = SheetOp::SetRowHeight {
+            sheet_id: "s1".to_string(),
+            row: 3,
+            height: None,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"op":"set_row_height","sheet_id":"s1","row":3}"#);
         assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
 
         let sheet = SheetMeta {
@@ -241,7 +398,31 @@ mod tests {
             revision: 1,
             updated_by: "ホスト".to_string(),
             updated_at: 1,
+            format: CellFormat::default(),
         };
+        // format が既定ならワイヤ上は省略される(旧クライアント互換)
+        let json = serde_json::to_string(&cell).unwrap();
+        assert!(!json.contains("format"));
+        assert_eq!(serde_json::from_str::<SheetCell>(&json).unwrap(), cell);
+
+        let formatted_cell = SheetCell {
+            format: CellFormat {
+                bold: true,
+                italic: true,
+                font_size: Some(14),
+                align: Some("center".to_string()),
+                border_top: true,
+                ..Default::default()
+            },
+            ..cell.clone()
+        };
+        let json = serde_json::to_string(&formatted_cell).unwrap();
+        assert!(json.contains(r#""format""#));
+        assert_eq!(
+            serde_json::from_str::<SheetCell>(&json).unwrap(),
+            formatted_cell
+        );
+
         let reply = SheetReply::WriteResult {
             applied: 1,
             conflicts: vec![cell.clone()],
@@ -252,10 +433,14 @@ mod tests {
         let reply = SheetReply::CellsData {
             sheet_id: "s1".to_string(),
             cells: vec![cell.clone()],
+            col_widths: vec![(0, 150)],
+            row_heights: Vec::new(),
             offline: true,
         };
         let json = serde_json::to_string(&reply).unwrap();
         assert!(json.contains(r#""offline":true"#));
+        assert!(json.contains(r#""col_widths":[[0,150]]"#));
+        assert!(!json.contains("row_heights"));
         assert_eq!(serde_json::from_str::<SheetReply>(&json).unwrap(), reply);
 
         let msg = SheetEventMsg::SheetChanged { sheet };
@@ -275,5 +460,28 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<SheetEventMsg>(&json).unwrap(), msg);
+
+        let msg = SheetEventMsg::Layout {
+            sheet_id: "s1".to_string(),
+            col_widths: vec![(0, 150), (2, 80)],
+            row_heights: vec![(1, 40)],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<SheetEventMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn cell_format_is_default() {
+        assert!(CellFormat::default().is_default());
+        assert!(!CellFormat {
+            bold: true,
+            ..Default::default()
+        }
+        .is_default());
+        assert!(!CellFormat {
+            color: Some("#000000".to_string()),
+            ..Default::default()
+        }
+        .is_default());
     }
 }

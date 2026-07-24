@@ -738,15 +738,21 @@ impl MemoService {
                 })
             }
             SheetOp::Cells { sheet_id } => {
-                let cells = self
+                let (cells, (col_widths, row_heights)) = self
                     .blocking({
                         let sheet_id = sheet_id.clone();
-                        move |store| store.sheet_cells(&sheet_id)
+                        move |store| {
+                            let cells = store.sheet_cells(&sheet_id)?;
+                            let layout = store.sheet_layout(&sheet_id)?;
+                            Ok((cells, layout))
+                        }
                     })
                     .await?;
                 Ok(SheetReply::CellsData {
                     sheet_id,
                     cells,
+                    col_widths,
+                    row_heights,
                     offline: false,
                 })
             }
@@ -797,6 +803,34 @@ impl MemoService {
                     self.bump();
                 }
                 Ok(SheetReply::WriteResult { applied, conflicts })
+            }
+            SheetOp::SetColWidth {
+                sheet_id,
+                col,
+                width,
+            } => {
+                self.blocking({
+                    let sheet_id = sheet_id.clone();
+                    move |store| store.sheet_set_col_width(&sheet_id, col, width)
+                })
+                .await?;
+                self.broadcast_sheet_layout(sheet_id).await;
+                self.bump();
+                Ok(SheetReply::Done)
+            }
+            SheetOp::SetRowHeight {
+                sheet_id,
+                row,
+                height,
+            } => {
+                self.blocking({
+                    let sheet_id = sheet_id.clone();
+                    move |store| store.sheet_set_row_height(&sheet_id, row, height)
+                })
+                .await?;
+                self.broadcast_sheet_layout(sheet_id).await;
+                self.bump();
+                Ok(SheetReply::Done)
             }
         }
     }
@@ -1185,6 +1219,36 @@ impl MemoService {
             });
         }
     }
+
+    /// 列幅・行高の変更を全員へ配信する(全量、**閲覧権限フィルタなし** —
+    /// シート全体の見た目は共有、ADR-0055 決定 6)。
+    async fn broadcast_sheet_layout(self: &Arc<Self>, sheet_id: String) {
+        let layout = self
+            .blocking({
+                let sheet_id = sheet_id.clone();
+                move |store| store.sheet_layout(&sheet_id)
+            })
+            .await;
+        let (col_widths, row_heights) = match layout {
+            Ok(layout) => layout,
+            Err(e) => {
+                tracing::warn!("共有シートのレイアウト取得に失敗しました: {e:#}");
+                return;
+            }
+        };
+        let event = SharedMemoEvent::Sheet {
+            sheet: SheetEventMsg::Layout {
+                sheet_id,
+                col_widths,
+                row_heights,
+            },
+        };
+        for (_, connection) in self.memo_connections() {
+            connection.send(ControlMessage::MemoEvent {
+                event: event.clone(),
+            });
+        }
+    }
 }
 
 fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
@@ -1292,6 +1356,16 @@ impl MemberMemoCache {
                     self.blocking(move |store| store.sheet_cells_apply(&sheet_id, &cells))
                         .await
                 }
+                SheetEventMsg::Layout {
+                    sheet_id,
+                    col_widths,
+                    row_heights,
+                } => {
+                    self.blocking(move |store| {
+                        store.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)
+                    })
+                    .await
+                }
             },
         };
         match result {
@@ -1389,6 +1463,16 @@ impl MemberMemoCache {
             .await
     }
 
+    /// 1 シートの列幅・行高(オフライン時はここが唯一のソース、M6 H-4、
+    /// ADR-0055 決定 6)。
+    pub async fn sheet_layout(
+        self: &Arc<Self>,
+        sheet_id: String,
+    ) -> anyhow::Result<(Vec<(u32, u16)>, Vec<(u32, u16)>)> {
+        self.blocking(move |store| store.sheet_layout(&sheet_id))
+            .await
+    }
+
     /// 接続時の同期: List 応答でシートのメタ全量を置き換える(孤児セルも
     /// 掃除される、ADR-0054)。
     pub async fn sheet_sync_from_list(
@@ -1401,14 +1485,20 @@ impl MemberMemoCache {
         Ok(())
     }
 
-    /// 接続時の同期: 1 シートの Cells 応答でそのシートのセル全量を置き換える。
+    /// 接続時の同期: 1 シートの Cells 応答でそのシートのセル全量(+ 列幅・
+    /// 行高)を置き換える(M6 H-4、ADR-0055 決定 6)。
     pub async fn sheet_sync_cells(
         self: &Arc<Self>,
         sheet_id: String,
         cells: Vec<SheetCell>,
+        col_widths: Vec<(u32, u16)>,
+        row_heights: Vec<(u32, u16)>,
     ) -> anyhow::Result<()> {
-        self.blocking(move |store| store.sheet_cells_replace_all(&sheet_id, &cells))
-            .await?;
+        self.blocking(move |store| {
+            store.sheet_cells_replace_all(&sheet_id, &cells)?;
+            store.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)
+        })
+        .await?;
         self.bump();
         Ok(())
     }

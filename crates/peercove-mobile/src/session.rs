@@ -1262,12 +1262,17 @@ impl SessionShared {
             SharedMemoReply::Sheet {
                 reply:
                     peercove_core::sheet::SheetReply::CellsData {
-                        sheet_id, cells, ..
+                        sheet_id,
+                        cells,
+                        col_widths,
+                        row_heights,
+                        ..
                     },
             } => {
                 let result = (|| -> anyhow::Result<()> {
                     let mut cache = self.open_memo_cache()?;
-                    cache.sheet_cells_replace_all(&sheet_id, &cells)
+                    cache.sheet_cells_replace_all(&sheet_id, &cells)?;
+                    cache.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)
                 })();
                 if let Err(e) = result {
                     tracing::warn!("共有シートのセル同期に失敗しました: {e:#}");
@@ -1300,6 +1305,11 @@ impl SessionShared {
                     SheetEventMsg::CellsChanged { sheet_id, cells } => {
                         cache.sheet_cells_apply(&sheet_id, &cells)
                     }
+                    SheetEventMsg::Layout {
+                        sheet_id,
+                        col_widths,
+                        row_heights,
+                    } => cache.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights),
                 },
             }
         })();

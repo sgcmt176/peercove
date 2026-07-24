@@ -3985,6 +3985,10 @@ button.msg__ref:hover {
   box-shadow: inset 0 0 0 2px #1a73e8;
 }
 
+.sheet__cell--in-range {
+  background-color: rgba(26, 115, 232, 0.12);
+}
+
 .sheet__cell--numeric .sheet__cell-value {
   display: block;
   text-align: right;
@@ -4013,6 +4017,123 @@ button.msg__ref:hover {
 
 .sheet__cell-input:focus {
   outline: none;
+}
+
+/* 列幅・行高のドラッグリサイズハンドル(ADR-0055 決定 6)。ヘッダーの端に
+   薄い当たり判定を置き、ホバー時だけ見えるようにする(常時表示だと格子線が
+   うるさくなるため)。 */
+.sheet__col-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 4;
+}
+
+.sheet__col-resize-handle:hover {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+.sheet__row-resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 6px;
+  cursor: row-resize;
+  z-index: 4;
+}
+
+.sheet__row-resize-handle:hover {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+/* 書式ツールバー(ADR-0055 決定 6)。グリッドの上、タブバーの下に 1 行で
+   並べる(タブ式グルーピングは H-5 で拡張予定)。周辺 UI なのでテーマ追従。 */
+.sheet__toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+}
+
+.sheet__toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 10px;
+  border-right: 1px solid var(--border);
+}
+
+.sheet__toolbar-group:last-of-type {
+  border-right: none;
+  padding-right: 0;
+}
+
+.sheet__toolbar-btn {
+  min-width: 28px;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+}
+
+.sheet__toolbar-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.sheet__toolbar-btn--active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.sheet__toolbar-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sheet__toolbar-select {
+  height: 28px;
+}
+
+.sheet__toolbar-color {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.sheet__toolbar-color:hover {
+  background: var(--accent-soft);
+}
+
+.sheet__toolbar-color input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.sheet__toolbar-range {
+  margin-left: auto;
 }
 
 @media (max-width: 900px) {

@@ -528,7 +528,7 @@ use peercove_core::memo::{
     SharedMemoHistoryEntry, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
 };
 use peercove_core::schedule::{ScheduleEvent, ScheduleOp, ScheduleParticipant, ScheduleReply};
-use peercove_core::sheet::{CellWrite, SheetCell, SheetMeta, SheetOp, SheetReply};
+use peercove_core::sheet::{CellFormat, CellWrite, SheetCell, SheetMeta, SheetOp, SheetReply};
 
 #[derive(uniffi::Record)]
 pub struct SharedMemoSummaryInfo {
@@ -1106,6 +1106,9 @@ impl From<SheetMeta> for SheetMetaInfo {
     }
 }
 
+/// 書式(M6 H-4、ADR-0055 決定 6)。JSON 文字列として運ぶ(空文字 = 既定)。
+/// UniFFI レコードを増やさずに済み、Kotlin 側での解析(表示対応)は H-6 に
+/// 先送りできる — 現時点では「表示はしないが値は失わない」ための最小追随。
 #[derive(uniffi::Record)]
 pub struct SheetCellInfo {
     pub row: u32,
@@ -1114,6 +1117,8 @@ pub struct SheetCellInfo {
     pub revision: u64,
     pub updated_by: String,
     pub updated_at: u64,
+    /// [`CellFormat`] の JSON(既定なら空文字)。
+    pub format: String,
 }
 
 impl From<SheetCell> for SheetCellInfo {
@@ -1125,17 +1130,39 @@ impl From<SheetCell> for SheetCellInfo {
             revision: cell.revision,
             updated_by: cell.updated_by,
             updated_at: cell.updated_at,
+            format: format_to_json(&cell.format),
         }
     }
 }
 
+/// [`CellFormat`] を JSON 文字列へ(既定なら空文字)。
+fn format_to_json(format: &CellFormat) -> String {
+    if format.is_default() {
+        String::new()
+    } else {
+        serde_json::to_string(format).unwrap_or_default()
+    }
+}
+
+/// JSON 文字列(空文字 = 既定)を [`CellFormat`] へ。解析失敗は既定扱い。
+fn format_from_json(text: &str) -> CellFormat {
+    if text.is_empty() {
+        CellFormat::default()
+    } else {
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
 /// セル書き込み 1 件分(Kotlin → Rust)。`base_revision` = 0 は新規セル想定。
+/// `format` は `None` = 書式変更なし、`Some(json)` = 丸ごと置き換え
+/// (json が空文字なら既定書式に戻す)。
 #[derive(uniffi::Record)]
 pub struct SheetCellWriteArg {
     pub row: u32,
     pub col: u32,
     pub value: String,
     pub base_revision: u64,
+    pub format: Option<String>,
 }
 
 impl From<SheetCellWriteArg> for CellWrite {
@@ -1145,6 +1172,7 @@ impl From<SheetCellWriteArg> for CellWrite {
             col: write.col,
             value: write.value,
             base_revision: write.base_revision,
+            format: write.format.as_deref().map(format_from_json),
         }
     }
 }
@@ -1160,9 +1188,27 @@ pub struct SheetListResult {
     pub generation: u64,
 }
 
+/// 列幅・行高 1 件分(M6 H-4、ADR-0055 決定 6)。
+#[derive(uniffi::Record)]
+pub struct SheetLayoutEntry {
+    pub idx: u32,
+    pub size: u16,
+}
+
+fn layout_to_entries(layout: Vec<(u32, u16)>) -> Vec<SheetLayoutEntry> {
+    layout
+        .into_iter()
+        .map(|(idx, size)| SheetLayoutEntry { idx, size })
+        .collect()
+}
+
 #[derive(uniffi::Record)]
 pub struct SheetCellsResult {
     pub cells: Vec<SheetCellInfo>,
+    /// 既定でない列幅(表示対応は H-6)。
+    pub col_widths: Vec<SheetLayoutEntry>,
+    /// 既定でない行高(表示対応は H-6)。
+    pub row_heights: Vec<SheetLayoutEntry>,
     pub offline: bool,
     pub generation: u64,
 }
@@ -1214,6 +1260,7 @@ pub fn sheet_cells(
 ) -> Result<SheetCellsResult, MobileError> {
     let cache = open_cache(&base_dir, &slug)?;
     let cells = cache.sheet_cells(&sheet_id)?;
+    let (col_widths, row_heights) = cache.sheet_layout(&sheet_id)?;
     let session = crate::session_of(&slug);
     let online = session.as_ref().is_some_and(|s| {
         s.control_connected
@@ -1221,6 +1268,8 @@ pub fn sheet_cells(
     });
     Ok(SheetCellsResult {
         cells: cells.into_iter().map(Into::into).collect(),
+        col_widths: layout_to_entries(col_widths),
+        row_heights: layout_to_entries(row_heights),
         offline: !online,
         generation: session
             .as_ref()

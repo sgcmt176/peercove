@@ -214,7 +214,8 @@ fun SheetTab(
                     sheetWrite(
                         slug,
                         id,
-                        listOf(SheetCellWriteArg(state.row, state.col, newValue, state.revision)),
+                        // format = null(書式変更なし。表示・編集対応は M6 H-6、ADR-0055 決定 6)
+                        listOf(SheetCellWriteArg(state.row, state.col, newValue, state.revision, null)),
                     )
                 }
                 if (result.conflicts.isNotEmpty()) {

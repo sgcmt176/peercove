@@ -1397,12 +1397,20 @@ async fn memo_sync(link: Arc<MemberLink>, cache: Arc<crate::memoshare::MemberMem
             return;
         };
         if let Ok(Ok(SharedMemoReply::Sheet {
-            reply: SheetReply::CellsData {
-                sheet_id, cells, ..
-            },
+            reply:
+                SheetReply::CellsData {
+                    sheet_id,
+                    cells,
+                    col_widths,
+                    row_heights,
+                    ..
+                },
         })) = tokio::time::timeout(SYNC_TIMEOUT, rx).await
         {
-            if let Err(e) = cache.sheet_sync_cells(sheet_id, cells).await {
+            if let Err(e) = cache
+                .sheet_sync_cells(sheet_id, cells, col_widths, row_heights)
+                .await
+            {
                 tracing::warn!("共有シートのセル同期に失敗しました: {e:#}");
             }
         }
