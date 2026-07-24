@@ -527,31 +527,38 @@ export type MemoOp =
   | { op: "folder_create"; name: string }
   | { op: "folder_rename"; id: string; name: string }
   | { op: "folder_delete"; id: string }
-  // リマインダー(端末ローカル、ADR-0052 決定 6)。共有メモに対する
-  // 「自分用リマインダー」もここへ(network = 共有メモの configPath)。
+  // リマインダー(端末ローカル、ADR-0052 決定 6 / ADR-0055 決定 3)。共有メモ・
+  // スケジュールの予定に対する「自分用リマインダー」もここへ(network =
+  // 共有メモ・スケジュールの configPath)。1 対象に複数件可(上限 10、
+  // サーバー側で強制)。
   | {
       op: "reminder_set";
       scope: ReminderScope;
       network?: string;
       memo_id: string;
       remind_at: number;
+      /** 「開始 n 分前」設定の表示用メタ。任意日時指定なら省略(ADR-0055 決定 3)。 */
+      offset_minutes?: number;
     }
   | {
       op: "reminder_clear";
       scope: ReminderScope;
       network?: string;
       memo_id: string;
+      /** 省略するとその対象の全件を削除(ADR-0055 決定 3、additive)。 */
+      remind_at?: number;
     }
   | { op: "reminder_list" }
   | { op: "reminder_take_due" };
 
-export type ReminderScope = "personal" | "shared";
+export type ReminderScope = "personal" | "shared" | "schedule";
 
 export interface MemoReminder {
   scope: ReminderScope;
   network?: string;
   memo_id: string;
   remind_at: number;
+  offset_minutes?: number;
 }
 
 export type MemoReply =
@@ -689,6 +696,12 @@ export interface DiffLine {
 // additive な `schedule` variant として相乗りする(crates/peercove-core/
 // src/schedule.rs の serde 表現に一致させる)。 ----
 
+/** 予定の参加メンバー 1 名(Outlook 風、ADR-0055 決定 5)。 */
+export interface ScheduleParticipant {
+  member_id: string;
+  name: string;
+}
+
 export interface ScheduleEvent {
   id: string;
   title: string;
@@ -701,6 +714,8 @@ export interface ScheduleEvent {
   owner_id: string;
   owner_name: string;
   updated_by: string;
+  /** 参加メンバー(ADR-0055 決定 5、additive)。 */
+  participants?: ScheduleParticipant[];
   revision: number;
   created_at: number;
   updated_at: number;
@@ -717,6 +732,7 @@ export type ScheduleOp =
       start_unix_ms: number;
       end_unix_ms?: number;
       all_day?: boolean;
+      participants?: ScheduleParticipant[];
     }
   | {
       op: "update";
@@ -727,6 +743,7 @@ export type ScheduleOp =
       start_unix_ms: number;
       end_unix_ms?: number;
       all_day?: boolean;
+      participants?: ScheduleParticipant[];
     }
   | { op: "delete"; id: string };
 

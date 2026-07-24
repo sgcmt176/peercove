@@ -358,27 +358,58 @@ export async function notifyCommentEvents(tunnel: Tunnel): Promise<void> {
 // ADR-0055 決定 3: メモ側の ⏰ 設定 UI(ReminderButton の呼び出し)は
 // MemoView.tsx / SharedMemoView.tsx から撤去したが、この発火処理自体は
 // あえてそのまま残してある。理由は 2 つ: (1) 既に設定済みのメモリマインダー
-// が引き続き発火しても害はない、(2) スケジュールの予定リマインダー
-// (実装順 H-3)でこの仕組み(ポーリング + OS 通知)を流用する。
+// が引き続き発火しても害はない、(2) スケジュールの予定リマインダー(M6
+// H-3b、ScheduleView.tsx の ScheduleReminderPanel)がこの仕組み(ポーリング +
+// OS 通知)をそのまま流用している(scope "schedule" の分岐は下の
+// resolveReminderTitle を参照)。
 
 const REMINDER_POLL_MS = 30_000;
 let reminderCheckedAt = 0;
 
-/** タイトルはローカル通知への表示であり、ログではない(ADR-0049)。 */
+/** HH:mm(ローカル時刻)。予定リマインダーの通知タイトルに使う。 */
+function formatEventTime(unixMs: number): string {
+  const d = new Date(unixMs);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * リマインダーの通知タイトル(表示専用でログではない、ADR-0049)。
+ * scope "schedule"(ADR-0055 決定 3、M6 H-3b)は予定のタイトルをスケジュール
+ * 一覧から解決する(専用の get op が無いため list から探す — ScheduleView.tsx
+ * と同じやり方)。解決できなければ通知しない(予定が削除済み・ホスト未接続など)。
+ */
 async function resolveReminderTitle(reminder: MemoReminder): Promise<string | null> {
   try {
+    if (reminder.scope === "schedule") {
+      const reply = await api.sharedMemoOp(reminder.network ?? "", {
+        op: "schedule",
+        schedule: { op: "list" },
+      });
+      if (reply.kind !== "schedule" || reply.reply.kind !== "events") return null;
+      const event = reply.reply.events.find((e) => e.id === reminder.memo_id);
+      if (!event) return null;
+      return t.notify.scheduleReminderTitle(
+        event.title || t.schedule.titlePlaceholder,
+        formatEventTime(event.start_unix_ms),
+      );
+    }
     if (reminder.scope === "shared") {
       const reply = await api.sharedMemoOp(reminder.network ?? "", {
         op: "get",
         id: reminder.memo_id,
       });
-      return reply.kind === "memo" ? reply.memo.title || t.memo.untitled : null;
+      return reply.kind === "memo"
+        ? t.notify.reminderTitle(reply.memo.title || t.memo.untitled)
+        : null;
     }
     const reply = await api.memoOp({ op: "get", id: reminder.memo_id });
-    return reply.kind === "memo" ? reply.memo.title || t.memo.untitled : null;
+    return reply.kind === "memo"
+      ? t.notify.reminderTitle(reply.memo.title || t.memo.untitled)
+      : null;
   } catch {
     // 削除済み・ホスト未接続などで解決できない場合は黙って捨てる
-    // (共有メモの削除はローカルで知れないため — ADR-0052 決定 6)
+    // (共有メモ・予定の削除はローカルで知れないため — ADR-0052 決定 6)
     return null;
   }
 }
@@ -400,7 +431,7 @@ export async function notifyReminderEvents(): Promise<void> {
       const title = await resolveReminderTitle(reminder);
       if (title === null) continue;
       try {
-        await invoke("notify", { title: t.notify.reminderTitle(title), body: "" });
+        await invoke("notify", { title, body: "" });
       } catch {
         // 通知の失敗で UI を止めない
       }

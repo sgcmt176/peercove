@@ -325,6 +325,35 @@ async fn check_update() -> Result<update::UpdateInfo, String> {
     update::check().await.map_err(to_message)
 }
 
+/// 日本の祝日一覧(holidays-jp API)を取得する(M6 H-3b、ADR-0055 決定 4)。
+/// UI の CSP(default-src 'self')は外部 fetch を許さないため Rust 側で
+/// 取得する。応答は {"YYYY-MM-DD": "祝日名"} の素通し。失敗は UI 側で
+/// キャッシュ/週末色のみへフォールバックする(致命的ではない)。
+#[tauri::command]
+async fn fetch_holidays() -> Result<std::collections::HashMap<String, String>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get("https://holidays-jp.github.io/api/v1/date.json")
+        .send()
+        .await
+        .map_err(|_| "祝日データを取得できません".to_string())?;
+    if !resp.status().is_success() {
+        return Err("祝日データを取得できません".to_string());
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|_| "祝日データを取得できません".to_string())?;
+    // 応答は高々数 KB だが安全弁として 1MB で打ち切る
+    if bytes.len() > 1024 * 1024 {
+        return Err("祝日データが大きすぎます".to_string());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "祝日データを解釈できません".to_string())
+}
+
 /// トンネルを開始する(ホスト)。設定パスは絶対にしてからデーモンへ渡す。
 #[tauri::command]
 async fn start_host(config_path: String, upnp: bool) -> Result<(), String> {
@@ -1614,6 +1643,7 @@ pub fn run() {
             restore_backup,
             daemon_status,
             check_update,
+            fetch_holidays,
             daemon_logs,
             diagnose_network,
             quality_history,

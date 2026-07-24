@@ -56,6 +56,7 @@ const TABS: SharedHubTab[] = [
         isHost={props.isHost}
         supported={props.supported}
         seq={props.seq}
+        members={props.members}
         focusEventId={props.focusScheduleId}
         onFocusConsumed={props.onScheduleFocusConsumed}
       />

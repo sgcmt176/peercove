@@ -21,6 +21,9 @@
   --danger: #c0392b;
   --error-bg: #fff5f5;
   --error-border: #f0b4b4;
+  /* カレンダーの曜日色(ADR-0055 決定 4): 土曜 = 青系、日曜・祝日 = 赤系 */
+  --weekday-sat: #1d5fd6;
+  --weekday-sun: #c0392b;
   --shadow: 0 1px 2px rgb(16 20 30 / 0.05), 0 1px 6px rgb(16 20 30 / 0.04);
   /* アバターの彩度・明度(色相はメンバーごとに JS が --hue で与える) */
   --avatar-s: 52%;
@@ -49,6 +52,8 @@
     --accent-soft: #26314d;
     --error-bg: #332323;
     --error-border: #6b3d3d;
+    --weekday-sat: #7aa7ff;
+    --weekday-sun: #ff7a7a;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.3);
     --avatar-s: 45%;
     --avatar-l: 55%;
@@ -66,6 +71,8 @@
   --accent-soft: #26314d;
   --error-bg: #332323;
   --error-border: #6b3d3d;
+  --weekday-sat: #7aa7ff;
+  --weekday-sun: #ff7a7a;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.3);
   --avatar-s: 45%;
   --avatar-l: 55%;
@@ -3649,6 +3656,130 @@ button.msg__ref:hover {
   flex-direction: column;
   gap: 2px;
   margin: 6px 0;
+}
+
+/* 曜日色(ADR-0055 決定 4): 曜日ヘッダーとセルの日付数字 */
+.schedule__dow--sat {
+  color: var(--weekday-sat);
+}
+
+.schedule__dow--sun,
+.schedule__dow--holiday {
+  color: var(--weekday-sun);
+}
+
+.schedule__cell-date-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* 祝日バッジ(ADR-0055 決定 4): スペースが無いのでセル内は省略表示 +
+   title 属性のツールチップで全名を出す */
+.schedule__holiday-badge {
+  font-size: 0.65rem;
+  color: var(--weekday-sun);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.schedule__holiday-badge--inline {
+  margin-left: 6px;
+  font-weight: 400;
+}
+
+.schedule__header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.schedule__filter {
+  display: flex;
+  gap: 4px;
+}
+
+.schedule__filter-btn--active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* 参加メンバー(ADR-0055 決定 5) */
+.schedule__participants-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.schedule__participant-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+
+.schedule__participant-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0;
+}
+
+/* 予定のリマインダー(端末ローカル、複数件可、ADR-0055 決定 3) */
+.schedule__reminders {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 10px 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.schedule__reminders-title {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.schedule__reminder-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.schedule__reminder-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.schedule__reminder-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.schedule__reminder-custom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.schedule__reminder-custom input[type="datetime-local"] {
+  font: inherit;
 }
 
 @media (max-width: 900px) {

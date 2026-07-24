@@ -957,6 +957,9 @@ export const ja = {
       `📝 ${from} があなたのメモ「${memoTitle}」にコメントしました ${token}`,
     // メモのリマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)
     reminderTitle: (memoTitle: string) => `⏰ メモのリマインダー: ${memoTitle}`,
+    // 予定のリマインダー(端末ローカル、M6 H-3b、ADR-0055 決定 3)
+    scheduleReminderTitle: (title: string, hm: string) =>
+      `⏰ 予定: ${title}（${hm}）`,
   },
 
   // 個人メモ(M5 F-1、ADR-0049)
@@ -1189,6 +1192,31 @@ export const ja = {
     excerptAllDay: (md: string) => `${md} 終日`,
     excerptTimed: (md: string, hm: string) => `${md} ${hm}`,
     viewerBadge: "閲覧のみ",
+
+    // 参加メンバー(ADR-0055 決定 5)
+    participantsLabel: "参加メンバー",
+    participantsBadgeCount: (n: number) => `👥${n}`,
+    selfBadge: "(自分)",
+    filterAll: "すべて",
+    filterMine: "自分の予定",
+
+    // カレンダーの祝日(ADR-0055 決定 4)
+    holidayBadgeTitle: (name: string) => name,
+
+    // 予定のリマインダー(端末ローカル、複数件可、ADR-0055 決定 3)
+    remindersTitle: "⏰ リマインダー",
+    reminderEmpty: "リマインダーは設定されていません",
+    reminderPreset5: "5分前",
+    reminderPreset15: "15分前",
+    reminderPreset30: "30分前",
+    reminderPreset60: "1時間前",
+    reminderPreset1440: "1日前",
+    reminderPresetGeneric: (n: number) => `${n}分前`,
+    reminderOffsetLabel: (preset: string, hm: string) => `${preset}（${hm}）`,
+    reminderAdd: "追加",
+    reminderLimitReached: "リマインダーは最大10件までです",
+    reminderHelp:
+      "予定の日時を変更しても、設定済みのリマインダーの時刻は追従しません",
   },
 
   // 共有シート(Excel ライク表、M6 G-2、ADR-0054)

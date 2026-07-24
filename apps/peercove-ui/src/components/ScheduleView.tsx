@@ -5,10 +5,19 @@
 // **予定のタイトル・詳細は console に出さないこと。**
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ScheduleEvent, ScheduleOp, api, errorMessage } from "../ipc";
+import {
+  Member,
+  ScheduleEvent,
+  ScheduleOp,
+  ScheduleParticipant,
+  api,
+  errorMessage,
+} from "../ipc";
 import { t } from "../i18n";
 import { Modal } from "./Modal";
 import { sharedRefToken } from "../sharedRefs";
+import { getHolidays, holidayKey } from "../holidays";
+import { ScheduleReminderPanel } from "./ReminderButton";
 
 // ---- 日付ユーティリティ(すべてローカル時刻扱い) ----
 
@@ -90,6 +99,28 @@ function compareEvents(a: ScheduleEvent, b: ScheduleEvent): number {
   return a.start_unix_ms - b.start_unix_ms;
 }
 
+/**
+ * 参加メンバー選択・「自分の予定」判定に使う id(ADR-0055 決定 5)。
+ * ホストは `memberId` が無く(ADR-0047)、スケジュールの `owner_id` 側でも
+ * 空文字 = ホストという規約があるため、そちらに揃える。それ以外で
+ * `memberId` が無い旧形式メンバーは名前ベースの代替 id にする(実装上の
+ * 判断。詳細は作業報告を参照)。
+ */
+function participantKey(member: Member): string {
+  if (member.memberId) return member.memberId;
+  if (member.isHost) return "";
+  return `name:${member.name ?? member.ip}`;
+}
+
+/** 土曜 = 青、日曜・祝日 = 赤(ADR-0055 決定 4)。 */
+function dowColorClass(day: Date, holidayName: string | undefined): string {
+  if (holidayName) return "schedule__dow--holiday";
+  const dow = day.getDay();
+  if (dow === 0) return "schedule__dow--sun";
+  if (dow === 6) return "schedule__dow--sat";
+  return "";
+}
+
 interface DialogState {
   mode: "create" | "edit";
   id?: string;
@@ -99,6 +130,7 @@ interface DialogState {
   allDay: boolean;
   startInput: string;
   endInput: string;
+  participantIds: string[];
 }
 
 export function ScheduleView({
@@ -106,6 +138,7 @@ export function ScheduleView({
   isHost,
   supported,
   seq,
+  members,
   focusEventId,
   onFocusConsumed,
 }: {
@@ -115,6 +148,8 @@ export function ScheduleView({
   supported: boolean;
   /** 変更世代。進んだら再取得する。 */
   seq: number;
+  /** 参加メンバー選択・「自分の予定」判定に使う(ADR-0055 決定 5)。 */
+  members: Member[];
   /** チャットの `@schedule:id` カード(ADR-0053)から開く予定。 */
   focusEventId?: string | null;
   onFocusConsumed?: () => void;
@@ -133,6 +168,24 @@ export function ScheduleView({
   );
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const [saving, setSaving] = useState(false);
+  const [holidays, setHolidays] = useState<Record<string, string>>({});
+  const [filterMine, setFilterMine] = useState(false);
+
+  useEffect(() => {
+    void getHolidays().then(setHolidays);
+  }, []);
+
+  const self = useMemo(() => members.find((m) => m.isSelf) ?? null, [members]);
+  const selfId = self ? participantKey(self) : null;
+  const isMine = useCallback(
+    (event: ScheduleEvent) => {
+      if (!self || selfId === null) return false;
+      if (event.owner_id === selfId) return true;
+      if (self.isHost && event.owner_id === "") return true;
+      return (event.participants ?? []).some((p) => p.member_id === selfId);
+    },
+    [self, selfId],
+  );
 
   const scheduleOp = useCallback(
     async (op: ScheduleOp) => {
@@ -188,18 +241,25 @@ export function ScheduleView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusEventId, loaded]);
 
+  // 「自分の予定」フィルタ(ADR-0055 決定 5)。カレンダー・日別リストの
+  // 両方に効かせる
+  const visibleEvents = useMemo(
+    () => (filterMine ? events.filter(isMine) : events),
+    [events, filterMine, isMine],
+  );
+
   const eventsForDay = useCallback(
     (day: Date) => {
       const dayStart = startOfDay(day).getTime();
       const dayEnd = dayStart + 24 * 60 * 60 * 1000 - 1;
-      return events
+      return visibleEvents
         .filter((event) => {
           const end = event.end_unix_ms ?? event.start_unix_ms;
           return event.start_unix_ms <= dayEnd && end >= dayStart;
         })
         .sort(compareEvents);
     },
-    [events],
+    [visibleEvents],
   );
 
   const gridDays = useMemo(() => {
@@ -224,6 +284,7 @@ export function ScheduleView({
         new Date(day.getFullYear(), day.getMonth(), day.getDate(), 9, 0).getTime(),
       ),
       endInput: "",
+      participantIds: [],
     });
   };
 
@@ -244,6 +305,17 @@ export function ScheduleView({
           ? dateInputValue(event.end_unix_ms)
           : dateTimeInputValue(event.end_unix_ms)
         : "",
+      participantIds: (event.participants ?? []).map((p) => p.member_id),
+    });
+  };
+
+  const toggleParticipant = (id: string, checked: boolean) => {
+    setDialog((prev) => {
+      if (!prev) return prev;
+      const next = checked
+        ? [...prev.participantIds, id]
+        : prev.participantIds.filter((pid) => pid !== id);
+      return { ...prev, participantIds: next };
     });
   };
 
@@ -285,6 +357,12 @@ export function ScheduleView({
         ? endOfDayMs(dialog.endInput)
         : new Date(dialog.endInput).getTime()
       : undefined;
+    const participants: ScheduleParticipant[] = dialog.participantIds
+      .map((id) => {
+        const member = members.find((m) => participantKey(m) === id);
+        return member ? { member_id: id, name: member.name ?? member.ip } : null;
+      })
+      .filter((p): p is ScheduleParticipant => p !== null);
     setSaving(true);
     try {
       const reply =
@@ -296,6 +374,7 @@ export function ScheduleView({
               start_unix_ms,
               end_unix_ms,
               all_day: dialog.allDay,
+              participants,
             })
           : await scheduleOp({
               op: "update",
@@ -306,6 +385,7 @@ export function ScheduleView({
               start_unix_ms,
               end_unix_ms,
               all_day: dialog.allDay,
+              participants,
             });
       if (reply.kind === "event") {
         setDialog(null);
@@ -319,7 +399,7 @@ export function ScheduleView({
     } finally {
       setSaving(false);
     }
-  }, [dialog, scheduleOp, refresh, onSaveErr]);
+  }, [dialog, scheduleOp, refresh, onSaveErr, members]);
 
   const deleteEvent = useCallback(
     async (event: ScheduleEvent) => {
@@ -375,16 +455,42 @@ export function ScheduleView({
               ▶
             </button>
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              const today = startOfDay(new Date());
-              setMonth(startOfMonth(today));
-              setSelectedDay(today);
-            }}
-          >
-            {t.schedule.today}
-          </button>
+          <div className="schedule__header-right">
+            <button
+              type="button"
+              onClick={() => {
+                const today = startOfDay(new Date());
+                setMonth(startOfMonth(today));
+                setSelectedDay(today);
+              }}
+            >
+              {t.schedule.today}
+            </button>
+            <div className="schedule__filter" role="group">
+              <button
+                type="button"
+                className={
+                  filterMine
+                    ? "button--ghost"
+                    : "button--ghost schedule__filter-btn--active"
+                }
+                onClick={() => setFilterMine(false)}
+              >
+                {t.schedule.filterAll}
+              </button>
+              <button
+                type="button"
+                className={
+                  filterMine
+                    ? "button--ghost schedule__filter-btn--active"
+                    : "button--ghost"
+                }
+                onClick={() => setFilterMine(true)}
+              >
+                {t.schedule.filterMine}
+              </button>
+            </div>
+          </div>
         </div>
         {readOnlyReason && (
           <p className="schedule__notice small">{readOnlyReason}</p>
@@ -392,7 +498,12 @@ export function ScheduleView({
         {notice && <p className="schedule__notice small">{notice}</p>}
         <div className="schedule__weekdays">
           {t.schedule.weekdays.map((w, i) => (
-            <span key={i}>{w}</span>
+            <span
+              key={i}
+              className={i === 0 ? "schedule__dow--sun" : i === 6 ? "schedule__dow--sat" : undefined}
+            >
+              {w}
+            </span>
           ))}
         </div>
         <div className="schedule__grid">
@@ -401,6 +512,7 @@ export function ScheduleView({
             const today = isSameDay(day, new Date());
             const active = selectedDay !== null && isSameDay(day, selectedDay);
             const dayEvents = eventsForDay(day);
+            const holidayName = holidays[holidayKey(day)];
             return (
               <button
                 type="button"
@@ -415,13 +527,31 @@ export function ScheduleView({
                   .join(" ")}
                 onClick={() => setSelectedDay(day)}
               >
-                <span className="schedule__cell-date">{day.getDate()}</span>
+                <span className="schedule__cell-date-row">
+                  <span
+                    className={
+                      "schedule__cell-date " + dowColorClass(day, holidayName)
+                    }
+                  >
+                    {day.getDate()}
+                  </span>
+                  {holidayName && (
+                    <span
+                      className="schedule__holiday-badge"
+                      title={t.schedule.holidayBadgeTitle(holidayName)}
+                    >
+                      {holidayName}
+                    </span>
+                  )}
+                </span>
                 <span className="schedule__cell-events">
                   {dayEvents.slice(0, 3).map((event) => (
                     <span key={event.id} className="schedule__event-chip">
                       {event.all_day
                         ? event.title
                         : `${formatTime(event.start_unix_ms)} ${event.title}`}
+                      {(event.participants?.length ?? 0) > 0 &&
+                        ` ${t.schedule.participantsBadgeCount(event.participants!.length)}`}
                     </span>
                   ))}
                   {dayEvents.length > 3 && (
@@ -440,6 +570,11 @@ export function ScheduleView({
         <div className="schedule__day-head">
           <span className="schedule__day-title">
             {selectedDay ? dayLabel(selectedDay) : ""}
+            {selectedDay && holidays[holidayKey(selectedDay)] && (
+              <span className="schedule__holiday-badge schedule__holiday-badge--inline">
+                {holidays[holidayKey(selectedDay)]}
+              </span>
+            )}
           </span>
           <button
             type="button"
@@ -476,6 +611,13 @@ export function ScheduleView({
                   <span className="schedule__day-item-title">
                     {event.title}
                   </span>
+                  {(event.participants?.length ?? 0) > 0 && (
+                    <span className="muted small">
+                      {t.schedule.participantsBadgeCount(
+                        event.participants!.length,
+                      )}
+                    </span>
+                  )}
                   {!event.can_edit && (
                     <span className="tag">{t.schedule.viewerBadge}</span>
                   )}
@@ -545,6 +687,33 @@ export function ScheduleView({
               }
             />
           </div>
+          <div className="field">
+            <label>{t.schedule.participantsLabel}</label>
+            <div className="schedule__participants-picker">
+              {members.map((member) => {
+                const id = participantKey(member);
+                const checked = dialog.participantIds.includes(id);
+                return (
+                  <label key={id} className="schedule__participant-option">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(event) =>
+                        toggleParticipant(id, event.target.checked)
+                      }
+                    />
+                    {member.name ?? member.ip}
+                    {member.isSelf && (
+                      <span className="muted small">
+                        {" "}
+                        {t.schedule.selfBadge}
+                      </span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
           <div className="modal__actions">
             <button
               type="button"
@@ -589,6 +758,15 @@ export function ScheduleView({
           {(selectedEvent.note ?? "").trim() !== "" && (
             <p className="schedule__detail-note">{selectedEvent.note}</p>
           )}
+          {(selectedEvent.participants?.length ?? 0) > 0 && (
+            <div className="schedule__participant-badges">
+              {selectedEvent.participants!.map((p) => (
+                <span key={p.member_id} className="tag">
+                  {p.name}
+                </span>
+              ))}
+            </div>
+          )}
           <div className="schedule__detail-meta">
             <span className="muted small">
               {t.schedule.ownerLabel(
@@ -601,6 +779,12 @@ export function ScheduleView({
               </span>
             )}
           </div>
+          <ScheduleReminderPanel
+            network={configPath}
+            eventId={selectedEvent.id}
+            startUnixMs={selectedEvent.start_unix_ms}
+            onNotice={setNotice}
+          />
           <div className="modal__actions">
             <button
               type="button"

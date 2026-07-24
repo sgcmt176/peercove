@@ -28,10 +28,11 @@ import {
 } from "../ipc";
 import { t } from "../i18n";
 import { Modal } from "./Modal";
-// ReminderButton はここでは使わない(ADR-0055 決定 3: メモのリマインダー UI
-// は撤去し、スケジュールの予定リマインダー(H-3)へ移設する)。
-// ReminderButton.tsx 自体と notify.ts の発火処理・ストアはそちらで流用する
-// ため、あえて残してある。
+// ⏰ リマインダーはここでは使わない(ADR-0055 決定 3: メモのリマインダー
+// UI は撤去し、スケジュールの予定リマインダーへ移設した)。ReminderButton.tsx
+// は ScheduleReminderPanel(複数件対応)に置き換わり、ScheduleView.tsx の
+// 予定詳細から使われている(M6 H-3b)。notify.ts の発火処理・ストアも
+// そのまま流用。
 import {
   useResolvedWikiLinks,
   wikiLinkify,
@@ -721,7 +722,7 @@ export function SharedMemoView({
                 ⧉
               </button>
               {/* ⏰ リマインダーはここから撤去(ADR-0055 決定 3)。スケジュールの
-                  予定リマインダー(H-3)で ReminderButton / notify.ts を流用する。 */}
+                  予定リマインダー(M6 H-3b、ScheduleReminderPanel)へ移設済み。 */}
               <button
                 type="button"
                 className="button--icon"
