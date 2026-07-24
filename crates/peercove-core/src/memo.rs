@@ -18,6 +18,12 @@ pub const MAX_TITLE_CHARS: usize = 200;
 /// ゴミ箱の保持日数(要件 §13)。超えた分は開いたときに完全削除される。
 pub const TRASH_RETENTION_DAYS: u64 = 30;
 
+/// 共有メモのコメント本文の上限(バイト、ADR-0052 決定 4)。
+pub const MAX_COMMENT_BODY_BYTES: usize = 4 * 1024;
+
+/// 1 メモあたりのコメント件数上限(ADR-0052 決定 4)。
+pub const MAX_COMMENTS_PER_MEMO: u32 = 500;
+
 /// 一覧の抜粋(本文先頭)の最大文字数。
 pub const EXCERPT_CHARS: usize = 120;
 
@@ -322,6 +328,9 @@ pub struct SharedMemoSummary {
     pub checklist_done: u32,
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub checklist_total: u32,
+    /// コメント件数(ADR-0052 決定 4)。一覧の 💬 バッジ用。
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub comment_count: u32,
 }
 
 /// 共有メモ 1 件の全体。`everyone` / `members` は can_manage のときだけ載る。
@@ -358,6 +367,25 @@ pub struct SharedMemoDetail {
     /// グループ単位の権限(ADR-0051)。can_manage のときだけ載る。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<SharedGroupPerm>,
+    /// コメント件数(ADR-0052 決定 4)。
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub comment_count: u32,
+}
+
+/// 共有メモのコメント 1 件(ADR-0052 決定 4)。単層(返信ツリーなし)。
+/// **本文はメモ本文と同格の秘匿対象**(ログ・標準出力へ出さない)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMemoComment {
+    pub comment_id: String,
+    pub memo_id: String,
+    /// 投稿者の member_id(ホスト = 空文字)。
+    #[serde(default)]
+    pub author_id: String,
+    /// 投稿者の表示名(スナップショット)。
+    #[serde(default)]
+    pub author_name: String,
+    pub body: String,
+    pub created_at_unix_ms: u64,
 }
 
 /// 共有メモへの操作。メンバーは `MemoReq` に載せてホストへ送り、
@@ -476,6 +504,23 @@ pub enum SharedMemoOp {
     SetLimits {
         limits: SharedMemoLimits,
     },
+    /// コメント一覧(古い順。閲覧権限があれば可)。応答は
+    /// [`SharedMemoReply::Comments`](ADR-0052 決定 4)。メンバー経路では
+    /// 常時オンライン専用(キャッシュに保存しない)。
+    CommentList {
+        id: String,
+    },
+    /// コメント追加(閲覧権限があれば可。本文上限・件数上限あり)。応答は
+    /// 追加したコメント 1 件の [`SharedMemoReply::Comment`]。
+    CommentAdd {
+        id: String,
+        body: String,
+    },
+    /// コメント削除(本人・メモ所有者・ホスト管理者)。
+    CommentDelete {
+        id: String,
+        comment_id: String,
+    },
 }
 
 /// [`SharedMemoOp`] への応答。
@@ -513,6 +558,14 @@ pub enum SharedMemoReply {
     /// GetLimits / SetLimits への応答。
     Limits {
         limits: SharedMemoLimits,
+    },
+    /// CommentList への応答(古い順、全件)。
+    Comments {
+        comments: Vec<SharedMemoComment>,
+    },
+    /// CommentAdd への応答(追加した 1 件)。
+    Comment {
+        comment: SharedMemoComment,
     },
     Done,
     /// 拒否・競合など(コントロールチャネル経由の応答用)。

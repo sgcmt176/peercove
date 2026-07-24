@@ -12,6 +12,7 @@ import {
   PermGroup,
   SharedGroupPerm,
   SharedMemberPerm,
+  SharedMemoComment,
   SharedMemoDetail,
   SharedMemoHistoryDetail,
   SharedMemoHistoryEntry,
@@ -92,6 +93,14 @@ export function SharedMemoView({
   const op = useCallback(
     (op: SharedMemoOp) => api.sharedMemoOp(configPath, op),
     [configPath],
+  );
+
+  // コメントの自分本人判定(ADR-0052 決定 4)。所有者・ホストは can_manage で
+  // 別途どのコメントでも削除できるため、ここは「一般の閲覧者が自分の
+  // コメントを削除できるか」の判定にだけ使う。
+  const myMemberId = useMemo(
+    () => members.find((m) => m.isSelf)?.memberId ?? null,
+    [members],
   );
 
   const refresh = useCallback(async () => {
@@ -537,6 +546,11 @@ export function SharedMemoView({
                       {memo.checklist_done ?? 0}/{memo.checklist_total}
                     </>
                   )}
+                  {(memo.comment_count ?? 0) > 0 && (
+                    <span className="tag">
+                      {t.sharedMemo.commentBadge(memo.comment_count ?? 0)}
+                    </span>
+                  )}
                   {!memo.can_edit && (
                     <span className="tag">{t.sharedMemo.viewerBadge}</span>
                   )}
@@ -844,12 +858,209 @@ export function SharedMemoView({
                     </ul>
                   </details>
                 )}
+
+                {!editing && (
+                  <CommentsPanel
+                    key={selected.id}
+                    memoId={selected.id}
+                    op={op}
+                    seq={seq}
+                    canManage={Boolean(selected.can_manage)}
+                    myMemberId={myMemberId}
+                    members={members}
+                    onNotice={setNotice}
+                  />
+                )}
               </>
             )}
           </div>
         )}
       </section>
     </div>
+  );
+}
+
+/**
+ * 共有メモのコメント欄(M5 F-5 Stage 3、ADR-0052 決定 4・5)。閲覧モードの
+ * 本文下に表示する。閲覧権限があれば追加・閲覧でき、削除は本人・所有者・
+ * ホストだけ(サーバー側でも検査されるため、ここでのボタン表示判定は
+ * 見た目だけの近似でよい)。
+ *
+ * メンション補助: 入力中に `@` に続く文字列でメンバー名を絞り込むだけの
+ * 簡易サジェスト(カーソル追従のポップアップは持たない)。
+ */
+function CommentsPanel({
+  memoId,
+  op,
+  seq,
+  canManage,
+  myMemberId,
+  members,
+  onNotice,
+}: {
+  memoId: string;
+  op: (op: SharedMemoOp) => Promise<SharedMemoReply>;
+  seq: number;
+  canManage: boolean;
+  myMemberId: string | null;
+  members: Member[];
+  onNotice: (message: string) => void;
+}) {
+  const [comments, setComments] = useState<SharedMemoComment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const reply = await op({ op: "comment_list", id: memoId });
+      if (reply.kind === "comments") {
+        setComments(reply.comments);
+        setLoadError(null);
+      }
+    } catch (error) {
+      setLoadError(errorMessage(error));
+    } finally {
+      setLoading(false);
+    }
+  }, [op, memoId]);
+
+  useEffect(() => {
+    setLoading(true);
+    void load();
+    // seq(共有メモの変更世代)が進むたびに再取得(自分・他人のコメント
+    // 追加/削除のどちらでも反映する)
+  }, [load, seq]);
+
+  const handleDraftChange = (target: HTMLTextAreaElement) => {
+    const value = target.value;
+    setDraft(value);
+    const caret = target.selectionStart ?? value.length;
+    const before = value.slice(0, caret);
+    const match = /(?:^|\s)@([^\s@]*)$/.exec(before);
+    setMentionQuery(match ? match[1] : null);
+  };
+
+  const mentionCandidates = useMemo(() => {
+    if (mentionQuery === null) return [];
+    const query = mentionQuery.trim();
+    return members
+      .filter((m) => !m.isSelf && (m.name ?? "").length > 0)
+      .filter((m) => query === "" || (m.name ?? "").includes(query))
+      .slice(0, 6);
+  }, [mentionQuery, members]);
+
+  const insertMention = (name: string) => {
+    const value = draft;
+    const caret = textareaRef.current?.selectionStart ?? value.length;
+    const before = value.slice(0, caret);
+    const after = value.slice(caret);
+    const replaced = before.replace(/(?:^|\s)@([^\s@]*)$/, (whole) =>
+      whole.startsWith(" ") ? ` @${name} ` : `@${name} `,
+    );
+    setDraft(replaced + after);
+    setMentionQuery(null);
+    textareaRef.current?.focus();
+  };
+
+  const send = async () => {
+    const body = draft.trim();
+    if (body === "" || sending) return;
+    setSending(true);
+    try {
+      const reply = await op({ op: "comment_add", id: memoId, body });
+      if (reply.kind === "comment") {
+        setComments((prev) => [...prev, reply.comment]);
+        setDraft("");
+        setMentionQuery(null);
+      }
+    } catch (error) {
+      onNotice(errorMessage(error));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const remove = async (commentId: string) => {
+    if (!window.confirm(t.sharedMemo.commentDeleteConfirm)) return;
+    try {
+      await op({ op: "comment_delete", id: memoId, comment_id: commentId });
+      setComments((prev) => prev.filter((c) => c.comment_id !== commentId));
+    } catch (error) {
+      onNotice(errorMessage(error));
+    }
+  };
+
+  return (
+    <details className="memo__comments" open>
+      <summary>{t.sharedMemo.commentsTitle(comments.length)}</summary>
+      {loadError && <p className="memo__notice small">{loadError}</p>}
+      {!loading && comments.length === 0 && !loadError && (
+        <p className="muted small">{t.sharedMemo.commentsEmpty}</p>
+      )}
+      <ul className="memo__comments-list">
+        {comments.map((comment) => (
+          <li key={comment.comment_id} className="memo__comment">
+            <div className="memo__comment-meta">
+              <span className="memo__comment-author">
+                {comment.author_name || t.sharedMemo.hostName}
+              </span>
+              <span className="muted small">
+                {formatDate(comment.created_at_unix_ms)}
+              </span>
+              {(canManage || comment.author_id === myMemberId) && (
+                <button
+                  type="button"
+                  className="memo__comment-delete"
+                  title={t.sharedMemo.commentDelete}
+                  onClick={() => void remove(comment.comment_id)}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+            <p className="memo__comment-body">{comment.body}</p>
+          </li>
+        ))}
+      </ul>
+      <div className="memo__comment-input">
+        <textarea
+          ref={textareaRef}
+          value={draft}
+          placeholder={t.sharedMemo.commentPlaceholder}
+          rows={2}
+          onChange={(event) => handleDraftChange(event.target)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              void send();
+            }
+          }}
+        />
+        {mentionCandidates.length > 0 && (
+          <ul className="memo__mention-suggest">
+            {mentionCandidates.map((member) => (
+              <li key={member.publicKey}>
+                <button type="button" onClick={() => insertMention(member.name ?? "")}>
+                  {member.name}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <button
+          type="button"
+          className="memo__comment-send"
+          disabled={draft.trim() === "" || sending}
+          onClick={() => void send()}
+        >
+          {t.sharedMemo.commentSend}
+        </button>
+      </div>
+    </details>
   );
 }
 

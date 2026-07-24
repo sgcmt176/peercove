@@ -377,8 +377,8 @@ pub fn memo_export_name(title: String) -> String {
 // はすべてホスト正本で判定される。
 
 use peercove_core::memo::{
-    DiffLine, DiffLineKind, SharedMemoDetail, SharedMemoHistoryDetail, SharedMemoHistoryEntry,
-    SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
+    DiffLine, DiffLineKind, SharedMemoComment, SharedMemoDetail, SharedMemoHistoryDetail,
+    SharedMemoHistoryEntry, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
 };
 
 #[derive(uniffi::Record)]
@@ -397,6 +397,8 @@ pub struct SharedMemoSummaryInfo {
     pub locked_by: Option<String>,
     pub checklist_done: u32,
     pub checklist_total: u32,
+    /// コメント件数(ADR-0052 決定 4)。一覧の 💬 バッジ用。
+    pub comment_count: u32,
 }
 
 impl From<SharedMemoSummary> for SharedMemoSummaryInfo {
@@ -416,6 +418,7 @@ impl From<SharedMemoSummary> for SharedMemoSummaryInfo {
             locked_by: memo.locked_by,
             checklist_done: memo.checklist_done,
             checklist_total: memo.checklist_total,
+            comment_count: memo.comment_count,
         }
     }
 }
@@ -434,6 +437,8 @@ pub struct SharedMemoDetailInfo {
     pub can_edit: bool,
     pub can_manage: bool,
     pub locked_by: Option<String>,
+    /// コメント件数(ADR-0052 決定 4)。
+    pub comment_count: u32,
 }
 
 impl From<SharedMemoDetail> for SharedMemoDetailInfo {
@@ -451,6 +456,31 @@ impl From<SharedMemoDetail> for SharedMemoDetailInfo {
             can_edit: memo.can_edit,
             can_manage: memo.can_manage,
             locked_by: memo.locked_by,
+            comment_count: memo.comment_count,
+        }
+    }
+}
+
+/// 共有メモのコメント 1 件(ADR-0052 決定 4)。**本文はメモ本文と同格の
+/// 秘匿対象**(ログへ出さない)。Android は常にメンバー役割(ADR-0039)なので
+/// `can_manage`(= オーナー判定)と組み合わせて「自分のメモ」を判定できる。
+#[derive(uniffi::Record)]
+pub struct SharedMemoCommentInfo {
+    pub comment_id: String,
+    pub memo_id: String,
+    pub author_name: String,
+    pub body: String,
+    pub created_at_unix_ms: u64,
+}
+
+impl From<SharedMemoComment> for SharedMemoCommentInfo {
+    fn from(comment: SharedMemoComment) -> Self {
+        Self {
+            comment_id: comment.comment_id,
+            memo_id: comment.memo_id,
+            author_name: comment.author_name,
+            body: comment.body,
+            created_at_unix_ms: comment.created_at_unix_ms,
         }
     }
 }
@@ -774,6 +804,59 @@ pub fn shared_memo_history_restore(
 #[uniffi::export]
 pub fn shared_memo_save_version(slug: String, memo_id: String) -> Result<(), MobileError> {
     session_request(&slug, SharedMemoOp::SaveVersion { id: memo_id }).map(|_| ())
+}
+
+// ---- コメント(M5 F-5、ADR-0052 決定 4)-------------------------------------
+//
+// 閲覧・追加・削除はすべてホスト正本で権限判定されるため、常時オンライン
+// 専用(session_request)。キャッシュには保存しない(一覧は都度取得)。
+
+/// コメント一覧(古い順、全件)。
+#[uniffi::export]
+pub fn shared_memo_comment_list(
+    slug: String,
+    memo_id: String,
+) -> Result<Vec<SharedMemoCommentInfo>, MobileError> {
+    match session_request(&slug, SharedMemoOp::CommentList { id: memo_id })? {
+        SharedMemoReply::Comments { comments } => {
+            Ok(comments.into_iter().map(Into::into).collect())
+        }
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// コメント追加(本文上限 4KiB・1 メモ 500 件)。
+#[uniffi::export]
+pub fn shared_memo_comment_add(
+    slug: String,
+    memo_id: String,
+    body: String,
+) -> Result<SharedMemoCommentInfo, MobileError> {
+    match session_request(&slug, SharedMemoOp::CommentAdd { id: memo_id, body })? {
+        SharedMemoReply::Comment { comment } => Ok(comment.into()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// コメント削除(本人・メモ所有者・ホスト管理者)。
+#[uniffi::export]
+pub fn shared_memo_comment_delete(
+    slug: String,
+    memo_id: String,
+    comment_id: String,
+) -> Result<(), MobileError> {
+    session_request(
+        &slug,
+        SharedMemoOp::CommentDelete {
+            id: memo_id,
+            comment_id,
+        },
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

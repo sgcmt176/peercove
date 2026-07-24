@@ -342,4 +342,14 @@
     <string name="shared_memo_copied_to_personal">個人メモへコピーしました(メモタブで開けます)</string>
     <string name="shared_memo_save_version">版を保存</string>
     <string name="shared_memo_save_version_done">版を保存しました</string>
+
+    <!-- コメント・メンション(M5 F-5 Stage 3、ADR-0052 決定 4・5) -->
+    <string name="shared_memo_comments_title">コメント (%1$d)</string>
+    <string name="shared_memo_comments_empty">コメントはまだありません</string>
+    <string name="shared_memo_comment_hint">コメントを入力(@名前 でメンション)</string>
+    <string name="shared_memo_comment_send">送信</string>
+    <string name="shared_memo_comment_delete_confirm">このコメントを削除しますか?(元に戻せません)</string>
+    <string name="shared_memo_comment_badge">💬%1$d</string>
+    <string name="notif_memo_comment_title">%1$s が「%2$s」にコメントしました</string>
+    <string name="notif_memo_mention_title">%1$s があなたをメンションしました(「%2$s」)</string>
 </resources>

@@ -2884,6 +2884,109 @@ select {
   background: var(--accent-soft);
 }
 
+/* コメント欄(M5 F-5 Stage 3、ADR-0052 決定 4)。 */
+.memo__comments {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  font-size: 0.9rem;
+}
+
+.memo__comments summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.memo__comments-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memo__comment {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+.memo__comment-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memo__comment-author {
+  font-weight: 600;
+}
+
+.memo__comment-delete {
+  margin-left: auto;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.memo__comment-delete:hover {
+  color: var(--danger);
+}
+
+.memo__comment-body {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.memo__comment-input {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.memo__comment-input textarea {
+  resize: vertical;
+  font: inherit;
+}
+
+.memo__comment-send {
+  align-self: flex-end;
+}
+
+.memo__mention-suggest {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  z-index: 5;
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  max-width: 220px;
+}
+
+.memo__mention-suggest button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 4px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.memo__mention-suggest button:hover {
+  background: var(--accent-soft);
+}
+
 /* Markdown プレビューの整形(メモ)。チャットと違い文書向けの余白 */
 .markdown h1,
 .markdown h2,

@@ -571,6 +571,42 @@ impl MemoService {
                     .await?;
                 Ok(SharedMemoReply::Done)
             }
+            SharedMemoOp::CommentList { id } => {
+                let comments = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.comment_list(&actor, &id)
+                    })
+                    .await?;
+                Ok(SharedMemoReply::Comments { comments })
+            }
+            SharedMemoOp::CommentAdd { id, body } => {
+                let comment = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let id = id.clone();
+                        move |store| store.comment_add(&actor, &id, &body)
+                    })
+                    .await?;
+                // comment_count が変わるので既存の Changed 配信に相乗りする
+                // (ADR-0052 決定 4: 新しいイベント種別は追加しない)。受信側は
+                // detail の comment_count の増分を見てコメントを取り直し、
+                // メンション・自メモ宛の通知を判定する
+                self.broadcast_changed(id);
+                self.bump();
+                Ok(SharedMemoReply::Comment { comment })
+            }
+            SharedMemoOp::CommentDelete { id, comment_id } => {
+                self.blocking({
+                    let actor = actor.clone();
+                    let id = id.clone();
+                    move |store| store.comment_delete(&actor, &id, &comment_id)
+                })
+                .await?;
+                self.broadcast_changed(id);
+                self.bump();
+                Ok(SharedMemoReply::Done)
+            }
         }
     }
 

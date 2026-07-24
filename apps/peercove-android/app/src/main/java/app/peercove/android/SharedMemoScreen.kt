@@ -23,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Save
@@ -32,6 +33,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -64,14 +66,19 @@ import java.util.Date
 import java.util.Locale
 import uniffi.peercove_mobile.DiffLineInfo
 import uniffi.peercove_mobile.MobileException
+import uniffi.peercove_mobile.SharedMemoCommentInfo
 import uniffi.peercove_mobile.SharedMemoDetailInfo
 import uniffi.peercove_mobile.SharedMemoHistoryDetailInfo
 import uniffi.peercove_mobile.SharedMemoHistoryEntryInfo
 import uniffi.peercove_mobile.SharedMemoListResult
 import uniffi.peercove_mobile.SharedMemoSummaryInfo
 import uniffi.peercove_mobile.memoCreate
+import uniffi.peercove_mobile.members
 import uniffi.peercove_mobile.sharedMemoAcquire
 import uniffi.peercove_mobile.sharedMemoBacklinks
+import uniffi.peercove_mobile.sharedMemoCommentAdd
+import uniffi.peercove_mobile.sharedMemoCommentDelete
+import uniffi.peercove_mobile.sharedMemoCommentList
 import uniffi.peercove_mobile.sharedMemoCreate
 import uniffi.peercove_mobile.sharedMemoGeneration
 import uniffi.peercove_mobile.sharedMemoGet
@@ -301,6 +308,16 @@ fun SharedMemoTab(slug: String, onNotice: (String) -> Unit) {
                                             R.string.memo_checklist,
                                             memo.checklistDone.toInt(),
                                             memo.checklistTotal.toInt(),
+                                        ),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (memo.commentCount > 0u) {
+                                    Text(
+                                        stringResource(
+                                            R.string.shared_memo_comment_badge,
+                                            memo.commentCount.toInt(),
                                         ),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -662,9 +679,188 @@ private fun SharedMemoEditor(
                     titleOf = { it.title },
                     onOpen = { targetId -> stopEditing { onOpenMemo(targetId) } },
                 )
+                CommentsSection(
+                    slug = slug,
+                    memoId = id,
+                    commentCount = detail?.commentCount?.toInt() ?: 0,
+                    canManage = detail?.canManage == true,
+                    onNotice = onNotice,
+                )
             }
         }
         Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+/**
+ * コメント欄(M5 F-5 Stage 3、ADR-0052 決定 4・5)。閲覧・追加は閲覧権限が
+ * あれば可、削除は本人・所有者・ホストだけ(サーバー側でも検査される。
+ * ここでの削除ボタン表示は本人判定を表示名で近似する — Android は
+ * 常にメンバー役割なので、所有者・ホストの判定は `canManage` で正確に行える。
+ * ADR-0039 の「頭脳は Rust」に反しない範囲の UI 表示上の簡略化)。
+ * `commentCount` が変わるたびに一覧を取り直す(親の世代ポーリングに相乗り)。
+ */
+@Composable
+private fun CommentsSection(
+    slug: String,
+    memoId: String,
+    commentCount: Int,
+    canManage: Boolean,
+    onNotice: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var comments by remember(memoId) { mutableStateOf<List<SharedMemoCommentInfo>>(emptyList()) }
+    var draft by remember(memoId) { mutableStateOf("") }
+    var sending by remember { mutableStateOf(false) }
+    var myName by remember { mutableStateOf("") }
+    var memberNames by remember { mutableStateOf<List<String>>(emptyList()) }
+    var pendingDelete by remember { mutableStateOf<String?>(null) }
+    val hostLabel = stringResource(R.string.shared_memo_host)
+
+    LaunchedEffect(slug) {
+        try {
+            val list = withContext(Dispatchers.IO) { members(slug) }
+            myName = list.firstOrNull { it.isSelf }?.name ?: ""
+            memberNames = list.filter { !it.isSelf && it.name.isNotEmpty() }.map { it.name }
+        } catch (e: MobileException) {
+            // メンション候補が引けなくても入力自体は妨げない
+        }
+    }
+
+    LaunchedEffect(memoId, commentCount) {
+        comments = try {
+            withContext(Dispatchers.IO) { sharedMemoCommentList(slug, memoId) }
+        } catch (e: MobileException) {
+            onNotice(e.message ?: "")
+            emptyList()
+        }
+    }
+
+    val toDelete = pendingDelete
+    if (toDelete != null) {
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text(stringResource(R.string.shared_memo_comment_delete_confirm)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDelete = null
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                sharedMemoCommentDelete(slug, memoId, toDelete)
+                            }
+                            comments = comments.filter { it.commentId != toDelete }
+                        } catch (e: MobileException) {
+                            onNotice(e.message ?: "")
+                        }
+                    }
+                }) { Text(stringResource(R.string.action_remove)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
+    }
+
+    Spacer(modifier = Modifier.height(8.dp))
+    HorizontalDivider()
+    Spacer(modifier = Modifier.height(4.dp))
+    Text(
+        stringResource(R.string.shared_memo_comments_title, comments.size),
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    if (comments.isEmpty()) {
+        Text(
+            stringResource(R.string.shared_memo_comments_empty),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(vertical = 4.dp),
+        )
+    }
+    comments.forEach { comment ->
+        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    comment.authorName.ifEmpty { hostLabel },
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    sharedDateFmt.format(Date(comment.createdAtUnixMs.toLong())),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (canManage || (myName.isNotEmpty() && comment.authorName == myName)) {
+                    IconButton(
+                        onClick = { pendingDelete = comment.commentId },
+                        modifier = Modifier.height(24.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = stringResource(R.string.action_remove),
+                        )
+                    }
+                }
+            }
+            Text(comment.body, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+    Spacer(modifier = Modifier.height(4.dp))
+    val mentionMatches = remember(draft, memberNames) {
+        val at = draft.lastIndexOf('@')
+        if (at < 0 || (at > 0 && !draft[at - 1].isWhitespace())) {
+            emptyList()
+        } else {
+            val query = draft.substring(at + 1)
+            if (query.contains(' ') || query.contains('\n')) {
+                emptyList()
+            } else {
+                memberNames.filter { query.isEmpty() || it.contains(query) }.take(5)
+            }
+        }
+    }
+    if (mentionMatches.isNotEmpty()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            mentionMatches.forEach { name ->
+                TextButton(onClick = {
+                    val at = draft.lastIndexOf('@')
+                    draft = draft.substring(0, at) + "@" + name + " "
+                }) { Text(name) }
+            }
+        }
+    }
+    OutlinedTextField(
+        value = draft,
+        onValueChange = { draft = it },
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text(stringResource(R.string.shared_memo_comment_hint)) },
+    )
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        TextButton(
+            enabled = draft.isNotBlank() && !sending,
+            onClick = {
+                val body = draft.trim()
+                sending = true
+                scope.launch {
+                    try {
+                        val comment = withContext(Dispatchers.IO) {
+                            sharedMemoCommentAdd(slug, memoId, body)
+                        }
+                        comments = comments + comment
+                        draft = ""
+                    } catch (e: MobileException) {
+                        onNotice(e.message ?: "")
+                    }
+                    sending = false
+                }
+            },
+        ) { Text(stringResource(R.string.shared_memo_comment_send)) }
     }
 }
 

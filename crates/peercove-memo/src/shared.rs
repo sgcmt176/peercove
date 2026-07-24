@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use peercove_core::memo::{
     checklist_progress, excerpt, DiffLine, MemoFolder, SharedGroupPerm, SharedMemberPerm,
-    SharedMemoDetail, SharedMemoHistoryDetail, SharedMemoHistoryEntry, SharedMemoLimits,
-    SharedMemoQuery, SharedMemoSummary, SharedPermLevel, EXCERPT_CHARS,
+    SharedMemoComment, SharedMemoDetail, SharedMemoHistoryDetail, SharedMemoHistoryEntry,
+    SharedMemoLimits, SharedMemoQuery, SharedMemoSummary, SharedPermLevel, EXCERPT_CHARS,
+    MAX_COMMENTS_PER_MEMO, MAX_COMMENT_BODY_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -83,7 +84,7 @@ impl Actor {
     }
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 3;
+const SHARED_SCHEMA_VERSION: i64 = 4;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -115,6 +116,7 @@ struct Row {
     updated_by: Option<String>,
     everyone: SharedPermLevel,
     deleted_at: Option<i64>,
+    comment_count: u32,
 }
 
 /// 1 メモ分の権限計算に要る材料(メンバー個別 + グループ)。ホスト 1 回の
@@ -194,6 +196,7 @@ impl Row {
             locked_by: None, // サービス層(ロック保持者)が詰める
             checklist_done: done,
             checklist_total: total,
+            comment_count: self.comment_count,
         }
     }
 
@@ -235,6 +238,7 @@ impl Row {
             } else {
                 Vec::new()
             },
+            comment_count: self.comment_count,
         }
     }
 }
@@ -369,6 +373,24 @@ impl SharedStore {
                 "#,
             )?;
         }
+        if version < 4 {
+            // v4(M5 F-5、ADR-0052 決定 4): 共有メモのコメント(単層)。
+            // 容量計算(total_body_bytes)にはコメントを含めない
+            // (上限 4KiB×500 = 高々 2MiB/メモで別勘定にしても実害がないため)。
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS memo_comments (
+                    comment_id TEXT PRIMARY KEY,
+                    memo_id TEXT NOT NULL,
+                    author_id TEXT NOT NULL DEFAULT '',
+                    author_name TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memo_comments ON memo_comments(memo_id, created_at);
+                "#,
+            )?;
+        }
         tx.pragma_update(None, "user_version", SHARED_SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -377,9 +399,7 @@ impl SharedStore {
     fn row(&self, id: &str) -> anyhow::Result<Row> {
         self.conn
             .query_row(
-                "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                        created_at, updated_at, updated_by, everyone, deleted_at
-                 FROM memos WHERE id = ?1",
+                &format!("SELECT {ROW_COLUMNS} FROM memos WHERE id = ?1"),
                 params![id],
                 row_from_sql,
             )
@@ -471,11 +491,7 @@ impl SharedStore {
         actor: &Actor,
         query: &SharedMemoQuery,
     ) -> anyhow::Result<(Vec<SharedMemoSummary>, Vec<MemoFolder>)> {
-        let mut sql = String::from(
-            "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                    created_at, updated_at, updated_by, everyone, deleted_at
-             FROM memos m WHERE ",
-        );
+        let mut sql = format!("SELECT {ROW_COLUMNS_ALIASED} FROM memos m WHERE ");
         let mut clauses: Vec<String> = Vec::new();
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if query.trash {
@@ -536,9 +552,7 @@ impl SharedStore {
         let Some(row) = self
             .conn
             .query_row(
-                "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                        created_at, updated_at, updated_by, everyone, deleted_at
-                 FROM memos WHERE id = ?1",
+                &format!("SELECT {ROW_COLUMNS} FROM memos WHERE id = ?1"),
                 params![id],
                 row_from_sql,
             )
@@ -575,10 +589,10 @@ impl SharedStore {
             let row: Option<Row> = self
                 .conn
                 .query_row(
-                    "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                            created_at, updated_at, updated_by, everyone, deleted_at
-                     FROM memos WHERE title = ?1 AND deleted_at IS NULL
-                     ORDER BY updated_at DESC LIMIT 1",
+                    &format!(
+                        "SELECT {ROW_COLUMNS} FROM memos WHERE title = ?1 AND deleted_at IS NULL
+                         ORDER BY updated_at DESC LIMIT 1"
+                    ),
                     params![title],
                     row_from_sql,
                 )
@@ -605,13 +619,11 @@ impl SharedStore {
             return Ok(Vec::new());
         }
         let pattern = format!("%[[{}]]%", escape_like(&target.title));
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                    created_at, updated_at, updated_by, everyone, deleted_at
-             FROM memos
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ROW_COLUMNS} FROM memos
              WHERE deleted_at IS NULL AND id != ?1 AND body LIKE ?2 ESCAPE '\\'
-             ORDER BY updated_at DESC",
-        )?;
+             ORDER BY updated_at DESC"
+        ))?;
         let rows = stmt
             .query_map(params![id, pattern], row_from_sql)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1097,12 +1109,14 @@ impl SharedStore {
     fn purge_memo(&self, id: &str, now: i64) -> anyhow::Result<()> {
         self.conn
             .execute("DELETE FROM memo_history WHERE memo_id = ?1", params![id])?;
-        // memo_group_perms は memo_perms と違って FK CASCADE を持たないため
-        // (v3 マイグレーション、ADR-0051)手動で対で消す
+        // memo_group_perms / memo_comments は memo_perms と違って FK CASCADE を
+        // 持たないため(v3/v4 マイグレーション、ADR-0051/ADR-0052)手動で対で消す
         self.conn.execute(
             "DELETE FROM memo_group_perms WHERE memo_id = ?1",
             params![id],
         )?;
+        self.conn
+            .execute("DELETE FROM memo_comments WHERE memo_id = ?1", params![id])?;
         self.conn
             .execute("DELETE FROM memos WHERE id = ?1", params![id])?;
         self.conn.execute(
@@ -1244,6 +1258,107 @@ impl SharedStore {
         self.get(actor, id)
     }
 
+    /// コメント一覧(古い順)。閲覧権限があれば可(ADR-0052 決定 4)。
+    pub fn comment_list(&self, actor: &Actor, id: &str) -> anyhow::Result<Vec<SharedMemoComment>> {
+        let row = self.row(id)?;
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
+            bail!("このメモを閲覧する権限がありません");
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT comment_id, memo_id, author_id, author_name, body, created_at
+             FROM memo_comments WHERE memo_id = ?1 ORDER BY created_at ASC, comment_id ASC",
+        )?;
+        let comments = stmt
+            .query_map(params![id], comment_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(comments)
+    }
+
+    /// コメント追加。閲覧権限があれば可(本文上限・件数上限あり、ADR-0052 決定 4)。
+    pub fn comment_add(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        body: &str,
+    ) -> anyhow::Result<SharedMemoComment> {
+        let row = self.row(id)?;
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
+            bail!("このメモを閲覧する権限がありません");
+        }
+        let body = body.trim();
+        if body.is_empty() {
+            bail!("コメントの本文が空です");
+        }
+        if body.len() > MAX_COMMENT_BODY_BYTES {
+            bail!(
+                "コメントの本文が長すぎます(上限 {} KiB)",
+                MAX_COMMENT_BODY_BYTES / 1024
+            );
+        }
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memo_comments WHERE memo_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if count as u32 >= MAX_COMMENTS_PER_MEMO {
+            bail!(
+                "このメモのコメントが上限({} 件)に達しています。不要なコメントを削除してください",
+                MAX_COMMENTS_PER_MEMO
+            );
+        }
+        let comment_id: String =
+            self.conn
+                .query_row("SELECT lower(hex(randomblob(8)))", [], |row| row.get(0))?;
+        let now = unix_ms();
+        self.conn.execute(
+            "INSERT INTO memo_comments (comment_id, memo_id, author_id, author_name, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![comment_id, id, actor.owner_id(), actor.name, body, now],
+        )?;
+        Ok(SharedMemoComment {
+            comment_id,
+            memo_id: id.to_string(),
+            author_id: actor.owner_id().to_string(),
+            author_name: actor.name.clone(),
+            body: body.to_string(),
+            created_at_unix_ms: now as u64,
+        })
+    }
+
+    /// コメント削除(本人・メモ所有者・ホスト管理者、ADR-0052 決定 4)。
+    pub fn comment_delete(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        comment_id: &str,
+    ) -> anyhow::Result<()> {
+        let row = self.row(id)?;
+        let ctx = self.perm_context(id)?;
+        if !row.visible_to(actor, &ctx) {
+            bail!("このメモを閲覧する権限がありません");
+        }
+        let author_id: String = self
+            .conn
+            .query_row(
+                "SELECT author_id FROM memo_comments WHERE comment_id = ?1 AND memo_id = ?2",
+                params![comment_id, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("コメントが見つかりません")?;
+        let is_author = author_id == actor.owner_id();
+        if !is_author && !row.can_manage(actor) {
+            bail!("このコメントを削除できるのは本人・メモ所有者・ホスト管理者だけです");
+        }
+        self.conn.execute(
+            "DELETE FROM memo_comments WHERE comment_id = ?1 AND memo_id = ?2",
+            params![comment_id, id],
+        )?;
+        Ok(())
+    }
+
     pub fn folder_create(&mut self, actor: &Actor, name: &str) -> anyhow::Result<MemoFolder> {
         self.require_host(actor)?;
         let name = validate_folder_name(name)?;
@@ -1328,6 +1443,19 @@ impl SharedStore {
     }
 }
 
+/// メモ行の共通 SELECT 列(この順で `row_from_sql` が読む)。呼び出し側は
+/// `FROM memos ...`(または `FROM memos m ...`)に続けて使う。comment_count は
+/// 相関サブクエリで数える(索引テーブルの二重管理を避ける — 500 件上限なので
+/// 十分速い)。
+const ROW_COLUMNS: &str = "id, title, body, folder_id, revision, owner_id, owner_name,
+        created_at, updated_at, updated_by, everyone, deleted_at,
+        (SELECT COUNT(*) FROM memo_comments c WHERE c.memo_id = memos.id) AS comment_count";
+
+/// [`ROW_COLUMNS`] の別名(`m`)版。`FROM memos m` で使う。
+const ROW_COLUMNS_ALIASED: &str = "id, title, body, folder_id, revision, owner_id, owner_name,
+        created_at, updated_at, updated_by, everyone, deleted_at,
+        (SELECT COUNT(*) FROM memo_comments c WHERE c.memo_id = m.id) AS comment_count";
+
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok(Row {
         id: row.get(0)?,
@@ -1342,6 +1470,18 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         updated_by: row.get(9)?,
         everyone: level_from_str(&row.get::<_, String>(10)?),
         deleted_at: row.get(11)?,
+        comment_count: row.get::<_, i64>(12)? as u32,
+    })
+}
+
+fn comment_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedMemoComment> {
+    Ok(SharedMemoComment {
+        comment_id: row.get(0)?,
+        memo_id: row.get(1)?,
+        author_id: row.get(2)?,
+        author_name: row.get(3)?,
+        body: row.get(4)?,
+        created_at_unix_ms: row.get::<_, i64>(5)? as u64,
     })
 }
 
@@ -1413,7 +1553,7 @@ pub struct CacheStore {
     conn: Connection,
 }
 
-const CACHE_SCHEMA_VERSION: i64 = 1;
+const CACHE_SCHEMA_VERSION: i64 = 2;
 
 impl CacheStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -1470,6 +1610,13 @@ impl CacheStore {
                 "#,
             )?;
         }
+        if version < 2 {
+            // v2(M5 F-5、ADR-0052 決定 4): コメント件数(一覧の 💬 バッジ用)。
+            // コメント本文自体はキャッシュに保存しない(一覧は都度取得)。
+            tx.execute_batch(
+                "ALTER TABLE memos ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         tx.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -1480,12 +1627,12 @@ impl CacheStore {
         self.conn.execute(
             "INSERT INTO memos (id, title, body, folder_id, revision, owner_id, owner_name,
                                 created_at, updated_at, updated_by, can_edit, can_manage,
-                                locked_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                locked_by, comment_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                 title = ?2, body = ?3, folder_id = ?4, revision = ?5, owner_id = ?6,
                 owner_name = ?7, created_at = ?8, updated_at = ?9, updated_by = ?10,
-                can_edit = ?11, can_manage = ?12, locked_by = ?13",
+                can_edit = ?11, can_manage = ?12, locked_by = ?13, comment_count = ?14",
             params![
                 memo.id,
                 memo.title,
@@ -1500,6 +1647,7 @@ impl CacheStore {
                 memo.can_edit as i64,
                 memo.can_manage as i64,
                 memo.locked_by,
+                memo.comment_count as i64,
             ],
         )?;
         self.enforce_limit()?;
@@ -1611,7 +1759,8 @@ impl CacheStore {
     ) -> anyhow::Result<(Vec<SharedMemoSummary>, Vec<MemoFolder>)> {
         let mut sql = String::from(
             "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                    created_at, updated_at, updated_by, can_edit, can_manage, locked_by
+                    created_at, updated_at, updated_by, can_edit, can_manage, locked_by,
+                    comment_count
              FROM memos m WHERE 1 = 1",
         );
         let mut clauses: Vec<String> = Vec::new();
@@ -1651,6 +1800,7 @@ impl CacheStore {
                     row.get::<_, i64>(10)? != 0,
                     row.get::<_, i64>(11)? != 0,
                     row.get(12)?,
+                    row.get::<_, i64>(13)? as u32,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1674,7 +1824,8 @@ impl CacheStore {
         self.conn
             .query_row(
                 "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                        created_at, updated_at, updated_by, can_edit, can_manage, locked_by
+                        created_at, updated_at, updated_by, can_edit, can_manage, locked_by,
+                        comment_count
                  FROM memos WHERE id = ?1",
                 params![id],
                 |row| {
@@ -1696,6 +1847,7 @@ impl CacheStore {
                         everyone: None,
                         members: Vec::new(),
                         groups: Vec::new(),
+                        comment_count: row.get::<_, i64>(13)? as u32,
                     })
                 },
             )
@@ -1739,7 +1891,8 @@ impl CacheStore {
         let pattern = format!("%[[{}]]%", escape_like(&target.title));
         let mut stmt = self.conn.prepare(
             "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
-                    created_at, updated_at, updated_by, can_edit, can_manage, locked_by
+                    created_at, updated_at, updated_by, can_edit, can_manage, locked_by,
+                    comment_count
              FROM memos WHERE id != ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY updated_at DESC",
         )?;
@@ -1759,6 +1912,7 @@ impl CacheStore {
                     row.get::<_, i64>(10)? != 0,
                     row.get::<_, i64>(11)? != 0,
                     row.get(12)?,
+                    row.get::<_, i64>(13)? as u32,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1781,6 +1935,7 @@ fn cache_summary(
     can_edit: bool,
     can_manage: bool,
     locked_by: Option<String>,
+    comment_count: u32,
 ) -> SharedMemoSummary {
     let (done, total) = checklist_progress(&body);
     SharedMemoSummary {
@@ -1800,6 +1955,7 @@ fn cache_summary(
         locked_by,
         checklist_done: done,
         checklist_total: total,
+        comment_count,
     }
 }
 
@@ -2425,6 +2581,132 @@ mod tests {
         assert_eq!(store.memo_ids_with_group_perms().unwrap(), vec![memo_id]);
     }
 
+    /// コメント(ADR-0052 決定 4): 閲覧者(viewer 以上)が閲覧・追加でき、
+    /// 削除は本人・所有者・ホストだけ。全体権限を失った第三者は閲覧も追加も
+    /// できない。
+    #[test]
+    fn comment_add_list_delete_permissions() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス"); // 所有者
+        let bob = Actor::member("id-bob", "ボブ"); // 既定 viewer
+        let host = Actor::host("ホスト");
+
+        let memo = store.create(&alice, "共有", "本文", None).unwrap();
+        let comment = store.comment_add(&bob, &memo.id, "了解です").unwrap();
+        assert_eq!(comment.author_id, "id-bob");
+        assert_eq!(comment.author_name, "ボブ");
+        assert_eq!(comment.memo_id, memo.id);
+
+        let comments = store.comment_list(&alice, &memo.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].comment_id, comment.comment_id);
+        // 一覧・詳細の comment_count に反映される
+        assert_eq!(store.get(&alice, &memo.id).unwrap().comment_count, 1);
+        let (memos, _) = store.list(&alice, &SharedMemoQuery::default()).unwrap();
+        assert_eq!(memos[0].comment_count, 1);
+
+        // 第三者(閲覧権限なし)は閲覧・追加ともに拒否
+        store
+            .set_perms(&alice, &memo.id, SharedPermLevel::None, &[], None)
+            .unwrap();
+        let carol = Actor::member("id-carol", "キャロル");
+        assert!(store.comment_list(&carol, &memo.id).is_err());
+        assert!(store.comment_add(&carol, &memo.id, "x").is_err());
+        // 全体権限を戻す
+        store
+            .set_perms(&alice, &memo.id, SharedPermLevel::Viewer, &[], None)
+            .unwrap();
+
+        // 削除: 本人(ボブ)は自分のコメントを削除できる
+        let second = store.comment_add(&carol, &memo.id, "追加").unwrap();
+        assert!(
+            store
+                .comment_delete(&carol, &memo.id, &comment.comment_id)
+                .is_err(),
+            "他人のコメントは削除できない"
+        );
+        // 所有者(アリス)・ホストは誰のコメントでも削除できる
+        store
+            .comment_delete(&alice, &memo.id, &comment.comment_id)
+            .unwrap();
+        store
+            .comment_delete(&host, &memo.id, &second.comment_id)
+            .unwrap();
+        assert!(store.comment_list(&alice, &memo.id).unwrap().is_empty());
+        assert_eq!(store.get(&alice, &memo.id).unwrap().comment_count, 0);
+    }
+
+    /// コメントの本文上限(4KiB)・件数上限(500 件、ADR-0052 決定 4)。
+    #[test]
+    fn comment_add_enforces_body_and_count_limits() {
+        let (_dir, mut store) = open_temp();
+        let host = Actor::host("ホスト");
+        let memo = store.create(&host, "共有", "本文", None).unwrap();
+
+        let too_long = "a".repeat(4 * 1024 + 1);
+        assert!(store.comment_add(&host, &memo.id, &too_long).is_err());
+        let just_fits = "a".repeat(4 * 1024);
+        assert!(store.comment_add(&host, &memo.id, &just_fits).is_ok());
+
+        assert!(store.comment_add(&host, &memo.id, "").is_err(), "空は拒否");
+
+        // 件数上限(1 件は既に追加済みなので残り 499 件を追加して満杯にする)
+        for _ in 0..499 {
+            store.comment_add(&host, &memo.id, "x").unwrap();
+        }
+        assert_eq!(store.comment_list(&host, &memo.id).unwrap().len(), 500);
+        assert!(
+            store.comment_add(&host, &memo.id, "over").is_err(),
+            "500 件を超えるコメントは拒否"
+        );
+    }
+
+    /// メモの完全削除でコメントも消える(ADR-0052 決定 4)。
+    #[test]
+    fn delete_forever_cascades_comments() {
+        let (_dir, mut store) = open_temp();
+        let host = Actor::host("ホスト");
+        let memo = store.create(&host, "共有", "本文", None).unwrap();
+        store.comment_add(&host, &memo.id, "残る?").unwrap();
+        fn count_in_db(store: &SharedStore, memo_id: &str) -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memo_comments WHERE memo_id = ?1",
+                    params![memo_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+        assert_eq!(count_in_db(&store, &memo.id), 1);
+        store.trash(&host, &memo.id).unwrap();
+        store.delete_forever(&host, &memo.id).unwrap();
+        assert_eq!(count_in_db(&store, &memo.id), 0);
+    }
+
+    /// v3(ADR-0051 まで)→ v4(ADR-0052 決定 4、コメント)への移行。
+    #[test]
+    fn v3_database_migrates_to_v4_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        let memo_id = {
+            let mut store = SharedStore::open(&path).unwrap();
+            let host = Actor::host("ホスト");
+            let memo = store.create(&host, "移行前", "本文", None).unwrap();
+            // v3 相当に偽装
+            store.conn.pragma_update(None, "user_version", 3).unwrap();
+            memo.id
+        };
+        let mut store = SharedStore::open(&path).unwrap();
+        let host = Actor::host("ホスト");
+        let comment = store.comment_add(&host, &memo_id, "移行後の1件目").unwrap();
+        assert_eq!(store.comment_list(&host, &memo_id).unwrap().len(), 1);
+        assert_eq!(store.get(&host, &memo_id).unwrap().comment_count, 1);
+        store
+            .comment_delete(&host, &memo_id, &comment.comment_id)
+            .unwrap();
+    }
+
     /// メモ間リンク(ADR-0052 決定 2): タイトル解決に可視性フィルタがかかる
     /// (見えないメモは他に候補があっても解決結果から除外される)。
     #[test]
@@ -2517,6 +2799,7 @@ mod tests {
             everyone: None,
             members: vec![],
             groups: vec![],
+            comment_count: 0,
         };
         cache.upsert(&make("m1", "共有資料", "本文")).unwrap();
         cache
@@ -2557,6 +2840,7 @@ mod tests {
             everyone: None,
             members: vec![],
             groups: vec![],
+            comment_count: 0,
         };
         cache.upsert(&detail).unwrap();
         assert_eq!(cache.revision("m1").unwrap(), Some(3));
@@ -2600,6 +2884,7 @@ mod tests {
             everyone: None,
             members: vec![],
             groups: vec![],
+            comment_count: 0,
         };
         cache.upsert(&make("m1", 1, "a".repeat(1000))).unwrap();
         cache.upsert(&make("m2", 2, "b".repeat(1000))).unwrap();
@@ -2609,5 +2894,38 @@ mod tests {
         assert!(cache.get("m1").is_err());
         assert!(cache.get("m2").is_err());
         assert!(cache.get("m3").is_ok());
+    }
+
+    /// キャッシュの comment_count(ADR-0052 決定 4): Changed イベントの
+    /// upsert・List・Get のいずれでも反映される(コメント本文自体は
+    /// キャッシュに保存しない — 一覧は都度ホストへ取得する)。
+    #[test]
+    fn cache_upsert_carries_comment_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(&dir.path().join("m.memocache.db")).unwrap();
+        let detail = SharedMemoDetail {
+            id: "m1".to_string(),
+            title: "t".to_string(),
+            body: "本文".to_string(),
+            folder_id: None,
+            revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            updated_by: None,
+            owner_id: String::new(),
+            owner_name: "ホスト".to_string(),
+            deleted_at: None,
+            can_edit: false,
+            can_manage: false,
+            locked_by: None,
+            everyone: None,
+            members: vec![],
+            groups: vec![],
+            comment_count: 3,
+        };
+        cache.upsert(&detail).unwrap();
+        assert_eq!(cache.get("m1").unwrap().comment_count, 3);
+        let (memos, _) = cache.list(&SharedMemoQuery::default()).unwrap();
+        assert_eq!(memos[0].comment_count, 3);
     }
 }

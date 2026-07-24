@@ -12,9 +12,11 @@ import {
 } from "./ipc";
 import { t } from "./i18n";
 import {
+  clearCommentTracking,
   diffMembers,
   diffTransfers,
   notifyChatEvents,
+  notifyCommentEvents,
   notifyFileEvents,
   notifyQualityEvents,
   notifyMemberEvents,
@@ -152,6 +154,7 @@ export default function App() {
         );
         previousTransfers.current.set(tunnel.config, tunnel.transfers);
         void notifyQualityEvents(tunnel);
+        void notifyCommentEvents(tunnel);
       }
       // 止まったネットワークは次回接続を「初回」に戻す(全員分の通知を防ぐ)
       for (const key of [...previousMembers.current.keys()]) {
@@ -159,6 +162,7 @@ export default function App() {
           previousMembers.current.delete(key);
           previousTransfers.current.delete(key);
           clearChat(key);
+          clearCommentTracking(key);
         }
       }
     } catch (error) {

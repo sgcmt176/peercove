@@ -930,6 +930,12 @@ export const ja = {
     chatTitle: (from: string, network: string) => `${from}（${network}）`,
     chatBody: (text: string, isAll: boolean) =>
       isAll ? `[全体] ${text}` : text,
+    // 共有メモのコメント・メンション(M5 F-5 Stage 3、ADR-0052 決定 4・5)。
+    // 通知はローカル表示でありログではないため、メモタイトル・コメント本文を出してよい
+    commentTitle: (from: string, memoTitle: string) =>
+      `${from} が「${memoTitle}」にコメントしました`,
+    mentionTitle: (from: string, memoTitle: string) =>
+      `${from} があなたをメンションしました（「${memoTitle}」）`,
   },
 
   // 個人メモ(M5 F-1、ADR-0049)
@@ -1093,5 +1099,16 @@ export const ja = {
     limitsHistoryDaysLabel: "変更履歴の保持日数",
     limitsTrashDaysLabel: "ゴミ箱の保持日数",
     limitsSaved: "上限を保存しました",
+
+    // コメント・メンション(M5 F-5 Stage 3、ADR-0052 決定 4・5)
+    commentsTitle: (n: number) => `コメント (${n})`,
+    commentsEmpty: "コメントはまだありません",
+    commentPlaceholder: "コメントを入力(@名前 でメンション)",
+    commentSend: "送信",
+    commentDelete: "削除",
+    commentDeleteConfirm: "このコメントを削除しますか?(元に戻せません)",
+    commentLoadFailed: "コメントを読み込めません",
+    commentTooLong: (kib: number) => `コメントが長すぎます(上限 ${kib}KiB)`,
+    commentBadge: (n: number) => `💬${n}`,
   },
 };

@@ -587,6 +587,8 @@ export interface SharedMemoSummary {
   locked_by?: string;
   checklist_done?: number;
   checklist_total?: number;
+  /** コメント件数(ADR-0052 決定 4)。一覧の 💬 バッジ用。 */
+  comment_count?: number;
 }
 
 export interface SharedMemoDetail {
@@ -607,6 +609,18 @@ export interface SharedMemoDetail {
   everyone?: SharedPermLevel;
   members?: SharedMemberPerm[];
   groups?: SharedGroupPerm[];
+  /** コメント件数(ADR-0052 決定 4)。 */
+  comment_count?: number;
+}
+
+/** 共有メモのコメント 1 件(ADR-0052 決定 4)。単層(返信ツリーなし)。 */
+export interface SharedMemoComment {
+  comment_id: string;
+  memo_id: string;
+  author_id: string;
+  author_name: string;
+  body: string;
+  created_at_unix_ms: number;
 }
 
 /** 共有メモの容量・履歴の上限(ホスト設定可、M5 F-3)。 */
@@ -684,7 +698,12 @@ export type SharedMemoOp =
   | { op: "history_restore"; id: string; hid: number }
   | { op: "save_version"; id: string }
   | { op: "get_limits" }
-  | { op: "set_limits"; limits: SharedMemoLimits };
+  | { op: "set_limits"; limits: SharedMemoLimits }
+  // コメント(ADR-0052 決定 4)。閲覧・追加 = viewer 以上、削除 = 本人・
+  // 所有者・ホスト。メンバー経路は常時オンライン専用。
+  | { op: "comment_list"; id: string }
+  | { op: "comment_add"; id: string; body: string }
+  | { op: "comment_delete"; id: string; comment_id: string };
 
 export type SharedMemoReply =
   | {
@@ -700,6 +719,10 @@ export type SharedMemoReply =
   | { kind: "history_detail"; detail: SharedMemoHistoryDetail }
   | { kind: "diff"; lines: DiffLine[] }
   | { kind: "limits"; limits: SharedMemoLimits }
+  // CommentList への応答(古い順、全件)。
+  | { kind: "comments"; comments: SharedMemoComment[] }
+  // CommentAdd への応答(追加した 1 件)。
+  | { kind: "comment"; comment: SharedMemoComment }
   | { kind: "done" }
   | { kind: "err"; message: string };
 

@@ -232,3 +232,99 @@ export async function notifyQualityEvents(tunnel: Tunnel): Promise<void> {
     // 品質履歴がまだ無い／旧デーモンでも通常の状態更新を止めない。
   }
 }
+
+// ---- 共有メモのコメント・メンション通知(M5 F-5 Stage 3、ADR-0052 決定 4・5) ----
+//
+// プロトコルに専用イベントは無い(既存の Changed 配信 + comment_count に
+// 相乗り — ADR-0052 決定 4)。UI 側は「メモ一覧の comment_count が増えた」
+// ことを sharedMemoSeq の変化をきっかけに検知し、増えたメモだけコメントを
+// 取り直して、新着コメント(前回のチェック以降に作成されたもの)ごとに
+// メンション・自分のメモへのコメントかを判定して通知する。
+// 自分のコメントは通知しない(送信直後に自分でも検知してしまうため)。
+
+const commentLastSeq = new Map<string, number>();
+const commentBaseline = new Map<
+  string,
+  Map<string, { count: number; latestAt: number }>
+>();
+
+/** 停止したネットワークの追跡状態を消す(次の接続で「初回」に戻す)。 */
+export function clearCommentTracking(config: string): void {
+  commentLastSeq.delete(config);
+  commentBaseline.delete(config);
+}
+
+/**
+ * 共有メモのコメント・メンション通知。status ポーリングのたびに呼んで
+ * よい(sharedMemoSeq が変わっていなければ即返る = 追加のホスト問い合わせ
+ * を増やさない)。
+ */
+export async function notifyCommentEvents(tunnel: Tunnel): Promise<void> {
+  if (!loadPrefs().notifications) return;
+  if (!tunnel.sharedMemo) return;
+  if (commentLastSeq.get(tunnel.config) === tunnel.sharedMemoSeq) return;
+  commentLastSeq.set(tunnel.config, tunnel.sharedMemoSeq);
+
+  const self = tunnel.members.find((m) => m.isSelf);
+  const myMemberId = self?.memberId ?? null;
+  const myDisplayName = (self?.name ?? "").trim();
+
+  let baseline = commentBaseline.get(tunnel.config);
+  if (baseline === undefined) {
+    baseline = new Map();
+    commentBaseline.set(tunnel.config, baseline);
+  }
+
+  try {
+    const reply = await api.sharedMemoOp(tunnel.config, {
+      op: "list",
+      query: {},
+    });
+    if (reply.kind !== "memos") return;
+    for (const memo of reply.memos) {
+      const count = memo.comment_count ?? 0;
+      const previous = baseline.get(memo.id);
+      if (previous === undefined) {
+        // 初めて見るメモは基準点を作るだけ(起動直後にまとめて鳴らさない)
+        baseline.set(memo.id, { count, latestAt: Date.now() });
+        continue;
+      }
+      if (count <= previous.count) {
+        baseline.set(memo.id, { count, latestAt: previous.latestAt });
+        continue;
+      }
+      try {
+        const commentReply = await api.sharedMemoOp(tunnel.config, {
+          op: "comment_list",
+          id: memo.id,
+        });
+        if (commentReply.kind !== "comments") continue;
+        const fresh = commentReply.comments.filter(
+          (c) => c.created_at_unix_ms > previous.latestAt,
+        );
+        let latestAt = previous.latestAt;
+        for (const comment of fresh) {
+          latestAt = Math.max(latestAt, comment.created_at_unix_ms);
+          if (comment.author_id === myMemberId) continue; // 自分のコメントは通知しない
+          const mentionsMe =
+            myDisplayName !== "" && comment.body.includes(`@${myDisplayName}`);
+          const ownsMemo = memo.owner_id === (myMemberId ?? "");
+          if (!mentionsMe && !ownsMemo) continue;
+          const title = mentionsMe
+            ? t.notify.mentionTitle(comment.author_name, memo.title || t.memo.untitled)
+            : t.notify.commentTitle(comment.author_name, memo.title || t.memo.untitled);
+          try {
+            await invoke("notify", { title, body: comment.body });
+          } catch {
+            // 通知の失敗で UI を止めない
+          }
+        }
+        baseline.set(memo.id, { count, latestAt });
+      } catch {
+        // コメント取得に失敗しても次の周期で再試行する(基準点は更新しない)
+      }
+    }
+  } catch {
+    // 一覧取得に失敗しても次の周期で再試行する
+  }
+}
