@@ -2,7 +2,14 @@
 // リアルタイム閲覧。閲覧は常に可能(メンバーはキャッシュ = オフラインでも
 // 読める)。編集は「編集」ボタンでロックを取得してから。保存はリビジョン
 // CAS 付きでホストへ送られ、他の閲覧者へ数秒以内に配信される。
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -44,6 +51,7 @@ import {
   MentionSuggestList,
   useMentionCandidates,
 } from "./MentionSuggest";
+import { splitMentions } from "../mentions";
 
 const AUTOSAVE_DELAY_MS = 600;
 
@@ -987,6 +995,12 @@ function CommentsPanel({
   };
 
   const mentionCandidates = useMentionCandidates(mentionQuery, members);
+  // メンション強調表示(ADR-0055 決定 1、M6 H-7b)用に自分の名前・他メンバー名を控える
+  const myName = members.find((m) => m.isSelf)?.name ?? "";
+  const memberNames = members
+    .filter((m) => !m.isSelf)
+    .map((m) => m.name)
+    .filter((name): name is string => Boolean(name));
 
   const insertMention = (name: string) => {
     const value = draft;
@@ -1052,7 +1066,9 @@ function CommentsPanel({
                 </button>
               )}
             </div>
-            <p className="memo__comment-body">{comment.body}</p>
+            <p className="memo__comment-body">
+              {renderCommentBody(comment.body, myName, memberNames)}
+            </p>
           </li>
         ))}
       </ul>
@@ -1730,6 +1746,31 @@ function LimitsDialog({
         </>
       )}
     </Modal>
+  );
+}
+
+/**
+ * コメント本文の `@名前` / `@All` を強調表示する(ADR-0055 決定 1、M6 H-7b
+ * でチャットと同じ配色に揃えた)。ChatPanel.tsx の linkify と同じ判定
+ * ロジック(mentions.ts の splitMentions)を使うが、コメントは URL の
+ * リンク化までは行わない(範囲外)。
+ */
+function renderCommentBody(
+  text: string,
+  myName: string,
+  memberNames: string[],
+): ReactNode {
+  return splitMentions(text, myName, memberNames).map((seg, index) =>
+    seg.mention ? (
+      <span
+        key={index}
+        className={seg.self ? "msg__mention msg__mention--self" : "msg__mention"}
+      >
+        {seg.value}
+      </span>
+    ) : (
+      <span key={index}>{seg.value}</span>
+    ),
   );
 }
 

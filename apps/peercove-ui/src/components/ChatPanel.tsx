@@ -40,6 +40,7 @@ import {
   toggleMute,
   togglePin,
   unreadCounts,
+  unreadMentionConversations,
 } from "../chat";
 import { Avatar } from "./Avatar";
 import { ConfirmModal, Modal } from "./Modal";
@@ -131,6 +132,9 @@ export function ChatPanel({
   const messages = chatMessages(tunnel.config);
   const unread = unreadCounts(tunnel);
   const memberByIp = new Map(tunnel.members.map((m) => [m.ip, m]));
+  // 未読メンションバッジ(会話一覧、ADR-0055 決定 1、M6 H-7b)
+  const myName = memberByIp.get(selfIp)?.name ?? "";
+  const unreadMentions = unreadMentionConversations(tunnel, myName);
   const groupById = new Map(tunnel.groups.map((g) => [g.id, g]));
 
   // ピン留めは順序付きリスト(手動順・新規は末尾)。ミュートは集合。
@@ -585,6 +589,14 @@ export function ChatPanel({
                 </span>
               </span>
               {count > 0 && <span className="chat__badge">{count}</span>}
+              {unreadMentions.has(item.key) && (
+                <span
+                  className="chat__badge chat__badge--mention"
+                  title={t.chat.mentionBadgeTitle}
+                >
+                  @
+                </span>
+              )}
               <span
                 role="button"
                 tabIndex={0}

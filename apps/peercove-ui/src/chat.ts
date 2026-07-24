@@ -8,6 +8,7 @@
 // 未読管理はこのマシンのローカル(会話ごとの最終既読 seq を localStorage)。
 
 import { ChatMessage, Tunnel, api } from "./ipc";
+import { isMentioned } from "./mentions";
 
 /**
  * 会話のキー。ネットワーク全体は "network"、グループは "g:<グループID>"、
@@ -36,6 +37,8 @@ interface ChatState {
   lastSeq: number;
   /** 直近に見たチャット消去世代。増えたら手元を捨てて取り直す。 */
   generation: number;
+  /** 大量の未読を追いつくフェッチ中か(M6 H-7b、下記 syncChat 参照)。 */
+  catchingUp: boolean;
 }
 
 const stores = new Map<string, ChatState>();
@@ -58,6 +61,13 @@ export function chatMessages(config: string): ChatMessage[] {
 /**
  * status の chatSeq に追いつくまで差分フェッチする。戻り値は新しく取れた分
  * (通知用。初回のまとめ読みでは空を返し、起動時に鳴らさない)。
+ *
+ * M6 H-7b: 大量の未読(ページングが複数回に渡る量)を抱えて起動した直後は、
+ * 1 回の追いつきフェッチが 2 秒のポーリング間隔をまたぐことがある。その間に
+ * 次のポーリングが割り込むと、`isFirst` が既に false になった 2 回目の
+ * 呼び出しが「取得中の続き」を新着として拾ってしまい、起動直後なのに
+ * 過去メッセージがまとめて通知される不具合があった。`catchingUp` で
+ * 追いつき中の呼び出しを直列化し、割り込んだ側は何もせず次回に譲る。
  */
 export async function syncChat(
   config: string,
@@ -65,17 +75,20 @@ export async function syncChat(
   chatGeneration = 0,
 ): Promise<ChatMessage[]> {
   let state = stores.get(config);
-  const isFirst = state === undefined;
+  let treatAsFirst = state === undefined;
   if (state === undefined) {
-    state = { messages: [], lastSeq: 0, generation: chatGeneration };
+    state = { messages: [], lastSeq: 0, generation: chatGeneration, catchingUp: false };
     stores.set(config, state);
   }
   // 履歴が消された(メンバー再追加での 1:1 クリア等)= 消去世代が変わった、
-  // または seq が巻き戻ったら、手元を捨てて取り直す
+  // または seq が巻き戻ったら、手元を捨てて取り直す(このときも「初回の
+  // まとめ読み」と同じ扱いで通知は鳴らさない — クリア直後の再取得ぶんを
+  // 新着として誤通知しないため)
   if (chatGeneration !== state.generation || chatSeq < state.lastSeq) {
     state.messages = [];
     state.lastSeq = 0;
     state.generation = chatGeneration;
+    treatAsFirst = true;
   }
   if (chatSeq <= state.lastSeq) {
     // 新着なしでも末尾を取り直す: 送信キュー(E-E 3)の failed フラグは
@@ -83,21 +96,26 @@ export async function syncChat(
     await refreshTail(config, state);
     return [];
   }
-
-  const fresh: ChatMessage[] = [];
-  // 1 応答には上限があるため、追いつくまで繰り返す(進まなければ打ち切り)
-  while (state.lastSeq < chatSeq) {
-    const page = await api.chatFetch(config, state.lastSeq);
-    if (page.messages.length === 0) break;
-    for (const message of page.messages) {
-      if (message.seq > state.lastSeq) {
-        state.messages.push(message);
-        state.lastSeq = message.seq;
-        fresh.push(message);
+  if (state.catchingUp) return []; // 前回の追いつきが進行中。次回のポーリングに譲る
+  state.catchingUp = true;
+  try {
+    const fresh: ChatMessage[] = [];
+    // 1 応答には上限があるため、追いつくまで繰り返す(進まなければ打ち切り)
+    while (state.lastSeq < chatSeq) {
+      const page = await api.chatFetch(config, state.lastSeq);
+      if (page.messages.length === 0) break;
+      for (const message of page.messages) {
+        if (message.seq > state.lastSeq) {
+          state.messages.push(message);
+          state.lastSeq = message.seq;
+          fresh.push(message);
+        }
       }
     }
+    return treatAsFirst ? [] : fresh;
+  } finally {
+    state.catchingUp = false;
   }
-  return isFirst ? [] : fresh;
 }
 
 /** フェッチ済みの末尾(直近 30 通)を取り直して差し替える。 */
@@ -116,6 +134,7 @@ export function appendLocal(config: string, message: ChatMessage): void {
     messages: [],
     lastSeq: 0,
     generation: 0,
+    catchingUp: false,
   };
   stores.set(config, state);
   if (message.seq > state.lastSeq) {
@@ -273,6 +292,30 @@ export function totalUnread(tunnel: Tunnel): number {
   let total = 0;
   for (const count of unreadCounts(tunnel).values()) total += count;
   return total;
+}
+
+/**
+ * 未読メッセージの中に自分宛メンション(`@自分` / `@All`)を含む会話の集合
+ * (会話一覧の「@」バッジ用、M6 H-7b)。`unreadCounts` と同じく手元に既に
+ * ある履歴を 1 回走査するだけで、会話ごとに全履歴を舐め直したりホストへ
+ * 問い合わせたりはしない。既読にすれば(read seq が進めば)次の呼び出しで
+ * 自然に外れる。
+ */
+export function unreadMentionConversations(
+  tunnel: Tunnel,
+  myName: string,
+): Set<ConversationKey> {
+  const read = loadRead(tunnel.config);
+  const result = new Set<ConversationKey>();
+  for (const message of chatMessages(tunnel.config)) {
+    if (message.from === tunnel.address) continue;
+    if (message.system || message.file) continue;
+    const conversation = conversationOf(message, tunnel.address);
+    if (result.has(conversation)) continue; // 判定済みなら isMentioned を省く
+    if (message.seq <= (read[conversation] ?? 0)) continue;
+    if (isMentioned(message.text, myName)) result.add(conversation);
+  }
+  return result;
 }
 
 // ---- 通知の抑制(いま見ている会話は鳴らさない) ----

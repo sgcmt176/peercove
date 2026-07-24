@@ -519,6 +519,8 @@ export const ja = {
     noMessages: "メッセージなし",
     pin: "ピン留め（常に上に表示）",
     unpin: "ピン留めを解除",
+    // 未読メンションバッジ(会話一覧、M6 H-7b)
+    mentionBadgeTitle: "未読の中に自分宛のメンションがあります",
     mute: "通知をミュート",
     unmute: "ミュートを解除",
     moveUp: "上に移動",

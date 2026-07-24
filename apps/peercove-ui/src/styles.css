@@ -1370,6 +1370,15 @@ select {
   text-align: center;
 }
 
+/* 未読メンションバッジ(会話一覧、M6 H-7b)。未読数バッジの隣に「@」を
+   黄色地で出す。固定色にして自分宛メンションの強調(.msg__mention--self)
+   と揃える。 */
+.chat__badge--mention {
+  background: #f5cf3d;
+  color: #3a2c00;
+  font-weight: 700;
+}
+
 /* 「全体」のアイコン(アバターの形を借りる。色はアクセント固定) */
 .chat__all-icon {
   background: var(--accent);
@@ -1737,27 +1746,32 @@ select {
   word-break: break-all;
 }
 
-/* チャットのメンション強調表示(ADR-0055 決定 1)。@名前 / @All を分かる
-   ようにする。自分宛(自分の名前 or @All)はより目立つ色にする */
+/* チャット・メモコメント本文のメンション強調表示(ADR-0055 決定 1、
+   M6 H-7b で配色を変更)。他人宛は控えめな青系(旧・自分宛の配色を流用)、
+   自分宛(自分の名前 or @All)は黄色地に濃色文字で強調する。黄色は固定色
+   (ライト/ダーク両テーマで読める組み合わせ)にして、テーマの --accent 系
+   変数には依存させない。 */
 .msg__mention {
   font-weight: 600;
   border-radius: 4px;
   padding: 0 3px;
-  background: rgba(127, 127, 127, 0.18);
-}
-
-.msg__mention--self {
   background: var(--accent-soft);
   color: var(--accent);
 }
 
+.msg__mention--self {
+  background: #f5cf3d;
+  color: #3a2c00;
+}
+
 .msg--own .msg__mention {
-  background: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.28);
+  color: inherit;
 }
 
 .msg--own .msg__mention--self {
-  background: #fff;
-  color: var(--accent);
+  background: #f5cf3d;
+  color: #3a2c00;
 }
 
 /* リンクプレビューのカード(M3-13e、ADR-0017 — LINE 風) */
@@ -2603,8 +2617,14 @@ button.msg__ref:hover {
   display: flex;
   gap: 14px;
   align-items: stretch;
-  height: calc(100vh - 120px);
-  min-height: 420px;
+  /* 固定 vh 計算(旧実装)は共有ハブのタブ帯(.shared-hub__tabs)を含む
+     入れ子で高さがずれ、カードが親(.shared-hub__body)からはみ出して
+     ページ全体がスクロールするバグの一因だった(M6 H-7b 検証 FB)。
+     親(.app__content や .shared-hub__body)側で確定した高さを
+     flex:1 でそのまま受け取る形にする(祖先チェーンはどちらも
+     display:flex; flex-direction:column; min-height:0 済み)。 */
+  flex: 1;
+  min-height: 0;
 }
 
 .memo__side {
@@ -2795,8 +2815,12 @@ button.msg__ref:hover {
 .memo__editor {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  /* カード自体を高さの確定した箱にし、内部の伸縮計算がずれても
+     ページへあふれ出さないようにする最終防波堤(M6 H-7b)。 */
+  overflow: hidden;
 }
 
 .memo__editor-inner {
@@ -2987,7 +3011,13 @@ button.msg__ref:hover {
    開いたときにメモ本文(.memo__panes、flex:1)を押し出して見えなくして
    いたバグの修正(ADR-0055 決定 2): このセクション自体の高さを本文の
    独立スクロール領域とは別に最大 40% へ制限し、コメント一覧だけを内部で
-   スクロールさせる(入力欄と開閉トグルは常に見える位置に残す)。 */
+   スクロールさせる(入力欄と開閉トグルは常に見える位置に残す)。
+   M6 H-7b 追補: `max-height: 40%` は祖先(.memo__editor-inner)の高さが
+   実際には「確定値」として伝播しない場面があり(祖先チェーンの1つでも
+   flex-basis:auto の縮小が絡むと % が 0 扱いになる典型問題)、カードの
+   外まで伸びる不具合が実機で再現した。ビューポート相対の vh に変更して
+   祖先の高さ確定に依存せず常に効くようにし、overflow:hidden で保険を
+   かける(中身は .memo__comments-list 側の独立スクロールに任せる)。 */
 .memo__comments {
   border-top: 1px solid var(--border);
   padding-top: 8px;
@@ -2996,10 +3026,11 @@ button.msg__ref:hover {
   flex-direction: column;
   flex: none;
   min-height: 0;
+  overflow: hidden;
 }
 
 .memo__comments[open] {
-  max-height: 40%;
+  max-height: 40vh;
 }
 
 .memo__comments summary {
@@ -3455,8 +3486,10 @@ button.msg__ref:hover {
   display: flex;
   gap: 14px;
   align-items: flex-start;
-  height: calc(100vh - 120px);
-  min-height: 420px;
+  /* 親(共有ハブ)の実高さに従う。100vh の決め打ちはタブバー分を無視して
+     はみ出す(H-7b でメモ側に出た不具合と同種)ため使わない */
+  flex: 1;
+  min-height: 0;
 }
 
 .schedule__calendar {
