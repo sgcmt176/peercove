@@ -584,6 +584,7 @@ export const ja = {
     inaccessible: (noun: string) => `アクセスできない${noun}`,
     nounMemo: "メモ",
     nounSchedule: "予定",
+    nounSheet: "シート",
   },
 
   // ファイル送信・受信ボックス(M3-9b、ADR-0015)
@@ -1045,6 +1046,7 @@ export const ja = {
   sharedHub: {
     tabMemos: "メモ",
     tabSchedule: "スケジュール",
+    tabSheets: "表",
   },
 
   // 共有メモ(M5 F-2、ADR-0049)
@@ -1174,5 +1176,31 @@ export const ja = {
     excerptAllDay: (md: string) => `${md} 終日`,
     excerptTimed: (md: string, hm: string) => `${md} ${hm}`,
     viewerBadge: "閲覧のみ",
+  },
+
+  // 共有シート(Excel ライク表、M6 G-2、ADR-0054)
+  sheet: {
+    title: "表",
+    loadFailed:
+      "表を読み込めません。デーモンが起動しているか、バージョンが古くないか確認してください",
+    offline: "オフライン(ホスト未接続)のため読み取り専用です",
+    unsupported:
+      "ホストと同期できていません(ホストのバージョンが古い可能性があります)",
+    empty: "まだシートがありません",
+    addSheet: "シートを作成",
+    moreOptions: "その他の操作",
+    newSheetNamePrompt: "シート名を入力してください",
+    newSheetDefaultName: "シート1",
+    renameSheet: "シート名を変更",
+    renamePrompt: "新しいシート名を入力してください",
+    deleteSheet: "シートを削除",
+    deleteConfirm: (name: string) =>
+      `シート「${name}」を削除しますか?(元に戻せません)`,
+    copyLink: "リンクをコピー",
+    copyLinkDone: "チャットに貼り付けられるリンクをコピーしました",
+    conflictNotice: (n: number) =>
+      `他の端末が先に更新したセルがあります(${n} 件)`,
+    pasteRejected: "貼り付け範囲が表の上限を超えています",
+    ownerLabel: (name: string) => `作成者: ${name}`,
   },
 };

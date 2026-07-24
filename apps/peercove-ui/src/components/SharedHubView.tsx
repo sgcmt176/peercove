@@ -1,12 +1,13 @@
 // 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。共有系機能をタブで増やし続け
 // ず「共有」1 か所にまとめる器。内部はサブタブで切り替える。サブタブは
-// 「メモ」「スケジュール」(M6 G-1、ADR-0053)。今後 Excel ライク表を足す
-// ときも TABS 配列に 1 要素足すだけで済むようにしてある。
+// 「メモ」「スケジュール」(M6 G-1、ADR-0053)「表」(M6 G-2、ADR-0054)。
+// 今後増やすときも TABS 配列に 1 要素足すだけで済むようにしてある。
 import { ReactNode, useEffect, useState } from "react";
 import { Member, PermGroup } from "../ipc";
 import { t } from "../i18n";
 import { SharedMemoView } from "./SharedMemoView";
 import { ScheduleView } from "./ScheduleView";
+import { SheetView } from "./SheetView";
 
 type SharedHubProps = {
   configPath: string;
@@ -24,6 +25,9 @@ type SharedHubProps = {
   /** チャットの `@schedule:id` カード(ADR-0053)から開く予定。 */
   focusScheduleId?: string | null;
   onScheduleFocusConsumed?: () => void;
+  /** チャットの `@sheet:id` カード(ADR-0054)から開くシート。 */
+  focusSheetId?: string | null;
+  onSheetFocusConsumed?: () => void;
 };
 
 type SharedHubTab = {
@@ -57,6 +61,21 @@ const TABS: SharedHubTab[] = [
       />
     ),
   },
+  {
+    id: "sheets",
+    label: t.sharedHub.tabSheets,
+    icon: "📊",
+    render: (props) => (
+      <SheetView
+        configPath={props.configPath}
+        isHost={props.isHost}
+        supported={props.supported}
+        seq={props.seq}
+        focusSheetId={props.focusSheetId}
+        onFocusConsumed={props.onSheetFocusConsumed}
+      />
+    ),
+  },
 ];
 
 export function SharedHubView(props: SharedHubProps) {
@@ -70,6 +89,12 @@ export function SharedHubView(props: SharedHubProps) {
     if (props.focusScheduleId) setTabId("schedule");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.focusScheduleId]);
+
+  // チャットの `@sheet:id` カードから開いたときも同様に「表」へ切り替える
+  useEffect(() => {
+    if (props.focusSheetId) setTabId("sheets");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.focusSheetId]);
 
   return (
     <div className="shared-hub">

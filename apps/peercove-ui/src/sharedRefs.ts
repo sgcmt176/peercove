@@ -8,10 +8,10 @@
 // オフラインでも出る)。取得できなければ「アクセスできません」カードとし、
 // タイトル等は一切出さない。**メモのタイトル・本文はログへ出さない**。
 import { useEffect, useState } from "react";
-import { ScheduleEvent, api } from "./ipc";
+import { ScheduleEvent, SheetMeta, api } from "./ipc";
 import { t } from "./i18n";
 
-export type SharedRefKind = "memo" | "schedule";
+export type SharedRefKind = "memo" | "schedule" | "sheet";
 
 export interface SharedRefResolved {
   /** カードのタイトル(見出し)。 */
@@ -70,6 +70,27 @@ function scheduleExcerpt(event: ScheduleEvent): string {
   return t.schedule.excerptTimed(md, `${pad(start.getHours())}:${pad(start.getMinutes())}`);
 }
 
+// 共有シート(M6 G-2、ADR-0054)。`Get` op が無いため一覧から id を引く
+// (schedule と同じ TTL メモ化)。
+const SHEET_LIST_TTL_MS = 5000;
+const sheetListCache = new Map<string, { sheets: SheetMeta[]; at: number }>();
+
+async function listSheets(configPath: string): Promise<SheetMeta[]> {
+  const cached = sheetListCache.get(configPath);
+  const now = Date.now();
+  if (cached && now - cached.at < SHEET_LIST_TTL_MS) return cached.sheets;
+  const reply = await api.sharedMemoOp(configPath, {
+    op: "sheet",
+    sheet: { op: "list" },
+  });
+  const sheets =
+    reply.kind === "sheet" && reply.reply.kind === "sheets"
+      ? reply.reply.sheets
+      : [];
+  sheetListCache.set(configPath, { sheets, at: now });
+  return sheets;
+}
+
 /** 対応している種別のレジストリ。増やすときはここへ 1 エントリ足すだけでよい。 */
 const SHARED_REF_KINDS: Record<SharedRefKind, SharedRefKindSpec> = {
   memo: {
@@ -92,6 +113,19 @@ const SHARED_REF_KINDS: Record<SharedRefKind, SharedRefKindSpec> = {
       const event = events.find((e) => e.id === id);
       if (!event) return null;
       return { title: event.title, excerpt: scheduleExcerpt(event) };
+    },
+  },
+  sheet: {
+    icon: "📊",
+    noun: t.sharedRef.nounSheet,
+    resolve: async (configPath, id) => {
+      const sheets = await listSheets(configPath);
+      const sheet = sheets.find((s) => s.id === id);
+      if (!sheet) return null;
+      return {
+        title: sheet.name,
+        excerpt: t.memo.updatedAt(new Date(sheet.updated_at).toLocaleString()),
+      };
     },
   },
 };

@@ -736,6 +736,56 @@ export type ScheduleReply =
   | { kind: "done" }
   | { kind: "err"; message: string };
 
+// ---- 共有シート(Excel ライク表、M6 G-2、ADR-0054)。SharedMemoOp/Reply に
+// additive な `sheet` variant として相乗りする(crates/peercove-core/
+// src/sheet.rs の serde 表現に一致させる)。 ----
+
+export interface SheetMeta {
+  id: string;
+  name: string;
+  /** 所有者(作成者)の member_id。空文字 = ホスト。 */
+  owner_id: string;
+  owner_name: string;
+  created_at: number;
+  updated_at: number;
+  /** 受信者視点: 改名・削除できるか(作成者 + ホスト)。 */
+  can_manage?: boolean;
+}
+
+export interface SheetCell {
+  row: number;
+  col: number;
+  value: string;
+  /** 単調増加リビジョン(CAS 用)。 */
+  revision: number;
+  updated_by: string;
+  updated_at: number;
+}
+
+/** セル書き込み 1 件分。base_revision 0 = 新規セル想定。値が空文字ならセル削除。 */
+export interface CellWrite {
+  row: number;
+  col: number;
+  value: string;
+  base_revision?: number;
+}
+
+export type SheetOp =
+  | { op: "list" }
+  | { op: "cells"; sheet_id: string }
+  | { op: "create"; name?: string }
+  | { op: "rename"; sheet_id: string; name?: string }
+  | { op: "delete"; sheet_id: string }
+  | { op: "write"; sheet_id: string; cells: CellWrite[] };
+
+export type SheetReply =
+  | { kind: "sheets"; sheets: SheetMeta[]; offline?: boolean }
+  | { kind: "cells_data"; sheet_id: string; cells: SheetCell[]; offline?: boolean }
+  | { kind: "sheet"; sheet: SheetMeta }
+  | { kind: "write_result"; applied: number; conflicts: SheetCell[] }
+  | { kind: "done" }
+  | { kind: "err"; message: string };
+
 export type SharedMemoOp =
   | { op: "list"; query: SharedMemoQuery }
   | { op: "get"; id: string }
@@ -784,7 +834,9 @@ export type SharedMemoOp =
   | { op: "comment_add"; id: string; body: string }
   | { op: "comment_delete"; id: string; comment_id: string }
   // 共有スケジュール表(M6 G-1、ADR-0053)。additive な相乗り。
-  | { op: "schedule"; schedule: ScheduleOp };
+  | { op: "schedule"; schedule: ScheduleOp }
+  // 共有シート(M6 G-2、ADR-0054)。additive な相乗り。
+  | { op: "sheet"; sheet: SheetOp };
 
 export type SharedMemoReply =
   | {
@@ -807,7 +859,9 @@ export type SharedMemoReply =
   | { kind: "done" }
   | { kind: "err"; message: string }
   // 共有スケジュール表(M6 G-1、ADR-0053)。
-  | { kind: "schedule"; reply: ScheduleReply };
+  | { kind: "schedule"; reply: ScheduleReply }
+  // 共有シート(M6 G-2、ADR-0054)。
+  | { kind: "sheet"; reply: SheetReply };
 
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =

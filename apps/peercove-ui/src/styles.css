@@ -3593,3 +3593,221 @@ button.msg__ref:hover {
     min-height: 56px;
   }
 }
+
+/* ---- 共有シート (M6 G-2, ADR-0054) ----
+   手作りグリッド(外部ライブラリ不使用)。ヘッダー行・列は position: sticky。
+   .schedule__* / .memo__folder-row の流儀(card, hover 表示の操作ボタン)を
+   踏襲する */
+
+.sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: calc(100vh - 120px);
+  min-height: 420px;
+}
+
+.sheet__tabbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.sheet__tab-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.sheet__tab {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  border-radius: 0;
+  padding: 4px 8px;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheet__tab:hover {
+  background: var(--accent-soft);
+}
+
+.sheet__tab--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sheet__tab-menu-btn {
+  padding: 4px 6px;
+  opacity: 0.5;
+}
+
+.sheet__tab-wrap:hover .sheet__tab-menu-btn {
+  opacity: 1;
+}
+
+.sheet__tab-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 10em;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 4px;
+  gap: 2px;
+}
+
+.sheet__tab-menu button {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 5px 8px;
+  border-radius: 6px;
+}
+
+.sheet__tab-menu button:hover {
+  background: var(--accent-soft);
+}
+
+.sheet__tab-menu-danger {
+  color: var(--danger) !important;
+}
+
+.sheet__notice {
+  color: var(--accent);
+  margin: 0;
+}
+
+.sheet__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex: 1;
+}
+
+.sheet__table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0;
+}
+
+.sheet__table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: max-content;
+  font-size: 0.85rem;
+}
+
+.sheet__corner,
+.sheet__col-head,
+.sheet__row-head,
+.sheet__cell {
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.sheet__col-head,
+.sheet__corner {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--card);
+  color: var(--muted);
+  font-weight: 600;
+  padding: 4px 8px;
+  min-width: 90px;
+}
+
+.sheet__corner {
+  left: 0;
+  z-index: 3;
+  min-width: 44px;
+}
+
+.sheet__row-head {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--card);
+  color: var(--muted);
+  text-align: right;
+  padding: 4px 8px;
+  font-weight: 400;
+}
+
+.sheet__cell {
+  min-width: 90px;
+  height: 26px;
+  padding: 3px 6px;
+  cursor: cell;
+  outline: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sheet__cell:focus {
+  outline: none;
+}
+
+.sheet__cell--selected {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.sheet__cell--numeric .sheet__cell-value {
+  display: block;
+  text-align: right;
+}
+
+.sheet__cell--conflict {
+  background: rgba(230, 180, 20, 0.28);
+}
+
+.sheet__cell-value {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sheet__cell-input {
+  width: 100%;
+  min-width: 80px;
+  border: none;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+
+.sheet__cell-input:focus {
+  outline: none;
+}
+
+@media (max-width: 900px) {
+  .sheet {
+    height: auto;
+  }
+
+  .sheet__table-wrap {
+    max-height: 70vh;
+  }
+}

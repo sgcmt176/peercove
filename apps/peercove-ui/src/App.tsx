@@ -108,6 +108,11 @@ export default function App() {
    */
   const [scheduleFocus, setScheduleFocus] = useState<string | null>(null);
   /**
+   * チャットの `@sheet:id` カード(ADR-0054)から共有ハブの該当シートへ
+   * フォーカスする。一度反映したら(SheetView 側で)null に戻る。
+   */
+  const [sheetFocus, setSheetFocus] = useState<string | null>(null);
+  /**
    * ディープリンクで受けた招待トークン(M3-5)。オブジェクトで包むのは、
    * 同じリンクを 2 回クリックしても再度フォームを開くため(参照が変わる)。
    */
@@ -585,6 +590,8 @@ export default function App() {
               onFocusConsumed={() => setMemoFocus(null)}
               focusScheduleId={scheduleFocus}
               onScheduleFocusConsumed={() => setScheduleFocus(null)}
+              focusSheetId={sheetFocus}
+              onSheetFocusConsumed={() => setSheetFocus(null)}
             />
           ) : openTunnel !== null ? (
             <TunnelView
@@ -606,6 +613,8 @@ export default function App() {
               onOpenRef={(kind, id) => {
                 if (kind === "schedule") {
                   setScheduleFocus(id);
+                } else if (kind === "sheet") {
+                  setSheetFocus(id);
                 } else {
                   setMemoFocus(id);
                 }
