@@ -630,6 +630,13 @@ fun SheetTab(
                             isHeader = true,
                             gridlines = gridlines,
                         )
+                        // 検証観点(タップ→セル編集の対応):
+                        // 1) 先頭行・先頭列(A1)タップで row=0,col=0 が開くこと
+                        // 2) 結合セル内側・周辺のタップで結合の左上セルの row/col になること
+                        // 3) 横スクロール後のタップでも(ピクセル座標からの逆算を行わないため)
+                        //    ずれが生じないこと
+                        // いずれも各セル生成時に val で固定した row/col をラムダに
+                        // キャプチャさせる方式(下記 cellRow/cellCol)で担保している。
                         var c = 0
                         while (c < displayCols) {
                             val merge = mergeCovered[r to c]
@@ -644,6 +651,18 @@ fun SheetTab(
                                     val spanHeight = (merge.row.toInt() until spanEndRow).fold(0.dp) { acc, row ->
                                         acc + rowHeightFor(row)
                                     }
+                                    // バグ修正: r は for ループの反復ごとに新しい val として
+                                    // 束縛されるため安全だが、c は while ループの外で
+                                    // `var c = 0` として宣言され、以後 `c += 1` / `c = spanEndCol`
+                                    // で使い回される単一の可変変数。以前は onClick ラムダが
+                                    // この c を直接キャプチャしていたため、Compose がラムダを
+                                    // 実際に呼び出す(タップされた)時点では、その行の while ループが
+                                    // 既に完走して c は行内の最終列まで進んだ後の値になっており、
+                                    // 行内のどのセルをタップしても同じ(誤った)列が編集されていた。
+                                    // 修正: 各セルの生成時点の row/col を val に固定してからラムダに
+                                    // キャプチャさせることで、後続のループ進行の影響を受けないようにする。
+                                    val cellRow = r
+                                    val cellCol = c
                                     val cell = cellsByKey[r.toUInt() to c.toUInt()]
                                     val value = cell?.value ?: ""
                                     val format = parseCellFormat(cell?.format ?: "")
@@ -656,8 +675,8 @@ fun SheetTab(
                                         gridlines = gridlines,
                                         onClick = {
                                             cellDialog = SheetCellDialogState(
-                                                row = r.toUInt(),
-                                                col = c.toUInt(),
+                                                row = cellRow.toUInt(),
+                                                col = cellCol.toUInt(),
                                                 revision = cell?.revision ?: 0uL,
                                                 value = value,
                                             )
@@ -680,6 +699,11 @@ fun SheetTab(
                                     c += 1
                                 }
                                 else -> {
+                                    // 上の結合セル分岐と同じ理由(c は while ループを跨いで
+                                    // 使い回される可変変数)で、タップ時に確定させたい
+                                    // row/col を val に固定してからラムダにキャプチャさせる。
+                                    val cellRow = r
+                                    val cellCol = c
                                     val cell = cellsByKey[r.toUInt() to c.toUInt()]
                                     val value = cell?.value ?: ""
                                     val format = parseCellFormat(cell?.format ?: "")
@@ -692,8 +716,8 @@ fun SheetTab(
                                         gridlines = gridlines,
                                         onClick = {
                                             cellDialog = SheetCellDialogState(
-                                                row = r.toUInt(),
-                                                col = c.toUInt(),
+                                                row = cellRow.toUInt(),
+                                                col = cellCol.toUInt(),
                                                 revision = cell?.revision ?: 0uL,
                                                 value = value,
                                             )

@@ -3939,7 +3939,11 @@ button.msg__ref:hover {
 .sheet__corner {
   position: sticky;
   top: 0;
-  z-index: 2;
+  /* 列ヘッダー/行ヘッダーは常に最前面(固定枠セルより上、ADR-0055 決定 6
+     追補 H-7a)。以前は固定枠セル(.sheet__cell--frozen)と同じ z-index 2
+     で並んでいたため、DOM 順(tbody が thead より後)により固定行が
+     ヘッダーへ食い込んで見える不具合があった。 */
+  z-index: 4;
   background: #f3f3f3;
   color: #3c3c3c;
   font-weight: 600;
@@ -3949,14 +3953,14 @@ button.msg__ref:hover {
 
 .sheet__corner {
   left: 0;
-  z-index: 3;
+  z-index: 5;
   min-width: 44px;
 }
 
 .sheet__row-head {
   position: sticky;
   left: 0;
-  z-index: 1;
+  z-index: 4;
   background: #f3f3f3;
   color: #3c3c3c;
   text-align: right;
@@ -4139,8 +4143,27 @@ button.msg__ref:hover {
   cursor: pointer;
 }
 
-.sheet__toolbar-range {
-  margin-left: auto;
+/* 選択範囲の常設ステータスバー(ADR-0055 決定 6 追補 H-7a)。以前はツール
+   バー右上に「複数選択のときだけ」出していたため、単一選択との間で出たり
+   消えたりしてグリッドが上下にずれていた。グリッド枠外の左下に常設し、
+   単一セルでも常に表示することでレイアウトシフトを無くす。依頼者要望で
+   視認性重視のはっきり大きいサイズにする。 */
+.sheet__status-bar {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  align-self: flex-start;
+}
+
+.sheet__status-bar-range {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
 }
 
 @media (max-width: 900px) {
@@ -4161,10 +4184,11 @@ button.msg__ref:hover {
   border-bottom: none;
 }
 
-/* 固定枠(freeze panes、ADR-0055 決定 6)。行・列ヘッダーの上に重ねる
-   ため、通常セルより高い z-index を敷く。 */
+/* 固定枠(freeze panes、ADR-0055 決定 6)。通常セルより高い z-index を
+   敷いて重なりを表から浮かせるが、列/行ヘッダー(z-index 4/5)より下に
+   留める(ADR-0055 決定 6 追補 H-7a: 以前は同値でヘッダーに食い込んでいた)。 */
 .sheet__cell--frozen {
-  z-index: 2;
+  z-index: 3;
 }
 
 /* プレゼンス(選択セル共有、ADR-0055 決定 6)。色は名前のハッシュから

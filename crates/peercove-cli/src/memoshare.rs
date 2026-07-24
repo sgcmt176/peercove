@@ -29,7 +29,7 @@ use peercove_core::schedule::{ScheduleEvent, ScheduleEventMsg, ScheduleOp, Sched
 use peercove_core::sheet::{
     SheetCell, SheetEventMsg, SheetMerge, SheetMeta, SheetOp, SheetPresencePeer, SheetReply,
 };
-use peercove_memo::shared::{Actor, CacheStore, SharedStore};
+use peercove_memo::shared::{is_retryable_sqlite_error, Actor, CacheStore, SharedStore};
 
 use crate::control::Connections;
 
@@ -909,8 +909,21 @@ impl MemoService {
             }
             SheetOp::Presence { sheet_id, row, col } => {
                 let key = actor.member_id.clone().unwrap_or_default();
-                {
+                // ホスト UI は seq(bump)の変化でのみ再取得するため、在席表が
+                // 実際に変化したときだけ bump する(ADR-0055 決定 6 追補
+                // H-7a: バグ修正)。以前は bump しておらず、ホストの画面には
+                // メンバーの選択位置が(他の操作のついでの再取得以外では)
+                // 永久に反映されなかった。同じ位置への再送(250ms スロットル
+                // でも選択セルが変わらなければ UI 側は送らないが、念のため
+                // ここでも変化判定して過剰な bump を避ける)は素通しする。
+                let changed = {
                     let mut presence = self.sheet_presence.lock().unwrap();
+                    let is_new_or_changed = match presence.get(&key) {
+                        Some(prev) => {
+                            prev.sheet_id != sheet_id || prev.row != row || prev.col != col
+                        }
+                        None => true,
+                    };
                     presence.insert(
                         key.clone(),
                         SheetPresenceEntry {
@@ -921,8 +934,12 @@ impl MemoService {
                             seen: Instant::now(),
                         },
                     );
-                }
+                    is_new_or_changed
+                };
                 self.broadcast_sheet_presence(&sheet_id, Some(&key));
+                if changed {
+                    self.bump();
+                }
                 Ok(SheetReply::Done)
             }
         }
@@ -1111,12 +1128,14 @@ impl MemoService {
     async fn blocking<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut SharedStore) -> anyhow::Result<T> + Send + 'static,
+        F: Fn(&mut SharedStore) -> anyhow::Result<T> + Send + 'static,
     {
         let path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut store = SharedStore::open(&path)?;
-            f(&mut store)
+            retry_on_lock_error(|| {
+                let mut store = SharedStore::open(&path)?;
+                f(&mut store)
+            })
         })
         .await
         .context("メモ処理タスクが失敗しました")?
@@ -1431,14 +1450,51 @@ impl MemoService {
             });
             affected.into_iter().collect()
         };
-        for sheet_id in affected {
-            self.broadcast_sheet_presence(&sheet_id, None);
+        if affected.is_empty() {
+            return;
         }
+        for sheet_id in &affected {
+            self.broadcast_sheet_presence(sheet_id, None);
+        }
+        // 失効で在席表が実際に変化したときだけ bump する(ADR-0055 決定 6
+        // 追補 H-7a)。affected は空でないので必ず 1 回。
+        self.bump();
     }
 }
 
 fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
     locks.retain(|_, lock| lock.last_activity.elapsed() <= LOCK_TTL);
+}
+
+/// `SharedStore`/`CacheStore` を都度 open する構造(各 op ごとに新しい
+/// コネクションを開く)のため、書き込みが集中すると SQLite の
+/// locking protocol エラー(SQLITE_BUSY/SQLITE_LOCKED/SQLITE_PROTOCOL)が
+/// まれに起きる(ADR-0055 決定 6 追補 H-7a)。busy_timeout(5秒)は個々の
+/// SQL 文の待ちはカバーするが、コネクションの open/close 自体が重なった
+/// ときのロック取得プロトコルのエラーまでは吸収しないため、ここで
+/// アプリ層の安全弁として 50ms 間隔・最大 5 回まで再試行する。対象外の
+/// エラー(制約違反・データ不整合など)は最初の失敗でそのまま返す。
+const RETRY_MAX_ATTEMPTS: u32 = 5;
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn retry_on_lock_error<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let mut last_err = None;
+    for i in 0..RETRY_MAX_ATTEMPTS {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if i + 1 < RETRY_MAX_ATTEMPTS && is_retryable_sqlite_error(&err) {
+                    std::thread::sleep(RETRY_DELAY);
+                    last_err = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    // MAX_ATTEMPTS >= 1 なので実際にはループ内で return 済みだが、
+    // 型を満たすために保険で置いておく。
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("リトライに失敗しました")))
 }
 
 /// (同期文脈から)複数メモの編集終了時スナップショットをまとめて行う。
@@ -1499,12 +1555,14 @@ impl MemberMemoCache {
     async fn blocking<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut CacheStore) -> anyhow::Result<T> + Send + 'static,
+        F: Fn(&mut CacheStore) -> anyhow::Result<T> + Send + 'static,
     {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut store = CacheStore::open(&path)?;
-            f(&mut store)
+            retry_on_lock_error(|| {
+                let mut store = CacheStore::open(&path)?;
+                f(&mut store)
+            })
         })
         .await
         .context("メモキャッシュタスクが失敗しました")?

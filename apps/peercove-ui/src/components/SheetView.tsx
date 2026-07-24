@@ -10,10 +10,12 @@ import {
   MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import { flushSync } from "react-dom";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   CellFormat,
@@ -48,11 +50,22 @@ const NUMERIC_RE = /^-?\d+(\.\d+)?$/;
 
 const FONT_SIZE_CHOICES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36];
 
-// 固定枠(freeze panes、ADR-0055 決定 6)のピクセル計算に使う近似値。列
-// ヘッダー行・行番号列の実測サイズは CSS の .sheet__col-head / .sheet__corner
-// と揃えてある(厳密な Excel 互換は不要 = 破綻しない範囲での近似)。
+// 固定枠(freeze panes、ADR-0055 決定 6/ADR-0055 決定 6 追補 H-7a)の
+// ピクセルオフセット計算のフォールバック初期値(DOM 実測が終わるまでの
+// 一瞬だけ使う。useLayoutEffect が paint 前に実測値へ差し替えるため、
+// 画面には出ない)。H-5 時点はこの定数だけで offset を計算していたが、
+// 実際の行高(可変)・ヘッダーの実描画高とずれて固定枠がヘッダーへ食い
+// 込む不具合があったため、H-7a で DOM 実測ベースに切り替えた。
 const HEADER_ROW_HEIGHT = DEFAULT_ROW_HEIGHT;
 const ROW_HEAD_WIDTH = 44;
+
+function numberArraysEqual(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 // プレゼンス送信のスロットル間隔(ADR-0055 決定 6: 選択位置の共有 ~4 回/秒)。
 const PRESENCE_THROTTLE_MS = 250;
@@ -263,6 +276,28 @@ export function SheetView({
   // プレゼンス送信のスロットル(ADR-0055 決定 6)。
   const presenceThrottleRef = useRef<number | null>(null);
   const lastSentPresenceRef = useRef<string | null>(null);
+  // 文字キーでの編集開始時、直後の自動 focus+select(既存 useEffect)を
+  // 1 回だけ止める(ADR-0055 決定 6 追補 H-7a: IME バグ修正)。true の間は
+  // その useEffect が select() で IME 変換中の状態を壊さないようにする。
+  const skipAutoFocusSelectRef = useRef(false);
+  // シートへの write を直列化する送信キュー(ADR-0055 決定 6 追補 H-7a:
+  // SQLite 側の locking protocol エラー対策)。前の write の応答を待って
+  // から次を送る。書式適用・編集確定・貼り付け・Undo すべて writeCells
+  // 経由なのでここ 1 箇所で足りる。
+  const writeQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  // 文字色・背景色 <input type="color"> のデバウンス(ADR-0055 決定 6
+  // 追補 H-7a)。ドラッグ中は onChange が大量発火するため、確定(次の
+  // onChange が来ない = 入力が止まった、または blur)までまとめる。
+  const textColorDebounceRef = useRef<number | null>(null);
+  const bgColorDebounceRef = useRef<number | null>(null);
+  // 固定枠(freeze panes)のピクセルオフセット実測用(ADR-0055 決定 6
+  // 追補 H-7a)。DOM の実描画サイズを useLayoutEffect で読み取る。
+  const theadRowRef = useRef<HTMLTableRowElement | null>(null);
+  const cornerRef = useRef<HTMLTableCellElement | null>(null);
+  const rowElRefs = useRef<Map<number, HTMLTableRowElement>>(new Map());
+  const colHeadElRefs = useRef<Map<number, HTMLTableCellElement>>(new Map());
+  const [measuredRowTopOffsets, setMeasuredRowTopOffsets] = useState<number[]>([]);
+  const [measuredColLeftOffsets, setMeasuredColLeftOffsets] = useState<number[]>([]);
 
   useEffect(() => {
     activeSheetIdRef.current = activeSheetId;
@@ -375,9 +410,17 @@ export function SheetView({
     el?.focus();
   }, [selection, editing]);
 
-  // 編集開始時だけ input へフォーカス + 全選択(打鍵のたびには再実行しない)
+  // 編集開始時だけ input へフォーカス + 全選択(打鍵のたびには再実行しない)。
+  // 文字キーでの編集開始(startTypedEdit)は既に同期的に focus 済みで、
+  // かつ IME 変換中にここで select() すると変換が壊れうるため 1 回だけ
+  // 飛ばす(ADR-0055 決定 6 追補 H-7a)。F2/ダブルクリック(startEdit)は
+  // このガードを通らないので従来どおり focus+select する。
   useEffect(() => {
     if (!editing) return;
+    if (skipAutoFocusSelectRef.current) {
+      skipAutoFocusSelectRef.current = false;
+      return;
+    }
     inputRef.current?.focus();
     inputRef.current?.select();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -443,6 +486,39 @@ export function SheetView({
       : null;
 
   const activeSheet = sheets.find((s) => s.id === activeSheetId) ?? null;
+
+  // 固定枠(freeze panes)のピクセルオフセットを DOM の実描画サイズから
+  // 計算する(ADR-0055 決定 6 追補 H-7a)。useLayoutEffect は commit 後・
+  // paint 前に同期実行されるため、初回マウントや行高/列幅変更の際も
+  // ずれた中間状態が画面に出ることはない。
+  useLayoutEffect(() => {
+    const freezeRows = activeSheet?.freeze_rows ?? 0;
+    const freezeCols = activeSheet?.freeze_cols ?? 0;
+    const headerH = theadRowRef.current?.offsetHeight ?? HEADER_ROW_HEIGHT;
+    const rowHeadW = cornerRef.current?.offsetWidth ?? ROW_HEAD_WIDTH;
+    const rowTops: number[] = [];
+    let accR = headerH;
+    for (let r = 0; r < freezeRows; r++) {
+      rowTops.push(accR);
+      accR += rowElRefs.current.get(r)?.offsetHeight ?? rowHeights.get(r) ?? DEFAULT_ROW_HEIGHT;
+    }
+    const colLefts: number[] = [];
+    let accC = rowHeadW;
+    for (let c = 0; c < freezeCols; c++) {
+      colLefts.push(accC);
+      accC += colHeadElRefs.current.get(c)?.offsetWidth ?? colWidths.get(c) ?? DEFAULT_COL_WIDTH;
+    }
+    setMeasuredRowTopOffsets((prev) => (numberArraysEqual(prev, rowTops) ? prev : rowTops));
+    setMeasuredColLeftOffsets((prev) => (numberArraysEqual(prev, colLefts) ? prev : colLefts));
+  }, [
+    activeSheet?.freeze_rows,
+    activeSheet?.freeze_cols,
+    activeSheet?.gridlines,
+    rowHeights,
+    colWidths,
+    cells,
+    merges,
+  ]);
 
   const cellsByKey = useMemo(() => {
     const map = new Map<string, SheetCell>();
@@ -545,7 +621,9 @@ export function SheetView({
     async (writes: CellWrite[]) => {
       if (!activeSheetId || writes.length === 0) return;
       // Undo 履歴(自分の直近操作、ADR-0055 決定 6): 書き込み前の状態を
-      // 積む。Undo 自体の書き戻しは積み直さない(Redo は不要)。
+      // 積む。Undo 自体の書き戻しは積み直さない(Redo は不要)。書き込み
+      // キュー投入前(=呼び出し直後)の状態を積む必要があるため、送信の
+      // 直列化より前にここで計算する。
       if (!isUndoingRef.current) {
         const snapshot: UndoCellSnapshot[] = writes.map((write) => {
           const current = cellsByKey.get(keyOf(write.row, write.col));
@@ -560,20 +638,30 @@ export function SheetView({
           -MAX_UNDO_STACK,
         );
       }
-      try {
-        const reply = await sheetOp({ op: "write", sheet_id: activeSheetId, cells: writes });
-        if (reply.kind === "write_result") {
-          if (reply.conflicts.length > 0) {
-            applyConflicts(reply.conflicts);
-            setNotice(t.sheet.conflictNotice(reply.conflicts.length));
+      const targetSheetId = activeSheetId;
+      const send = async () => {
+        try {
+          const reply = await sheetOp({ op: "write", sheet_id: targetSheetId, cells: writes });
+          if (reply.kind === "write_result") {
+            if (reply.conflicts.length > 0) {
+              applyConflicts(reply.conflicts);
+              setNotice(t.sheet.conflictNotice(reply.conflicts.length));
+            }
+            void loadCells(targetSheetId);
+          } else if (reply.kind === "err") {
+            setNotice(reply.message);
           }
-          void loadCells(activeSheetId);
-        } else if (reply.kind === "err") {
-          setNotice(reply.message);
+        } catch (error) {
+          setNotice(errorMessage(error));
         }
-      } catch (error) {
-        setNotice(errorMessage(error));
-      }
+      };
+      // 送信の直列化(ADR-0055 決定 6 追補 H-7a): 前の write の応答を待って
+      // から次を送る。書式適用・編集確定・貼り付けはすべてこの関数を通る
+      // ので、ここ 1 箇所の直列化で足りる(大量の色ドラッグ連打などで
+      // SQLite 側の locking protocol エラーを誘発しないようにする)。
+      const next = writeQueueRef.current.then(send, send);
+      writeQueueRef.current = next;
+      await next;
     },
     [activeSheetId, sheetOp, applyConflicts, loadCells, cellsByKey],
   );
@@ -694,6 +782,28 @@ export function SheetView({
     [readOnlyReason, resolveMergeAnchor, cellsByKey],
   );
 
+  /** 文字キーで編集を開始する(ADR-0055 決定 6 追補 H-7a: IME バグ修正)。
+   * 空値で編集モードへ入り、その場で input へ同期的に focus する。呼び
+   * 出し側(handleGridKeyDown)は該当 keydown を preventDefault しないので、
+   * ブラウザはこの直後の既定動作(文字挿入 / IME 変換開始)をこの時点で
+   * focus されている要素、つまりここで作った input に対して行う。結果、
+   * 1 打鍵目が生のキー文字として注入されることも、IME の変換開始が
+   * 素通しされて "a" が混ざることもなくなる。
+   * React 18+ はイベントハンドラ内の setState を自動バッチするため、
+   * flushSync で同期コミットしないと inputRef.current がこの時点でまだ
+   * 古い(または null の)ままになる。 */
+  const startTypedEdit = useCallback(
+    (row: number, col: number) => {
+      if (readOnlyReason) return;
+      skipAutoFocusSelectRef.current = true;
+      flushSync(() => {
+        startEdit(row, col, "");
+      });
+      inputRef.current?.focus();
+    },
+    [readOnlyReason, startEdit],
+  );
+
   const cancelEdit = useCallback(() => setEditing(null), []);
 
   const commitEdit = useCallback(
@@ -793,6 +903,54 @@ export function SheetView({
       applyFormatToSelection((current) => ({ ...current, bg }));
     },
     [applyFormatToSelection],
+  );
+
+  // <input type="color"> はドラッグ中に大量の onChange を発火するため、
+  // 適用は入力確定時までデバウンスする(ADR-0055 決定 6 追補 H-7a)。
+  // blur(ピッカーを閉じた/フォーカスが外れた)では即座に確定させる。
+  const debouncedTextColor = useCallback(
+    (color: string) => {
+      if (textColorDebounceRef.current !== null) {
+        window.clearTimeout(textColorDebounceRef.current);
+      }
+      textColorDebounceRef.current = window.setTimeout(() => {
+        textColorDebounceRef.current = null;
+        setTextColor(color);
+      }, 250);
+    },
+    [setTextColor],
+  );
+  const flushTextColor = useCallback(
+    (color: string) => {
+      if (textColorDebounceRef.current !== null) {
+        window.clearTimeout(textColorDebounceRef.current);
+        textColorDebounceRef.current = null;
+      }
+      setTextColor(color);
+    },
+    [setTextColor],
+  );
+  const debouncedBgColor = useCallback(
+    (bg: string) => {
+      if (bgColorDebounceRef.current !== null) {
+        window.clearTimeout(bgColorDebounceRef.current);
+      }
+      bgColorDebounceRef.current = window.setTimeout(() => {
+        bgColorDebounceRef.current = null;
+        setBgColor(bg);
+      }, 250);
+    },
+    [setBgColor],
+  );
+  const flushBgColor = useCallback(
+    (bg: string) => {
+      if (bgColorDebounceRef.current !== null) {
+        window.clearTimeout(bgColorDebounceRef.current);
+        bgColorDebounceRef.current = null;
+      }
+      setBgColor(bg);
+    },
+    [setBgColor],
   );
 
   const setAlign = useCallback(
@@ -1186,8 +1344,9 @@ export function SheetView({
         !event.metaKey &&
         !event.altKey
       ) {
-        event.preventDefault();
-        startEdit(row, col, event.key);
+        // ここでは preventDefault しない(ADR-0055 決定 6 追補 H-7a: IME
+        // バグ修正)。詳細は startTypedEdit のコメント参照。
+        startTypedEdit(row, col);
       }
     },
     [
@@ -1199,6 +1358,7 @@ export function SheetView({
       cancelEdit,
       moveActiveCell,
       startEdit,
+      startTypedEdit,
       writeCells,
       undo,
     ],
@@ -1408,25 +1568,11 @@ export function SheetView({
   const freezeRows = activeSheet?.freeze_rows ?? 0;
   const freezeCols = activeSheet?.freeze_cols ?? 0;
 
-  // 固定枠(freeze panes)のピクセルオフセット(ADR-0055 決定 6)。列/行
-  // ヘッダーの実測に近い値を近似として使う(破綻しない範囲での近似、
-  // 厳密な Excel 互換は不要)。
-  const rowTopOffsets: number[] = [];
-  {
-    let acc = HEADER_ROW_HEIGHT;
-    for (let r = 0; r < freezeRows; r++) {
-      rowTopOffsets.push(acc);
-      acc += rowHeights.get(r) ?? DEFAULT_ROW_HEIGHT;
-    }
-  }
-  const colLeftOffsets: number[] = [];
-  {
-    let acc = ROW_HEAD_WIDTH;
-    for (let c = 0; c < freezeCols; c++) {
-      colLeftOffsets.push(acc);
-      acc += colWidths.get(c) ?? DEFAULT_COL_WIDTH;
-    }
-  }
+  // 固定枠(freeze panes)のピクセルオフセットは DOM 実測ベース
+  // (measuredRowTopOffsets/measuredColLeftOffsets、上の useLayoutEffect
+  // 参照、ADR-0055 決定 6 追補 H-7a)。
+  const rowTopOffsets = measuredRowTopOffsets;
+  const colLeftOffsets = measuredColLeftOffsets;
 
   /** 右クリックメニューの項目(ADR-0055 決定 6)。 */
   function buildCellMenuItems(menu: { row: number; col: number }): ContextMenuEntry[] {
@@ -1591,7 +1737,8 @@ export function SheetView({
                 type="color"
                 disabled={toolbarDisabled}
                 value={primaryFormat.color ?? "#000000"}
-                onChange={(event) => setTextColor(event.target.value)}
+                onChange={(event) => debouncedTextColor(event.target.value)}
+                onBlur={(event) => flushTextColor(event.target.value)}
               />
             </label>
             <button
@@ -1609,7 +1756,8 @@ export function SheetView({
                 type="color"
                 disabled={toolbarDisabled}
                 value={primaryFormat.bg ?? "#ffffff"}
-                onChange={(event) => setBgColor(event.target.value)}
+                onChange={(event) => debouncedBgColor(event.target.value)}
+                onBlur={(event) => flushBgColor(event.target.value)}
               />
             </label>
             <button
@@ -1744,13 +1892,6 @@ export function SheetView({
               {t.sheet.toolbarUnfreeze}
             </button>
           </div>
-          {hasRangeSelection && selectionRect && (
-            <span className="sheet__toolbar-range muted small">
-              {colLabel(selectionRect.c0)}
-              {selectionRect.r0 + 1}:{colLabel(selectionRect.c1)}
-              {selectionRect.r1 + 1}
-            </span>
-          )}
         </div>
       )}
 
@@ -1825,11 +1966,15 @@ export function SheetView({
             }
           >
             <thead>
-              <tr>
-                <th className="sheet__corner" />
+              <tr ref={theadRowRef}>
+                <th className="sheet__corner" ref={cornerRef} />
                 {colIndexes.map((c) => (
                   <th
                     key={c}
+                    ref={(el) => {
+                      if (el) colHeadElRefs.current.set(c, el);
+                      else colHeadElRefs.current.delete(c);
+                    }}
                     className="sheet__col-head"
                     style={boxStyle(undefined, colWidths.get(c))}
                   >
@@ -1846,7 +1991,14 @@ export function SheetView({
             </thead>
             <tbody>
               {rowIndexes.map((r) => (
-                <tr key={r} style={{ height: rowHeights.get(r) }}>
+                <tr
+                  key={r}
+                  ref={(el) => {
+                    if (el) rowElRefs.current.set(r, el);
+                    else rowElRefs.current.delete(r);
+                  }}
+                  style={{ height: rowHeights.get(r) }}
+                >
                   <th className="sheet__row-head">
                     {r + 1}
                     <span
@@ -1965,6 +2117,24 @@ export function SheetView({
           </table>
         </div>
       ) : null}
+
+      {activeSheet && (
+        // 選択範囲の常設ステータスバー(ADR-0055 決定 6 追補 H-7a)。
+        // グリッド枠外の左下に置き、単一セルでも常に表示することで、
+        // 複数選択との切り替えでツールバーが出たり消えたりして
+        // グリッドが上下にずれる問題を無くす。
+        <div className="sheet__status-bar">
+          <span className="sheet__status-bar-range">
+            {selectionRect
+              ? hasRangeSelection
+                ? `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}:${colLabel(
+                    selectionRect.c1,
+                  )}${selectionRect.r1 + 1}`
+                : `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}`
+              : ""}
+          </span>
+        </div>
+      )}
 
       {cellMenu && activeSheetId && (
         <ContextMenu

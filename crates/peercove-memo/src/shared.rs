@@ -295,9 +295,11 @@ impl SharedStore {
             path: path.to_path_buf(),
         };
         store.migrate()?;
-        // 保持期限を過ぎたゴミ箱を自動で完全削除(要件 §13/§17。M5 F-3 で
-        // 保持日数はホスト設定可になったため purge_expired() へ一本化)
-        store.purge_expired()?;
+        // ゴミ箱の自動完全削除(要件 §13/§17)はここでは行わない(M6 H-7a):
+        // op ごとに open するサービス構造では、読み取り操作まで毎回書き込み
+        // トランザクションを持つことになりロック輻輳の一因になるため、
+        // supervisor の定期メンテナンス(MemoService::maintain → purge_expired、
+        // 10 分間隔)へ一本化した。
         Ok(store)
     }
 
@@ -2601,12 +2603,47 @@ fn open_db(path: &Path) -> anyhow::Result<Connection> {
     }
     let conn = Connection::open(path)
         .with_context(|| format!("メモデータベースを開けません: {}", path.display()))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // busy_timeout は他のどの PRAGMA/クエリより先に設定する(ADR-0055 決定 6
+    // 追補 H-7a: locking protocol エラーの調査結果)。次の journal_mode=WAL
+    // への切り替え自体がロック取得を伴い、busy_timeout 未設定のまま実行する
+    // と既定のタイムアウト(0 = 即失敗)で他コネクションの一時ロックにぶつかり
+    // SQLITE_BUSY/SQLITE_PROTOCOL を誘発しうる。
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // WAL は DB ファイルに永続化されるモードなので、すでに WAL の DB へ
+    // 毎回 "PRAGMA journal_mode=WAL" を実行する必要はない(新規作成直後の
+    // 1 回だけで足りる)。無条件に発行し続けると、書き込みが集中していると
+    // きに不要なロック要求を積み増すおそれがあるため、現在のモードを見て
+    // からにする。
+    let current_mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !current_mode.eq_ignore_ascii_case("wal") {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+    }
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     register_kana_fold(&conn)?;
     Ok(conn)
+}
+
+/// SQLite の一時的なロック競合エラー(SQLITE_BUSY/SQLITE_LOCKED/
+/// SQLITE_PROTOCOL)かどうかを判定する(ADR-0055 決定 6 追補 H-7a)。
+/// `blocking()` 側の短時間リトライの対象を絞り込むために使う。busy_timeout
+/// で吸収しきれない、コネクションの開閉が重なったときのロック取得プロトコル
+/// 自体のエラー(SQLITE_PROTOCOL)はリトライで解消することが多いが、それ以外
+/// (制約違反・型不一致など)はリトライしても直らないため対象外にする。
+pub fn is_retryable_sqlite_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(ffi_err, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            return matches!(
+                ffi_err.code,
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::FileLockingProtocolFailed
+            );
+        }
+    }
+    false
 }
 
 /// メイン DB ファイルパスから WAL ファイルのパスを組み立てる。
