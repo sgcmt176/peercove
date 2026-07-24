@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::schedule::{ScheduleEventMsg, ScheduleOp, ScheduleReply};
+use crate::sheet::{SheetEventMsg, SheetOp, SheetReply};
 
 /// 1 メモの本文の上限(要件 §14)。超過は保存を拒否して理由を返す。
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -581,6 +582,13 @@ pub enum SharedMemoOp {
     Schedule {
         schedule: ScheduleOp,
     },
+    /// 共有シート(M6 G-2、ADR-0054)。additive な相乗り(capability は
+    /// `shared_memo` のまま。旧クライアントはこの variant を解析失敗で
+    /// 無視する)。フィールド名は `sheet`(`op` はこの enum のタグ名と
+    /// 衝突するため使えない)。
+    Sheet {
+        sheet: SheetOp,
+    },
 }
 
 /// [`SharedMemoOp`] への応答。
@@ -635,6 +643,10 @@ pub enum SharedMemoReply {
     /// 共有スケジュール表(M6 G-1、ADR-0053)。
     Schedule {
         reply: ScheduleReply,
+    },
+    /// 共有シート(M6 G-2、ADR-0054)。
+    Sheet {
+        reply: SheetReply,
     },
 }
 
@@ -756,6 +768,9 @@ pub enum SharedMemoEvent {
     /// 共有スケジュール表(M6 G-1、ADR-0053)。フィールド名は `schedule`
     /// (`event` はこの enum のタグ名と衝突するため使えない)。
     Schedule { schedule: ScheduleEventMsg },
+    /// 共有シート(M6 G-2、ADR-0054)。フィールド名は `sheet`(`event` は
+    /// この enum のタグ名と衝突するため使えない)。
+    Sheet { sheet: SheetEventMsg },
 }
 
 /// チェックリスト(`- [ ]` / `- [x]`)の進捗を数える。戻り値は (完了, 総数)。

@@ -1145,6 +1145,17 @@ impl SessionShared {
                 schedule: peercove_core::schedule::ScheduleOp::List,
             },
         });
+        // 共有シートの初回同期(M6 G-2、ADR-0054)。メモ・スケジュールの同期に
+        // 相乗り。List への応答で各シートの Cells 取得を追い掛ける
+        // (handle_memo_resp、SHEET_SYNC_LIMIT 枚まで)
+        let sheet_seq = self.next_memo_seq();
+        self.memo_sync_pending.lock().unwrap().insert(sheet_seq);
+        self.outbox.lock().unwrap().push(ControlMessage::MemoReq {
+            seq: sheet_seq,
+            op: peercove_core::memo::SharedMemoOp::Sheet {
+                sheet: peercove_core::sheet::SheetOp::List,
+            },
+        });
     }
 
     fn handle_memo_resp(&self, seq: u64, reply: peercove_core::memo::SharedMemoReply) {
@@ -1214,6 +1225,55 @@ impl SessionShared {
                 }
                 self.bump_memo();
             }
+            SharedMemoReply::Sheet {
+                reply: peercove_core::sheet::SheetReply::Sheets { sheets, .. },
+            } => {
+                // 接続時に全シートのセルまで取りに行くのは重いため、最初の
+                // 数枚だけ即時同期し、残りは各シートを開いたときの Cells
+                // 取得に任せる(実装簡素化の判断、control.rs と同じ方針)
+                const SHEET_SYNC_LIMIT: usize = 10;
+                let total = sheets.len();
+                let result = (|| -> anyhow::Result<()> {
+                    let mut cache = self.open_memo_cache()?;
+                    cache.sheet_replace_all(&sheets)
+                })();
+                match result {
+                    Ok(()) => {
+                        tracing::info!("共有シートを同期しました({total} 枚)");
+                        let mut pending = self.memo_sync_pending.lock().unwrap();
+                        let mut outbox = self.outbox.lock().unwrap();
+                        for sheet in sheets.into_iter().take(SHEET_SYNC_LIMIT) {
+                            let seq = self.next_memo_seq();
+                            pending.insert(seq);
+                            outbox.push(ControlMessage::MemoReq {
+                                seq,
+                                op: SharedMemoOp::Sheet {
+                                    sheet: peercove_core::sheet::SheetOp::Cells {
+                                        sheet_id: sheet.id,
+                                    },
+                                },
+                            });
+                        }
+                    }
+                    Err(e) => tracing::warn!("共有シートの同期に失敗しました: {e:#}"),
+                }
+                self.bump_memo();
+            }
+            SharedMemoReply::Sheet {
+                reply:
+                    peercove_core::sheet::SheetReply::CellsData {
+                        sheet_id, cells, ..
+                    },
+            } => {
+                let result = (|| -> anyhow::Result<()> {
+                    let mut cache = self.open_memo_cache()?;
+                    cache.sheet_cells_replace_all(&sheet_id, &cells)
+                })();
+                if let Err(e) = result {
+                    tracing::warn!("共有シートのセル同期に失敗しました: {e:#}");
+                }
+                self.bump_memo();
+            }
             _ => {}
         }
     }
@@ -1221,6 +1281,7 @@ impl SessionShared {
     fn handle_memo_event(&self, event: peercove_core::memo::SharedMemoEvent) {
         use peercove_core::memo::SharedMemoEvent;
         use peercove_core::schedule::ScheduleEventMsg;
+        use peercove_core::sheet::SheetEventMsg;
         self.memo_supported.store(true, Ordering::Relaxed);
         let result = (|| -> anyhow::Result<()> {
             let mut cache = self.open_memo_cache()?;
@@ -1232,6 +1293,13 @@ impl SessionShared {
                 SharedMemoEvent::Schedule { schedule } => match schedule {
                     ScheduleEventMsg::Changed { event } => cache.schedule_upsert(&event),
                     ScheduleEventMsg::Removed { id } => cache.schedule_remove(&id),
+                },
+                SharedMemoEvent::Sheet { sheet } => match sheet {
+                    SheetEventMsg::SheetChanged { sheet } => cache.sheet_upsert(&sheet),
+                    SheetEventMsg::SheetRemoved { sheet_id } => cache.sheet_remove(&sheet_id),
+                    SheetEventMsg::CellsChanged { sheet_id, cells } => {
+                        cache.sheet_cells_apply(&sheet_id, &cells)
+                    }
                 },
             }
         })();

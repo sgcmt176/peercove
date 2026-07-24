@@ -22,6 +22,10 @@ use peercove_core::memo::{
 use peercove_core::schedule::{
     ScheduleEvent, MAX_SCHEDULE_EVENTS, MAX_SCHEDULE_NOTE_BYTES, MAX_SCHEDULE_TITLE_CHARS,
 };
+use peercove_core::sheet::{
+    CellWrite, SheetCell, SheetMeta, MAX_CELL_VALUE_BYTES, MAX_SHEETS, MAX_SHEET_CELLS,
+    MAX_SHEET_COLS, MAX_SHEET_NAME_CHARS, MAX_SHEET_ROWS,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
@@ -87,7 +91,7 @@ impl Actor {
     }
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 5;
+const SHARED_SCHEMA_VERSION: i64 = 6;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -259,6 +263,8 @@ pub struct SharedMemoDbStats {
     pub limits: SharedMemoLimits,
     /// 共有スケジュール表の予定件数(ADR-0053)。
     pub schedule_count: u64,
+    /// 共有シートの枚数(ADR-0054)。
+    pub sheet_count: u64,
 }
 
 /// ホスト正本の共有メモ DB。
@@ -416,6 +422,34 @@ impl SharedStore {
                     updated_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_schedule_events_start ON schedule_events(start_at);
+                "#,
+            )?;
+        }
+        if version < 6 {
+            // v6(M6 G-2、ADR-0054): 共有シート(Excel ライク表)。アドレスは
+            // 固定(挿入/削除による繰り上げは持たない)。セルは疎な格納
+            // (非空セルだけが存在する。空文字への更新 = セル削除)。
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sheets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    owner_id TEXT NOT NULL DEFAULT '',
+                    owner_name TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sheet_cells (
+                    sheet_id TEXT NOT NULL,
+                    row INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (sheet_id, row, col)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sheet_cells_sheet ON sheet_cells(sheet_id);
                 "#,
             )?;
         }
@@ -1184,6 +1218,9 @@ impl SharedStore {
         let schedule_count: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM schedule_events", [], |row| row.get(0))?;
+        let sheet_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sheets", [], |row| row.get(0))?;
         Ok(SharedMemoDbStats {
             db_bytes,
             wal_bytes,
@@ -1193,6 +1230,7 @@ impl SharedStore {
             total_body_bytes: self.total_body_bytes()?,
             limits: self.limits()?,
             schedule_count: schedule_count as u64,
+            sheet_count: sheet_count as u64,
         })
     }
 
@@ -1604,6 +1642,254 @@ impl SharedStore {
             .execute("DELETE FROM schedule_events WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    // ---- 共有シート(M6 G-2、ADR-0054) ----
+    //
+    // シート(メタ)の作成は全員可。改名・削除は作成者 + ホストのみ。
+    // セルの読み取り・書き込みは全員可(決定 5)。アドレスは固定(行・列の
+    // 挿入/削除による繰り上げは持たない、決定 3)。競合はセル単位の
+    // revision CAS のみ(決定 4)。
+
+    fn sheet_row(&self, id: &str) -> anyhow::Result<SheetRow> {
+        self.conn
+            .query_row(
+                &format!("SELECT {SHEET_ROW_COLUMNS} FROM sheets WHERE id = ?1"),
+                params![id],
+                sheet_row_from_sql,
+            )
+            .optional()?
+            .context("シートが見つかりません(削除された可能性があります)")
+    }
+
+    /// シート一覧(メタのみ、V1。件数上限 [`MAX_SHEETS`] のため全量で良い)。
+    pub fn sheet_list(&self, actor: &Actor) -> anyhow::Result<Vec<SheetMeta>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SHEET_ROW_COLUMNS} FROM sheets ORDER BY created_at ASC, id ASC"
+        ))?;
+        let rows = stmt
+            .query_map([], sheet_row_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().map(|row| row.into_meta(actor)).collect())
+    }
+
+    pub fn sheet_get(&self, actor: &Actor, id: &str) -> anyhow::Result<SheetMeta> {
+        Ok(self.sheet_row(id)?.into_meta(actor))
+    }
+
+    /// 1 シートの全非空セル(行・列昇順)。
+    pub fn sheet_cells(&self, id: &str) -> anyhow::Result<Vec<SheetCell>> {
+        // シートの存在確認(削除済みなら理由を返す)
+        self.sheet_row(id)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SHEET_CELL_COLUMNS} FROM sheet_cells
+             WHERE sheet_id = ?1 ORDER BY row ASC, col ASC"
+        ))?;
+        let cells = stmt
+            .query_map(params![id], sheet_cell_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(cells)
+    }
+
+    /// 新規作成(全員可、決定 5)。
+    pub fn sheet_create(&mut self, actor: &Actor, name: &str) -> anyhow::Result<SheetMeta> {
+        validate_sheet_name(name)?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sheets", [], |row| row.get(0))?;
+        if count as u32 >= MAX_SHEETS {
+            bail!(
+                "シートの枚数が上限({} 枚)に達しています。不要なシートを削除してください",
+                MAX_SHEETS
+            );
+        }
+        let id: String = self
+            .conn
+            .query_row("SELECT lower(hex(randomblob(8)))", [], |row| row.get(0))?;
+        let now = unix_ms();
+        self.conn.execute(
+            "INSERT INTO sheets (id, name, owner_id, owner_name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, name, actor.owner_id(), actor.name, now],
+        )?;
+        self.sheet_get(actor, &id)
+    }
+
+    /// 改名(作成者 + ホストのみ、決定 5)。
+    pub fn sheet_rename(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        name: &str,
+    ) -> anyhow::Result<SheetMeta> {
+        validate_sheet_name(name)?;
+        let row = self.sheet_row(id)?;
+        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
+            bail!("このシートを改名できるのは作成者とホスト管理者だけです");
+        }
+        self.conn.execute(
+            "UPDATE sheets SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![name, unix_ms(), id],
+        )?;
+        self.sheet_get(actor, id)
+    }
+
+    /// 削除(作成者 + ホストのみ、決定 5)。セルもまとめて削除する。
+    pub fn sheet_delete(&mut self, actor: &Actor, id: &str) -> anyhow::Result<()> {
+        let row = self.sheet_row(id)?;
+        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
+            bail!("このシートを削除できるのは作成者とホスト管理者だけです");
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM sheet_cells WHERE sheet_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sheets WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// セルのバッチ書き込み(全員可、決定 5)。競合セルは部分失敗として
+    /// `conflicts` へ現在値を返す(決定 4)。戻り値は
+    /// `(適用件数, 競合セル, 適用済みセルの最新形(配信用))`。
+    pub fn sheet_write(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        cells: &[CellWrite],
+    ) -> anyhow::Result<(u32, Vec<SheetCell>, Vec<SheetCell>)> {
+        self.sheet_row(id)?; // シートの存在確認
+        if cells.is_empty() {
+            return Ok((0, Vec::new(), Vec::new()));
+        }
+        let tx = self.conn.transaction()?;
+        let mut current_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM sheet_cells WHERE sheet_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let now = unix_ms();
+        let mut applied = 0u32;
+        let mut conflicts = Vec::new();
+        let mut changed = Vec::new();
+        for write in cells {
+            if write.row >= MAX_SHEET_ROWS || write.col >= MAX_SHEET_COLS {
+                bail!(
+                    "セルの位置が上限を超えています(行は {} 未満、列は {} 未満にしてください)",
+                    MAX_SHEET_ROWS,
+                    MAX_SHEET_COLS
+                );
+            }
+            if write.value.len() > MAX_CELL_VALUE_BYTES {
+                bail!(
+                    "セルの値が長すぎます(上限 {} KiB)",
+                    MAX_CELL_VALUE_BYTES / 1024
+                );
+            }
+            let existing: Option<(i64, String, String, i64)> = tx
+                .query_row(
+                    "SELECT revision, value, updated_by, updated_at FROM sheet_cells
+                     WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
+                    params![id, write.row, write.col],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((revision, value, updated_by, updated_at)) => {
+                    if revision as u64 != write.base_revision {
+                        conflicts.push(SheetCell {
+                            row: write.row,
+                            col: write.col,
+                            value,
+                            revision: revision as u64,
+                            updated_by,
+                            updated_at: updated_at as u64,
+                        });
+                        continue;
+                    }
+                    let new_revision = revision as u64 + 1;
+                    if write.value.is_empty() {
+                        tx.execute(
+                            "DELETE FROM sheet_cells WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
+                            params![id, write.row, write.col],
+                        )?;
+                        current_count -= 1;
+                    } else {
+                        tx.execute(
+                            "UPDATE sheet_cells SET value = ?1, revision = ?2, updated_by = ?3,
+                                    updated_at = ?4
+                             WHERE sheet_id = ?5 AND row = ?6 AND col = ?7",
+                            params![
+                                write.value,
+                                new_revision as i64,
+                                actor.name,
+                                now,
+                                id,
+                                write.row,
+                                write.col
+                            ],
+                        )?;
+                    }
+                    changed.push(SheetCell {
+                        row: write.row,
+                        col: write.col,
+                        value: write.value.clone(),
+                        revision: new_revision,
+                        updated_by: actor.name.clone(),
+                        updated_at: now as u64,
+                    });
+                    applied += 1;
+                }
+                None => {
+                    if write.base_revision != 0 {
+                        // 存在しないセルに対する非 0 の base_revision =
+                        // 他の端末が既に削除済み(競合として現在値=不在を返す)
+                        conflicts.push(SheetCell {
+                            row: write.row,
+                            col: write.col,
+                            value: String::new(),
+                            revision: 0,
+                            updated_by: String::new(),
+                            updated_at: 0,
+                        });
+                        continue;
+                    }
+                    if write.value.is_empty() {
+                        // 存在しないセルへの削除要求は無害な no-op
+                        applied += 1;
+                        continue;
+                    }
+                    if current_count as u32 >= MAX_SHEET_CELLS {
+                        bail!(
+                            "セルの件数が上限({} 件)に達しています。不要なセルを削除してください",
+                            MAX_SHEET_CELLS
+                        );
+                    }
+                    tx.execute(
+                        "INSERT INTO sheet_cells
+                            (sheet_id, row, col, value, revision, updated_by, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+                        params![id, write.row, write.col, write.value, actor.name, now],
+                    )?;
+                    current_count += 1;
+                    changed.push(SheetCell {
+                        row: write.row,
+                        col: write.col,
+                        value: write.value.clone(),
+                        revision: 1,
+                        updated_by: actor.name.clone(),
+                        updated_at: now as u64,
+                    });
+                    applied += 1;
+                }
+            }
+        }
+        if !changed.is_empty() {
+            tx.execute(
+                "UPDATE sheets SET updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok((applied, conflicts, changed))
+    }
 }
 
 /// スケジュール 1 件分の生データ(受信者視点の計算前)。
@@ -1692,6 +1978,70 @@ fn validate_schedule_range(start_unix_ms: u64, end_unix_ms: Option<u64>) -> anyh
         if end < start_unix_ms {
             bail!("終了日時は開始日時より後にしてください");
         }
+    }
+    Ok(())
+}
+
+/// シート 1 枚分の生データ(受信者視点の計算前)。
+struct SheetRow {
+    id: String,
+    name: String,
+    owner_id: String,
+    owner_name: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl SheetRow {
+    /// can_manage は作成者本人かホストなら真(ADR-0054 決定 5)。
+    fn into_meta(self, actor: &Actor) -> SheetMeta {
+        let can_manage = actor.is_host() || self.owner_id == actor.owner_id();
+        SheetMeta {
+            id: self.id,
+            name: self.name,
+            owner_id: self.owner_id,
+            owner_name: self.owner_name,
+            created_at: self.created_at as u64,
+            updated_at: self.updated_at as u64,
+            can_manage,
+        }
+    }
+}
+
+const SHEET_ROW_COLUMNS: &str = "id, name, owner_id, owner_name, created_at, updated_at";
+
+fn sheet_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetRow> {
+    Ok(SheetRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        owner_id: row.get(2)?,
+        owner_name: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+/// [`SheetCell`] の共通 SELECT 列(ホスト正本・キャッシュ両方で使う)。
+const SHEET_CELL_COLUMNS: &str = "row, col, value, revision, updated_by, updated_at";
+
+fn sheet_cell_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetCell> {
+    Ok(SheetCell {
+        row: row.get::<_, i64>(0)? as u32,
+        col: row.get::<_, i64>(1)? as u32,
+        value: row.get(2)?,
+        revision: row.get::<_, i64>(3)? as u64,
+        updated_by: row.get(4)?,
+        updated_at: row.get::<_, i64>(5)? as u64,
+    })
+}
+
+/// シート名の検証(必須 + 上限文字数、ADR-0054 決定 7)。
+fn validate_sheet_name(name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() {
+        bail!("シート名を入力してください");
+    }
+    if name.chars().count() > MAX_SHEET_NAME_CHARS {
+        bail!("シート名が長すぎます(上限 {MAX_SHEET_NAME_CHARS} 文字)");
     }
     Ok(())
 }
@@ -1806,7 +2156,7 @@ pub struct CacheStore {
     conn: Connection,
 }
 
-const CACHE_SCHEMA_VERSION: i64 = 3;
+const CACHE_SCHEMA_VERSION: i64 = 4;
 
 impl CacheStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -1891,6 +2241,34 @@ impl CacheStore {
                     can_edit INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_schedule_events_start ON schedule_events(start_at);
+                "#,
+            )?;
+        }
+        if version < 4 {
+            // v4(M6 G-2、ADR-0054): 共有シートのキャッシュ(can_manage は
+            // ホストが計算済みの値をそのまま保存する)。
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sheets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    owner_id TEXT NOT NULL DEFAULT '',
+                    owner_name TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    can_manage INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS sheet_cells (
+                    sheet_id TEXT NOT NULL,
+                    row INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (sheet_id, row, col)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sheet_cells_sheet ON sheet_cells(sheet_id);
                 "#,
             )?;
         }
@@ -2242,6 +2620,96 @@ impl CacheStore {
             .optional()?
             .context("予定が見つかりません(削除された可能性があります)")
     }
+
+    // ---- 共有シートのキャッシュ(M6 G-2、ADR-0054) ----
+
+    /// 接続時の同期(List 応答)でメタの全量を置き換える。List に含まれない
+    /// (= 削除された)シートのセルも一緒に消す。
+    pub fn sheet_replace_all(&mut self, sheets: &[SheetMeta]) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM sheets", [])?;
+        for sheet in sheets {
+            insert_cache_sheet(&tx, sheet)?;
+        }
+        tx.execute(
+            "DELETE FROM sheet_cells WHERE sheet_id NOT IN (SELECT id FROM sheets)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 単発のメタ反映(SheetChanged = 作成・改名)。
+    pub fn sheet_upsert(&mut self, sheet: &SheetMeta) -> anyhow::Result<()> {
+        insert_cache_sheet(&self.conn, sheet)
+    }
+
+    /// 単発のメタ反映(SheetRemoved = 削除)。セルもまとめて消す。
+    pub fn sheet_remove(&mut self, id: &str) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM sheet_cells WHERE sheet_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sheets WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// オフライン時の唯一のソース(作成順)。
+    pub fn sheet_list(&self) -> anyhow::Result<Vec<SheetMeta>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CACHE_SHEET_COLUMNS} FROM sheets ORDER BY created_at ASC, id ASC"
+        ))?;
+        let sheets = stmt
+            .query_map([], cache_sheet_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(sheets)
+    }
+
+    /// 接続時の同期(Cells 応答)でそのシートのセル全量を置き換える。
+    pub fn sheet_cells_replace_all(
+        &mut self,
+        sheet_id: &str,
+        cells: &[SheetCell],
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM sheet_cells WHERE sheet_id = ?1",
+            params![sheet_id],
+        )?;
+        for cell in cells {
+            insert_cache_cell(&tx, sheet_id, cell)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// イベント反映(CellsChanged)。value = "" のセルは削除。
+    pub fn sheet_cells_apply(&mut self, sheet_id: &str, cells: &[SheetCell]) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        for cell in cells {
+            if cell.value.is_empty() {
+                tx.execute(
+                    "DELETE FROM sheet_cells WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
+                    params![sheet_id, cell.row, cell.col],
+                )?;
+            } else {
+                insert_cache_cell(&tx, sheet_id, cell)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 1 シートの全非空セル(行・列昇順)。
+    pub fn sheet_cells(&self, sheet_id: &str) -> anyhow::Result<Vec<SheetCell>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SHEET_CELL_COLUMNS} FROM sheet_cells
+             WHERE sheet_id = ?1 ORDER BY row ASC, col ASC"
+        ))?;
+        let cells = stmt
+            .query_map(params![sheet_id], sheet_cell_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(cells)
+    }
 }
 
 const CACHE_SCHEDULE_COLUMNS: &str = "id, title, note, start_at, end_at, all_day, owner_id,
@@ -2292,6 +2760,60 @@ fn cache_schedule_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule
         updated_at: row.get::<_, i64>(11)? as u64,
         can_edit: row.get::<_, i64>(12)? != 0,
     })
+}
+
+const CACHE_SHEET_COLUMNS: &str =
+    "id, name, owner_id, owner_name, created_at, updated_at, can_manage";
+
+fn insert_cache_sheet(conn: &Connection, sheet: &SheetMeta) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO sheets (id, name, owner_id, owner_name, created_at, updated_at, can_manage)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+            name = ?2, owner_id = ?3, owner_name = ?4, created_at = ?5, updated_at = ?6,
+            can_manage = ?7",
+        params![
+            sheet.id,
+            sheet.name,
+            sheet.owner_id,
+            sheet.owner_name,
+            sheet.created_at as i64,
+            sheet.updated_at as i64,
+            sheet.can_manage as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn cache_sheet_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetMeta> {
+    Ok(SheetMeta {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        owner_id: row.get(2)?,
+        owner_name: row.get(3)?,
+        created_at: row.get::<_, i64>(4)? as u64,
+        updated_at: row.get::<_, i64>(5)? as u64,
+        can_manage: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+fn insert_cache_cell(conn: &Connection, sheet_id: &str, cell: &SheetCell) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO sheet_cells (sheet_id, row, col, value, revision, updated_by, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(sheet_id, row, col) DO UPDATE SET
+            value = ?4, revision = ?5, updated_by = ?6, updated_at = ?7",
+        params![
+            sheet_id,
+            cell.row,
+            cell.col,
+            cell.value,
+            cell.revision as i64,
+            cell.updated_by,
+            cell.updated_at as i64,
+        ],
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3558,5 +4080,477 @@ mod tests {
         cache.schedule_remove("e2").unwrap();
         assert_eq!(cache.schedule_list().unwrap().len(), 1);
         assert!(cache.schedule_get("e2").is_err());
+    }
+
+    // ---- 共有シート(M6 G-2、ADR-0054) ----
+
+    /// シート CRUD の基本動作。作成は全員可、改名・削除は作成者 + ホスト
+    /// (決定 5)。
+    #[test]
+    fn sheet_crud_basic() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+
+        let sheet = store.sheet_create(&alice, "在庫表").unwrap();
+        assert_eq!(sheet.name, "在庫表");
+        assert_eq!(sheet.owner_id, "id-alice");
+        assert!(sheet.can_manage, "作成者は管理できる");
+
+        // 全員が閲覧できる(ボブから見ても can_manage は偽)
+        let list = store.sheet_list(&bob).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].can_manage, "作成者以外は管理不可");
+
+        // ボブも作成できる(決定 5: 作成は全員可)
+        let bob_sheet = store.sheet_create(&bob, "ボブの表").unwrap();
+        assert!(bob_sheet.can_manage);
+        assert_eq!(store.sheet_list(&alice).unwrap().len(), 2);
+
+        let renamed = store
+            .sheet_rename(&alice, &sheet.id, "改題した在庫表")
+            .unwrap();
+        assert_eq!(renamed.name, "改題した在庫表");
+
+        store.sheet_delete(&alice, &sheet.id).unwrap();
+        assert_eq!(store.sheet_list(&alice).unwrap().len(), 1);
+        assert!(store.sheet_get(&alice, &sheet.id).is_err());
+    }
+
+    /// 改名・削除は作成者 + ホストのみ(決定 5)。他人は拒否される。
+    #[test]
+    fn sheet_manage_restricted_to_owner_and_host() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+        let host = Actor::host("ホスト");
+
+        let sheet = store.sheet_create(&alice, "アリスの表").unwrap();
+
+        assert!(store.sheet_rename(&bob, &sheet.id, "改ざん").is_err());
+        assert!(store.sheet_delete(&bob, &sheet.id).is_err());
+
+        let by_host = store
+            .sheet_rename(&host, &sheet.id, "ホストが改名")
+            .unwrap();
+        assert_eq!(by_host.name, "ホストが改名");
+        assert!(store.sheet_delete(&host, &sheet.id).is_ok());
+    }
+
+    /// セル書き込みは全員可(決定 5)。新規セルは revision 1、
+    /// 更新は revision+1。空文字書き込みでセル削除。
+    #[test]
+    fn sheet_write_basic_and_delete() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+
+        let (applied, conflicts, changed) = store
+            .sheet_write(
+                &bob,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: "10".to_string(),
+                    base_revision: 0,
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(conflicts.is_empty());
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].revision, 1);
+
+        let cells = store.sheet_cells(&sheet.id).unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].value, "10");
+
+        // 更新(base_revision 一致)
+        let (applied, conflicts, changed) = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: "20".to_string(),
+                    base_revision: 1,
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(conflicts.is_empty());
+        assert_eq!(changed[0].revision, 2);
+        assert_eq!(store.sheet_cells(&sheet.id).unwrap()[0].value, "20");
+
+        // 空文字 = セル削除
+        let (applied, conflicts, changed) = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: String::new(),
+                    base_revision: 2,
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(conflicts.is_empty());
+        assert_eq!(changed[0].value, "");
+        assert!(store.sheet_cells(&sheet.id).unwrap().is_empty());
+    }
+
+    /// バッチ書き込みの部分失敗: 競合セルだけ conflicts に載り、他は適用される。
+    #[test]
+    fn sheet_write_partial_conflict() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+        store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[
+                    CellWrite {
+                        row: 0,
+                        col: 0,
+                        value: "A".to_string(),
+                        base_revision: 0,
+                    },
+                    CellWrite {
+                        row: 0,
+                        col: 1,
+                        value: "B".to_string(),
+                        base_revision: 0,
+                    },
+                ],
+            )
+            .unwrap();
+
+        // (0,0) は古い base_revision(競合)、(0,1) は new(別セル、成功)、
+        // (1,0) は新規セル(成功)
+        let (applied, conflicts, changed) = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[
+                    CellWrite {
+                        row: 0,
+                        col: 0,
+                        value: "A2".to_string(),
+                        base_revision: 0, // 本当は 1 のはずが古いまま
+                    },
+                    CellWrite {
+                        row: 0,
+                        col: 1,
+                        value: "B2".to_string(),
+                        base_revision: 1,
+                    },
+                    CellWrite {
+                        row: 1,
+                        col: 0,
+                        value: "C".to_string(),
+                        base_revision: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].row, 0);
+        assert_eq!(conflicts[0].col, 0);
+        assert_eq!(conflicts[0].value, "A", "競合セルの現在値が返る");
+        assert_eq!(changed.len(), 2);
+
+        let cells = store.sheet_cells(&sheet.id).unwrap();
+        assert_eq!(cells.len(), 3, "競合した (0,0) は元の値のまま残る");
+        let a = cells.iter().find(|c| c.row == 0 && c.col == 0).unwrap();
+        assert_eq!(a.value, "A");
+    }
+
+    /// 存在しないセルに非 0 の base_revision を送ると競合扱い(既に削除済み扱い)。
+    #[test]
+    fn sheet_write_stale_delete_is_conflict() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+        let (applied, conflicts, _) = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: "X".to_string(),
+                    base_revision: 5,
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied, 0);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].revision, 0);
+    }
+
+    /// 上限の検証(決定 7): シート名必須・上限文字数、セル値のバイト上限、
+    /// セルの行・列上限。
+    #[test]
+    fn sheet_validates_input() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+
+        assert!(store.sheet_create(&alice, "  ").is_err(), "空名は拒否");
+        assert!(
+            store.sheet_create(&alice, &"あ".repeat(101)).is_err(),
+            "101 文字は上限超過"
+        );
+
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+        assert!(
+            store
+                .sheet_write(
+                    &alice,
+                    &sheet.id,
+                    &[CellWrite {
+                        row: 0,
+                        col: 0,
+                        value: "x".repeat(4 * 1024 + 1),
+                        base_revision: 0,
+                    }],
+                )
+                .is_err(),
+            "セル値 4KiB 超過"
+        );
+        assert!(
+            store
+                .sheet_write(
+                    &alice,
+                    &sheet.id,
+                    &[CellWrite {
+                        row: MAX_SHEET_ROWS,
+                        col: 0,
+                        value: "x".to_string(),
+                        base_revision: 0,
+                    }],
+                )
+                .is_err(),
+            "行の上限超過"
+        );
+        assert!(
+            store
+                .sheet_write(
+                    &alice,
+                    &sheet.id,
+                    &[CellWrite {
+                        row: 0,
+                        col: MAX_SHEET_COLS,
+                        value: "x".to_string(),
+                        base_revision: 0,
+                    }],
+                )
+                .is_err(),
+            "列の上限超過"
+        );
+    }
+
+    /// シート枚数の上限(決定 7)。
+    #[test]
+    fn sheet_enforces_sheet_count_limit() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        {
+            let tx = store.conn.transaction().unwrap();
+            for i in 0..MAX_SHEETS {
+                tx.execute(
+                    "INSERT INTO sheets (id, name, owner_id, owner_name, created_at, updated_at)
+                     VALUES (?1, 't', '', '', 0, 0)",
+                    params![format!("s{i}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let err = store.sheet_create(&alice, "溢れるシート").unwrap_err();
+        assert!(err.to_string().contains("上限"));
+    }
+
+    /// 非空セル数の上限(決定 7)。
+    #[test]
+    fn sheet_enforces_cell_count_limit() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+        {
+            let tx = store.conn.transaction().unwrap();
+            for i in 0..MAX_SHEET_CELLS {
+                tx.execute(
+                    "INSERT INTO sheet_cells (sheet_id, row, col, value, revision, updated_by, updated_at)
+                     VALUES (?1, ?2, 0, 'v', 1, '', 0)",
+                    params![sheet.id, i as i64],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let err = store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 999,
+                    col: 1,
+                    value: "溢れるセル".to_string(),
+                    base_revision: 0,
+                }],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("上限"));
+    }
+
+    /// シート削除でセルもまとめて消える。
+    #[test]
+    fn sheet_delete_cascades_cells() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let sheet = store.sheet_create(&alice, "表").unwrap();
+        store
+            .sheet_write(
+                &alice,
+                &sheet.id,
+                &[CellWrite {
+                    row: 0,
+                    col: 0,
+                    value: "10".to_string(),
+                    base_revision: 0,
+                }],
+            )
+            .unwrap();
+        store.sheet_delete(&alice, &sheet.id).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM sheet_cells", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "削除したシートのセルは残らない");
+    }
+
+    /// v5 → v6 移行(ADR-0054): 既存の memos.db に sheets / sheet_cells が
+    /// 追加され、以後の操作が問題なく行える。
+    #[test]
+    fn v5_database_migrates_to_v6_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        {
+            let mut store = SharedStore::open(&path).unwrap();
+            let host = Actor::host("ホスト");
+            store
+                .schedule_create(&host, "既存予定", "", 1_000, None, false)
+                .unwrap();
+            // v5 相当に偽装
+            store.conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+        let mut store = SharedStore::open(&path).unwrap();
+        let host = Actor::host("ホスト");
+        let sheet = store.sheet_create(&host, "移行後の表").unwrap();
+        assert_eq!(store.sheet_list(&host).unwrap().len(), 1);
+        assert_eq!(store.db_stats().unwrap().sheet_count, 1);
+        store.sheet_delete(&host, &sheet.id).unwrap();
+    }
+
+    /// キャッシュ往復(メンバー側): メタの replace_all・upsert・remove・list、
+    /// セルの replace_all・apply(削除込み)・list。
+    #[test]
+    fn sheet_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(&dir.path().join("m.memocache.db")).unwrap();
+        let make_sheet = |id: &str, created: u64| SheetMeta {
+            id: id.to_string(),
+            name: format!("表{id}"),
+            owner_id: String::new(),
+            owner_name: "ホスト".to_string(),
+            created_at: created,
+            updated_at: created,
+            can_manage: true,
+        };
+        cache
+            .sheet_replace_all(&[make_sheet("s1", 1_000), make_sheet("s2", 2_000)])
+            .unwrap();
+        let list = cache.sheet_list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "s1");
+
+        let cell = SheetCell {
+            row: 0,
+            col: 0,
+            value: "10".to_string(),
+            revision: 1,
+            updated_by: "ホスト".to_string(),
+            updated_at: 1,
+        };
+        cache
+            .sheet_cells_replace_all("s1", std::slice::from_ref(&cell))
+            .unwrap();
+        assert_eq!(cache.sheet_cells("s1").unwrap().len(), 1);
+
+        let mut updated = cell.clone();
+        updated.value = "20".to_string();
+        updated.revision = 2;
+        cache.sheet_cells_apply("s1", &[updated]).unwrap();
+        assert_eq!(cache.sheet_cells("s1").unwrap()[0].value, "20");
+
+        // value = "" は削除
+        let deleted = SheetCell {
+            value: String::new(),
+            ..cell
+        };
+        cache.sheet_cells_apply("s1", &[deleted]).unwrap();
+        assert!(cache.sheet_cells("s1").unwrap().is_empty());
+
+        // メタ削除でセルも消える(sheet_remove)
+        cache
+            .sheet_cells_replace_all(
+                "s2",
+                &[SheetCell {
+                    row: 0,
+                    col: 0,
+                    value: "x".to_string(),
+                    revision: 1,
+                    updated_by: "ホスト".to_string(),
+                    updated_at: 1,
+                }],
+            )
+            .unwrap();
+        cache.sheet_remove("s2").unwrap();
+        assert_eq!(cache.sheet_list().unwrap().len(), 1);
+        assert!(cache.sheet_cells("s2").unwrap().is_empty());
+
+        // メタ upsert(改名)
+        let mut renamed = make_sheet("s1", 1_000);
+        renamed.name = "改題".to_string();
+        cache.sheet_upsert(&renamed).unwrap();
+        assert_eq!(cache.sheet_list().unwrap()[0].name, "改題");
+
+        // replace_all で消えたシートの孤児セルも掃除される
+        cache
+            .sheet_cells_replace_all(
+                "s1",
+                &[SheetCell {
+                    row: 1,
+                    col: 1,
+                    value: "残る?".to_string(),
+                    revision: 1,
+                    updated_by: "ホスト".to_string(),
+                    updated_at: 1,
+                }],
+            )
+            .unwrap();
+        cache.sheet_replace_all(&[]).unwrap();
+        assert!(cache.sheet_list().unwrap().is_empty());
+        assert!(
+            cache.sheet_cells("s1").unwrap().is_empty(),
+            "孤児セルは掃除される"
+        );
     }
 }

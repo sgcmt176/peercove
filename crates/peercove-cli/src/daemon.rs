@@ -331,6 +331,7 @@ impl DaemonShared {
                 // メモの内容はログへ出さない(ADR-0049)
                 use peercove_core::memo::{SharedMemoOp, SharedMemoReply};
                 use peercove_core::schedule::{ScheduleOp, ScheduleReply};
+                use peercove_core::sheet::{SheetOp, SheetReply};
                 let (memo, link) = {
                     let active = self.active.lock().await;
                     let active = active.get(&Self::key_for(&config)).with_context(|| {
@@ -404,6 +405,40 @@ impl DaemonShared {
                             Ok(IpcResponse::SharedMemo {
                                 reply: SharedMemoReply::Schedule {
                                     reply: ScheduleReply::Events { events, offline },
+                                },
+                            })
+                        }
+                        // 共有シートの一覧・セルもキャッシュから(全員閲覧可、
+                        // オフラインでも読める — M6 G-2、ADR-0054)。変更系
+                        // (Create/Rename/Delete/Write)は下の wildcard 経由でホストへ
+                        SharedMemoOp::Sheet {
+                            sheet: SheetOp::List,
+                        } => {
+                            let mut sheets = cache.sheet_list().await?;
+                            let offline = link.session().is_none();
+                            if offline {
+                                for sheet in &mut sheets {
+                                    sheet.can_manage = false;
+                                }
+                            }
+                            Ok(IpcResponse::SharedMemo {
+                                reply: SharedMemoReply::Sheet {
+                                    reply: SheetReply::Sheets { sheets, offline },
+                                },
+                            })
+                        }
+                        SharedMemoOp::Sheet {
+                            sheet: SheetOp::Cells { sheet_id },
+                        } => {
+                            let cells = cache.sheet_cells(sheet_id.clone()).await?;
+                            let offline = link.session().is_none();
+                            Ok(IpcResponse::SharedMemo {
+                                reply: SharedMemoReply::Sheet {
+                                    reply: SheetReply::CellsData {
+                                        sheet_id,
+                                        cells,
+                                        offline,
+                                    },
                                 },
                             })
                         }
@@ -1841,6 +1876,7 @@ fn memo_db_status_check(db_path: &Path) -> DiagnosticCheck {
                     ("max_total_bytes", stats.limits.max_total_bytes.to_string()),
                     ("max_memo_count", stats.limits.max_memo_count.to_string()),
                     ("schedule_count", stats.schedule_count.to_string()),
+                    ("sheet_count", stats.sheet_count.to_string()),
                 ],
             )
         }

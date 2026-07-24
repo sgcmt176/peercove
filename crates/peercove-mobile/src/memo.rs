@@ -491,6 +491,7 @@ use peercove_core::memo::{
     SharedMemoHistoryEntry, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
 };
 use peercove_core::schedule::{ScheduleEvent, ScheduleOp, ScheduleReply};
+use peercove_core::sheet::{CellWrite, SheetCell, SheetMeta, SheetOp, SheetReply};
 
 #[derive(uniffi::Record)]
 pub struct SharedMemoSummaryInfo {
@@ -1002,6 +1003,246 @@ pub fn schedule_delete(slug: String, id: String) -> Result<(), MobileError> {
         },
     )
     .map(|_| ())
+}
+
+// ---- 共有シート(M6 G-2、ADR-0054)-------------------------------------------
+//
+// 共有メモ・共有スケジュール表と同じキャッシュ・generation を共用する
+// (`<config>.memocache.db`、`memo_generation`)。ネットワーク全員が閲覧・
+// セル編集でき、シートの作成・改名・削除は作成者 + ホストのみ(権限判定は
+// ホスト正本の store 層)。読み取りは常にキャッシュ、変更はオンライン専用
+// (コントロールチャネル経由)。**シート名・セル値はログへ出さない。**
+
+#[derive(uniffi::Record)]
+pub struct SheetMetaInfo {
+    pub id: String,
+    pub name: String,
+    pub owner_name: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    /// 受信者視点: 改名・削除できるか(作成者 + ホスト)。
+    pub can_manage: bool,
+}
+
+impl From<SheetMeta> for SheetMetaInfo {
+    fn from(sheet: SheetMeta) -> Self {
+        Self {
+            id: sheet.id,
+            name: sheet.name,
+            owner_name: sheet.owner_name,
+            created_at: sheet.created_at,
+            updated_at: sheet.updated_at,
+            can_manage: sheet.can_manage,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct SheetCellInfo {
+    pub row: u32,
+    pub col: u32,
+    pub value: String,
+    pub revision: u64,
+    pub updated_by: String,
+    pub updated_at: u64,
+}
+
+impl From<SheetCell> for SheetCellInfo {
+    fn from(cell: SheetCell) -> Self {
+        Self {
+            row: cell.row,
+            col: cell.col,
+            value: cell.value,
+            revision: cell.revision,
+            updated_by: cell.updated_by,
+            updated_at: cell.updated_at,
+        }
+    }
+}
+
+/// セル書き込み 1 件分(Kotlin → Rust)。`base_revision` = 0 は新規セル想定。
+#[derive(uniffi::Record)]
+pub struct SheetCellWriteArg {
+    pub row: u32,
+    pub col: u32,
+    pub value: String,
+    pub base_revision: u64,
+}
+
+impl From<SheetCellWriteArg> for CellWrite {
+    fn from(write: SheetCellWriteArg) -> Self {
+        Self {
+            row: write.row,
+            col: write.col,
+            value: write.value,
+            base_revision: write.base_revision,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct SheetListResult {
+    pub sheets: Vec<SheetMetaInfo>,
+    /// セッション未接続(キャッシュ表示 = 読み取り専用)。
+    pub offline: bool,
+    /// ホストが共有シートに応答済みか(共有メモと共通の判定)。
+    pub supported: bool,
+    /// キャッシュの変更世代(共有メモと共通。進んだら再取得する)。
+    pub generation: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct SheetCellsResult {
+    pub cells: Vec<SheetCellInfo>,
+    pub offline: bool,
+    pub generation: u64,
+}
+
+/// Write の結果(部分失敗をサポートする、ADR-0054 決定 4)。
+#[derive(uniffi::Record)]
+pub struct SheetWriteResult {
+    pub applied: u32,
+    /// base_revision 不一致で適用しなかったセルの現在値。
+    pub conflicts: Vec<SheetCellInfo>,
+}
+
+/// シート一覧(キャッシュから。オフラインでも使える。全員閲覧可 = ADR-0054 決定 5)。
+#[uniffi::export]
+pub fn sheet_list(base_dir: String, slug: String) -> Result<SheetListResult, MobileError> {
+    let cache = open_cache(&base_dir, &slug)?;
+    let sheets = cache.sheet_list()?;
+    let session = crate::session_of(&slug);
+    let online = session.as_ref().is_some_and(|s| {
+        s.control_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut sheets: Vec<SheetMetaInfo> = sheets.into_iter().map(Into::into).collect();
+    if !online {
+        // オフライン中は読み取り専用(共有メモの List と同じ扱い)
+        for sheet in &mut sheets {
+            sheet.can_manage = false;
+        }
+    }
+    Ok(SheetListResult {
+        sheets,
+        offline: !online,
+        supported: session
+            .as_ref()
+            .is_some_and(|s| s.memo_supported.load(std::sync::atomic::Ordering::Relaxed)),
+        generation: session
+            .as_ref()
+            .map(|s| s.memo_generation.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
+    })
+}
+
+/// 1 シートの全非空セル(キャッシュから。オフラインでも使える)。
+#[uniffi::export]
+pub fn sheet_cells(
+    base_dir: String,
+    slug: String,
+    sheet_id: String,
+) -> Result<SheetCellsResult, MobileError> {
+    let cache = open_cache(&base_dir, &slug)?;
+    let cells = cache.sheet_cells(&sheet_id)?;
+    let session = crate::session_of(&slug);
+    let online = session.as_ref().is_some_and(|s| {
+        s.control_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    Ok(SheetCellsResult {
+        cells: cells.into_iter().map(Into::into).collect(),
+        offline: !online,
+        generation: session
+            .as_ref()
+            .map(|s| s.memo_generation.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
+    })
+}
+
+fn expect_sheet(reply: SharedMemoReply) -> Result<SheetMetaInfo, MobileError> {
+    match reply {
+        SharedMemoReply::Sheet {
+            reply: SheetReply::Sheet { sheet },
+        } => Ok(sheet.into()),
+        SharedMemoReply::Sheet {
+            reply: SheetReply::Err { message },
+        } => Err(MobileError::Failure { msg: message }),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// 新規作成(全員可、オンライン専用)。
+#[uniffi::export]
+pub fn sheet_create(slug: String, name: String) -> Result<SheetMetaInfo, MobileError> {
+    expect_sheet(session_request(
+        &slug,
+        SharedMemoOp::Sheet {
+            sheet: SheetOp::Create { name },
+        },
+    )?)
+}
+
+/// 改名(作成者 + ホストのみ、オンライン専用)。
+#[uniffi::export]
+pub fn sheet_rename(
+    slug: String,
+    sheet_id: String,
+    name: String,
+) -> Result<SheetMetaInfo, MobileError> {
+    expect_sheet(session_request(
+        &slug,
+        SharedMemoOp::Sheet {
+            sheet: SheetOp::Rename { sheet_id, name },
+        },
+    )?)
+}
+
+/// 削除(作成者 + ホストのみ、オンライン専用)。
+#[uniffi::export]
+pub fn sheet_delete(slug: String, sheet_id: String) -> Result<(), MobileError> {
+    session_request(
+        &slug,
+        SharedMemoOp::Sheet {
+            sheet: SheetOp::Delete { sheet_id },
+        },
+    )
+    .map(|_| ())
+}
+
+/// セルのバッチ書き込み(全員可、オンライン専用)。競合セルは
+/// `conflicts` に現在値が入って返る(部分失敗、ADR-0054 決定 4)。
+#[uniffi::export]
+pub fn sheet_write(
+    slug: String,
+    sheet_id: String,
+    cells: Vec<SheetCellWriteArg>,
+) -> Result<SheetWriteResult, MobileError> {
+    let reply = session_request(
+        &slug,
+        SharedMemoOp::Sheet {
+            sheet: SheetOp::Write {
+                sheet_id,
+                cells: cells.into_iter().map(Into::into).collect(),
+            },
+        },
+    )?;
+    match reply {
+        SharedMemoReply::Sheet {
+            reply: SheetReply::WriteResult { applied, conflicts },
+        } => Ok(SheetWriteResult {
+            applied,
+            conflicts: conflicts.into_iter().map(Into::into).collect(),
+        }),
+        SharedMemoReply::Sheet {
+            reply: SheetReply::Err { message },
+        } => Err(MobileError::Failure { msg: message }),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
 }
 
 // ---- 変更履歴(M5 F-3、ADR-0049)---------------------------------------------

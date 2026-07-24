@@ -1298,7 +1298,12 @@ async fn member_session(
 async fn memo_sync(link: Arc<MemberLink>, cache: Arc<crate::memoshare::MemberMemoCache>) {
     use peercove_core::memo::{SharedMemoOp, SharedMemoQuery, SharedMemoReply};
     use peercove_core::schedule::{ScheduleOp, ScheduleReply};
+    use peercove_core::sheet::{SheetOp, SheetReply};
     const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
+    // 接続時に全シートのセルまで取りに行くのは重いため、最初の数枚だけ
+    // 即時同期し、残りは各シートを開いたときの Cells 取得に任せる
+    // (実装簡素化の判断、ADR-0054 の作業指示書どおり)
+    const SHEET_SYNC_LIMIT: usize = 10;
     let Some(rx) = link.request_memo(SharedMemoOp::List {
         query: SharedMemoQuery::default(),
     }) else {
@@ -1356,6 +1361,51 @@ async fn memo_sync(link: Arc<MemberLink>, cache: Arc<crate::memoshare::MemberMem
             }
         }
         _ => tracing::debug!("共有スケジュール表の同期応答がありません(ホスト未対応の可能性)"),
+    }
+
+    // 共有シートの初回同期(M6 G-2、ADR-0054)。メモ・スケジュールの同期に
+    // 相乗り。ホストが未対応(旧バージョン)なら応答が無いままタイムアウトし、
+    // 既存のキャッシュをそのまま温存する(既存の互換モデル)
+    let Some(rx) = link.request_memo(SharedMemoOp::Sheet {
+        sheet: SheetOp::List,
+    }) else {
+        return;
+    };
+    let sheets = match tokio::time::timeout(SYNC_TIMEOUT, rx).await {
+        Ok(Ok(SharedMemoReply::Sheet {
+            reply: SheetReply::Sheets { sheets, .. },
+        })) => sheets,
+        _ => {
+            tracing::debug!("共有シートの同期応答がありません(ホスト未対応の可能性)");
+            return;
+        }
+    };
+    let total = sheets.len();
+    match cache.sheet_sync_from_list(sheets.clone()).await {
+        Ok(()) => tracing::info!("共有シートを同期しました({total} 枚)"),
+        Err(e) => {
+            tracing::warn!("共有シートの同期に失敗しました: {e:#}");
+            return;
+        }
+    }
+    for sheet in sheets.into_iter().take(SHEET_SYNC_LIMIT) {
+        let Some(rx) = link.request_memo(SharedMemoOp::Sheet {
+            sheet: SheetOp::Cells {
+                sheet_id: sheet.id.clone(),
+            },
+        }) else {
+            return;
+        };
+        if let Ok(Ok(SharedMemoReply::Sheet {
+            reply: SheetReply::CellsData {
+                sheet_id, cells, ..
+            },
+        })) = tokio::time::timeout(SYNC_TIMEOUT, rx).await
+        {
+            if let Err(e) = cache.sheet_sync_cells(sheet_id, cells).await {
+                tracing::warn!("共有シートのセル同期に失敗しました: {e:#}");
+            }
+        }
     }
 }
 

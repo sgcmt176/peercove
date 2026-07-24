@@ -26,6 +26,7 @@ use peercove_core::memo::{
 };
 use peercove_core::proto::ControlMessage;
 use peercove_core::schedule::{ScheduleEvent, ScheduleEventMsg, ScheduleOp, ScheduleReply};
+use peercove_core::sheet::{SheetCell, SheetEventMsg, SheetMeta, SheetOp, SheetReply};
 use peercove_memo::shared::{Actor, CacheStore, SharedStore};
 
 use crate::control::Connections;
@@ -612,6 +613,10 @@ impl MemoService {
                 let reply = self.handle_schedule(actor, schedule).await?;
                 Ok(SharedMemoReply::Schedule { reply })
             }
+            SharedMemoOp::Sheet { sheet } => {
+                let reply = self.handle_sheet(actor, sheet).await?;
+                Ok(SharedMemoReply::Sheet { reply })
+            }
         }
     }
 
@@ -703,6 +708,91 @@ impl MemoService {
                 self.broadcast_schedule_removed(&id);
                 self.bump();
                 Ok(ScheduleReply::Done)
+            }
+        }
+    }
+
+    /// 共有シート(M6 G-2、ADR-0054)。全員閲覧・セル編集可、シートの作成・
+    /// 改名・削除は作成者 + ホストのみ(権限判定は store 側)。編集ロックは
+    /// 持たない(セル単位の revision CAS のみ)。
+    async fn handle_sheet(
+        self: &Arc<Self>,
+        actor: Actor,
+        op: SheetOp,
+    ) -> anyhow::Result<SheetReply> {
+        match op {
+            SheetOp::List => {
+                let sheets = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.sheet_list(&actor)
+                    })
+                    .await?;
+                Ok(SheetReply::Sheets {
+                    sheets,
+                    offline: false,
+                })
+            }
+            SheetOp::Cells { sheet_id } => {
+                let cells = self
+                    .blocking({
+                        let sheet_id = sheet_id.clone();
+                        move |store| store.sheet_cells(&sheet_id)
+                    })
+                    .await?;
+                Ok(SheetReply::CellsData {
+                    sheet_id,
+                    cells,
+                    offline: false,
+                })
+            }
+            SheetOp::Create { name } => {
+                let sheet = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.sheet_create(&actor, &name)
+                    })
+                    .await?;
+                self.broadcast_sheet_changed(sheet.clone());
+                self.bump();
+                Ok(SheetReply::Sheet { sheet })
+            }
+            SheetOp::Rename { sheet_id, name } => {
+                let sheet = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let sheet_id = sheet_id.clone();
+                        move |store| store.sheet_rename(&actor, &sheet_id, &name)
+                    })
+                    .await?;
+                self.broadcast_sheet_changed(sheet.clone());
+                self.bump();
+                Ok(SheetReply::Sheet { sheet })
+            }
+            SheetOp::Delete { sheet_id } => {
+                self.blocking({
+                    let actor = actor.clone();
+                    let sheet_id = sheet_id.clone();
+                    move |store| store.sheet_delete(&actor, &sheet_id)
+                })
+                .await?;
+                self.broadcast_sheet_removed(&sheet_id);
+                self.bump();
+                Ok(SheetReply::Done)
+            }
+            SheetOp::Write { sheet_id, cells } => {
+                let (applied, conflicts, changed) = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let sheet_id = sheet_id.clone();
+                        move |store| store.sheet_write(&actor, &sheet_id, &cells)
+                    })
+                    .await?;
+                if applied > 0 {
+                    self.broadcast_sheet_cells_changed(sheet_id, changed);
+                    self.bump();
+                }
+                Ok(SheetReply::WriteResult { applied, conflicts })
             }
         }
     }
@@ -1033,6 +1123,64 @@ impl MemoService {
             });
         }
     }
+
+    /// シートの作成・改名を全員へ配信する(**閲覧権限フィルタなし** —
+    /// ADR-0054 決定 5)。受信者ごとに can_manage だけ計算し直して詰める。
+    fn broadcast_sheet_changed(self: &Arc<Self>, sheet: SheetMeta) {
+        let service = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let targets = service.memo_connections();
+            if targets.is_empty() {
+                return;
+            }
+            let Ok(config) = Config::load(&service.config_path) else {
+                return;
+            };
+            for (ip, connection) in targets {
+                let Ok(actor) = Self::actor_for_ip(&config, ip) else {
+                    continue;
+                };
+                let mut for_actor = sheet.clone();
+                for_actor.can_manage = actor.member_id.is_none()
+                    || actor.member_id.as_deref() == Some(sheet.owner_id.as_str());
+                connection.send(ControlMessage::MemoEvent {
+                    event: SharedMemoEvent::Sheet {
+                        sheet: SheetEventMsg::SheetChanged { sheet: for_actor },
+                    },
+                });
+            }
+        });
+    }
+
+    /// シートの削除を全員へ配信する(フィルタなし)。
+    fn broadcast_sheet_removed(self: &Arc<Self>, sheet_id: &str) {
+        let event = SharedMemoEvent::Sheet {
+            sheet: SheetEventMsg::SheetRemoved {
+                sheet_id: sheet_id.to_string(),
+            },
+        };
+        for (_, connection) in self.memo_connections() {
+            connection.send(ControlMessage::MemoEvent {
+                event: event.clone(),
+            });
+        }
+    }
+
+    /// セルのバッチ変更を全員へ配信する(**閲覧権限フィルタなし・受信者ごとの
+    /// 再計算も不要** — 全員が同じ内容を編集できる、ADR-0054 決定 5)。
+    fn broadcast_sheet_cells_changed(self: &Arc<Self>, sheet_id: String, cells: Vec<SheetCell>) {
+        if cells.is_empty() {
+            return;
+        }
+        let event = SharedMemoEvent::Sheet {
+            sheet: SheetEventMsg::CellsChanged { sheet_id, cells },
+        };
+        for (_, connection) in self.memo_connections() {
+            connection.send(ControlMessage::MemoEvent {
+                event: event.clone(),
+            });
+        }
+    }
 }
 
 fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
@@ -1128,6 +1276,19 @@ impl MemberMemoCache {
                     self.blocking(move |store| store.schedule_remove(&id)).await
                 }
             },
+            SharedMemoEvent::Sheet { sheet } => match sheet {
+                SheetEventMsg::SheetChanged { sheet } => {
+                    self.blocking(move |store| store.sheet_upsert(&sheet)).await
+                }
+                SheetEventMsg::SheetRemoved { sheet_id } => {
+                    self.blocking(move |store| store.sheet_remove(&sheet_id))
+                        .await
+                }
+                SheetEventMsg::CellsChanged { sheet_id, cells } => {
+                    self.blocking(move |store| store.sheet_cells_apply(&sheet_id, &cells))
+                        .await
+                }
+            },
         };
         match result {
             Ok(()) => self.bump(),
@@ -1208,6 +1369,41 @@ impl MemberMemoCache {
         events: Vec<ScheduleEvent>,
     ) -> anyhow::Result<()> {
         self.blocking(move |store| store.schedule_replace_all(&events))
+            .await?;
+        self.bump();
+        Ok(())
+    }
+
+    /// シート一覧(オフライン時はここが唯一のソース、M6 G-2)。
+    pub async fn sheet_list(self: &Arc<Self>) -> anyhow::Result<Vec<SheetMeta>> {
+        self.blocking(|store| store.sheet_list()).await
+    }
+
+    /// 1 シートの全非空セル(オフライン時はここが唯一のソース、M6 G-2)。
+    pub async fn sheet_cells(self: &Arc<Self>, sheet_id: String) -> anyhow::Result<Vec<SheetCell>> {
+        self.blocking(move |store| store.sheet_cells(&sheet_id))
+            .await
+    }
+
+    /// 接続時の同期: List 応答でシートのメタ全量を置き換える(孤児セルも
+    /// 掃除される、ADR-0054)。
+    pub async fn sheet_sync_from_list(
+        self: &Arc<Self>,
+        sheets: Vec<SheetMeta>,
+    ) -> anyhow::Result<()> {
+        self.blocking(move |store| store.sheet_replace_all(&sheets))
+            .await?;
+        self.bump();
+        Ok(())
+    }
+
+    /// 接続時の同期: 1 シートの Cells 応答でそのシートのセル全量を置き換える。
+    pub async fn sheet_sync_cells(
+        self: &Arc<Self>,
+        sheet_id: String,
+        cells: Vec<SheetCell>,
+    ) -> anyhow::Result<()> {
+        self.blocking(move |store| store.sheet_cells_replace_all(&sheet_id, &cells))
             .await?;
         self.bump();
         Ok(())
