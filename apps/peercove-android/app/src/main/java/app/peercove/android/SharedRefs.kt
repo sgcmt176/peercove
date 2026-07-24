@@ -29,15 +29,21 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.peercove_mobile.MobileException
+import uniffi.peercove_mobile.ScheduleEventInfo
+import uniffi.peercove_mobile.scheduleList
 import uniffi.peercove_mobile.sharedMemoGet
 
 /** 対応している種別のレジストリ。増やすときはここへ 1 エントリ足すだけでよい。 */
-enum class SharedRefKind(val prefix: String, val icon: String) {
-    MEMO("memo", "📝"),
+enum class SharedRefKind(val prefix: String, val icon: String, val nounRes: Int) {
+    MEMO("memo", "📝", R.string.shared_ref_noun_memo),
+    SCHEDULE("schedule", "📅", R.string.shared_ref_noun_schedule),
     ;
 
     companion object {
@@ -82,15 +88,50 @@ private data class SharedRefResolved(val title: String, val excerpt: String)
 private fun firstBodyLine(body: String): String =
     body.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(80) ?: ""
 
+// 共有スケジュール表(M6 G-1、ADR-0053)。`get` 単体の op が無いため一覧
+// (キャッシュ読み取り = 軽量)から id を引く。カードが並ぶ場面で 1 件ごとに
+// list を叩かないよう slug ごとに短時間メモ化する(デスクトップと同じ TTL)。
+private const val SCHEDULE_LIST_TTL_MS = 5000L
+private data class ScheduleListCacheEntry(val events: List<ScheduleEventInfo>, val at: Long)
+private val scheduleListCache = ConcurrentHashMap<String, ScheduleListCacheEntry>()
+private val scheduleExcerptDateFmt = SimpleDateFormat("M/d", Locale.getDefault())
+private val scheduleExcerptTimeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+
+private suspend fun listScheduleEventsCached(baseDir: String, slug: String): List<ScheduleEventInfo> {
+    val now = System.currentTimeMillis()
+    val cached = scheduleListCache[slug]
+    if (cached != null && now - cached.at < SCHEDULE_LIST_TTL_MS) return cached.events
+    val events = withContext(Dispatchers.IO) { scheduleList(baseDir, slug) }.events
+    scheduleListCache[slug] = ScheduleListCacheEntry(events, now)
+    return events
+}
+
+/** 予定の抜粋文字列(例 "7/28 14:00" / 終日 "7/28 終日")。 */
+private fun scheduleExcerpt(event: ScheduleEventInfo, allDayLabel: String): String {
+    val md = scheduleExcerptDateFmt.format(Date(event.startUnixMs.toLong()))
+    return if (event.allDay) {
+        "$md $allDayLabel"
+    } else {
+        "$md ${scheduleExcerptTimeFmt.format(Date(event.startUnixMs.toLong()))}"
+    }
+}
+
 /** 表示時に受信者自身の権限で解決する。キャッシュ経由 = オフラインでも出る。 */
 private suspend fun resolveSharedRef(
     baseDir: String,
     slug: String,
     token: SharedRefToken,
+    allDayLabel: String,
 ): SharedRefResolved? = when (token.kind) {
     SharedRefKind.MEMO -> try {
         val memo = withContext(Dispatchers.IO) { sharedMemoGet(baseDir, slug, token.id) }
         SharedRefResolved(memo.title, firstBodyLine(memo.body))
+    } catch (e: MobileException) {
+        null
+    }
+    SharedRefKind.SCHEDULE -> try {
+        listScheduleEventsCached(baseDir, slug).firstOrNull { it.id == token.id }
+            ?.let { SharedRefResolved(it.title, scheduleExcerpt(it, allDayLabel)) }
     } catch (e: MobileException) {
         null
     }
@@ -111,13 +152,14 @@ fun SharedRefCard(
     val key = "$slug::${token.kind.prefix}:${token.id}"
     var loading by remember(key) { mutableStateOf(!sharedRefCache.containsKey(key)) }
     var resolved by remember(key) { mutableStateOf(sharedRefCache[key]) }
+    val allDayLabel = stringResource(R.string.schedule_all_day)
     LaunchedEffect(key) {
         if (sharedRefCache.containsKey(key)) {
             resolved = sharedRefCache[key]
             loading = false
             return@LaunchedEffect
         }
-        val value = resolveSharedRef(baseDir, slug, token)
+        val value = resolveSharedRef(baseDir, slug, token, allDayLabel)
         sharedRefCache[key] = value
         resolved = value
         loading = false
@@ -137,7 +179,10 @@ fun SharedRefCard(
             Text(
                 text = " " + when {
                     loading -> stringResource(R.string.shared_ref_loading)
-                    current == null -> stringResource(R.string.shared_ref_inaccessible)
+                    current == null -> stringResource(
+                        R.string.shared_ref_inaccessible,
+                        stringResource(token.kind.nounRes),
+                    )
                     else -> current.title.ifEmpty { stringResource(R.string.memo_untitled) }
                 },
                 color = content,

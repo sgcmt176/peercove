@@ -319,9 +319,11 @@
     <string name="memo_reminder_saved">リマインダーを設定しました</string>
     <string name="memo_reminder_cleared">リマインダーを解除しました</string>
 
-    <!-- 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは現在「メモ」
-         のみ。今後スケジュール・表を足す際はここへキーを追加するだけでよい -->
+    <!-- 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは「メモ」
+         「スケジュール」(M6 G-1、ADR-0053)。今後表を足す際はここへ
+         キーを追加するだけでよい -->
     <string name="shared_hub_tab_memos">メモ</string>
+    <string name="shared_hub_tab_schedule">スケジュール</string>
 
     <!-- 共有メモ(M5 F-2、ADR-0049) -->
     <string name="shared_memo_empty">共有メモがありません</string>
@@ -364,8 +366,46 @@
     <string name="notif_memo_comment_title">%1$s が「%2$s」にコメントしました</string>
     <string name="notif_memo_mention_title">%1$s があなたをメンションしました(「%2$s」)</string>
 
-    <!-- 共有オブジェクト参照 `@memo:id`(M5 F-5 Stage 4、ADR-0052 決定 1) -->
+    <!-- 共有オブジェクト参照 `@種別:id`(M5 F-5 Stage 4、ADR-0052 決定 1。
+         M6 G-1、ADR-0053 でスケジュールを追加) -->
     <string name="shared_memo_copy_link">リンクをコピー</string>
     <string name="shared_ref_loading">読み込み中…</string>
-    <string name="shared_ref_inaccessible">アクセスできないメモ</string>
+    <string name="shared_ref_inaccessible">アクセスできない%1$s</string>
+    <string name="shared_ref_noun_memo">メモ</string>
+    <string name="shared_ref_noun_schedule">予定</string>
+
+    <!-- 共有スケジュール表(M6 G-1、ADR-0053) -->
+    <string-array name="schedule_weekdays">
+        <item>日</item>
+        <item>月</item>
+        <item>火</item>
+        <item>水</item>
+        <item>木</item>
+        <item>金</item>
+        <item>土</item>
+    </string-array>
+    <string name="schedule_today">今日</string>
+    <string name="schedule_all_day">終日</string>
+    <string name="schedule_add_event">予定を追加</string>
+    <string name="schedule_edit_event">編集</string>
+    <string name="schedule_delete_event">削除</string>
+    <string name="schedule_delete_confirm">この予定を削除しますか?(元に戻せません)</string>
+    <string name="schedule_create_title">予定を追加</string>
+    <string name="schedule_edit_title">予定を編集</string>
+    <string name="schedule_title_label">タイトル</string>
+    <string name="schedule_title_placeholder">タイトルを入力</string>
+    <string name="schedule_note_label">詳細</string>
+    <string name="schedule_note_placeholder">詳細(任意)</string>
+    <string name="schedule_start_label">開始</string>
+    <string name="schedule_end_label">終了(任意)</string>
+    <string name="schedule_end_unset">未設定</string>
+    <string name="schedule_clear_end">終了をクリア</string>
+    <string name="schedule_owner">作成者: %1$s</string>
+    <string name="schedule_updated_by">更新者: %1$s</string>
+    <string name="schedule_no_events_for_day">この日の予定はありません</string>
+    <string name="schedule_copy_link">リンクをコピー</string>
+    <string name="schedule_viewer_badge">閲覧のみ</string>
+    <string name="schedule_offline">オフライン(ホスト未接続)のため読み取り専用です</string>
+    <string name="schedule_unsupported">ホストと同期できていません(ホストのバージョンが古い可能性があります)</string>
+    <string name="schedule_conflict_notice">他の端末の変更が先に保存されています。読み込み直してください</string>
 </resources>

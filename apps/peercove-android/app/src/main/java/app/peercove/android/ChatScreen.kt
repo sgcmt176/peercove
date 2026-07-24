@@ -124,8 +124,8 @@ fun ConversationScreen(
     messages: List<ChatMessage>,
     members: List<MemberInfo>,
     onNotice: (String) -> Unit,
-    /** 本文中の `@memo:id` カード(ADR-0052 決定 1)をタップしたときの遷移先。 */
-    onOpenMemo: (String) -> Unit,
+    /** 本文中の `@種別:id` カード(ADR-0052 決定 1)をタップしたときの遷移先。 */
+    onOpenRef: (SharedRefToken) -> Unit,
 ) {
     val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
@@ -211,14 +211,14 @@ fun ConversationScreen(
             items(convMessages, key = { it.seq.toLong() }) { message ->
                 when {
                     message.system -> SystemLine(message.text)
-                    message.outgoing -> OutgoingBubble(slug, baseDir, message, onNotice, onOpenMemo)
+                    message.outgoing -> OutgoingBubble(slug, baseDir, message, onNotice, onOpenRef)
                     else -> IncomingBubble(
                         slug,
                         baseDir,
                         message,
                         showName = conv !is ConvKey.Direct,
                         onNotice = onNotice,
-                        onOpenMemo = onOpenMemo,
+                        onOpenRef = onOpenRef,
                     )
                 }
             }
@@ -278,7 +278,7 @@ private fun IncomingBubble(
     message: ChatMessage,
     showName: Boolean,
     onNotice: (String) -> Unit,
-    onOpenMemo: (String) -> Unit,
+    onOpenRef: (SharedRefToken) -> Unit,
 ) {
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         // アバター(名前の頭文字)
@@ -313,7 +313,7 @@ private fun IncomingBubble(
                     content = MaterialTheme.colorScheme.onSurface,
                     shape = RoundedCornerShape(4.dp, 16.dp, 16.dp, 16.dp),
                     onNotice = onNotice,
-                    onOpenMemo = onOpenMemo,
+                    onOpenRef = onOpenRef,
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
@@ -332,7 +332,7 @@ private fun OutgoingBubble(
     baseDir: String,
     message: ChatMessage,
     onNotice: (String) -> Unit,
-    onOpenMemo: (String) -> Unit,
+    onOpenRef: (SharedRefToken) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val resendFailed = stringResource(R.string.chat_send_failed)
@@ -412,7 +412,7 @@ private fun OutgoingBubble(
             content = Color(0xFF102A00),
             shape = RoundedCornerShape(16.dp, 4.dp, 16.dp, 16.dp),
             onNotice = onNotice,
-            onOpenMemo = onOpenMemo,
+            onOpenRef = onOpenRef,
         )
     }
 }
@@ -444,7 +444,7 @@ private fun Bubble(
     content: Color,
     shape: RoundedCornerShape,
     onNotice: (String) -> Unit,
-    onOpenMemo: (String) -> Unit,
+    onOpenRef: (SharedRefToken) -> Unit,
 ) {
     // ファイルのタップ = 操作シート(開く / 共有 / 保存 / SHA-256)
     var showSheet by remember { mutableStateOf(false) }
@@ -534,7 +534,7 @@ private fun Bubble(
                                 slug = slug,
                                 token = part.token,
                                 content = content,
-                                onOpen = { onOpenMemo(part.token.id) },
+                                onOpen = { onOpenRef(part.token) },
                             )
                             is SharedRefPart.PlainText -> if (part.value.isNotEmpty()) {
                                 val urls = remember(part.value) {

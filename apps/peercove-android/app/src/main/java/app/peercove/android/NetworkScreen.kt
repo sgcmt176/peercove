@@ -130,9 +130,12 @@ fun NetworkScreen(
     var dnsList by remember { mutableStateOf<List<DnsEntry>>(emptyList()) }
     var messages by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
     var conv by remember { mutableStateOf<ConvKey?>(null) }
-    // チャットの `@memo:id` カード(ADR-0052 決定 1)・リマインダー通知タップ
-    // から「共有」タブの該当メモへ遷移するための一時状態。反映したら null に戻す
-    var memoFocus by remember { mutableStateOf(initialMemoFocus) }
+    // チャットの `@種別:id` カード(ADR-0052 決定 1。ADR-0053 で種別に
+    // スケジュールを追加)・リマインダー通知タップから「共有」タブの該当
+    // 項目へ遷移するための一時状態。反映したら null に戻す
+    var focusRef by remember {
+        mutableStateOf(initialMemoFocus?.let { SharedRefToken(SharedRefKind.MEMO, it) })
+    }
     var showGroupDialog by remember { mutableStateOf(false) }
     var showGroupManage by remember { mutableStateOf(false) }
     var showFiles by remember { mutableStateOf(false) }
@@ -339,8 +342,8 @@ fun NetworkScreen(
                 messages,
                 memberList,
                 onNotice,
-                onOpenMemo = { id ->
-                    memoFocus = id
+                onOpenRef = { token ->
+                    focusRef = token
                     tab = 2
                     conv = null
                 },
@@ -383,8 +386,8 @@ fun NetworkScreen(
             2 -> SharedHubTab(
                 slug,
                 onNotice,
-                focusMemoId = memoFocus,
-                onFocusConsumed = { memoFocus = null },
+                focusRef = focusRef,
+                onFocusConsumed = { focusRef = null },
             )
             3 -> DnsList(memberList, dnsList, onCopy = ::copy, onNotice = onNotice)
             else -> SettingsTab(slug, state, tunnel, onNotice, onChatCleared = { chatEpoch++ })

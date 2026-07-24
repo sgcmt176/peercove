@@ -104,15 +104,18 @@ import uniffi.peercove_mobile.sharedMemoTrash
 private val sharedDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
 
 // 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。共有系機能をタブで増やし続け
-// ず「共有」1 か所にまとめる器。サブタブは現在「メモ」のみだが、今後
-// スケジュール・表を足すときは SHARED_HUB_TABS に 1 要素足すだけでよい
+// ず「共有」1 か所にまとめる器。サブタブは「メモ」「スケジュール」
+// (M6 G-1、ADR-0053)。今後表を足すときは SHARED_HUB_TABS に 1 要素足す
+// だけでよい。チャットの `@種別:id` 参照カードからの遷移(ADR-0052 決定 1)
+// は種別(kind)を見て対応サブタブへ自動で切り替える(汎用化)。
 private data class SharedHubTabSpec(
     val id: String,
     val labelRes: Int,
+    val kind: SharedRefKind,
     val content: @Composable (
         slug: String,
         onNotice: (String) -> Unit,
-        focusMemoId: String?,
+        focusId: String?,
         onFocusConsumed: () -> Unit,
     ) -> Unit,
 )
@@ -121,8 +124,17 @@ private val SHARED_HUB_TABS = listOf(
     SharedHubTabSpec(
         id = "memos",
         labelRes = R.string.shared_hub_tab_memos,
-        content = { slug, onNotice, focusMemoId, onFocusConsumed ->
-            SharedMemoTab(slug, onNotice, focusMemoId, onFocusConsumed)
+        kind = SharedRefKind.MEMO,
+        content = { slug, onNotice, focusId, onFocusConsumed ->
+            SharedMemoTab(slug, onNotice, focusId, onFocusConsumed)
+        },
+    ),
+    SharedHubTabSpec(
+        id = "schedule",
+        labelRes = R.string.shared_hub_tab_schedule,
+        kind = SharedRefKind.SCHEDULE,
+        content = { slug, onNotice, focusId, onFocusConsumed ->
+            ScheduleTab(slug, onNotice, focusId, onFocusConsumed)
         },
     ),
 )
@@ -131,12 +143,18 @@ private val SHARED_HUB_TABS = listOf(
 fun SharedHubTab(
     slug: String,
     onNotice: (String) -> Unit,
-    /** チャットの `@memo:id` カード(ADR-0052 決定 1)から開くメモ。反映後は呼び出し元で null に戻す。 */
-    focusMemoId: String? = null,
+    /** チャットの `@種別:id` カード(ADR-0052 決定 1)から開く対象。反映後は呼び出し元で null に戻す。 */
+    focusRef: SharedRefToken? = null,
     onFocusConsumed: () -> Unit = {},
 ) {
     var tabId by remember { mutableStateOf(SHARED_HUB_TABS.first().id) }
     val active = SHARED_HUB_TABS.firstOrNull { it.id == tabId } ?: SHARED_HUB_TABS.first()
+
+    // 参照カードから開いたときは、反映前に対応する種別のサブタブへ切り替える
+    LaunchedEffect(focusRef) {
+        val kind = focusRef?.kind ?: return@LaunchedEffect
+        SHARED_HUB_TABS.firstOrNull { it.kind == kind }?.let { tabId = it.id }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -154,7 +172,12 @@ fun SharedHubTab(
                 )
             }
         }
-        active.content(slug, onNotice, focusMemoId, onFocusConsumed)
+        active.content(
+            slug,
+            onNotice,
+            focusRef?.takeIf { it.kind == active.kind }?.id,
+            onFocusConsumed,
+        )
     }
 }
 
