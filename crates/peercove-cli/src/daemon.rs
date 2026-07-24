@@ -369,6 +369,24 @@ impl DaemonShared {
                                 reply: SharedMemoReply::Memo { memo },
                             })
                         }
+                        // メモ間リンク(ADR-0052)もキャッシュから解決できる
+                        // (List/Get と同様、オフラインでも使えた方がよい)
+                        SharedMemoOp::ResolveTitles { titles } => {
+                            let map = cache.resolve_titles(titles).await?;
+                            Ok(IpcResponse::SharedMemo {
+                                reply: SharedMemoReply::Titles { map },
+                            })
+                        }
+                        SharedMemoOp::Backlinks { id } => {
+                            let memos = cache.backlinks(id).await?;
+                            Ok(IpcResponse::SharedMemo {
+                                reply: SharedMemoReply::Memos {
+                                    memos,
+                                    folders: Vec::new(),
+                                    offline: link.session().is_none(),
+                                },
+                            })
+                        }
                         op => {
                             // 変更系はホストへ(権限・ロック・CAS はホスト正本で判定)
                             let reply = link.request_memo(op).context(

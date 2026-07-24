@@ -508,6 +508,9 @@ export interface MemoPatch {
 export type MemoOp =
   | { op: "list"; query: MemoQuery }
   | { op: "get"; id: string }
+  // メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)。
+  | { op: "resolve_titles"; titles: string[] }
+  | { op: "backlinks"; id: string }
   | {
       op: "create";
       title: string;
@@ -533,6 +536,8 @@ export type MemoReply =
       tags: MemoTagCount[];
     }
   | { kind: "memo"; memo: MemoDetail }
+  // ResolveTitles への応答(タイトル → memo_id、見つかったものだけ)。
+  | { kind: "titles"; map: Record<string, string> }
   | { kind: "folder"; folder: MemoFolder }
   | { kind: "done" };
 
@@ -641,6 +646,9 @@ export interface DiffLine {
 export type SharedMemoOp =
   | { op: "list"; query: SharedMemoQuery }
   | { op: "get"; id: string }
+  // メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)。
+  | { op: "resolve_titles"; titles: string[] }
+  | { op: "backlinks"; id: string }
   | { op: "create"; title: string; body: string; folder_id?: string }
   | {
       op: "update";
@@ -686,6 +694,8 @@ export type SharedMemoReply =
       offline?: boolean;
     }
   | { kind: "memo"; memo: SharedMemoDetail }
+  // ResolveTitles への応答(タイトル → memo_id、actor に見えるものだけ)。
+  | { kind: "titles"; map: Record<string, string> }
   | { kind: "history"; entries: SharedMemoHistoryEntry[] }
   | { kind: "history_detail"; detail: SharedMemoHistoryDetail }
   | { kind: "diff"; lines: DiffLine[] }

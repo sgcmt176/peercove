@@ -270,6 +270,28 @@ impl MemoService {
                 self.refresh_group_names(&mut memo);
                 Ok(SharedMemoReply::Memo { memo })
             }
+            SharedMemoOp::ResolveTitles { titles } => {
+                let map = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.resolve_titles(&actor, &titles)
+                    })
+                    .await?;
+                Ok(SharedMemoReply::Titles { map })
+            }
+            SharedMemoOp::Backlinks { id } => {
+                let memos = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.backlinks(&actor, &id)
+                    })
+                    .await?;
+                Ok(SharedMemoReply::Memos {
+                    memos,
+                    folders: Vec::new(),
+                    offline: false,
+                })
+            }
             SharedMemoOp::Create {
                 title,
                 body,
@@ -940,6 +962,20 @@ impl MemberMemoCache {
 
     pub async fn get(self: &Arc<Self>, id: String) -> anyhow::Result<SharedMemoDetail> {
         self.blocking(move |store| store.get(&id)).await
+    }
+
+    /// メモ間リンクの解決(キャッシュから。オフラインでも使える、ADR-0052)。
+    pub async fn resolve_titles(
+        self: &Arc<Self>,
+        titles: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        self.blocking(move |store| store.resolve_titles(&titles))
+            .await
+    }
+
+    /// バックリンク(キャッシュから。オフラインでも使える、ADR-0052)。
+    pub async fn backlinks(self: &Arc<Self>, id: String) -> anyhow::Result<Vec<SharedMemoSummary>> {
+        self.blocking(move |store| store.backlinks(&id)).await
     }
 
     /// 接続時の同期: List 応答を突き合わせ、取り直しが必要な ID を返す。

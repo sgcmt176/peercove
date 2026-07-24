@@ -21,8 +21,8 @@ use peercove_core::memo::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
-    diff_lines, kana_fold, register_kana_fold, unix_ms, validate_body_bytes, validate_folder_name,
-    validate_title,
+    diff_lines, escape_like, kana_fold, register_kana_fold, unix_ms, validate_body_bytes,
+    validate_folder_name, validate_title,
 };
 
 /// 変更履歴の自動保存の間隔(ミリ秒)。編集セッション中はこの間隔でしか
@@ -555,6 +555,74 @@ impl SharedStore {
             return Ok(None);
         }
         Ok(Some(row.detail(actor, &ctx)))
+    }
+
+    /// メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)の解決。タイトル →
+    /// memo_id(見つかったものだけ。ゴミ箱除外、複数一致は updated_at
+    /// 最新)。**可視性フィルタあり**(actor に見えないメモは結果から除く。
+    /// 次に新しい候補へフォールバックはしない = シンプル優先)。
+    pub fn resolve_titles(
+        &self,
+        actor: &Actor,
+        titles: &[String],
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = HashMap::new();
+        for title in titles {
+            if title.is_empty() || !seen.insert(title.clone()) {
+                continue;
+            }
+            let row: Option<Row> = self
+                .conn
+                .query_row(
+                    "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
+                            created_at, updated_at, updated_by, everyone, deleted_at
+                     FROM memos WHERE title = ?1 AND deleted_at IS NULL
+                     ORDER BY updated_at DESC LIMIT 1",
+                    params![title],
+                    row_from_sql,
+                )
+                .optional()?;
+            let Some(row) = row else { continue };
+            let ctx = self.perm_context(&row.id)?;
+            if row.visible_to(actor, &ctx) {
+                out.insert(title.clone(), row.id.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// バックリンク: 本文に `[[<このメモのタイトル>]]` をリテラルとして含む、
+    /// actor に見えるメモの一覧(自分自身・ゴミ箱は除く)。タイトルが空なら
+    /// 対象外。
+    pub fn backlinks(&self, actor: &Actor, id: &str) -> anyhow::Result<Vec<SharedMemoSummary>> {
+        let target = self.row(id)?;
+        let target_ctx = self.perm_context(id)?;
+        if !target.visible_to(actor, &target_ctx) {
+            bail!("このメモを閲覧する権限がありません");
+        }
+        if target.title.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%[[{}]]%", escape_like(&target.title));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
+                    created_at, updated_at, updated_by, everyone, deleted_at
+             FROM memos
+             WHERE deleted_at IS NULL AND id != ?1 AND body LIKE ?2 ESCAPE '\\'
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![id, pattern], row_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for row in rows {
+            let ctx = self.perm_context(&row.id)?;
+            if row.visible_to(actor, &ctx) {
+                out.push(row.summary(actor, &ctx));
+            }
+        }
+        Ok(out)
     }
 
     pub fn create(
@@ -1330,13 +1398,7 @@ fn push_search_clause(
             args.len()
         ));
     } else {
-        let pattern = format!(
-            "%{}%",
-            search
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
+        let pattern = format!("%{}%", escape_like(&search));
         args.push(Box::new(pattern));
         let n = args.len();
         clauses.push(format!(
@@ -1639,6 +1701,68 @@ impl CacheStore {
             )
             .optional()?
             .context("共有メモが見つかりません(削除された可能性があります)")
+    }
+
+    /// メモ間リンク `[[タイトル]]` の解決(キャッシュ版。オフラインでも使える。
+    /// キャッシュには actor が見えるメモしか同期されないため可視性フィルタは
+    /// 不要)。タイトル → memo_id(見つかったものだけ。複数一致は updated_at
+    /// 最新)。
+    pub fn resolve_titles(&self, titles: &[String]) -> anyhow::Result<HashMap<String, String>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = HashMap::new();
+        for title in titles {
+            if title.is_empty() || !seen.insert(title.clone()) {
+                continue;
+            }
+            let id: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM memos WHERE title = ?1 ORDER BY updated_at DESC LIMIT 1",
+                    params![title],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = id {
+                out.insert(title.clone(), id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// バックリンク(キャッシュ版)。本文に `[[<このメモのタイトル>]]` を
+    /// リテラルとして含むメモの一覧(自分自身は除く)。
+    pub fn backlinks(&self, id: &str) -> anyhow::Result<Vec<SharedMemoSummary>> {
+        let target = self.get(id)?;
+        if target.title.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%[[{}]]%", escape_like(&target.title));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
+                    created_at, updated_at, updated_by, can_edit, can_manage, locked_by
+             FROM memos WHERE id != ?1 AND body LIKE ?2 ESCAPE '\\'
+             ORDER BY updated_at DESC",
+        )?;
+        let memos = stmt
+            .query_map(params![id, pattern], |row| {
+                Ok(cache_summary(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get::<_, i64>(10)? != 0,
+                    row.get::<_, i64>(11)? != 0,
+                    row.get(12)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(memos)
     }
 }
 
@@ -2299,6 +2423,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.memo_ids_with_group_perms().unwrap(), vec![memo_id]);
+    }
+
+    /// メモ間リンク(ADR-0052 決定 2): タイトル解決に可視性フィルタがかかる
+    /// (見えないメモは他に候補があっても解決結果から除外される)。
+    #[test]
+    fn resolve_titles_applies_visibility_and_excludes_trash() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+
+        let old = store.create(&alice, "重複", "古い方", None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newest = store.create(&alice, "重複", "新しい方", None).unwrap();
+        let trashed = store.create(&alice, "捨てた", "x", None).unwrap();
+        store.trash(&alice, &trashed.id).unwrap();
+
+        // 既定(everyone = viewer)ではボブにも見える
+        let map = store
+            .resolve_titles(&bob, &["重複".to_string(), "捨てた".to_string()])
+            .unwrap();
+        assert_eq!(map.get("重複"), Some(&newest.id));
+        assert_ne!(map.get("重複"), Some(&old.id));
+        assert!(!map.contains_key("捨てた"), "ゴミ箱は解決対象外");
+
+        // 見えなくすると解決結果から消える(古い方へフォールバックしない)
+        store
+            .set_perms(&alice, &newest.id, SharedPermLevel::None, &[], None)
+            .unwrap();
+        let map = store.resolve_titles(&bob, &["重複".to_string()]).unwrap();
+        assert!(!map.contains_key("重複"));
+        // ホストには常に見える
+        let host = Actor::host("ホスト");
+        assert_eq!(
+            store.resolve_titles(&host, &["重複".to_string()]).unwrap()["重複"],
+            newest.id
+        );
+    }
+
+    /// バックリンク(共有): 可視性フィルタがかかり、自分自身・ゴミ箱は除く。
+    #[test]
+    fn shared_backlinks_applies_visibility() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+
+        let target = store.create(&alice, "共有資料", "本文", None).unwrap();
+        let linking = store
+            .create(&alice, "議事録", "[[共有資料]] を参照", None)
+            .unwrap();
+        // ボブだけが見えるリンク元(アリスから見ても構わないが、可視性の
+        // 対称性は問わない仕様。ここではボブ視点で検証する)
+        let backlinks = store.backlinks(&bob, &target.id).unwrap();
+        assert_eq!(backlinks.len(), 1);
+        assert_eq!(backlinks[0].id, linking.id);
+
+        // リンク元をボブに見せなくすると、ボブの結果から消える
+        store
+            .set_perms(&alice, &linking.id, SharedPermLevel::None, &[], None)
+            .unwrap();
+        assert!(store.backlinks(&bob, &target.id).unwrap().is_empty());
+        // 所有者(アリス)には常に見える
+        assert_eq!(store.backlinks(&alice, &target.id).unwrap().len(), 1);
+
+        // ターゲット自体が見えなければバックリンク取得は拒否される
+        store
+            .set_perms(&alice, &target.id, SharedPermLevel::None, &[], None)
+            .unwrap();
+        assert!(store.backlinks(&bob, &target.id).is_err());
+    }
+
+    /// メモ間リンク(キャッシュ版、ADR-0052 決定 2): List/Get と同じく
+    /// オフライン(ホスト未接続)でもキャッシュだけで解決・バックリンクが働く。
+    #[test]
+    fn cache_resolve_titles_and_backlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(&dir.path().join("m.memocache.db")).unwrap();
+        let make = |id: &str, title: &str, body: &str| SharedMemoDetail {
+            id: id.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            folder_id: None,
+            revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            updated_by: None,
+            owner_id: String::new(),
+            owner_name: "ホスト".to_string(),
+            deleted_at: None,
+            can_edit: false,
+            can_manage: false,
+            locked_by: None,
+            everyone: None,
+            members: vec![],
+            groups: vec![],
+        };
+        cache.upsert(&make("m1", "共有資料", "本文")).unwrap();
+        cache
+            .upsert(&make("m2", "議事録", "[[共有資料]] を参照"))
+            .unwrap();
+
+        let map = cache
+            .resolve_titles(&["共有資料".to_string(), "存在しない".to_string()])
+            .unwrap();
+        assert_eq!(map.get("共有資料"), Some(&"m1".to_string()));
+        assert!(!map.contains_key("存在しない"));
+
+        let backlinks = cache.backlinks("m1").unwrap();
+        assert_eq!(backlinks.len(), 1);
+        assert_eq!(backlinks[0].id, "m2");
+        assert!(cache.backlinks("m2").unwrap().is_empty());
     }
 
     #[test]

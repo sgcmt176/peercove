@@ -25,6 +25,11 @@ import {
 } from "../ipc";
 import { t } from "../i18n";
 import { Modal } from "./Modal";
+import {
+  useResolvedWikiLinks,
+  wikiLinkify,
+  wikiLinkTitle,
+} from "../memoLinks";
 
 const AUTOSAVE_DELAY_MS = 600;
 
@@ -65,6 +70,8 @@ export function SharedMemoView({
   );
   const [saveError, setSaveError] = useState("");
   const [permsFor, setPermsFor] = useState<SharedMemoDetail | null>(null);
+  // メモ間リンクのバックリンク欄(M5 F-5 Stage 2、ADR-0052 決定 2)。
+  const [backlinks, setBacklinks] = useState<SharedMemoSummary[]>([]);
   /** 変更履歴パネルを開いているか(本文領域を置き換える)。 */
   const [historyOpen, setHistoryOpen] = useState(false);
   const [limitsOpen, setLimitsOpen] = useState(false);
@@ -112,6 +119,35 @@ export function SharedMemoView({
     void refresh();
     // seq(共有メモの変更世代)が進むたびに再取得 = リアルタイム反映
   }, [refresh, seq]);
+
+  // メモ間リンク(ADR-0052 決定 2): タイトル解決とバックリンク取得
+  const resolveTitles = useCallback(
+    async (titles: string[]) => {
+      try {
+        const reply = await op({ op: "resolve_titles", titles });
+        return reply.kind === "titles" ? reply.map : {};
+      } catch {
+        return {};
+      }
+    },
+    [op],
+  );
+  const resolvedTitles = useResolvedWikiLinks(
+    editing ? draft.body : (selected?.body ?? ""),
+    resolveTitles,
+  );
+
+  const fetchBacklinks = useCallback(
+    async (id: string) => {
+      try {
+        const reply = await op({ op: "backlinks", id });
+        setBacklinks(reply.kind === "memos" ? reply.memos : []);
+      } catch {
+        setBacklinks([]);
+      }
+    },
+    [op],
+  );
 
   // 選択中メモも配信に追随する(編集中は上書きしない)
   useEffect(() => {
@@ -183,12 +219,13 @@ export function SharedMemoView({
           setSelected(reply.memo);
           setDraft({ title: reply.memo.title, body: reply.memo.body });
           setMode("edit");
+          void fetchBacklinks(id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [op, stopEditing],
+    [op, stopEditing, fetchBacklinks],
   );
 
   /** 編集ロックを取得して編集を始める(最新内容が返る)。 */
@@ -209,12 +246,13 @@ export function SharedMemoView({
           setEditing(true);
           setSaveState("saved");
           setSaveError("");
+          void fetchBacklinks(id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [op],
+    [op, fetchBacklinks],
   );
 
   // 自動保存(CAS)。編集中のみ
@@ -249,6 +287,8 @@ export function SharedMemoView({
             setSelected(reply.memo);
             setSaveState("saved");
             setSaveError("");
+            // タイトル変更でバックリンクの対象が変わりうる(ADR-0052 決定 2)
+            void fetchBacklinks(base.id);
           }
         })
         .catch((error) => {
@@ -257,7 +297,7 @@ export function SharedMemoView({
         });
     }, AUTOSAVE_DELAY_MS);
     return () => window.clearTimeout(timer);
-  }, [draft, editing, op]);
+  }, [draft, editing, op, fetchBacklinks]);
 
   const createMemo = useCallback(async () => {
     await stopEditing();
@@ -272,6 +312,7 @@ export function SharedMemoView({
         setTrashView(false);
         setSelected(reply.memo);
         setDraft({ title: "", body: "" });
+        setBacklinks([]);
         await startEditing(reply.memo.id);
       }
     } catch (error) {
@@ -297,6 +338,7 @@ export function SharedMemoView({
     baseRef.current = null;
     setEditing(false);
     setHistoryOpen(false);
+    setBacklinks([]);
   }, []);
 
   /** 復元後: 最新内容を取り直して履歴パネルを閉じる。 */
@@ -309,10 +351,11 @@ export function SharedMemoView({
       } catch {
         // 配信(seq)側の再取得に任せる
       }
+      void fetchBacklinks(selected.id);
     }
     setNotice(t.sharedMemo.historyRestored);
     void refresh();
-  }, [op, selected, refresh]);
+  }, [op, selected, refresh, fetchBacklinks]);
 
   const saveVersion = useCallback(async () => {
     if (!selected) return;
@@ -710,23 +753,54 @@ export function SharedMemoView({
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         components={{
-                          a: ({ href, children }) => (
-                            <a
-                              href={href}
-                              onClick={(event) => {
-                                event.preventDefault();
-                                if (href) void api.openLink(href);
-                              }}
-                            >
-                              {children}
-                            </a>
-                          ),
+                          a: ({ href, children }) => {
+                            const wikiTitle = wikiLinkTitle(href);
+                            if (wikiTitle !== null) {
+                              const targetId = resolvedTitles[wikiTitle];
+                              return (
+                                <a
+                                  href={href}
+                                  className={
+                                    targetId
+                                      ? "memo__wikilink"
+                                      : "memo__wikilink memo__wikilink--missing"
+                                  }
+                                  title={
+                                    targetId
+                                      ? undefined
+                                      : t.sharedMemo.wikilinkMissing
+                                  }
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    if (targetId) {
+                                      void open(targetId);
+                                    } else {
+                                      setNotice(t.sharedMemo.wikilinkMissing);
+                                    }
+                                  }}
+                                >
+                                  {children}
+                                </a>
+                              );
+                            }
+                            return (
+                              <a
+                                href={href}
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  if (href) void api.openLink(href);
+                                }}
+                              >
+                                {children}
+                              </a>
+                            );
+                          },
                           input: ({ checked }) => (
                             <input type="checkbox" checked={Boolean(checked)} disabled readOnly />
                           ),
                         }}
                       >
-                        {editing ? draft.body : selected.body}
+                        {wikiLinkify(editing ? draft.body : selected.body)}
                       </ReactMarkdown>
                     </div>
                   )}
@@ -749,6 +823,27 @@ export function SharedMemoView({
                   <span className="muted small">rev {selected.revision}</span>
                   {editing && <span className="muted small">{stats}</span>}
                 </div>
+
+                {backlinks.length > 0 && (
+                  <details className="memo__backlinks" open>
+                    <summary>
+                      {t.sharedMemo.backlinksTitle(backlinks.length)}
+                    </summary>
+                    <ul className="memo__backlinks-list">
+                      {backlinks.map((memo) => (
+                        <li key={memo.id}>
+                          <button
+                            type="button"
+                            className="memo__backlinks-item"
+                            onClick={() => void open(memo.id)}
+                          >
+                            {memo.title || t.memo.untitled}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
               </>
             )}
           </div>

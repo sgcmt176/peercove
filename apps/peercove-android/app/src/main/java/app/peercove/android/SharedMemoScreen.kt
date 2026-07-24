@@ -68,8 +68,10 @@ import uniffi.peercove_mobile.SharedMemoDetailInfo
 import uniffi.peercove_mobile.SharedMemoHistoryDetailInfo
 import uniffi.peercove_mobile.SharedMemoHistoryEntryInfo
 import uniffi.peercove_mobile.SharedMemoListResult
+import uniffi.peercove_mobile.SharedMemoSummaryInfo
 import uniffi.peercove_mobile.memoCreate
 import uniffi.peercove_mobile.sharedMemoAcquire
+import uniffi.peercove_mobile.sharedMemoBacklinks
 import uniffi.peercove_mobile.sharedMemoCreate
 import uniffi.peercove_mobile.sharedMemoGeneration
 import uniffi.peercove_mobile.sharedMemoGet
@@ -79,6 +81,7 @@ import uniffi.peercove_mobile.sharedMemoHistoryList
 import uniffi.peercove_mobile.sharedMemoHistoryRestore
 import uniffi.peercove_mobile.sharedMemoList
 import uniffi.peercove_mobile.sharedMemoRelease
+import uniffi.peercove_mobile.sharedMemoResolveTitles
 import uniffi.peercove_mobile.sharedMemoSave
 import uniffi.peercove_mobile.sharedMemoSaveVersion
 import uniffi.peercove_mobile.sharedMemoTrash
@@ -170,6 +173,8 @@ fun SharedMemoTab(slug: String, onNotice: (String) -> Unit) {
                 openId = null
                 refreshTick++
             },
+            // メモ間リンク(ADR-0052 決定 2)クリックで同じ画面内の別メモへ切替
+            onOpenMemo = { openId = it },
             onNotice = onNotice,
         )
         return
@@ -316,6 +321,8 @@ private fun SharedMemoEditor(
     slug: String,
     id: String,
     onClose: () -> Unit,
+    /** メモ間リンク(ADR-0052 決定 2)クリックで同じ画面内の別メモへ切替。 */
+    onOpenMemo: (String) -> Unit,
     onNotice: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -331,6 +338,18 @@ private fun SharedMemoEditor(
     var confirmTrash by remember { mutableStateOf(false) }
     var historyOpen by remember { mutableStateOf(false) }
     val savedVersionMsg = stringResource(R.string.shared_memo_save_version_done)
+    // メモ間リンク(ADR-0052 決定 2): タイトル → memo_id(見つかったものだけ)
+    var wikiLinks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var backlinks by remember { mutableStateOf<List<SharedMemoSummaryInfo>>(emptyList()) }
+    val wikilinkMissing = stringResource(R.string.memo_wikilink_missing)
+
+    suspend fun refreshBacklinks() {
+        backlinks = try {
+            withContext(Dispatchers.IO) { sharedMemoBacklinks(baseDir, slug, id) }
+        } catch (e: MobileException) {
+            emptyList()
+        }
+    }
 
     // 閲覧中はリアルタイム追随(編集中は上書きしない)
     LaunchedEffect(id, editing) {
@@ -342,6 +361,7 @@ private fun SharedMemoEditor(
                 detail = memo
                 title = memo.title
                 body = memo.body
+                refreshBacklinks()
             } catch (e: MobileException) {
                 onNotice(e.message ?: "")
                 onClose()
@@ -359,6 +379,21 @@ private fun SharedMemoEditor(
         }
     }
 
+    // メモ間リンクの解決(本文のデバウンス、ADR-0052 決定 2)
+    LaunchedEffect(body) {
+        val titles = extractWikiTitles(body)
+        if (titles.isEmpty()) {
+            wikiLinks = emptyMap()
+            return@LaunchedEffect
+        }
+        delay(400)
+        wikiLinks = try {
+            withContext(Dispatchers.IO) { sharedMemoResolveTitles(baseDir, slug, titles) }
+        } catch (e: MobileException) {
+            emptyMap()
+        }
+    }
+
     // 自動保存(CAS)。編集中のみ
     LaunchedEffect(title, body) {
         val base = saved ?: return@LaunchedEffect
@@ -372,6 +407,8 @@ private fun SharedMemoEditor(
             saved = title to body
             saveFailed = null
             detail = memo
+            // タイトル変更でバックリンクの対象が変わりうる
+            refreshBacklinks()
         } catch (e: MobileException) {
             saveFailed = e.message
         }
@@ -607,7 +644,24 @@ private fun SharedMemoEditor(
                     .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
             ) {
-                MarkdownPreview(body)
+                MarkdownPreview(
+                    body,
+                    resolvedTitles = wikiLinks.keys,
+                    onWikiLink = { linkedTitle ->
+                        val targetId = wikiLinks[linkedTitle]
+                        if (targetId != null) {
+                            stopEditing { onOpenMemo(targetId) }
+                        } else {
+                            onNotice(wikilinkMissing)
+                        }
+                    },
+                )
+                BacklinksSection(
+                    backlinks = backlinks,
+                    idOf = { it.id },
+                    titleOf = { it.title },
+                    onOpen = { targetId -> stopEditing { onOpenMemo(targetId) } },
+                )
             }
         }
         Spacer(modifier = Modifier.height(8.dp))

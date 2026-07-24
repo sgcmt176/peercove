@@ -1008,6 +1008,9 @@ export const ja = {
     copyToShared: "共有メモへコピー",
     copyToSharedChoose: "コピー先のネットワークを選択",
     copiedToShared: "共有メモへコピーしました",
+    // メモ間リンク・バックリンク(M5 F-5 Stage 2、ADR-0052 決定 2)
+    wikilinkMissing: "リンク先のメモが見つかりません",
+    backlinksTitle: (n: number) => `バックリンク (${n})`,
   },
 
   // 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは現在「メモ」の
@@ -1055,6 +1058,9 @@ export const ja = {
     updatedBy: (name: string) => `更新者: ${name}`,
     plaintextNote:
       "共有メモはホスト端末へ平文で保存されます。パスワード、秘密鍵、招待トークンなどの保存には使用しないでください。",
+    // メモ間リンク・バックリンク(M5 F-5 Stage 2、ADR-0052 決定 2)
+    wikilinkMissing: "リンク先のメモが見つかりません",
+    backlinksTitle: (n: number) => `バックリンク (${n})`,
 
     // 変更履歴(M5 F-3、ADR-0049)
     history: "履歴",

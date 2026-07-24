@@ -2826,6 +2826,64 @@ select {
   font-size: 0.9rem;
 }
 
+/* メモ間リンク `[[タイトル]]`(M5 F-5 Stage 2、ADR-0052 決定 2)。 */
+.memo__wikilink {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--accent);
+}
+
+.memo__wikilink:hover {
+  text-decoration: none;
+  border-bottom-style: solid;
+}
+
+.memo__wikilink--missing {
+  color: var(--muted);
+  border-bottom: 1px dotted var(--muted);
+  cursor: help;
+}
+
+.memo__wikilink--missing:hover {
+  border-bottom-style: solid;
+}
+
+/* バックリンク欄(M5 F-5 Stage 2、ADR-0052 決定 2)。 */
+.memo__backlinks {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  font-size: 0.9rem;
+}
+
+.memo__backlinks summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.memo__backlinks-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.memo__backlinks-item {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  padding: 3px 12px;
+  font-size: 0.85rem;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.memo__backlinks-item:hover {
+  background: var(--accent-soft);
+}
+
 /* Markdown プレビューの整形(メモ)。チャットと違い文書向けの余白 */
 .markdown h1,
 .markdown h2,

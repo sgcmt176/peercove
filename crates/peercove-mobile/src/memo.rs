@@ -6,6 +6,7 @@
 //! ファイル入出力(SAF)は Kotlin が行い、本文の受け渡しだけをここで担う。
 //! **メモのタイトル・本文・タグはログへ出さない。**
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use peercove_core::memo::{
@@ -192,6 +193,32 @@ pub fn memo_list(
 #[uniffi::export]
 pub fn memo_get(base_dir: String, id: String) -> Result<MemoDetailInfo, MobileError> {
     expect_memo(apply(&base_dir, MemoOp::Get { id })?)
+}
+
+/// メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)の解決。タイトル → memo_id
+/// (見つかったものだけ)。
+#[uniffi::export]
+pub fn memo_resolve_titles(
+    base_dir: String,
+    titles: Vec<String>,
+) -> Result<HashMap<String, String>, MobileError> {
+    match apply(&base_dir, MemoOp::ResolveTitles { titles })? {
+        MemoReply::Titles { map } => Ok(map),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// バックリンク(本文に `[[このメモのタイトル]]` を含むメモの一覧)。
+#[uniffi::export]
+pub fn memo_backlinks(base_dir: String, id: String) -> Result<Vec<MemoSummaryInfo>, MobileError> {
+    match apply(&base_dir, MemoOp::Backlinks { id })? {
+        MemoReply::Memos { memos, .. } => Ok(memos.into_iter().map(Into::into).collect()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
 }
 
 #[uniffi::export]
@@ -593,6 +620,28 @@ pub fn shared_memo_get(
     id: String,
 ) -> Result<SharedMemoDetailInfo, MobileError> {
     Ok(open_cache(&base_dir, &slug)?.get(&id)?.into())
+}
+
+/// メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)の解決(キャッシュから。
+/// List/Get と同じくオフラインでも使える)。
+#[uniffi::export]
+pub fn shared_memo_resolve_titles(
+    base_dir: String,
+    slug: String,
+    titles: Vec<String>,
+) -> Result<HashMap<String, String>, MobileError> {
+    Ok(open_cache(&base_dir, &slug)?.resolve_titles(&titles)?)
+}
+
+/// バックリンク(キャッシュから。List/Get と同じくオフラインでも使える)。
+#[uniffi::export]
+pub fn shared_memo_backlinks(
+    base_dir: String,
+    slug: String,
+    id: String,
+) -> Result<Vec<SharedMemoSummaryInfo>, MobileError> {
+    let memos = open_cache(&base_dir, &slug)?.backlinks(&id)?;
+    Ok(memos.into_iter().map(Into::into).collect())
 }
 
 #[uniffi::export]

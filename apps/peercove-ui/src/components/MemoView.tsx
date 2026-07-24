@@ -24,6 +24,11 @@ import {
 } from "../ipc";
 import { t } from "../i18n";
 import { Modal } from "./Modal";
+import {
+  useResolvedWikiLinks,
+  wikiLinkify,
+  wikiLinkTitle,
+} from "../memoLinks";
 
 type EditorMode = "edit" | "preview" | "split";
 type SaveState = "saved" | "saving" | "error";
@@ -58,6 +63,8 @@ export function MemoView({
     title: "",
     body: "",
   });
+  // メモ間リンクのバックリンク欄(M5 F-5 Stage 2、ADR-0052 決定 2)。
+  const [backlinks, setBacklinks] = useState<MemoSummary[]>([]);
   const [mode, setMode] = useState<EditorMode>("edit");
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [saveError, setSaveError] = useState("");
@@ -97,6 +104,26 @@ export function MemoView({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // メモ間リンク(ADR-0052 決定 2): タイトル解決とバックリンク取得
+  const resolveTitles = useCallback(async (titles: string[]) => {
+    try {
+      const reply = await api.memoOp({ op: "resolve_titles", titles });
+      return reply.kind === "titles" ? reply.map : {};
+    } catch {
+      return {};
+    }
+  }, []);
+  const resolvedTitles = useResolvedWikiLinks(draft.body, resolveTitles);
+
+  const fetchBacklinks = useCallback(async (id: string) => {
+    try {
+      const reply = await api.memoOp({ op: "backlinks", id });
+      setBacklinks(reply.kind === "memos" ? reply.memos : []);
+    } catch {
+      setBacklinks([]);
+    }
+  }, []);
 
   // 一時通知は数秒で消す
   useEffect(() => {
@@ -154,12 +181,13 @@ export function MemoView({
           };
           setSaveState("saved");
           setSaveError("");
+          void fetchBacklinks(reply.memo.id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [flush],
+    [flush, fetchBacklinks],
   );
 
   // 自動保存(タイトル・本文のデバウンス)
@@ -193,6 +221,8 @@ export function MemoView({
             setSaveState("saved");
             setSaveError("");
             void refresh();
+            // タイトル変更でバックリンクの対象が変わりうる(ADR-0052 決定 2)
+            void fetchBacklinks(id);
           }
         } catch (error) {
           setSaveState("error");
@@ -202,7 +232,7 @@ export function MemoView({
     }, AUTOSAVE_DELAY_MS);
     timerRef.current = timer;
     return () => window.clearTimeout(timer);
-  }, [draft, selected, refresh]);
+  }, [draft, selected, refresh, fetchBacklinks]);
 
   /** 属性の即時更新(ピン留め・アーカイブ・フォルダー・タグ)。 */
   const patch = useCallback(
@@ -244,6 +274,7 @@ export function MemoView({
         setDraft({ title: "", body: "" });
         savedRef.current = { id: reply.memo.id, title: "", body: "" };
         setSaveState("saved");
+        setBacklinks([]);
         void refresh();
       }
     } catch (error) {
@@ -267,6 +298,7 @@ export function MemoView({
   const closeSelected = useCallback(() => {
     setSelected(null);
     savedRef.current = null;
+    setBacklinks([]);
   }, []);
 
   const [chooseSharedTarget, setChooseSharedTarget] = useState(false);
@@ -492,6 +524,10 @@ export function MemoView({
             saveState={saveState}
             saveError={saveError}
             bodyRef={bodyRef}
+            resolvedTitles={resolvedTitles}
+            backlinks={backlinks}
+            onWikiLink={(id) => void open(id)}
+            onWikiLinkMissing={() => setNotice(t.memo.wikilinkMissing)}
             onMode={setMode}
             onDraft={setDraft}
             onPatch={(update) => void patch(selected.id, update)}
@@ -673,6 +709,10 @@ function Editor({
   saveState,
   saveError,
   bodyRef,
+  resolvedTitles,
+  backlinks,
+  onWikiLink,
+  onWikiLinkMissing,
   onMode,
   onDraft,
   onPatch,
@@ -690,6 +730,12 @@ function Editor({
   saveState: SaveState;
   saveError: string;
   bodyRef: React.MutableRefObject<HTMLTextAreaElement | null>;
+  /** メモ間リンク `[[タイトル]]` の解決結果(タイトル → memo_id、ADR-0052)。 */
+  resolvedTitles: Record<string, string>;
+  /** このメモへのバックリンク一覧(0 件なら欄自体を出さない)。 */
+  backlinks: MemoSummary[];
+  onWikiLink: (id: string) => void;
+  onWikiLinkMissing: () => void;
   onMode: (mode: EditorMode) => void;
   onDraft: (draft: { title: string; body: string }) => void;
   onPatch: (patch: MemoPatch) => void;
@@ -925,18 +971,45 @@ function Editor({
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
-                // リンクは Tauri の WebView 内で遷移させず既定ブラウザで開く
-                a: ({ href, children }) => (
-                  <a
-                    href={href}
-                    onClick={(event) => {
-                      event.preventDefault();
-                      if (href) void api.openLink(href);
-                    }}
-                  >
-                    {children}
-                  </a>
-                ),
+                a: ({ href, children }) => {
+                  const wikiTitle = wikiLinkTitle(href);
+                  if (wikiTitle !== null) {
+                    const targetId = resolvedTitles[wikiTitle];
+                    return (
+                      <a
+                        href={href}
+                        className={
+                          targetId
+                            ? "memo__wikilink"
+                            : "memo__wikilink memo__wikilink--missing"
+                        }
+                        title={targetId ? undefined : t.memo.wikilinkMissing}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          if (targetId) {
+                            onWikiLink(targetId);
+                          } else {
+                            onWikiLinkMissing();
+                          }
+                        }}
+                      >
+                        {children}
+                      </a>
+                    );
+                  }
+                  // それ以外は Tauri の WebView 内で遷移させず既定ブラウザで開く
+                  return (
+                    <a
+                      href={href}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        if (href) void api.openLink(href);
+                      }}
+                    >
+                      {children}
+                    </a>
+                  );
+                },
                 // チェックリストはプレビューから直接オン・オフできる
                 input: ({ node, checked }) => {
                   const line = node?.position?.start.line;
@@ -953,7 +1026,7 @@ function Editor({
                 },
               }}
             >
-              {draft.body}
+              {wikiLinkify(draft.body)}
             </ReactMarkdown>
           </div>
         )}
@@ -981,7 +1054,39 @@ function Editor({
           </span>
         </div>
       )}
+
+      {backlinks.length > 0 && (
+        <BacklinksSection backlinks={backlinks} onOpen={onWikiLink} />
+      )}
     </div>
+  );
+}
+
+/** バックリンク欄(ADR-0052 決定 2)。折りたたみ可能、0 件なら呼び出し元が出さない。 */
+function BacklinksSection({
+  backlinks,
+  onOpen,
+}: {
+  backlinks: MemoSummary[];
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <details className="memo__backlinks" open>
+      <summary>{t.memo.backlinksTitle(backlinks.length)}</summary>
+      <ul className="memo__backlinks-list">
+        {backlinks.map((memo) => (
+          <li key={memo.id}>
+            <button
+              type="button"
+              className="memo__backlinks-item"
+              onClick={() => onOpen(memo.id)}
+            >
+              {memo.title || t.memo.untitled}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 

@@ -12,6 +12,7 @@
 
 pub mod shared;
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -150,6 +151,14 @@ impl MemoStore {
             MemoOp::Get { id } => Ok(MemoReply::Memo {
                 memo: self.get(&id)?,
             }),
+            MemoOp::ResolveTitles { titles } => Ok(MemoReply::Titles {
+                map: self.resolve_titles(&titles)?,
+            }),
+            MemoOp::Backlinks { id } => Ok(MemoReply::Memos {
+                memos: self.backlinks(&id)?,
+                folders: Vec::new(),
+                tags: Vec::new(),
+            }),
             MemoOp::Create {
                 title,
                 body,
@@ -247,6 +256,71 @@ impl MemoStore {
             .query_map(params![id], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(tags)
+    }
+
+    /// メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)の解決。タイトル →
+    /// memo_id(見つかったものだけ。ゴミ箱除外、複数一致は updated_at 最新)。
+    pub fn resolve_titles(&self, titles: &[String]) -> anyhow::Result<HashMap<String, String>> {
+        let mut seen = HashSet::new();
+        let mut out = HashMap::new();
+        for title in titles {
+            if title.is_empty() || !seen.insert(title.clone()) {
+                continue;
+            }
+            let id: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM memos WHERE title = ?1 AND deleted_at IS NULL
+                     ORDER BY updated_at DESC LIMIT 1",
+                    params![title],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = id {
+                out.insert(title.clone(), id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// バックリンク: 本文に `[[<このメモのタイトル>]]` をリテラルとして含む
+    /// メモの一覧(自分自身・ゴミ箱は除く)。タイトルが空なら対象外。
+    pub fn backlinks(&self, id: &str) -> anyhow::Result<Vec<MemoSummary>> {
+        let memo = self.get(id)?;
+        if memo.title.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%[[{}]]%", escape_like(&memo.title));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, body, folder_id, pinned, archived, created_at, updated_at,
+                    deleted_at
+             FROM memos
+             WHERE deleted_at IS NULL AND id != ?1 AND body LIKE ?2 ESCAPE '\\'
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![id, pattern], row_to_detail)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for detail in rows {
+            let tags = self.tags_of(&detail.id)?;
+            let (done, total) = checklist_progress(&detail.body);
+            out.push(MemoSummary {
+                excerpt: excerpt(&detail.body, EXCERPT_CHARS),
+                tags,
+                checklist_done: done,
+                checklist_total: total,
+                id: detail.id,
+                title: detail.title,
+                folder_id: detail.folder_id,
+                pinned: detail.pinned,
+                archived: detail.archived,
+                created_at: detail.created_at,
+                updated_at: detail.updated_at,
+                deleted_at: detail.deleted_at,
+            });
+        }
+        Ok(out)
     }
 
     fn create(
@@ -448,13 +522,7 @@ impl MemoStore {
                 ));
             } else {
                 // trigram は 3 文字未満に一致しないため LIKE で代替する
-                let pattern = format!(
-                    "%{}%",
-                    search
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_")
-                );
+                let pattern = format!("%{}%", escape_like(&search));
                 args.push(Box::new(pattern));
                 let n = args.len();
                 clauses.push(format!(
@@ -773,6 +841,15 @@ pub fn kana_fold(text: &str) -> String {
             }
         })
         .collect()
+}
+
+/// LIKE のメタ文字(`% _ \`)をエスケープする(`ESCAPE '\\'` と対で使う)。
+/// 検索・メモ間リンクのバックリンク探索(本文中の `[[タイトル]]` の
+/// リテラル一致)の両方から使う。
+pub fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// `kana_fold` を SQL 関数として登録する(トリガーと LIKE 代替が使う)。
@@ -1224,6 +1301,87 @@ mod tests {
             .is_empty(),
             "30 日を過ぎたゴミ箱は開いたときに完全削除される"
         );
+    }
+
+    /// メモ間リンク(ADR-0052 決定 2): タイトル解決・複数一致・ゴミ箱除外。
+    #[test]
+    fn resolve_titles_picks_newest_and_excludes_trash() {
+        let (_dir, mut store) = open_temp();
+        let old = create(&mut store, "重複", "古い方");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newest = create(&mut store, "重複", "新しい方");
+        let trashed = create(&mut store, "捨てた", "x");
+        store
+            .apply(MemoOp::Trash {
+                id: trashed.id.clone(),
+            })
+            .unwrap();
+
+        let map = store
+            .resolve_titles(&[
+                "重複".to_string(),
+                "重複".to_string(), // 重複指定は 1 回だけ処理される
+                "捨てた".to_string(),
+                "存在しない".to_string(),
+                "".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(map.get("重複"), Some(&newest.id));
+        assert_ne!(map.get("重複"), Some(&old.id));
+        assert_eq!(map.len(), 1, "ゴミ箱・存在しない・空は含まれない");
+    }
+
+    /// バックリンクの LIKE エスケープ: タイトルに `%` を含んでいても、
+    /// SQL ワイルドカードとして働かず厳密一致だけがヒットする。
+    #[test]
+    fn backlinks_escapes_like_metacharacters_in_title() {
+        let (_dir, mut store) = open_temp();
+        let target = create(&mut store, "50%割引", "本文");
+        let genuine = create(&mut store, "案内", "[[50%割引]] を見てください");
+        // エスケープが効いていなければ `%` がワイルドカードとなり、
+        // これも誤って一致してしまう(ダミーメモ)
+        let decoy = create(&mut store, "ダミー", "[[50XY割引]] は無関係");
+
+        let backlinks = store.backlinks(&target.id).unwrap();
+        let ids: Vec<&str> = backlinks.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec![genuine.id.as_str()]);
+        assert!(!ids.contains(&decoy.id.as_str()));
+    }
+
+    /// バックリンク: 自分自身・ゴミ箱を除き、`[[タイトル]]` を含むメモだけ
+    /// 返る。タイトルが空のメモはバックリンク対象外(自分が呼び出し先の場合)。
+    #[test]
+    fn backlinks_finds_literal_wikilinks_and_excludes_self_and_trash() {
+        let (_dir, mut store) = open_temp();
+        let target = create(&mut store, "サーバー情報", "本文");
+        let linking = create(&mut store, "議事録", "参照: [[サーバー情報]] を見ること");
+        let unrelated = create(&mut store, "無関係", "特に関係ない本文");
+        let trashed_link = create(&mut store, "捨てた参照", "[[サーバー情報]] だが捨てた");
+        store
+            .apply(MemoOp::Trash {
+                id: trashed_link.id.clone(),
+            })
+            .unwrap();
+        // 自分自身の本文に自分へのリンクがあっても自分は含まれない
+        store
+            .apply(MemoOp::Update {
+                id: target.id.clone(),
+                patch: MemoPatch {
+                    body: Some("[[サーバー情報]] 自己参照".to_string()),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let backlinks = store.backlinks(&target.id).unwrap();
+        assert_eq!(backlinks.len(), 1);
+        assert_eq!(backlinks[0].id, linking.id);
+        assert!(!backlinks.iter().any(|m| m.id == unrelated.id));
+        assert!(!backlinks.iter().any(|m| m.id == trashed_link.id));
+
+        // タイトルが空のメモに対するバックリンクは常に空
+        let untitled = create(&mut store, "", "本文だけ");
+        assert!(store.backlinks(&untitled.id).unwrap().is_empty());
     }
 
     fn texts(lines: &[DiffLine]) -> Vec<(DiffLineKind, &str)> {

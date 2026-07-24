@@ -39,6 +39,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -85,8 +86,10 @@ import uniffi.peercove_mobile.memoExportName
 import uniffi.peercove_mobile.memoFolderCreate
 import uniffi.peercove_mobile.memoFolderDelete
 import uniffi.peercove_mobile.memoFolderRename
+import uniffi.peercove_mobile.memoBacklinks
 import uniffi.peercove_mobile.memoGet
 import uniffi.peercove_mobile.memoList
+import uniffi.peercove_mobile.memoResolveTitles
 import uniffi.peercove_mobile.memoRestore
 import uniffi.peercove_mobile.memoSaveText
 import uniffi.peercove_mobile.memoSetFlags
@@ -174,6 +177,8 @@ fun MemoScreen(onBack: () -> Unit, onNotice: (String) -> Unit) {
                 editingId = null
                 refresh()
             },
+            // メモ間リンク(ADR-0052 決定 2)クリックで同じ画面内の別メモへ切替
+            onOpenMemo = { editingId = it },
             onNotice = onNotice,
         )
         return
@@ -601,6 +606,8 @@ private fun MemoEditor(
     id: String,
     folders: List<MemoFolderInfo>,
     onClose: () -> Unit,
+    /** メモ間リンク(ADR-0052 決定 2)クリックで同じ画面内の別メモへ切替。 */
+    onOpenMemo: (String) -> Unit,
     onNotice: (String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -619,11 +626,23 @@ private fun MemoEditor(
     var copyToSharedDialog by remember { mutableStateOf(false) }
     // 共有メモへコピーの先のネットワーク一覧(0 件ならメニュー自体を出さない)
     val networks: List<NetworkInfo> = remember { listNetworks(baseDir) }
+    // メモ間リンク(ADR-0052 決定 2): タイトル → memo_id(見つかったものだけ)
+    var wikiLinks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var backlinks by remember { mutableStateOf<List<MemoSummaryInfo>>(emptyList()) }
 
     val exportDone = stringResource(R.string.memo_export_done)
     val exportFailed = stringResource(R.string.memo_export_failed)
     val copiedToShared = stringResource(R.string.memo_copied_to_shared)
+    val wikilinkMissing = stringResource(R.string.memo_wikilink_missing)
     val inTrash = detail?.deletedAt != null
+
+    suspend fun refreshBacklinks() {
+        try {
+            backlinks = withContext(Dispatchers.IO) { memoBacklinks(baseDir, id) }
+        } catch (e: MobileException) {
+            backlinks = emptyList()
+        }
+    }
 
     LaunchedEffect(id) {
         try {
@@ -639,6 +658,23 @@ private fun MemoEditor(
         } catch (e: MobileException) {
             onNotice(e.message ?: "")
             onClose()
+            return@LaunchedEffect
+        }
+        refreshBacklinks()
+    }
+
+    // メモ間リンクの解決(本文のデバウンス、ADR-0052 決定 2)
+    LaunchedEffect(body) {
+        val titles = extractWikiTitles(body)
+        if (titles.isEmpty()) {
+            wikiLinks = emptyMap()
+            return@LaunchedEffect
+        }
+        delay(400)
+        wikiLinks = try {
+            withContext(Dispatchers.IO) { memoResolveTitles(baseDir, titles) }
+        } catch (e: MobileException) {
+            emptyMap()
         }
     }
 
@@ -651,6 +687,8 @@ private fun MemoEditor(
             withContext(Dispatchers.IO) { memoSaveText(baseDir, id, title, body) }
             saved = title to body
             saveFailed = false
+            // タイトル変更でバックリンクの対象が変わりうる
+            refreshBacklinks()
         } catch (e: MobileException) {
             saveFailed = true
             onNotice(e.message ?: "")
@@ -670,6 +708,23 @@ private fun MemoEditor(
             }
         } else {
             onClose()
+        }
+    }
+
+    /** メモ間リンクのタップ: 未保存の変更を保存してから遷移する。 */
+    fun openLinkedMemo(targetId: String) {
+        val base = saved
+        if (base != null && !inTrash && (base.first != title || base.second != body)) {
+            scope.launch {
+                try {
+                    withContext(Dispatchers.IO) { memoSaveText(baseDir, id, title, body) }
+                } catch (e: MobileException) {
+                    onNotice(e.message ?: "")
+                }
+                onOpenMemo(targetId)
+            }
+        } else {
+            onOpenMemo(targetId)
         }
     }
 
@@ -1034,7 +1089,24 @@ private fun MemoEditor(
                     .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
             ) {
-                MarkdownPreview(body)
+                MarkdownPreview(
+                    body,
+                    resolvedTitles = wikiLinks.keys,
+                    onWikiLink = { linkedTitle ->
+                        val targetId = wikiLinks[linkedTitle]
+                        if (targetId != null) {
+                            openLinkedMemo(targetId)
+                        } else {
+                            onNotice(wikilinkMissing)
+                        }
+                    },
+                )
+                BacklinksSection(
+                    backlinks = backlinks,
+                    idOf = { it.id },
+                    titleOf = { it.title },
+                    onOpen = { openLinkedMemo(it) },
+                )
             }
         } else {
             OutlinedTextField(
@@ -1045,6 +1117,59 @@ private fun MemoEditor(
             )
         }
         Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+/**
+ * メモ間リンクの解決対象タイトルの抽出(前後空白除去、重複なし)。
+ * `SharedMemoScreen.kt` からも使う(共有メモも同じ記法、ADR-0052 決定 2)。
+ */
+fun extractWikiTitles(body: String): List<String> {
+    val re = Regex("\\[\\[([^\\[\\]]+)\\]\\]")
+    return re.findAll(body)
+        .mapNotNull { it.groupValues.getOrNull(1)?.trim()?.ifEmpty { null } }
+        .distinct()
+        .toList()
+}
+
+/**
+ * バックリンク欄(ADR-0052 決定 2)。0 件なら何も表示しない。個人メモ
+ * (`MemoSummaryInfo`)・共有メモ(`SharedMemoSummaryInfo`)の両方の要約型に
+ * 共通の親が無いため、id/title の取り出し方をラムダで渡す形にしてある
+ * (`SharedMemoScreen.kt` からも使う)。
+ */
+@Composable
+fun <T> BacklinksSection(
+    backlinks: List<T>,
+    idOf: (T) -> String,
+    titleOf: (T) -> String,
+    onOpen: (String) -> Unit,
+) {
+    if (backlinks.isEmpty()) return
+    Spacer(modifier = Modifier.height(8.dp))
+    HorizontalDivider()
+    Spacer(modifier = Modifier.height(4.dp))
+    Text(
+        stringResource(R.string.memo_backlinks_title, backlinks.size),
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(modifier = Modifier.height(4.dp))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        backlinks.forEach { memo ->
+            FilterChip(
+                selected = false,
+                onClick = { onOpen(idOf(memo)) },
+                label = {
+                    Text(titleOf(memo).ifEmpty { stringResource(R.string.memo_untitled) })
+                },
+            )
+        }
     }
 }
 

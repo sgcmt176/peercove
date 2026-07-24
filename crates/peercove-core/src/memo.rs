@@ -5,6 +5,8 @@
 //! 置く。**メモのタイトル・本文・タグ・フォルダー名はチャット本文と同格の
 //! 秘匿対象 — ログ・標準出力へ出さない**(memo_id・件数は可)。
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// 1 メモの本文の上限(要件 §14)。超過は保存を拒否して理由を返す。
@@ -170,6 +172,14 @@ pub enum MemoOp {
     },
     /// 1 件取得。
     Get { id: String },
+    /// メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)の解決。タイトル → memo_id
+    /// (見つかったものだけ。ゴミ箱除外、複数一致は更新が新しい方)。
+    /// 応答は [`MemoReply::Titles`]。
+    ResolveTitles { titles: Vec<String> },
+    /// バックリンク(本文に `[[このメモのタイトル]]` を含むメモの一覧。
+    /// ゴミ箱除外、タイトルが空のメモは対象外)。応答は [`MemoReply::Memos`]
+    /// (folders・tags は空)。
+    Backlinks { id: String },
     /// 新規作成。応答は作成されたメモの [`MemoReply::Memo`]。
     Create {
         #[serde(default)]
@@ -213,6 +223,8 @@ pub enum MemoReply {
     },
     /// Get / Create / Update / Duplicate への応答。
     Memo { memo: MemoDetail },
+    /// ResolveTitles への応答(タイトル → memo_id、見つかったものだけ)。
+    Titles { map: HashMap<String, String> },
     /// FolderCreate への応答。
     Folder { folder: MemoFolder },
     /// 副作用のみの操作への応答。
@@ -360,6 +372,18 @@ pub enum SharedMemoOp {
     Get {
         id: String,
     },
+    /// メモ間リンク `[[タイトル]]`(ADR-0052 決定 2)の解決。同一ストア内
+    /// (共有 → 共有)でタイトル完全一致。**可視性フィルタあり**(応答は
+    /// actor に見えるメモだけ)。応答は [`SharedMemoReply::Titles`]。
+    ResolveTitles {
+        titles: Vec<String>,
+    },
+    /// バックリンク(本文に `[[このメモのタイトル]]` を含む、actor に見える
+    /// メモの一覧。ゴミ箱除外、タイトルが空のメモは対象外)。応答は
+    /// [`SharedMemoReply::Memos`](folders は空)。
+    Backlinks {
+        id: String,
+    },
     Create {
         #[serde(default)]
         title: String,
@@ -469,6 +493,10 @@ pub enum SharedMemoReply {
     },
     Memo {
         memo: SharedMemoDetail,
+    },
+    /// ResolveTitles への応答(タイトル → memo_id、actor に見えるものだけ)。
+    Titles {
+        map: HashMap<String, String>,
     },
     /// HistoryList への応答。
     History {
@@ -796,5 +824,47 @@ mod tests {
         );
         let parsed: MemoReply = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, reply);
+    }
+
+    /// メモ間リンク(ADR-0052 決定 2)のワイヤ表現。
+    #[test]
+    fn wikilink_ops_wire_format() {
+        let op = MemoOp::ResolveTitles {
+            titles: vec!["買い物".to_string()],
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"op":"resolve_titles","titles":["買い物"]}"#);
+        assert_eq!(serde_json::from_str::<MemoOp>(&json).unwrap(), op);
+
+        let op = MemoOp::Backlinks {
+            id: "m1".to_string(),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"op":"backlinks","id":"m1"}"#);
+        assert_eq!(serde_json::from_str::<MemoOp>(&json).unwrap(), op);
+
+        let mut map = HashMap::new();
+        map.insert("買い物".to_string(), "m1".to_string());
+        let reply = MemoReply::Titles { map };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MemoReply>(&json).unwrap(),
+            reply,
+            "map の丸め往復(キー順は不定なので構造比較)"
+        );
+
+        let op = SharedMemoOp::ResolveTitles {
+            titles: vec!["議事録".to_string()],
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"op":"resolve_titles","titles":["議事録"]}"#);
+        assert_eq!(serde_json::from_str::<SharedMemoOp>(&json).unwrap(), op);
+
+        let op = SharedMemoOp::Backlinks {
+            id: "s1".to_string(),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"op":"backlinks","id":"s1"}"#);
+        assert_eq!(serde_json::from_str::<SharedMemoOp>(&json).unwrap(), op);
     }
 }

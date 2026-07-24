@@ -4,7 +4,8 @@ package app.peercove.android
 // 外部レンダラ(multiplatform-markdown-renderer)が実機でクラッシュしたため
 // (2026-07-21 検証フィードバック)、依存なしの軽量実装に置き換えた。
 // 対応: 見出し / 太字 / 斜体 / 取り消し線 / インラインコード / コードブロック /
-// 箇条書き / 番号付き / チェックリスト / 引用 / 区切り線 / リンク / 表(等幅表示)。
+// 箇条書き / 番号付き / チェックリスト / 引用 / 区切り線 / リンク / 表(等幅表示) /
+// メモ間リンク `[[タイトル]]`(M5 F-5 Stage 2、ADR-0052 決定 2)。
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -37,7 +38,14 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 
 @Composable
-fun MarkdownPreview(body: String, modifier: Modifier = Modifier) {
+fun MarkdownPreview(
+    body: String,
+    modifier: Modifier = Modifier,
+    /** メモ間リンク(ADR-0052 決定 2)の事前解決済みタイトル集合。未解決はグレー表示。 */
+    resolvedTitles: Set<String> = emptySet(),
+    /** `[[タイトル]]` タップの通知(解決済み・未解決どちらも呼ばれる。呼び出し元が判定)。 */
+    onWikiLink: ((String) -> Unit)? = null,
+) {
     Column(modifier = modifier) {
         var inCode = false
         val codeLines = mutableListOf<String>()
@@ -55,7 +63,7 @@ fun MarkdownPreview(body: String, modifier: Modifier = Modifier) {
                 codeLines.add(raw)
                 continue
             }
-            MarkdownLine(line)
+            MarkdownLine(line, resolvedTitles, onWikiLink)
         }
         // 閉じ忘れのコードブロックも表示する(編集途中のプレビュー)
         if (inCode && codeLines.isNotEmpty()) {
@@ -65,7 +73,11 @@ fun MarkdownPreview(body: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun MarkdownLine(line: String) {
+private fun MarkdownLine(
+    line: String,
+    resolvedTitles: Set<String>,
+    onWikiLink: ((String) -> Unit)?,
+) {
     val trimmed = line.trimStart()
     val colors = MaterialTheme.colorScheme
     when {
@@ -73,17 +85,17 @@ private fun MarkdownLine(line: String) {
         trimmed == "---" || trimmed == "***" || trimmed == "___" ->
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
         trimmed.startsWith("### ") -> Text(
-            inline(trimmed.removePrefix("### ")),
+            inline(trimmed.removePrefix("### "), resolvedTitles, onWikiLink),
             style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(top = 8.dp, bottom = 2.dp),
         )
         trimmed.startsWith("## ") -> Text(
-            inline(trimmed.removePrefix("## ")),
+            inline(trimmed.removePrefix("## "), resolvedTitles, onWikiLink),
             style = MaterialTheme.typography.titleLarge,
             modifier = Modifier.padding(top = 10.dp, bottom = 2.dp),
         )
         trimmed.startsWith("# ") -> Text(
-            inline(trimmed.removePrefix("# ")),
+            inline(trimmed.removePrefix("# "), resolvedTitles, onWikiLink),
             style = MaterialTheme.typography.headlineSmall,
             modifier = Modifier.padding(top = 10.dp, bottom = 2.dp),
         )
@@ -96,7 +108,7 @@ private fun MarkdownLine(line: String) {
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                inline(trimmed.removePrefix(">").trimStart()),
+                inline(trimmed.removePrefix(">").trimStart(), resolvedTitles, onWikiLink),
                 style = MaterialTheme.typography.bodyMedium.copy(
                     fontStyle = FontStyle.Italic,
                 ),
@@ -105,7 +117,7 @@ private fun MarkdownLine(line: String) {
         }
         isChecklist(trimmed) -> {
             val done = trimmed.contains("[x]") || trimmed.contains("[X]")
-            val content = inline(trimmed.substringAfter("]").trimStart())
+            val content = inline(trimmed.substringAfter("]").trimStart(), resolvedTitles, onWikiLink)
             Row {
                 Text(
                     if (done) "☑" else "☐",
@@ -133,7 +145,10 @@ private fun MarkdownLine(line: String) {
         }
         trimmed.startsWith("- ") || trimmed.startsWith("* ") || trimmed.startsWith("+ ") -> Row {
             Text("・", style = MaterialTheme.typography.bodyMedium)
-            Text(inline(trimmed.drop(2)), style = MaterialTheme.typography.bodyMedium)
+            Text(
+                inline(trimmed.drop(2), resolvedTitles, onWikiLink),
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
         trimmed.startsWith("|") ->
             // 表は整形せず等幅でそのまま(初期版の割り切り)
@@ -143,7 +158,10 @@ private fun MarkdownLine(line: String) {
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 maxLines = 1,
             )
-        else -> Text(inline(trimmed), style = MaterialTheme.typography.bodyMedium)
+        else -> Text(
+            inline(trimmed, resolvedTitles, onWikiLink),
+            style = MaterialTheme.typography.bodyMedium,
+        )
     }
 }
 
@@ -176,11 +194,17 @@ private fun isChecklist(trimmed: String): Boolean {
         rest == "[ ]" || rest == "[x]" || rest == "[X]"
 }
 
-/** インライン記法(太字・斜体・取り消し線・コード・リンク)を再帰的に組む。 */
+/** インライン記法(太字・斜体・取り消し線・コード・リンク・メモ間リンク)を再帰的に組む。 */
 @Composable
-private fun inline(text: String): AnnotatedString {
+private fun inline(
+    text: String,
+    resolvedTitles: Set<String>,
+    onWikiLink: ((String) -> Unit)?,
+): AnnotatedString {
     val colors = MaterialTheme.colorScheme
-    return buildAnnotatedString { appendInline(text, this, colors.primary.hashCode(), colors) }
+    return buildAnnotatedString {
+        appendInline(text, this, colors.primary.hashCode(), colors, resolvedTitles, onWikiLink)
+    }
 }
 
 private fun appendInline(
@@ -188,6 +212,8 @@ private fun appendInline(
     builder: androidx.compose.ui.text.AnnotatedString.Builder,
     depthGuard: Int,
     colors: androidx.compose.material3.ColorScheme,
+    resolvedTitles: Set<String>,
+    onWikiLink: ((String) -> Unit)?,
 ) {
     var rest = text
     var guard = 0
@@ -207,6 +233,9 @@ private fun appendInline(
         consider("**", "**", 'b')
         consider("~~", "~~", 's')
         consider("`", "`", 'c')
+        // メモ間リンク [[タイトル]](ADR-0052 決定 2)。通常リンクより先に
+        // 判定することで `[` の重複と衝突しない
+        consider("[[", "]]", 'w')
         // リンク [text](url)
         run {
             val s = rest.indexOf('[')
@@ -248,17 +277,17 @@ private fun appendInline(
         when (hit.kind) {
             'b' -> {
                 builder.pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
-                appendInline(hit.inner, builder, depthGuard, colors)
+                appendInline(hit.inner, builder, depthGuard, colors, resolvedTitles, onWikiLink)
                 builder.pop()
             }
             'i' -> {
                 builder.pushStyle(SpanStyle(fontStyle = FontStyle.Italic))
-                appendInline(hit.inner, builder, depthGuard, colors)
+                appendInline(hit.inner, builder, depthGuard, colors, resolvedTitles, onWikiLink)
                 builder.pop()
             }
             's' -> {
                 builder.pushStyle(SpanStyle(textDecoration = TextDecoration.LineThrough))
-                appendInline(hit.inner, builder, depthGuard, colors)
+                appendInline(hit.inner, builder, depthGuard, colors, resolvedTitles, onWikiLink)
                 builder.pop()
             }
             'c' -> {
@@ -283,6 +312,33 @@ private fun appendInline(
                                 textDecoration = TextDecoration.Underline,
                             ),
                         ),
+                    ),
+                )
+                builder.append(hit.inner)
+                builder.pop()
+            }
+            'w' -> {
+                // メモ間リンク [[タイトル]](ADR-0052 決定 2)。前後空白は
+                // 解決・突き合わせ用に取り除く(表示は生のまま)。未解決は
+                // グレー + 下線なしにし、クリックで onWikiLink(title) を
+                // 通知する(呼び出し元が解決済みかどうかで遷移/スナックバー
+                // を判定)
+                val title = hit.inner.trim()
+                val resolved = resolvedTitles.contains(title)
+                builder.pushLink(
+                    LinkAnnotation.Clickable(
+                        tag = "wikilink:$title",
+                        styles = TextLinkStyles(
+                            SpanStyle(
+                                color = if (resolved) colors.primary else colors.onSurfaceVariant,
+                                textDecoration = if (resolved) {
+                                    TextDecoration.Underline
+                                } else {
+                                    null
+                                },
+                            ),
+                        ),
+                        linkInteractionListener = { onWikiLink?.invoke(title) },
                     ),
                 )
                 builder.append(hit.inner)
