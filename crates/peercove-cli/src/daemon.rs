@@ -463,6 +463,10 @@ impl DaemonShared {
                             let cells = cache.sheet_cells(sheet_id.clone()).await?;
                             let (col_widths, row_heights) =
                                 cache.sheet_layout(sheet_id.clone()).await?;
+                            let merges = cache.sheet_merges(sheet_id.clone()).await?;
+                            // プレゼンスは揮発情報(ホストが送信者自身を除外
+                            // 済みなので、ここで自分自身が混ざることはない)
+                            let presence = cache.sheet_presence(&sheet_id);
                             let offline = link.session().is_none();
                             Ok(IpcResponse::SharedMemo {
                                 reply: SharedMemoReply::Sheet {
@@ -471,6 +475,8 @@ impl DaemonShared {
                                         cells,
                                         col_widths,
                                         row_heights,
+                                        merges,
+                                        presence,
                                         offline,
                                     },
                                 },

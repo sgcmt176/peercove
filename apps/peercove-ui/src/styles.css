@@ -3965,14 +3965,13 @@ button.msg__ref:hover {
 }
 
 .sheet__cell {
+  position: relative;
   min-width: 90px;
   height: 26px;
   padding: 3px 6px;
   cursor: cell;
   outline: none;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   background: #ffffff;
   color: #1a1a1a;
 }
@@ -3996,6 +3995,14 @@ button.msg__ref:hover {
 
 .sheet__cell--conflict {
   background: #ffe58a;
+}
+
+.sheet__cell--search-match {
+  background: #fff59d;
+}
+
+.sheet__cell--search-current {
+  background: #ffca28;
 }
 
 .sheet__cell-value {
@@ -4144,4 +4151,110 @@ button.msg__ref:hover {
   .sheet__table-wrap {
     max-height: 70vh;
   }
+}
+
+/* 目盛線トグル(ADR-0055 決定 6)。OFF で既定罫線を消す。ユーザー指定の
+   罫線(セル書式の border_*)は inline style で敷いているため、この
+   クラスでは上書きされない。 */
+.sheet__table--no-gridlines .sheet__cell {
+  border-right: none;
+  border-bottom: none;
+}
+
+/* 固定枠(freeze panes、ADR-0055 決定 6)。行・列ヘッダーの上に重ねる
+   ため、通常セルより高い z-index を敷く。 */
+.sheet__cell--frozen {
+  z-index: 2;
+}
+
+/* プレゼンス(選択セル共有、ADR-0055 決定 6)。色は名前のハッシュから
+   決定的に決め、CSS 変数 --presence-color 経由で受け取る。 */
+.sheet__cell--presence {
+  box-shadow: inset 0 0 0 2px var(--presence-color);
+}
+
+.sheet__cell--selected.sheet__cell--presence {
+  box-shadow:
+    inset 0 0 0 2px #1a73e8,
+    inset 0 0 0 4px var(--presence-color);
+}
+
+.sheet__presence-badge {
+  position: absolute;
+  top: -1px;
+  right: -1px;
+  transform: translateY(-100%);
+  font-size: 0.65rem;
+  line-height: 1.4;
+  padding: 0 4px;
+  color: #ffffff;
+  background: var(--presence-color);
+  border-radius: 4px 4px 4px 0;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* シート内検索バー(Ctrl+F、ADR-0055 決定 6)。 */
+.sheet__search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.sheet__search-input {
+  flex: 1;
+  max-width: 260px;
+}
+
+.sheet__search-count {
+  white-space: nowrap;
+}
+
+/* 独自右クリックメニュー(ADR-0055 決定 6)。 */
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  min-width: 12em;
+  max-width: 20em;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 4px;
+  gap: 2px;
+}
+
+.context-menu__item {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.context-menu__item:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.context-menu__item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.context-menu__item--danger {
+  color: var(--danger);
+}
+
+.context-menu__sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border);
 }

@@ -24,8 +24,8 @@ use peercove_core::schedule::{
     MAX_SCHEDULE_PARTICIPANTS, MAX_SCHEDULE_TITLE_CHARS,
 };
 use peercove_core::sheet::{
-    CellFormat, CellWrite, SheetCell, SheetLayout, SheetMeta, MAX_CELL_VALUE_BYTES, MAX_COL_WIDTH,
-    MAX_FONT_SIZE, MAX_ROW_HEIGHT, MAX_SHEETS, MAX_SHEET_CELLS, MAX_SHEET_COLS,
+    CellFormat, CellWrite, SheetCell, SheetLayout, SheetMerge, SheetMeta, MAX_CELL_VALUE_BYTES,
+    MAX_COL_WIDTH, MAX_FONT_SIZE, MAX_ROW_HEIGHT, MAX_SHEETS, MAX_SHEET_CELLS, MAX_SHEET_COLS,
     MAX_SHEET_NAME_CHARS, MAX_SHEET_ROWS, MIN_COL_WIDTH, MIN_FONT_SIZE, MIN_ROW_HEIGHT,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -105,7 +105,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Res
     Ok(has_column)
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 8;
+const SHARED_SCHEMA_VERSION: i64 = 9;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -497,6 +497,30 @@ impl SharedStore {
                     idx INTEGER NOT NULL,
                     size INTEGER NOT NULL,
                     PRIMARY KEY (sheet_id, kind, idx)
+                );
+                "#,
+            )?;
+        }
+        if version < 9 {
+            // v9(M6 H-5、ADR-0055 決定 6): セル結合・シート設定(目盛線・
+            // 固定枠)。ALTER TABLE の非冪等対策は既存の sheet_cells.format
+            // と同じ。
+            if !table_has_column(&tx, "sheets", "gridlines")? {
+                tx.execute_batch(
+                    "ALTER TABLE sheets ADD COLUMN gridlines INTEGER NOT NULL DEFAULT 1;
+                     ALTER TABLE sheets ADD COLUMN freeze_rows INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE sheets ADD COLUMN freeze_cols INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sheet_merges (
+                    sheet_id TEXT NOT NULL,
+                    row INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    row_span INTEGER NOT NULL,
+                    col_span INTEGER NOT NULL,
+                    PRIMARY KEY (sheet_id, row, col)
                 );
                 "#,
             )?;
@@ -1802,6 +1826,7 @@ impl SharedStore {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM sheet_cells WHERE sheet_id = ?1", params![id])?;
         tx.execute("DELETE FROM sheet_layout WHERE sheet_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sheet_merges WHERE sheet_id = ?1", params![id])?;
         tx.execute("DELETE FROM sheets WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
@@ -1874,6 +1899,121 @@ impl SharedStore {
     pub fn sheet_layout(&self, id: &str) -> anyhow::Result<SheetLayout> {
         self.sheet_row(id)?; // シートの存在確認
         read_sheet_layout(&self.conn, id)
+    }
+
+    /// 1 シートのセル結合(ADR-0055 決定 6)。
+    pub fn sheet_merges(&self, id: &str) -> anyhow::Result<Vec<SheetMerge>> {
+        self.sheet_row(id)?; // シートの存在確認
+        read_sheet_merges(&self.conn, id)
+    }
+
+    /// セル結合(誰でも可、ADR-0055 決定 6)。左上以外のセルの値・書式は
+    /// 削除する(Excel と同じ)。戻り値は (結合後の全量、削除して配信が
+    /// 必要になったセル)。
+    pub fn sheet_merge(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        merge: &SheetMerge,
+    ) -> anyhow::Result<(Vec<SheetMerge>, Vec<SheetCell>)> {
+        self.sheet_row(id)?; // シートの存在確認
+        validate_merge(merge)?;
+        let tx = self.conn.transaction()?;
+        let existing = read_sheet_merges(&tx, id)?;
+        if existing.iter().any(|m| m.overlaps(merge)) {
+            bail!("この範囲は既存の結合と重なっています");
+        }
+        tx.execute(
+            "INSERT INTO sheet_merges (sheet_id, row, col, row_span, col_span)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, merge.row, merge.col, merge.row_span, merge.col_span],
+        )?;
+        let now = unix_ms();
+        let mut changed = Vec::new();
+        for r in merge.row..merge.row + merge.row_span {
+            for c in merge.col..merge.col + merge.col_span {
+                if r == merge.row && c == merge.col {
+                    continue;
+                }
+                let existing_revision: Option<i64> = tx
+                    .query_row(
+                        "SELECT revision FROM sheet_cells
+                         WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
+                        params![id, r, c],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(revision) = existing_revision {
+                    tx.execute(
+                        "DELETE FROM sheet_cells WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
+                        params![id, r, c],
+                    )?;
+                    changed.push(SheetCell {
+                        row: r,
+                        col: c,
+                        value: String::new(),
+                        revision: revision as u64 + 1,
+                        updated_by: actor.name.clone(),
+                        updated_at: now as u64,
+                        format: CellFormat::default(),
+                    });
+                }
+            }
+        }
+        if !changed.is_empty() {
+            tx.execute(
+                "UPDATE sheets SET updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
+        let merges = read_sheet_merges(&tx, id)?;
+        tx.commit()?;
+        Ok((merges, changed))
+    }
+
+    /// セル結合の解除(結合範囲内の任意セルの座標で指定できる、誰でも可)。
+    /// 戻り値は解除後の結合全量。
+    pub fn sheet_unmerge(
+        &mut self,
+        id: &str,
+        row: u32,
+        col: u32,
+    ) -> anyhow::Result<Vec<SheetMerge>> {
+        self.sheet_row(id)?; // シートの存在確認
+        let tx = self.conn.transaction()?;
+        let merges = read_sheet_merges(&tx, id)?;
+        let target = merges
+            .iter()
+            .find(|m| m.contains(row, col))
+            .copied()
+            .context("この位置に結合セルはありません")?;
+        tx.execute(
+            "DELETE FROM sheet_merges WHERE sheet_id = ?1 AND row = ?2 AND col = ?3",
+            params![id, target.row, target.col],
+        )?;
+        let merges = read_sheet_merges(&tx, id)?;
+        tx.commit()?;
+        Ok(merges)
+    }
+
+    /// シート設定(目盛線・固定枠、誰でも可、ADR-0055 決定 6)。
+    pub fn sheet_set_settings(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        gridlines: bool,
+        freeze_rows: u32,
+        freeze_cols: u32,
+    ) -> anyhow::Result<SheetMeta> {
+        self.sheet_row(id)?; // シートの存在確認
+        if freeze_rows >= MAX_SHEET_ROWS || freeze_cols >= MAX_SHEET_COLS {
+            bail!("固定するウインドウ枠が表の上限を超えています");
+        }
+        self.conn.execute(
+            "UPDATE sheets SET gridlines = ?1, freeze_rows = ?2, freeze_cols = ?3 WHERE id = ?4",
+            params![gridlines as i64, freeze_rows, freeze_cols, id],
+        )?;
+        self.sheet_get(actor, id)
     }
 
     /// セルのバッチ書き込み(全員可、決定 5)。競合セルは部分失敗として
@@ -2169,6 +2309,9 @@ struct SheetRow {
     owner_name: String,
     created_at: i64,
     updated_at: i64,
+    gridlines: bool,
+    freeze_rows: u32,
+    freeze_cols: u32,
 }
 
 impl SheetRow {
@@ -2183,11 +2326,15 @@ impl SheetRow {
             created_at: self.created_at as u64,
             updated_at: self.updated_at as u64,
             can_manage,
+            gridlines: self.gridlines,
+            freeze_rows: self.freeze_rows,
+            freeze_cols: self.freeze_cols,
         }
     }
 }
 
-const SHEET_ROW_COLUMNS: &str = "id, name, owner_id, owner_name, created_at, updated_at";
+const SHEET_ROW_COLUMNS: &str =
+    "id, name, owner_id, owner_name, created_at, updated_at, gridlines, freeze_rows, freeze_cols";
 
 fn sheet_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetRow> {
     Ok(SheetRow {
@@ -2197,6 +2344,9 @@ fn sheet_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetRow> {
         owner_name: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+        gridlines: row.get::<_, i64>(6)? != 0,
+        freeze_rows: row.get::<_, i64>(7)? as u32,
+        freeze_cols: row.get::<_, i64>(8)? as u32,
     })
 }
 
@@ -2289,6 +2439,63 @@ fn validate_col_width(width: u16) -> anyhow::Result<()> {
 fn validate_row_height(height: u16) -> anyhow::Result<()> {
     if !(MIN_ROW_HEIGHT..=MAX_ROW_HEIGHT).contains(&height) {
         bail!("行高は {MIN_ROW_HEIGHT}〜{MAX_ROW_HEIGHT}px の範囲で指定してください");
+    }
+    Ok(())
+}
+
+/// セル結合の検証(ADR-0055 決定 6)。span は 2 セル以上、表の上限内。
+/// 既存結合との重なりは呼び出し側(トランザクション内)で確認する。
+fn validate_merge(merge: &SheetMerge) -> anyhow::Result<()> {
+    if merge.row_span == 0 || merge.col_span == 0 {
+        bail!("結合範囲が不正です");
+    }
+    if (merge.row_span as u64) * (merge.col_span as u64) < 2 {
+        bail!("結合するセルは 2 つ以上選んでください");
+    }
+    if merge.row as u64 + merge.row_span as u64 > MAX_SHEET_ROWS as u64
+        || merge.col as u64 + merge.col_span as u64 > MAX_SHEET_COLS as u64
+    {
+        bail!("結合範囲が表の上限を超えています");
+    }
+    Ok(())
+}
+
+/// `sheet_merges` テーブルの読み取り(ホスト正本・キャッシュ共通のスキーマ)。
+fn read_sheet_merges(conn: &Connection, sheet_id: &str) -> anyhow::Result<Vec<SheetMerge>> {
+    let mut stmt = conn.prepare(
+        "SELECT row, col, row_span, col_span FROM sheet_merges
+         WHERE sheet_id = ?1 ORDER BY row ASC, col ASC",
+    )?;
+    let merges = stmt
+        .query_map(params![sheet_id], |row| {
+            Ok(SheetMerge {
+                row: row.get::<_, i64>(0)? as u32,
+                col: row.get::<_, i64>(1)? as u32,
+                row_span: row.get::<_, i64>(2)? as u32,
+                col_span: row.get::<_, i64>(3)? as u32,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(merges)
+}
+
+/// `sheet_merges` の全量置き換え(1 シート分。キャッシュの同期・Merges
+/// イベント反映の両方で使う — Merges イベントは全量配信のため)。
+fn replace_sheet_merges(
+    conn: &Connection,
+    sheet_id: &str,
+    merges: &[SheetMerge],
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM sheet_merges WHERE sheet_id = ?1",
+        params![sheet_id],
+    )?;
+    for m in merges {
+        conn.execute(
+            "INSERT INTO sheet_merges (sheet_id, row, col, row_span, col_span)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sheet_id, m.row, m.col, m.row_span, m.col_span],
+        )?;
     }
     Ok(())
 }
@@ -2455,7 +2662,7 @@ pub struct CacheStore {
     conn: Connection,
 }
 
-const CACHE_SCHEMA_VERSION: i64 = 6;
+const CACHE_SCHEMA_VERSION: i64 = 7;
 
 impl CacheStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -2597,6 +2804,29 @@ impl CacheStore {
                     idx INTEGER NOT NULL,
                     size INTEGER NOT NULL,
                     PRIMARY KEY (sheet_id, kind, idx)
+                );
+                "#,
+            )?;
+        }
+        if version < 7 {
+            // v7(M6 H-5、ADR-0055 決定 6): セル結合・シート設定のキャッシュ
+            // (ホスト正本と同じ形。理由は SharedStore 側と同じ)。
+            if !table_has_column(&tx, "sheets", "gridlines")? {
+                tx.execute_batch(
+                    "ALTER TABLE sheets ADD COLUMN gridlines INTEGER NOT NULL DEFAULT 1;
+                     ALTER TABLE sheets ADD COLUMN freeze_rows INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE sheets ADD COLUMN freeze_cols INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sheet_merges (
+                    sheet_id TEXT NOT NULL,
+                    row INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    row_span INTEGER NOT NULL,
+                    col_span INTEGER NOT NULL,
+                    PRIMARY KEY (sheet_id, row, col)
                 );
                 "#,
             )?;
@@ -2968,20 +3198,25 @@ impl CacheStore {
             "DELETE FROM sheet_layout WHERE sheet_id NOT IN (SELECT id FROM sheets)",
             [],
         )?;
+        tx.execute(
+            "DELETE FROM sheet_merges WHERE sheet_id NOT IN (SELECT id FROM sheets)",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// 単発のメタ反映(SheetChanged = 作成・改名)。
+    /// 単発のメタ反映(SheetChanged = 作成・改名・設定変更)。
     pub fn sheet_upsert(&mut self, sheet: &SheetMeta) -> anyhow::Result<()> {
         insert_cache_sheet(&self.conn, sheet)
     }
 
-    /// 単発のメタ反映(SheetRemoved = 削除)。セル・レイアウトもまとめて消す。
+    /// 単発のメタ反映(SheetRemoved = 削除)。セル・レイアウト・結合もまとめて消す。
     pub fn sheet_remove(&mut self, id: &str) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM sheet_cells WHERE sheet_id = ?1", params![id])?;
         tx.execute("DELETE FROM sheet_layout WHERE sheet_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sheet_merges WHERE sheet_id = ?1", params![id])?;
         tx.execute("DELETE FROM sheets WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
@@ -3061,6 +3296,21 @@ impl CacheStore {
     ) -> anyhow::Result<()> {
         replace_sheet_layout(&self.conn, sheet_id, col_widths, row_heights)
     }
+
+    /// 1 シートのセル結合(ADR-0055 決定 6)。
+    pub fn sheet_merges(&self, sheet_id: &str) -> anyhow::Result<Vec<SheetMerge>> {
+        read_sheet_merges(&self.conn, sheet_id)
+    }
+
+    /// セル結合の全量置き換え(接続時同期の Cells 応答、および Merges
+    /// イベント〔全量配信〕の両方で使う)。
+    pub fn sheet_merges_replace_all(
+        &mut self,
+        sheet_id: &str,
+        merges: &[SheetMerge],
+    ) -> anyhow::Result<()> {
+        replace_sheet_merges(&self.conn, sheet_id, merges)
+    }
 }
 
 const CACHE_SCHEDULE_COLUMNS: &str = "id, title, note, start_at, end_at, all_day, owner_id,
@@ -3120,16 +3370,17 @@ fn cache_schedule_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule
     })
 }
 
-const CACHE_SHEET_COLUMNS: &str =
-    "id, name, owner_id, owner_name, created_at, updated_at, can_manage";
+const CACHE_SHEET_COLUMNS: &str = "id, name, owner_id, owner_name, created_at, updated_at,
+        can_manage, gridlines, freeze_rows, freeze_cols";
 
 fn insert_cache_sheet(conn: &Connection, sheet: &SheetMeta) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO sheets (id, name, owner_id, owner_name, created_at, updated_at, can_manage)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO sheets (id, name, owner_id, owner_name, created_at, updated_at, can_manage,
+                              gridlines, freeze_rows, freeze_cols)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
             name = ?2, owner_id = ?3, owner_name = ?4, created_at = ?5, updated_at = ?6,
-            can_manage = ?7",
+            can_manage = ?7, gridlines = ?8, freeze_rows = ?9, freeze_cols = ?10",
         params![
             sheet.id,
             sheet.name,
@@ -3138,6 +3389,9 @@ fn insert_cache_sheet(conn: &Connection, sheet: &SheetMeta) -> anyhow::Result<()
             sheet.created_at as i64,
             sheet.updated_at as i64,
             sheet.can_manage as i64,
+            sheet.gridlines as i64,
+            sheet.freeze_rows,
+            sheet.freeze_cols,
         ],
     )?;
     Ok(())
@@ -3152,6 +3406,9 @@ fn cache_sheet_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<SheetMeta> 
         created_at: row.get::<_, i64>(4)? as u64,
         updated_at: row.get::<_, i64>(5)? as u64,
         can_manage: row.get::<_, i64>(6)? != 0,
+        gridlines: row.get::<_, i64>(7)? != 0,
+        freeze_rows: row.get::<_, i64>(8)? as u32,
+        freeze_cols: row.get::<_, i64>(9)? as u32,
     })
 }
 
@@ -5146,6 +5403,166 @@ mod tests {
         store.sheet_delete(&host, &sheet_id).unwrap();
     }
 
+    /// v8 → v9 移行(M6 H-5、ADR-0055 決定 6): sheets に gridlines /
+    /// freeze_rows / freeze_cols が additive に足され、sheet_merges
+    /// テーブルが追加される。旧行は gridlines=true・freeze=0 として読める。
+    #[test]
+    fn v8_database_migrates_to_v9_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        let host = Actor::host("ホスト");
+        let sheet_id = {
+            let mut store = SharedStore::open(&path).unwrap();
+            let sheet = store.sheet_create(&host, "移行前の表").unwrap();
+            // v8 相当に偽装(gridlines/freeze/sheet_merges が無かった頃)
+            store.conn.pragma_update(None, "user_version", 8).unwrap();
+            sheet.id
+        };
+        let mut store = SharedStore::open(&path).unwrap();
+        let sheet = store.sheet_get(&host, &sheet_id).unwrap();
+        assert!(sheet.gridlines);
+        assert_eq!(sheet.freeze_rows, 0);
+        assert_eq!(sheet.freeze_cols, 0);
+        assert!(store.sheet_merges(&sheet_id).unwrap().is_empty());
+
+        // 移行後も結合・設定変更が問題なく行える
+        let (merges, _) = store
+            .sheet_merge(
+                &host,
+                &sheet_id,
+                &SheetMerge {
+                    row: 0,
+                    col: 0,
+                    row_span: 2,
+                    col_span: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(merges.len(), 1);
+        let sheet = store
+            .sheet_set_settings(&host, &sheet_id, false, 1, 2)
+            .unwrap();
+        assert!(!sheet.gridlines);
+        assert_eq!(sheet.freeze_rows, 1);
+        assert_eq!(sheet.freeze_cols, 2);
+        store.sheet_delete(&host, &sheet_id).unwrap();
+    }
+
+    #[test]
+    fn sheet_merge_and_unmerge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        let mut store = SharedStore::open(&path).unwrap();
+        let host = Actor::host("ホスト");
+        let sheet = store.sheet_create(&host, "表").unwrap();
+
+        // 結合範囲内(左上以外)のセルは値・書式ごと削除される
+        store
+            .sheet_write(
+                &host,
+                &sheet.id,
+                &[
+                    CellWrite {
+                        row: 0,
+                        col: 0,
+                        value: "A1".to_string(),
+                        base_revision: 0,
+                        format: None,
+                    },
+                    CellWrite {
+                        row: 0,
+                        col: 1,
+                        value: "B1".to_string(),
+                        base_revision: 0,
+                        format: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let (merges, changed) = store
+            .sheet_merge(
+                &host,
+                &sheet.id,
+                &SheetMerge {
+                    row: 0,
+                    col: 0,
+                    row_span: 1,
+                    col_span: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(merges.len(), 1);
+        assert_eq!(changed.len(), 1, "左上以外の 1 セルだけが削除される");
+        assert_eq!(changed[0].col, 1);
+        assert_eq!(changed[0].value, "");
+        let cells = store.sheet_cells(&sheet.id).unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].col, 0);
+        assert_eq!(cells[0].value, "A1", "左上セルの値は残る");
+
+        // 重なる結合は拒否
+        let err = store
+            .sheet_merge(
+                &host,
+                &sheet.id,
+                &SheetMerge {
+                    row: 0,
+                    col: 0,
+                    row_span: 2,
+                    col_span: 1,
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("重なっています"));
+
+        // 単一セルは拒否(span 2 セル未満)
+        let err = store
+            .sheet_merge(
+                &host,
+                &sheet.id,
+                &SheetMerge {
+                    row: 5,
+                    col: 5,
+                    row_span: 1,
+                    col_span: 1,
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("2 つ以上"));
+
+        // 結合範囲内の任意セルの座標で解除できる
+        let merges = store.sheet_unmerge(&sheet.id, 0, 1).unwrap();
+        assert!(merges.is_empty());
+
+        // 解除済みの位置を再度解除するとエラー
+        assert!(store.sheet_unmerge(&sheet.id, 0, 1).is_err());
+    }
+
+    #[test]
+    fn sheet_settings_gridlines_and_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        let mut store = SharedStore::open(&path).unwrap();
+        let host = Actor::host("ホスト");
+        let sheet = store.sheet_create(&host, "表").unwrap();
+        assert!(sheet.gridlines);
+        assert_eq!(sheet.freeze_rows, 0);
+        assert_eq!(sheet.freeze_cols, 0);
+
+        let updated = store
+            .sheet_set_settings(&host, &sheet.id, false, 2, 1)
+            .unwrap();
+        assert!(!updated.gridlines);
+        assert_eq!(updated.freeze_rows, 2);
+        assert_eq!(updated.freeze_cols, 1);
+
+        // 上限超過は拒否
+        assert!(store
+            .sheet_set_settings(&host, &sheet.id, true, MAX_SHEET_ROWS, 0)
+            .is_err());
+    }
+
     /// キャッシュ往復(メンバー側): メタの replace_all・upsert・remove・list、
     /// セルの replace_all・apply(削除込み)・list。
     #[test]
@@ -5160,6 +5577,9 @@ mod tests {
             created_at: created,
             updated_at: created,
             can_manage: true,
+            gridlines: true,
+            freeze_rows: 0,
+            freeze_cols: 0,
         };
         cache
             .sheet_replace_all(&[make_sheet("s1", 1_000), make_sheet("s2", 2_000)])
@@ -5258,6 +5678,9 @@ mod tests {
             created_at: created,
             updated_at: created,
             can_manage: true,
+            gridlines: true,
+            freeze_rows: 0,
+            freeze_cols: 0,
         };
         cache.sheet_replace_all(&[make_sheet("s1", 1_000)]).unwrap();
 
@@ -5289,5 +5712,53 @@ mod tests {
         cache.sheet_replace_all(&[]).unwrap();
         let (col_widths, _) = cache.sheet_layout("s1").unwrap();
         assert!(col_widths.is_empty(), "孤児レイアウトは掃除される");
+    }
+
+    /// キャッシュのセル結合(M6 H-5、ADR-0055 決定 6): 全量置き換え・取得、
+    /// シート削除・全量置き換えでの孤児結合の掃除。
+    #[test]
+    fn sheet_cache_merges_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(&dir.path().join("m.memocache.db")).unwrap();
+        let make_sheet = |id: &str, created: u64| SheetMeta {
+            id: id.to_string(),
+            name: format!("表{id}"),
+            owner_id: String::new(),
+            owner_name: "ホスト".to_string(),
+            created_at: created,
+            updated_at: created,
+            can_manage: true,
+            gridlines: true,
+            freeze_rows: 0,
+            freeze_cols: 0,
+        };
+        cache.sheet_replace_all(&[make_sheet("s1", 1_000)]).unwrap();
+
+        let merge = SheetMerge {
+            row: 0,
+            col: 0,
+            row_span: 2,
+            col_span: 2,
+        };
+        cache.sheet_merges_replace_all("s1", &[merge]).unwrap();
+        assert_eq!(cache.sheet_merges("s1").unwrap(), vec![merge]);
+
+        // 全量置き換え(Merges イベント相当)
+        cache.sheet_merges_replace_all("s1", &[]).unwrap();
+        assert!(cache.sheet_merges("s1").unwrap().is_empty());
+
+        // シート削除で結合も消える
+        cache.sheet_merges_replace_all("s1", &[merge]).unwrap();
+        cache.sheet_remove("s1").unwrap();
+        assert!(cache.sheet_merges("s1").unwrap().is_empty());
+
+        // replace_all で消えたシートの孤児結合も掃除される
+        cache.sheet_replace_all(&[make_sheet("s1", 1_000)]).unwrap();
+        cache.sheet_merges_replace_all("s1", &[merge]).unwrap();
+        cache.sheet_replace_all(&[]).unwrap();
+        assert!(
+            cache.sheet_merges("s1").unwrap().is_empty(),
+            "孤児結合は掃除される"
+        );
     }
 }

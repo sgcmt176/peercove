@@ -26,7 +26,9 @@ use peercove_core::memo::{
 };
 use peercove_core::proto::ControlMessage;
 use peercove_core::schedule::{ScheduleEvent, ScheduleEventMsg, ScheduleOp, ScheduleReply};
-use peercove_core::sheet::{SheetCell, SheetEventMsg, SheetMeta, SheetOp, SheetReply};
+use peercove_core::sheet::{
+    SheetCell, SheetEventMsg, SheetMerge, SheetMeta, SheetOp, SheetPresencePeer, SheetReply,
+};
 use peercove_memo::shared::{Actor, CacheStore, SharedStore};
 
 use crate::control::Connections;
@@ -36,6 +38,19 @@ const LOCK_TTL: Duration = Duration::from_secs(120);
 
 /// 定期メンテナンス(ゴミ箱の完全削除 + WAL チェックポイント)の間隔(M5 F-3)。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// 定数期限(TTL)を過ぎたプレゼンスは失効扱いにする(ADR-0055 決定 6)。
+const SHEET_PRESENCE_TTL: Duration = Duration::from_secs(10);
+
+/// シートのプレゼンス 1 名分(揮発情報、DB には保存しない)。
+#[derive(Clone)]
+struct SheetPresenceEntry {
+    sheet_id: String,
+    row: u32,
+    col: u32,
+    name: String,
+    seen: Instant,
+}
 
 /// 供給側のどちらか(daemon の Active が保持する)。
 #[derive(Clone)]
@@ -99,6 +114,9 @@ pub struct MemoService {
     seq: AtomicU64,
     /// 直近の定期メンテナンス実行時刻(M5 F-3。10 分に 1 回だけ動かす)。
     last_maintenance: Mutex<Option<Instant>>,
+    /// シートのプレゼンス(選択セル、揮発。key = actor の member_id、
+    /// ホストは空文字。ADR-0055 決定 6。DB には保存しない)。
+    sheet_presence: Mutex<HashMap<String, SheetPresenceEntry>>,
 }
 
 impl MemoService {
@@ -112,6 +130,7 @@ impl MemoService {
             locks: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
             last_maintenance: Mutex::new(None),
+            sheet_presence: Mutex::new(HashMap::new()),
         })
     }
 
@@ -738,21 +757,26 @@ impl MemoService {
                 })
             }
             SheetOp::Cells { sheet_id } => {
-                let (cells, (col_widths, row_heights)) = self
+                let (cells, (col_widths, row_heights), merges) = self
                     .blocking({
                         let sheet_id = sheet_id.clone();
                         move |store| {
                             let cells = store.sheet_cells(&sheet_id)?;
                             let layout = store.sheet_layout(&sheet_id)?;
-                            Ok((cells, layout))
+                            let merges = store.sheet_merges(&sheet_id)?;
+                            Ok((cells, layout, merges))
                         }
                     })
                     .await?;
+                let exclude_key = actor.member_id.clone().unwrap_or_default();
+                let presence = self.sheet_presence_for(&sheet_id, Some(&exclude_key));
                 Ok(SheetReply::CellsData {
                     sheet_id,
                     cells,
                     col_widths,
                     row_heights,
+                    merges,
+                    presence,
                     offline: false,
                 })
             }
@@ -830,6 +854,75 @@ impl MemoService {
                 .await?;
                 self.broadcast_sheet_layout(sheet_id).await;
                 self.bump();
+                Ok(SheetReply::Done)
+            }
+            SheetOp::Merge { sheet_id, merge } => {
+                let (merges, deleted) = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let sheet_id = sheet_id.clone();
+                        move |store| store.sheet_merge(&actor, &sheet_id, &merge)
+                    })
+                    .await?;
+                self.broadcast_sheet_merges(sheet_id.clone(), merges);
+                if !deleted.is_empty() {
+                    self.broadcast_sheet_cells_changed(sheet_id, deleted);
+                }
+                self.bump();
+                Ok(SheetReply::Done)
+            }
+            SheetOp::Unmerge { sheet_id, row, col } => {
+                let merges = self
+                    .blocking({
+                        let sheet_id = sheet_id.clone();
+                        move |store| store.sheet_unmerge(&sheet_id, row, col)
+                    })
+                    .await?;
+                self.broadcast_sheet_merges(sheet_id, merges);
+                self.bump();
+                Ok(SheetReply::Done)
+            }
+            SheetOp::SetSheetSettings {
+                sheet_id,
+                gridlines,
+                freeze_rows,
+                freeze_cols,
+            } => {
+                let sheet = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let sheet_id = sheet_id.clone();
+                        move |store| {
+                            store.sheet_set_settings(
+                                &actor,
+                                &sheet_id,
+                                gridlines,
+                                freeze_rows,
+                                freeze_cols,
+                            )
+                        }
+                    })
+                    .await?;
+                self.broadcast_sheet_changed(sheet.clone());
+                self.bump();
+                Ok(SheetReply::Sheet { sheet })
+            }
+            SheetOp::Presence { sheet_id, row, col } => {
+                let key = actor.member_id.clone().unwrap_or_default();
+                {
+                    let mut presence = self.sheet_presence.lock().unwrap();
+                    presence.insert(
+                        key.clone(),
+                        SheetPresenceEntry {
+                            sheet_id: sheet_id.clone(),
+                            row,
+                            col,
+                            name: actor.name.clone(),
+                            seen: Instant::now(),
+                        },
+                    );
+                }
+                self.broadcast_sheet_presence(&sheet_id, Some(&key));
                 Ok(SheetReply::Done)
             }
         }
@@ -1249,6 +1342,99 @@ impl MemoService {
             });
         }
     }
+
+    /// セル結合の変更を全員へ配信する(全量、**閲覧権限フィルタなし** —
+    /// シート全体の見た目は共有、ADR-0055 決定 6)。
+    fn broadcast_sheet_merges(self: &Arc<Self>, sheet_id: String, merges: Vec<SheetMerge>) {
+        let event = SharedMemoEvent::Sheet {
+            sheet: SheetEventMsg::Merges { sheet_id, merges },
+        };
+        for (_, connection) in self.memo_connections() {
+            connection.send(ControlMessage::MemoEvent {
+                event: event.clone(),
+            });
+        }
+    }
+
+    /// 指定シートの在席メンバー一覧(TTL 10 秒、揮発)。`exclude_key` が
+    /// 指すメンバー自身のエントリは含めない(自分の選択は自分には出さない、
+    /// ADR-0055 決定 6)。
+    fn sheet_presence_for(
+        &self,
+        sheet_id: &str,
+        exclude_key: Option<&str>,
+    ) -> Vec<SheetPresencePeer> {
+        let presence = self.sheet_presence.lock().unwrap();
+        presence
+            .iter()
+            .filter(|(key, entry)| {
+                entry.sheet_id == sheet_id
+                    && entry.seen.elapsed() <= SHEET_PRESENCE_TTL
+                    && exclude_key != Some(key.as_str())
+            })
+            .map(|(_, entry)| SheetPresencePeer {
+                name: entry.name.clone(),
+                row: entry.row,
+                col: entry.col,
+            })
+            .collect()
+    }
+
+    /// プレゼンスの変更を、送信者以外の memo-capable 接続へ配信する
+    /// (該当シートの在席全量、ADR-0055 決定 6)。
+    fn broadcast_sheet_presence(self: &Arc<Self>, sheet_id: &str, sender_key: Option<&str>) {
+        let targets = self.memo_connections();
+        if targets.is_empty() {
+            return;
+        }
+        let peers = self.sheet_presence_for(sheet_id, None);
+        let event = SharedMemoEvent::Sheet {
+            sheet: SheetEventMsg::Presence {
+                sheet_id: sheet_id.to_string(),
+                peers,
+            },
+        };
+        let service = Arc::clone(self);
+        let sender_key = sender_key.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let Ok(config) = Config::load(&service.config_path) else {
+                return;
+            };
+            for (ip, connection) in targets {
+                let Ok(actor) = Self::actor_for_ip(&config, ip) else {
+                    continue;
+                };
+                if sender_key.as_deref() == Some(actor.member_id.as_deref().unwrap_or_default()) {
+                    continue;
+                }
+                connection.send(ControlMessage::MemoEvent {
+                    event: event.clone(),
+                });
+            }
+        });
+    }
+
+    /// プレゼンスの失効掃除(TTL 10 秒、ADR-0055 決定 6)。失効があった
+    /// シートだけ、更新後の在席一覧を再配信する。supervisor の tick
+    /// (sweep_expired_locks と同じ場所)から毎周期呼んでよい。
+    pub fn sweep_sheet_presence(self: &Arc<Self>) {
+        let affected: Vec<String> = {
+            let mut presence = self.sheet_presence.lock().unwrap();
+            let mut affected = std::collections::HashSet::new();
+            presence.retain(|_, entry| {
+                if entry.seen.elapsed() > SHEET_PRESENCE_TTL {
+                    affected.insert(entry.sheet_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            affected.into_iter().collect()
+        };
+        for sheet_id in affected {
+            self.broadcast_sheet_presence(&sheet_id, None);
+        }
+    }
 }
 
 fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
@@ -1279,6 +1465,9 @@ pub struct MemberMemoCache {
     generation: AtomicU64,
     /// ホストが共有メモに応答した(= 対応バージョン)。
     supported: AtomicBool,
+    /// シートのプレゼンス(選択セル、揮発。key = sheet_id。ADR-0055 決定 6。
+    /// **DB には保存しない**(SQLite キャッシュを経由させない)。
+    sheet_presence: Mutex<HashMap<String, Vec<SheetPresencePeer>>>,
 }
 
 impl MemberMemoCache {
@@ -1287,6 +1476,7 @@ impl MemberMemoCache {
             path: config_path.with_extension("memocache.db"),
             generation: AtomicU64::new(1),
             supported: AtomicBool::new(false),
+            sheet_presence: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1365,6 +1555,16 @@ impl MemberMemoCache {
                         store.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)
                     })
                     .await
+                }
+                SheetEventMsg::Merges { sheet_id, merges } => {
+                    self.blocking(move |store| store.sheet_merges_replace_all(&sheet_id, &merges))
+                        .await
+                }
+                SheetEventMsg::Presence { sheet_id, peers } => {
+                    // 揮発情報(DB には保存しない)。ホストは送信者自身へは
+                    // 配信しないため、ここに自分自身のエントリが来ることはない
+                    self.sheet_presence.lock().unwrap().insert(sheet_id, peers);
+                    Ok(())
                 }
             },
         };
@@ -1473,6 +1673,27 @@ impl MemberMemoCache {
             .await
     }
 
+    /// 1 シートのセル結合(オフライン時はここが唯一のソース、M6 H-5、
+    /// ADR-0055 決定 6)。
+    pub async fn sheet_merges(
+        self: &Arc<Self>,
+        sheet_id: String,
+    ) -> anyhow::Result<Vec<SheetMerge>> {
+        self.blocking(move |store| store.sheet_merges(&sheet_id))
+            .await
+    }
+
+    /// 1 シートの在席メンバー(揮発。ホストが送信者自身を除外済みなので、
+    /// ここで返す一覧に自分自身が含まれることはない、ADR-0055 決定 6)。
+    pub fn sheet_presence(&self, sheet_id: &str) -> Vec<SheetPresencePeer> {
+        self.sheet_presence
+            .lock()
+            .unwrap()
+            .get(sheet_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// 接続時の同期: List 応答でシートのメタ全量を置き換える(孤児セルも
     /// 掃除される、ADR-0054)。
     pub async fn sheet_sync_from_list(
@@ -1486,17 +1707,19 @@ impl MemberMemoCache {
     }
 
     /// 接続時の同期: 1 シートの Cells 応答でそのシートのセル全量(+ 列幅・
-    /// 行高)を置き換える(M6 H-4、ADR-0055 決定 6)。
+    /// 行高・セル結合)を置き換える(M6 H-4/H-5、ADR-0055 決定 6)。
     pub async fn sheet_sync_cells(
         self: &Arc<Self>,
         sheet_id: String,
         cells: Vec<SheetCell>,
         col_widths: Vec<(u32, u16)>,
         row_heights: Vec<(u32, u16)>,
+        merges: Vec<SheetMerge>,
     ) -> anyhow::Result<()> {
         self.blocking(move |store| {
             store.sheet_cells_replace_all(&sheet_id, &cells)?;
-            store.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)
+            store.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)?;
+            store.sheet_merges_replace_all(&sheet_id, &merges)
         })
         .await?;
         self.bump();

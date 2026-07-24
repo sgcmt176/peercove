@@ -1403,12 +1403,13 @@ async fn memo_sync(link: Arc<MemberLink>, cache: Arc<crate::memoshare::MemberMem
                     cells,
                     col_widths,
                     row_heights,
+                    merges,
                     ..
                 },
         })) = tokio::time::timeout(SYNC_TIMEOUT, rx).await
         {
             if let Err(e) = cache
-                .sheet_sync_cells(sheet_id, cells, col_widths, row_heights)
+                .sheet_sync_cells(sheet_id, cells, col_widths, row_heights, merges)
                 .await
             {
                 tracing::warn!("共有シートのセル同期に失敗しました: {e:#}");

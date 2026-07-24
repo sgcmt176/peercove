@@ -767,6 +767,28 @@ export interface SheetMeta {
   updated_at: number;
   /** 受信者視点: 改名・削除できるか(作成者 + ホスト)。 */
   can_manage?: boolean;
+  /** 目盛線の表示(既定 true、ADR-0055 決定 6)。 */
+  gridlines?: boolean;
+  /** ウインドウ枠を固定する先頭行数(既定 0 = 固定なし)。 */
+  freeze_rows?: number;
+  /** ウインドウ枠を固定する先頭列数(既定 0 = 固定なし)。 */
+  freeze_cols?: number;
+}
+
+/** セル結合の 1 件(左上セル座標 + 縦横スパン、ADR-0055 決定 6)。 */
+export interface SheetMerge {
+  row: number;
+  col: number;
+  row_span: number;
+  col_span: number;
+}
+
+/** プレゼンス 1 名分(選択セルの共有、揮発。DB には保存しない、
+ * ADR-0055 決定 6)。 */
+export interface SheetPresencePeer {
+  name: string;
+  row: number;
+  col: number;
 }
 
 /** セル書式(すべて省略可 = 既定、ADR-0055 決定 6)。crates/peercove-core/
@@ -825,7 +847,20 @@ export type SheetOp =
   // 列幅・行高(誰でも可。シート全体の見た目 = 共有、ADR-0055 決定 6)。
   // width/height 未指定(undefined)は既定へ戻す。
   | { op: "set_col_width"; sheet_id: string; col: number; width?: number }
-  | { op: "set_row_height"; sheet_id: string; row: number; height?: number };
+  | { op: "set_row_height"; sheet_id: string; row: number; height?: number }
+  // セル結合(誰でも可、ADR-0055 決定 6、M6 H-5)。
+  | { op: "merge"; sheet_id: string; merge: SheetMerge }
+  | { op: "unmerge"; sheet_id: string; row: number; col: number }
+  // シート設定(目盛線・固定枠、誰でも可)。
+  | {
+      op: "set_sheet_settings";
+      sheet_id: string;
+      gridlines: boolean;
+      freeze_rows: number;
+      freeze_cols: number;
+    }
+  // 選択セルのプレゼンス共有(揮発、DB 保存なし)。
+  | { op: "presence"; sheet_id: string; row: number; col: number };
 
 export type SheetReply =
   | { kind: "sheets"; sheets: SheetMeta[]; offline?: boolean }
@@ -837,6 +872,10 @@ export type SheetReply =
       col_widths?: [number, number][];
       /** 既定でない行高。[row, height] の組。 */
       row_heights?: [number, number][];
+      /** セル結合(M6 H-5、ADR-0055 決定 6)。 */
+      merges?: SheetMerge[];
+      /** 在席メンバー(自分以外、TTL 10 秒の揮発情報)。 */
+      presence?: SheetPresencePeer[];
       offline?: boolean;
     }
   | { kind: "sheet"; sheet: SheetMeta }

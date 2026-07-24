@@ -15,9 +15,20 @@ import {
   useState,
 } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { CellFormat, CellWrite, SheetCell, SheetMeta, SheetOp, api, errorMessage } from "../ipc";
+import {
+  CellFormat,
+  CellWrite,
+  SheetCell,
+  SheetMerge,
+  SheetMeta,
+  SheetOp,
+  SheetPresencePeer,
+  api,
+  errorMessage,
+} from "../ipc";
 import { t } from "../i18n";
 import { sharedRefToken } from "../sharedRefs";
+import { ContextMenu, ContextMenuEntry } from "./ContextMenu";
 
 // crates/peercove-core/src/sheet.rs の上限と同期(ADR-0054 決定 7、ADR-0055 決定 6)。
 const MAX_SHEET_ROWS = 1000;
@@ -36,6 +47,33 @@ const DISPLAY_MARGIN = 2;
 const NUMERIC_RE = /^-?\d+(\.\d+)?$/;
 
 const FONT_SIZE_CHOICES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36];
+
+// 固定枠(freeze panes、ADR-0055 決定 6)のピクセル計算に使う近似値。列
+// ヘッダー行・行番号列の実測サイズは CSS の .sheet__col-head / .sheet__corner
+// と揃えてある(厳密な Excel 互換は不要 = 破綻しない範囲での近似)。
+const HEADER_ROW_HEIGHT = DEFAULT_ROW_HEIGHT;
+const ROW_HEAD_WIDTH = 44;
+
+// プレゼンス送信のスロットル間隔(ADR-0055 決定 6: 選択位置の共有 ~4 回/秒)。
+const PRESENCE_THROTTLE_MS = 250;
+
+// Undo 履歴の最大件数(ADR-0055 決定 6)。
+const MAX_UNDO_STACK = 50;
+
+/** FNV-1a(32bit)。Avatar.tsx と同じ手法で、名前からプレゼンス色の色相を
+ * 決定的に決める(暗号用途ではない)。 */
+function hueOfName(name: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < name.length; i++) {
+    hash ^= name.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) % 360;
+}
+
+function presenceColor(name: string): string {
+  return `hsl(${hueOfName(name)}, 70%, 45%)`;
+}
 
 function keyOf(row: number, col: number): string {
   return `${row},${col}`;
@@ -88,6 +126,14 @@ interface EditingState {
   row: number;
   col: number;
   value: string;
+}
+
+/** Undo 1 セル分の旧状態(ADR-0055 決定 6)。 */
+interface UndoCellSnapshot {
+  row: number;
+  col: number;
+  value: string;
+  format?: CellFormat;
 }
 
 /** セルのテキスト装飾(太字・色・配置など)を CSS へ。 */
@@ -168,6 +214,8 @@ export function SheetView({
   const [cells, setCells] = useState<SheetCell[]>([]);
   const [colWidths, setColWidths] = useState<Map<number, number>>(new Map());
   const [rowHeights, setRowHeights] = useState<Map<number, number>>(new Map());
+  const [merges, setMerges] = useState<SheetMerge[]>([]);
+  const [presence, setPresence] = useState<SheetPresencePeer[]>([]);
   const [offline, setOffline] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [menuFor, setMenuFor] = useState<string | null>(null);
@@ -176,6 +224,18 @@ export function SheetView({
   const [conflictHighlight, setConflictHighlight] = useState<Set<string>>(
     new Set(),
   );
+  // 右クリックメニュー(ADR-0055 決定 6)
+  const [cellMenu, setCellMenu] = useState<{
+    x: number;
+    y: number;
+    row: number;
+    col: number;
+  } | null>(null);
+  // シート内検索(Ctrl+F、ADR-0055 決定 6)
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchIndex, setSearchIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   const activeSheetIdRef = useRef<string | null>(null);
   const cellRefs = useRef<Map<string, HTMLTableCellElement>>(new Map());
@@ -195,6 +255,14 @@ export function SheetView({
     startPos: number;
     startSize: number;
   } | null>(null);
+  // Undo 履歴(自分の直近操作、ローカルのみ。ADR-0055 決定 6)。
+  const undoStackRef = useRef<UndoCellSnapshot[][]>([]);
+  // Undo 自体の書き込み中は、その書き込みを新たな Undo 履歴として積まない
+  // (Redo は不要 = 積み直さない、ADR-0055 決定 6)。
+  const isUndoingRef = useRef(false);
+  // プレゼンス送信のスロットル(ADR-0055 決定 6)。
+  const presenceThrottleRef = useRef<number | null>(null);
+  const lastSentPresenceRef = useRef<string | null>(null);
 
   useEffect(() => {
     activeSheetIdRef.current = activeSheetId;
@@ -234,6 +302,8 @@ export function SheetView({
           setCells(reply.cells);
           setColWidths(new Map((reply.col_widths ?? []).map(([c, w]) => [c, w])));
           setRowHeights(new Map((reply.row_heights ?? []).map(([r, h]) => [r, h])));
+          setMerges(reply.merges ?? []);
+          setPresence(reply.presence ?? []);
           setOffline(reply.offline ?? false);
         }
       } catch (error) {
@@ -253,10 +323,22 @@ export function SheetView({
       setCells([]);
       setColWidths(new Map());
       setRowHeights(new Map());
+      setMerges([]);
+      setPresence([]);
       return;
     }
     void loadCells(activeSheetId);
   }, [activeSheetId, seq, loadCells]);
+
+  // シート切り替え時は Undo 履歴・検索・右クリックメニューをリセットする
+  // (他シートのセル座標を誤って書き戻さないように)。
+  useEffect(() => {
+    undoStackRef.current = [];
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchIndex(0);
+    setCellMenu(null);
+  }, [activeSheetId]);
 
   // シート一覧が変わったとき、選択中のシートが消えていたら先頭へ差し替える
   useEffect(() => {
@@ -375,6 +457,12 @@ export function SheetView({
       usedRows = Math.max(usedRows, cell.row + 1);
       usedCols = Math.max(usedCols, cell.col + 1);
     }
+    // 結合セルの範囲も必ず表示範囲に含める(colSpan/rowSpan が表示領域の
+    // 外へはみ出さないように)。
+    for (const merge of merges) {
+      usedRows = Math.max(usedRows, merge.row + merge.row_span);
+      usedCols = Math.max(usedCols, merge.col + merge.col_span);
+    }
     // 編集中セルは(seq ポーリングで cells が変わっても)必ず表示範囲に
     // 含める。範囲外に落ちて input が消える = 事実上の再マウントになるのを防ぐ。
     if (editing) {
@@ -393,7 +481,45 @@ export function SheetView({
     };
     // editing.value(打鍵ごと)は範囲計算に無関係なので row/col だけを見る
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cells, editing?.row, editing?.col]);
+  }, [cells, merges, editing?.row, editing?.col]);
+
+  // 結合セルの検索用マップ(ADR-0055 決定 6)。mergeCovered は結合範囲内の
+  // 全セル(左上を含む)→ その結合。mergeByTopLeft は左上セルだけの索引。
+  const mergeCovered = useMemo(() => {
+    const map = new Map<string, SheetMerge>();
+    for (const merge of merges) {
+      for (let r = merge.row; r < merge.row + merge.row_span; r++) {
+        for (let c = merge.col; c < merge.col + merge.col_span; c++) {
+          map.set(keyOf(r, c), merge);
+        }
+      }
+    }
+    return map;
+  }, [merges]);
+
+  /** 結合範囲内のセルはその結合の左上セルへ丸める(選択は結合全体を
+   * 1 単位として扱う、ADR-0055 決定 6)。 */
+  const resolveMergeAnchor = useCallback(
+    (row: number, col: number): CellPos => {
+      const merge = mergeCovered.get(keyOf(row, col));
+      return merge ? { row: merge.row, col: merge.col } : { row, col };
+    },
+    [mergeCovered],
+  );
+
+  // ツールバー・右クリックメニュー・Undo など複数箇所から参照するため、
+  // JSX 直前ではなくここで(hooks より前に)計算しておく。
+  const selectionRect = selection ? rangeOf(selection) : null;
+  const hasRangeSelection = selectionRect !== null && !isSingleCell(selectionRect);
+  const toolbarDisabled = readOnlyReason !== null || !selection;
+
+  // 現在の選択範囲がちょうど 1 件の既存結合と一致するか(単一セル選択かつ
+  // その左上が結合の左上と一致)。一致すれば「結合」ボタンは「解除」になる。
+  const mergeAtFocus = selection
+    ? mergeCovered.get(keyOf(selection.focus.row, selection.focus.col))
+    : undefined;
+  const canUnmergeSelection =
+    !!mergeAtFocus && selectionRect !== null && isSingleCell(selectionRect);
 
   const applyConflicts = useCallback((conflicts: SheetCell[]) => {
     setCells((prev) => {
@@ -418,6 +544,22 @@ export function SheetView({
   const writeCells = useCallback(
     async (writes: CellWrite[]) => {
       if (!activeSheetId || writes.length === 0) return;
+      // Undo 履歴(自分の直近操作、ADR-0055 決定 6): 書き込み前の状態を
+      // 積む。Undo 自体の書き戻しは積み直さない(Redo は不要)。
+      if (!isUndoingRef.current) {
+        const snapshot: UndoCellSnapshot[] = writes.map((write) => {
+          const current = cellsByKey.get(keyOf(write.row, write.col));
+          return {
+            row: write.row,
+            col: write.col,
+            value: current?.value ?? "",
+            format: current?.format,
+          };
+        });
+        undoStackRef.current = [...undoStackRef.current, snapshot].slice(
+          -MAX_UNDO_STACK,
+        );
+      }
       try {
         const reply = await sheetOp({ op: "write", sheet_id: activeSheetId, cells: writes });
         if (reply.kind === "write_result") {
@@ -433,8 +575,31 @@ export function SheetView({
         setNotice(errorMessage(error));
       }
     },
-    [activeSheetId, sheetOp, applyConflicts, loadCells],
+    [activeSheetId, sheetOp, applyConflicts, loadCells, cellsByKey],
   );
+
+  /** 自分の直近操作を 1 つ取り消す(Ctrl+Z、ローカル、ADR-0055 決定 6)。
+   * base_revision は「現在手元の revision」— 他人が先に変更していれば
+   * CAS 競合として自然にスキップされる(競合通知は writeCells 側に乗る)。
+   * 結合/解除・列幅/行高・シート設定は対象外(履歴に積んでいない)。 */
+  const undo = useCallback(() => {
+    const entry = undoStackRef.current.pop();
+    if (!entry || !activeSheetId) return;
+    const writes: CellWrite[] = entry.map((snapshot) => {
+      const current = cellsByKey.get(keyOf(snapshot.row, snapshot.col));
+      return {
+        row: snapshot.row,
+        col: snapshot.col,
+        value: snapshot.value,
+        base_revision: current?.revision ?? 0,
+        format: snapshot.format ?? {},
+      };
+    });
+    isUndoingRef.current = true;
+    void writeCells(writes).finally(() => {
+      isUndoingRef.current = false;
+    });
+  }, [activeSheetId, cellsByKey, writeCells]);
 
   const commitLayout = useCallback(
     async (kind: "col" | "row", index: number, size: number) => {
@@ -515,12 +680,18 @@ export function SheetView({
   );
 
   const startEdit = useCallback(
-    (row: number, col: number, value: string) => {
+    (row: number, col: number, value: string | null) => {
       if (readOnlyReason) return;
-      setSelection({ anchor: { row, col }, focus: { row, col } });
-      setEditing({ row, col, value });
+      // 結合セルは左上のみ編集可(選択は結合全体を 1 単位として扱う、
+      // ADR-0055 決定 6)。value が null なら既存値をそこから読み直す
+      // (直接文字入力で上書き開始する場合は呼び出し側が実値を渡す)。
+      const anchor = resolveMergeAnchor(row, col);
+      setSelection({ anchor, focus: anchor });
+      const resolvedValue =
+        value ?? cellsByKey.get(keyOf(anchor.row, anchor.col))?.value ?? "";
+      setEditing({ row: anchor.row, col: anchor.col, value: resolvedValue });
     },
-    [readOnlyReason],
+    [readOnlyReason, resolveMergeAnchor, cellsByKey],
   );
 
   const cancelEdit = useCallback(() => setEditing(null), []);
@@ -554,12 +725,15 @@ export function SheetView({
       if (direction === "down") nr = Math.min(displayRows - 1, row + 1);
       if (direction === "left") nc = Math.max(0, col - 1);
       if (direction === "right") nc = Math.min(displayCols - 1, col + 1);
+      // 結合セルへ着地したら左上へ丸める(結合内の非左上セルは td を
+      // 描画しないため、丸めないとフォーカスできずキー操作が固まる)。
+      const landed = resolveMergeAnchor(nr, nc);
       setSelection((prev) => {
-        if (extend && prev) return { anchor: prev.anchor, focus: { row: nr, col: nc } };
-        return { anchor: { row: nr, col: nc }, focus: { row: nr, col: nc } };
+        if (extend && prev) return { anchor: prev.anchor, focus: landed };
+        return { anchor: landed, focus: landed };
       });
     },
-    [displayRows, displayCols],
+    [displayRows, displayCols, resolveMergeAnchor],
   );
 
   /** 選択範囲の全セルへ書式を適用する(値は現値を維持したまま送る、
@@ -660,6 +834,285 @@ export function SheetView({
     }));
   }, [applyFormatToSelection]);
 
+  // ---- セル結合(ADR-0055 決定 6) ----
+
+  const toggleMerge = useCallback(() => {
+    if (!activeSheetId || !selectionRect) return;
+    if (canUnmergeSelection && mergeAtFocus) {
+      void (async () => {
+        try {
+          const reply = await sheetOp({
+            op: "unmerge",
+            sheet_id: activeSheetId,
+            row: mergeAtFocus.row,
+            col: mergeAtFocus.col,
+          });
+          if (reply.kind === "err") setNotice(reply.message);
+          else void loadCells(activeSheetId);
+        } catch (error) {
+          setNotice(errorMessage(error));
+        }
+      })();
+      return;
+    }
+    if (isSingleCell(selectionRect)) return; // 単一セルは結合不可(2 セル以上)
+    const { r0, r1, c0, c1 } = selectionRect;
+    let dataLoss = false;
+    for (let r = r0; r <= r1 && !dataLoss; r++) {
+      for (let c = c0; c <= c1; c++) {
+        if (r === r0 && c === c0) continue;
+        const cell = cellsByKey.get(keyOf(r, c));
+        if (cell && cell.value !== "") {
+          dataLoss = true;
+          break;
+        }
+      }
+    }
+    if (dataLoss && !window.confirm(t.sheet.mergeConfirmDataLoss)) return;
+    void (async () => {
+      try {
+        const reply = await sheetOp({
+          op: "merge",
+          sheet_id: activeSheetId,
+          merge: { row: r0, col: c0, row_span: r1 - r0 + 1, col_span: c1 - c0 + 1 },
+        });
+        if (reply.kind === "err") setNotice(reply.message);
+        else void loadCells(activeSheetId);
+      } catch (error) {
+        setNotice(errorMessage(error));
+      }
+    })();
+  }, [
+    activeSheetId,
+    selectionRect,
+    canUnmergeSelection,
+    mergeAtFocus,
+    cellsByKey,
+    sheetOp,
+    loadCells,
+  ]);
+
+  // ---- シート設定: 目盛線・固定枠(ADR-0055 決定 6) ----
+
+  const updateSheetSettings = useCallback(
+    (patch: Partial<{ gridlines: boolean; freeze_rows: number; freeze_cols: number }>) => {
+      if (!activeSheet) return;
+      void (async () => {
+        try {
+          const reply = await sheetOp({
+            op: "set_sheet_settings",
+            sheet_id: activeSheet.id,
+            gridlines: patch.gridlines ?? activeSheet.gridlines ?? true,
+            freeze_rows: patch.freeze_rows ?? activeSheet.freeze_rows ?? 0,
+            freeze_cols: patch.freeze_cols ?? activeSheet.freeze_cols ?? 0,
+          });
+          if (reply.kind === "err") setNotice(reply.message);
+          else void loadSheets();
+        } catch (error) {
+          setNotice(errorMessage(error));
+        }
+      })();
+    },
+    [activeSheet, sheetOp, loadSheets],
+  );
+
+  const freezeAtSelection = useCallback(() => {
+    if (!selectionRect) return;
+    updateSheetSettings({ freeze_rows: selectionRect.r0, freeze_cols: selectionRect.c0 });
+  }, [selectionRect, updateSheetSettings]);
+
+  const clearFreeze = useCallback(() => {
+    updateSheetSettings({ freeze_rows: 0, freeze_cols: 0 });
+  }, [updateSheetSettings]);
+
+  // ---- プレゼンス(選択セル共有、ADR-0055 決定 6) ----
+  // 選択の focus セルが変わるたびスロットル(250ms)して送信する。オフライン・
+  // 未対応時は送らない(readOnlyReason が立っている = 送っても無意味)。
+
+  useEffect(() => {
+    if (!selection || !activeSheetId || readOnlyReason) return;
+    const presenceKey = `${activeSheetId}:${selection.focus.row}:${selection.focus.col}`;
+    if (lastSentPresenceRef.current === presenceKey) return;
+    if (presenceThrottleRef.current !== null) window.clearTimeout(presenceThrottleRef.current);
+    presenceThrottleRef.current = window.setTimeout(() => {
+      lastSentPresenceRef.current = presenceKey;
+      void sheetOp({
+        op: "presence",
+        sheet_id: activeSheetId,
+        row: selection.focus.row,
+        col: selection.focus.col,
+      }).catch(() => {
+        // プレゼンスの送信失敗は静かに無視する(表示上の付随情報のため)
+      });
+    }, PRESENCE_THROTTLE_MS);
+    return () => {
+      if (presenceThrottleRef.current !== null) window.clearTimeout(presenceThrottleRef.current);
+    };
+  }, [selection, activeSheetId, readOnlyReason, sheetOp]);
+
+  const presenceByCell = useMemo(() => {
+    const map = new Map<string, SheetPresencePeer[]>();
+    for (const peer of presence) {
+      const key = keyOf(peer.row, peer.col);
+      const list = map.get(key);
+      if (list) list.push(peer);
+      else map.set(key, [peer]);
+    }
+    return map;
+  }, [presence]);
+
+  // ---- クリップボード(コピー/貼り付け、独自右クリックメニュー用、
+  // ADR-0055 決定 6)。Ctrl+C/Ctrl+V のブラウザ既定コピー/貼り付けは
+  // handleGridCopy/handleGridPaste が別途面倒を見ている。 ----
+
+  const copySelectionToClipboard = useCallback(() => {
+    if (!selectionRect) return;
+    const { r0, r1, c0, c1 } = selectionRect;
+    const lines: string[] = [];
+    for (let r = r0; r <= r1; r++) {
+      const line: string[] = [];
+      for (let c = c0; c <= c1; c++) line.push(cellsByKey.get(keyOf(r, c))?.value ?? "");
+      lines.push(line.join("\t"));
+    }
+    void writeText(lines.join("\n"));
+  }, [selectionRect, cellsByKey]);
+
+  const pasteIntoSelection = useCallback(async () => {
+    if (!selectionRect || readOnlyReason) return;
+    let text: string;
+    try {
+      // navigator.clipboard.readText() を試みる(ADR-0055 決定 6 の指示どおり。
+      // Tauri プラグイン側は allow-write-text しか許可していないため、読み取りは
+      // Web API 経由 — 権限が無ければここで例外になり、Ctrl+V を促す)。
+      text = (await navigator.clipboard.readText()) ?? "";
+    } catch {
+      setNotice(t.sheet.clipboardReadUnavailable);
+      return;
+    }
+    if (!text) return;
+    const startRow = selectionRect.r0;
+    const startCol = selectionRect.c0;
+    const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+    const grid = lines.map((line) => line.split("\t"));
+    const rowSpan = grid.length;
+    const colSpan = grid.reduce((max, line) => Math.max(max, line.length), 0);
+    if (startRow + rowSpan > MAX_SHEET_ROWS || startCol + colSpan > MAX_SHEET_COLS) {
+      setNotice(t.sheet.pasteRejected);
+      return;
+    }
+    const writes: CellWrite[] = [];
+    grid.forEach((line, r) => {
+      line.forEach((value, c) => {
+        const targetRow = startRow + r;
+        const targetCol = startCol + c;
+        const current = cellsByKey.get(keyOf(targetRow, targetCol));
+        writes.push({
+          row: targetRow,
+          col: targetCol,
+          value,
+          base_revision: current?.revision ?? 0,
+        });
+      });
+    });
+    void writeCells(writes);
+  }, [selectionRect, readOnlyReason, cellsByKey, writeCells]);
+
+  const clearSelection = useCallback(() => {
+    if (!selectionRect) return;
+    const { r0, r1, c0, c1 } = selectionRect;
+    const writes: CellWrite[] = [];
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const current = cellsByKey.get(keyOf(r, c));
+        if (current) writes.push({ row: r, col: c, value: "", base_revision: current.revision });
+      }
+    }
+    if (writes.length > 0) void writeCells(writes);
+  }, [selectionRect, cellsByKey, writeCells]);
+
+  // ---- 独自右クリックメニュー(ADR-0055 決定 6) ----
+
+  const openCellMenu = useCallback(
+    (event: ReactMouseEvent<HTMLTableCellElement>, row: number, col: number) => {
+      event.preventDefault();
+      if (editing) return;
+      const anchor = resolveMergeAnchor(row, col);
+      const inCurrentSelection =
+        selectionRect !== null &&
+        anchor.row >= selectionRect.r0 &&
+        anchor.row <= selectionRect.r1 &&
+        anchor.col >= selectionRect.c0 &&
+        anchor.col <= selectionRect.c1;
+      if (!inCurrentSelection) {
+        setSelection({ anchor, focus: anchor });
+      }
+      setCellMenu({ x: event.clientX, y: event.clientY, row: anchor.row, col: anchor.col });
+    },
+    [editing, resolveMergeAnchor, selectionRect],
+  );
+
+  // ---- シート内検索(Ctrl+F、ADR-0055 決定 6) ----
+
+  const searchMatches = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return [] as CellPos[];
+    return cells
+      .filter((cell) => cell.value.toLowerCase().includes(query))
+      .sort((a, b) => a.row - b.row || a.col - b.col)
+      .map((cell) => ({ row: cell.row, col: cell.col }));
+  }, [cells, searchQuery]);
+
+  const searchMatchKeys = useMemo(
+    () => new Set(searchMatches.map((m) => keyOf(m.row, m.col))),
+    [searchMatches],
+  );
+
+  const currentSearchMatch =
+    searchMatches.length > 0 ? searchMatches[searchIndex % searchMatches.length] : null;
+  const currentSearchKey = currentSearchMatch ? keyOf(currentSearchMatch.row, currentSearchMatch.col) : null;
+
+  const gotoSearchMatch = useCallback(
+    (index: number) => {
+      if (searchMatches.length === 0) return;
+      const clamped = ((index % searchMatches.length) + searchMatches.length) % searchMatches.length;
+      setSearchIndex(clamped);
+      const target = searchMatches[clamped];
+      const anchor = resolveMergeAnchor(target.row, target.col);
+      setSelection({ anchor, focus: anchor });
+      window.setTimeout(() => {
+        cellRefs.current
+          .get(keyOf(anchor.row, anchor.col))
+          ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }, 0);
+    },
+    [searchMatches, resolveMergeAnchor],
+  );
+
+  // 検索文字列が変わるたびに先頭の一致へジャンプする
+  useEffect(() => {
+    if (!searchOpen) return;
+    setSearchIndex(0);
+    gotoSearchMatch(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, searchOpen]);
+
+  // Ctrl+F で検索バーを開く/フォーカスする(ウインドウ全体で監視。SheetView
+  // は「表」サブタブがアクティブなときだけマウントされているので、他画面の
+  // 入力を横取りする心配はない)。
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+        if (!activeSheetIdRef.current) return;
+        event.preventDefault();
+        setSearchOpen(true);
+        window.setTimeout(() => searchInputRef.current?.focus(), 0);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const handleGridKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTableCellElement>, row: number, col: number) => {
       const isEditingThis = editing && editing.row === row && editing.col === col;
@@ -701,10 +1154,17 @@ export function SheetView({
         moveActiveCell(arrowMap[event.key], row, col, event.shiftKey);
         return;
       }
+      // Undo(Ctrl+Z / Cmd+Z、ローカル、ADR-0055 決定 6)。編集中でないときだけ
+      // 横取りする(input 自身のネイティブ undo は妨げない)。
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        undo();
+        return;
+      }
       if (readOnlyReason) return;
       if (event.key === "Enter") {
         event.preventDefault();
-        startEdit(row, col, cellsByKey.get(keyOf(row, col))?.value ?? "");
+        startEdit(row, col, null);
         return;
       }
       if (event.key === "Delete" || event.key === "Backspace") {
@@ -740,6 +1200,7 @@ export function SheetView({
       moveActiveCell,
       startEdit,
       writeCells,
+      undo,
     ],
   );
 
@@ -828,22 +1289,25 @@ export function SheetView({
     (event: ReactMouseEvent<HTMLTableCellElement>, row: number, col: number) => {
       if (event.button !== 0) return;
       if (editing) return;
+      const anchor = resolveMergeAnchor(row, col);
       if (event.shiftKey && selection) {
-        setSelection({ anchor: selection.anchor, focus: { row, col } });
+        setSelection({ anchor: selection.anchor, focus: anchor });
       } else {
-        setSelection({ anchor: { row, col }, focus: { row, col } });
+        setSelection({ anchor, focus: anchor });
       }
       isSelectingRef.current = true;
     },
-    [editing, selection],
+    [editing, selection, resolveMergeAnchor],
   );
 
-  const handleCellMouseEnter = useCallback((row: number, col: number) => {
-    if (!isSelectingRef.current) return;
-    setSelection((prev) =>
-      prev ? { anchor: prev.anchor, focus: { row, col } } : { anchor: { row, col }, focus: { row, col } },
-    );
-  }, []);
+  const handleCellMouseEnter = useCallback(
+    (row: number, col: number) => {
+      if (!isSelectingRef.current) return;
+      const focus = resolveMergeAnchor(row, col);
+      setSelection((prev) => (prev ? { anchor: prev.anchor, focus } : { anchor: focus, focus }));
+    },
+    [resolveMergeAnchor],
+  );
 
   const createSheet = useCallback(() => {
     const name = window.prompt(t.sheet.newSheetNamePrompt, t.sheet.newSheetDefaultName);
@@ -939,12 +1403,64 @@ export function SheetView({
 
   const rowIndexes = Array.from({ length: displayRows }, (_, i) => i);
   const colIndexes = Array.from({ length: displayCols }, (_, i) => i);
-  const selectionRect = selection ? rangeOf(selection) : null;
-  const hasRangeSelection = selectionRect !== null && !isSingleCell(selectionRect);
-  const toolbarDisabled = readOnlyReason !== null || !selection;
+
+  const gridlines = activeSheet?.gridlines ?? true;
+  const freezeRows = activeSheet?.freeze_rows ?? 0;
+  const freezeCols = activeSheet?.freeze_cols ?? 0;
+
+  // 固定枠(freeze panes)のピクセルオフセット(ADR-0055 決定 6)。列/行
+  // ヘッダーの実測に近い値を近似として使う(破綻しない範囲での近似、
+  // 厳密な Excel 互換は不要)。
+  const rowTopOffsets: number[] = [];
+  {
+    let acc = HEADER_ROW_HEIGHT;
+    for (let r = 0; r < freezeRows; r++) {
+      rowTopOffsets.push(acc);
+      acc += rowHeights.get(r) ?? DEFAULT_ROW_HEIGHT;
+    }
+  }
+  const colLeftOffsets: number[] = [];
+  {
+    let acc = ROW_HEAD_WIDTH;
+    for (let c = 0; c < freezeCols; c++) {
+      colLeftOffsets.push(acc);
+      acc += colWidths.get(c) ?? DEFAULT_COL_WIDTH;
+    }
+  }
+
+  /** 右クリックメニューの項目(ADR-0055 決定 6)。 */
+  function buildCellMenuItems(menu: { row: number; col: number }): ContextMenuEntry[] {
+    const disabled = readOnlyReason !== null;
+    return [
+      { label: t.sheet.ctxCopy, onClick: copySelectionToClipboard },
+      { label: t.sheet.ctxPaste, onClick: () => void pasteIntoSelection(), disabled },
+      { label: t.sheet.ctxClear, onClick: clearSelection, disabled },
+      { separator: true },
+      { label: t.sheet.toolbarBorderOuter, onClick: applyBorderOuter, disabled },
+      { label: t.sheet.toolbarBorderGrid, onClick: applyBorderGrid, disabled },
+      { label: t.sheet.toolbarBorderNone, onClick: applyBorderNone, disabled },
+      { separator: true },
+      {
+        label: canUnmergeSelection ? t.sheet.ctxUnmerge : t.sheet.ctxMerge,
+        onClick: toggleMerge,
+        disabled:
+          disabled ||
+          (!canUnmergeSelection && (!selectionRect || isSingleCell(selectionRect))),
+      },
+      { separator: true },
+      {
+        label: t.sheet.ctxResetColWidth,
+        onClick: () => void resetLayout("col", menu.col),
+      },
+      {
+        label: t.sheet.ctxResetRowHeight,
+        onClick: () => void resetLayout("row", menu.row),
+      },
+    ];
+  }
 
   return (
-    <div className="sheet">
+    <div className="sheet" onContextMenu={(event) => event.preventDefault()}>
       <div className="sheet__tabbar">
         {sheets.map((sheet) => (
           <div key={sheet.id} className="sheet__tab-wrap">
@@ -1178,6 +1694,56 @@ export function SheetView({
               ▭
             </button>
           </div>
+
+          <div className="sheet__toolbar-group">
+            <button
+              type="button"
+              className="sheet__toolbar-btn"
+              title={canUnmergeSelection ? t.sheet.toolbarUnmerge : t.sheet.toolbarMerge}
+              disabled={
+                readOnlyReason !== null ||
+                !selectionRect ||
+                (!canUnmergeSelection && isSingleCell(selectionRect))
+              }
+              onClick={toggleMerge}
+            >
+              {canUnmergeSelection ? t.sheet.toolbarUnmerge : t.sheet.toolbarMerge}
+            </button>
+          </div>
+
+          <div className="sheet__toolbar-group">
+            <button
+              type="button"
+              className={
+                gridlines
+                  ? "sheet__toolbar-btn sheet__toolbar-btn--active"
+                  : "sheet__toolbar-btn"
+              }
+              title={t.sheet.toolbarGridlines}
+              disabled={readOnlyReason !== null}
+              onClick={() => updateSheetSettings({ gridlines: !gridlines })}
+            >
+              {t.sheet.toolbarGridlines}
+            </button>
+            <button
+              type="button"
+              className="sheet__toolbar-btn"
+              title={t.sheet.toolbarFreeze}
+              disabled={readOnlyReason !== null || !selectionRect}
+              onClick={freezeAtSelection}
+            >
+              {t.sheet.toolbarFreeze}
+            </button>
+            <button
+              type="button"
+              className="sheet__toolbar-btn"
+              title={t.sheet.toolbarUnfreeze}
+              disabled={readOnlyReason !== null || (freezeRows === 0 && freezeCols === 0)}
+              onClick={clearFreeze}
+            >
+              {t.sheet.toolbarUnfreeze}
+            </button>
+          </div>
           {hasRangeSelection && selectionRect && (
             <span className="sheet__toolbar-range muted small">
               {colLabel(selectionRect.c0)}
@@ -1185,6 +1751,59 @@ export function SheetView({
               {selectionRect.r1 + 1}
             </span>
           )}
+        </div>
+      )}
+
+      {activeSheet && searchOpen && (
+        <div className="sheet__search-bar">
+          <input
+            ref={searchInputRef}
+            type="text"
+            className="sheet__search-input"
+            placeholder={t.sheet.searchPlaceholder}
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                gotoSearchMatch(searchIndex + (event.shiftKey ? -1 : 1));
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                setSearchOpen(false);
+              }
+            }}
+          />
+          <span className="sheet__search-count muted small">
+            {searchMatches.length > 0
+              ? t.sheet.searchCount(searchIndex + 1, searchMatches.length)
+              : t.sheet.searchNoMatch}
+          </span>
+          <button
+            type="button"
+            className="button--icon"
+            title={t.sheet.searchPrev}
+            disabled={searchMatches.length === 0}
+            onClick={() => gotoSearchMatch(searchIndex - 1)}
+          >
+            ▲
+          </button>
+          <button
+            type="button"
+            className="button--icon"
+            title={t.sheet.searchNext}
+            disabled={searchMatches.length === 0}
+            onClick={() => gotoSearchMatch(searchIndex + 1)}
+          >
+            ▼
+          </button>
+          <button
+            type="button"
+            className="button--icon"
+            title={t.common.close}
+            onClick={() => setSearchOpen(false)}
+          >
+            ×
+          </button>
         </div>
       )}
 
@@ -1200,7 +1819,11 @@ export function SheetView({
         </div>
       ) : activeSheet ? (
         <div className="sheet__table-wrap card">
-          <table className="sheet__table">
+          <table
+            className={
+              gridlines ? "sheet__table" : "sheet__table sheet__table--no-gridlines"
+            }
+          >
             <thead>
               <tr>
                 <th className="sheet__corner" />
@@ -1235,6 +1858,11 @@ export function SheetView({
                   </th>
                   {colIndexes.map((c) => {
                     const key = keyOf(r, c);
+                    // 結合範囲内で左上以外のセルは td を描画しない
+                    // (左上セルの colSpan/rowSpan がその領域を覆う)。
+                    const merge = mergeCovered.get(key);
+                    if (merge && (merge.row !== r || merge.col !== c)) return null;
+
                     const cell = cellsByKey.get(key);
                     const value = cell?.value ?? "";
                     const isFocusCell =
@@ -1248,6 +1876,23 @@ export function SheetView({
                     const isEditingThis = editing?.row === r && editing?.col === c;
                     const isConflict = conflictHighlight.has(key);
                     const numeric = !isEditingThis && NUMERIC_RE.test(value);
+                    const peersHere = presenceByCell.get(key);
+                    const isSearchMatch = searchOpen && searchMatchKeys.has(key);
+                    const isCurrentSearchMatch = searchOpen && currentSearchKey === key;
+                    const isFrozenRow = r < freezeRows;
+                    const isFrozenCol = c < freezeCols;
+                    const cellStyle: CSSProperties = {
+                      ...boxStyle(cell?.format, colWidths.get(c)),
+                    };
+                    if (isFrozenRow || isFrozenCol) {
+                      cellStyle.position = "sticky";
+                      if (isFrozenRow) cellStyle.top = rowTopOffsets[r];
+                      if (isFrozenCol) cellStyle.left = colLeftOffsets[c];
+                    }
+                    if (peersHere && peersHere.length > 0) {
+                      (cellStyle as Record<string, string>)["--presence-color"] =
+                        presenceColor(peersHere[0].name);
+                    }
                     return (
                       <td
                         key={c}
@@ -1256,22 +1901,29 @@ export function SheetView({
                           else cellRefs.current.delete(key);
                         }}
                         tabIndex={0}
-                        style={boxStyle(cell?.format, colWidths.get(c))}
+                        rowSpan={merge?.row_span}
+                        colSpan={merge?.col_span}
+                        style={cellStyle}
                         className={[
                           "sheet__cell",
                           isFocusCell && "sheet__cell--selected",
                           inRange && !isFocusCell && "sheet__cell--in-range",
                           numeric && "sheet__cell--numeric",
                           isConflict && "sheet__cell--conflict",
+                          (isFrozenRow || isFrozenCol) && "sheet__cell--frozen",
+                          peersHere && peersHere.length > 0 && "sheet__cell--presence",
+                          isSearchMatch && "sheet__cell--search-match",
+                          isCurrentSearchMatch && "sheet__cell--search-current",
                         ]
                           .filter(Boolean)
                           .join(" ")}
                         onMouseDown={(event) => handleCellMouseDown(event, r, c)}
                         onMouseEnter={() => handleCellMouseEnter(r, c)}
-                        onDoubleClick={() => startEdit(r, c, value)}
+                        onDoubleClick={() => startEdit(r, c, null)}
                         onKeyDown={(event) => handleGridKeyDown(event, r, c)}
                         onCopy={(event) => handleGridCopy(event, r, c)}
                         onPaste={(event) => handleGridPaste(event, r, c)}
+                        onContextMenu={(event) => openCellMenu(event, r, c)}
                       >
                         {isEditingThis ? (
                           <input
@@ -1299,6 +1951,11 @@ export function SheetView({
                             {value}
                           </span>
                         )}
+                        {peersHere && peersHere.length > 0 && (
+                          <span className="sheet__presence-badge">
+                            {peersHere.map((peer) => peer.name).join(", ")}
+                          </span>
+                        )}
                       </td>
                     );
                   })}
@@ -1308,6 +1965,15 @@ export function SheetView({
           </table>
         </div>
       ) : null}
+
+      {cellMenu && activeSheetId && (
+        <ContextMenu
+          x={cellMenu.x}
+          y={cellMenu.y}
+          onClose={() => setCellMenu(null)}
+          items={buildCellMenuItems(cellMenu)}
+        />
+      )}
     </div>
   );
 }

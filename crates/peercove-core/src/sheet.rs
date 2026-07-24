@@ -61,6 +61,18 @@ pub const MIN_ROW_HEIGHT: u16 = 16;
 /// 行高の上限(px)。
 pub const MAX_ROW_HEIGHT: u16 = 400;
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
 /// セル書式(すべて省略可 = 既定、ADR-0055 決定 6)。`is_default()` が
 /// 真の間はワイヤ上でも省略される(既存セル・旧クライアントとの互換)。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +141,51 @@ pub struct SheetMeta {
     /// 受信者視点: 改名・削除できるか(作成者 + ホスト、ADR-0054 決定 5)。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub can_manage: bool,
+    /// 目盛線の表示(既定 true、ADR-0055 決定 6)。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub gridlines: bool,
+    /// ウインドウ枠を固定する先頭行数(既定 0 = 固定なし、ADR-0055 決定 6)。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub freeze_rows: u32,
+    /// ウインドウ枠を固定する先頭列数(既定 0 = 固定なし)。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub freeze_cols: u32,
+}
+
+/// セル結合の 1 件(左上セル座標 + 縦横スパン、ADR-0055 決定 6)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheetMerge {
+    pub row: u32,
+    pub col: u32,
+    pub row_span: u32,
+    pub col_span: u32,
+}
+
+impl SheetMerge {
+    /// この結合が (row, col) を含むか。
+    pub fn contains(&self, row: u32, col: u32) -> bool {
+        row >= self.row
+            && row < self.row + self.row_span
+            && col >= self.col
+            && col < self.col + self.col_span
+    }
+
+    /// 2 つの結合が(セル単位で)重なるか。
+    pub fn overlaps(&self, other: &SheetMerge) -> bool {
+        self.row < other.row + other.row_span
+            && other.row < self.row + self.row_span
+            && self.col < other.col + other.col_span
+            && other.col < self.col + self.col_span
+    }
+}
+
+/// プレゼンス 1 名分(選択セルの共有、ADR-0055 決定 6)。**DB には保存しない**
+/// (揮発情報、TTL 10 秒)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheetPresencePeer {
+    pub name: String,
+    pub row: u32,
+    pub col: u32,
 }
 
 /// 1 セル分(疎な格納。非空セルだけが存在する。値が空でも書式が既定でなければ
@@ -205,6 +262,34 @@ pub enum SheetOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         height: Option<u16>,
     },
+    /// セル結合(誰でも可、ADR-0055 決定 6)。左上以外のセルの値・書式は
+    /// 削除される。応答は [`SheetReply::Done`]。
+    Merge { sheet_id: String, merge: SheetMerge },
+    /// セル結合の解除(結合範囲内の任意セルの座標で指定できる)。
+    /// 応答は [`SheetReply::Done`]。
+    Unmerge {
+        sheet_id: String,
+        row: u32,
+        col: u32,
+    },
+    /// シート設定(目盛線・固定枠、誰でも可、ADR-0055 決定 6)。
+    /// 応答は [`SheetReply::Sheet`](更新後のメタ)。
+    SetSheetSettings {
+        sheet_id: String,
+        #[serde(default = "default_true")]
+        gridlines: bool,
+        #[serde(default)]
+        freeze_rows: u32,
+        #[serde(default)]
+        freeze_cols: u32,
+    },
+    /// 選択セルのプレゼンス共有(揮発、DB 保存なし、ADR-0055 決定 6)。
+    /// 応答は [`SheetReply::Done`]。
+    Presence {
+        sheet_id: String,
+        row: u32,
+        col: u32,
+    },
 }
 
 /// [`SheetOp`] への応答。
@@ -228,6 +313,12 @@ pub enum SheetReply {
         /// 行高(既定でない行のみ)。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         row_heights: Vec<(u32, u16)>,
+        /// セル結合(ADR-0055 決定 6)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merges: Vec<SheetMerge>,
+        /// 在席メンバー(自分以外、TTL 10 秒の揮発情報。ADR-0055 決定 6)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        presence: Vec<SheetPresencePeer>,
         /// (メンバーのみ)ホスト未接続のキャッシュ応答 = 読み取り専用。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         offline: bool,
@@ -267,6 +358,17 @@ pub enum SheetEventMsg {
         sheet_id: String,
         col_widths: Vec<(u32, u16)>,
         row_heights: Vec<(u32, u16)>,
+    },
+    /// セル結合の変更(全量、ADR-0055 決定 6)。
+    Merges {
+        sheet_id: String,
+        merges: Vec<SheetMerge>,
+    },
+    /// プレゼンス(在席セルの共有、揮発。**DB には保存しない**、
+    /// ADR-0055 決定 6)。
+    Presence {
+        sheet_id: String,
+        peers: Vec<SheetPresencePeer>,
     },
 }
 
@@ -376,6 +478,45 @@ mod tests {
         assert_eq!(json, r#"{"op":"set_row_height","sheet_id":"s1","row":3}"#);
         assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
 
+        let op = SheetOp::Merge {
+            sheet_id: "s1".to_string(),
+            merge: SheetMerge {
+                row: 0,
+                col: 0,
+                row_span: 2,
+                col_span: 2,
+            },
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
+
+        let op = SheetOp::Unmerge {
+            sheet_id: "s1".to_string(),
+            row: 0,
+            col: 0,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"op":"unmerge","sheet_id":"s1","row":0,"col":0}"#);
+        assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
+
+        let op = SheetOp::SetSheetSettings {
+            sheet_id: "s1".to_string(),
+            gridlines: false,
+            freeze_rows: 1,
+            freeze_cols: 2,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
+
+        let op = SheetOp::Presence {
+            sheet_id: "s1".to_string(),
+            row: 4,
+            col: 5,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"op":"presence","sheet_id":"s1","row":4,"col":5}"#);
+        assert_eq!(serde_json::from_str::<SheetOp>(&json).unwrap(), op);
+
         let sheet = SheetMeta {
             id: "s1".to_string(),
             name: "在庫表".to_string(),
@@ -384,7 +525,32 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             can_manage: true,
+            gridlines: true,
+            freeze_rows: 0,
+            freeze_cols: 0,
         };
+        // 目盛線既定 true・固定枠既定 0 はワイヤ上省略される(旧クライアント互換)
+        let json = serde_json::to_string(&sheet).unwrap();
+        assert!(!json.contains("gridlines"));
+        assert!(!json.contains("freeze_rows"));
+        assert!(!json.contains("freeze_cols"));
+        assert_eq!(serde_json::from_str::<SheetMeta>(&json).unwrap(), sheet);
+
+        let sheet_with_settings = SheetMeta {
+            gridlines: false,
+            freeze_rows: 2,
+            freeze_cols: 1,
+            ..sheet.clone()
+        };
+        let json = serde_json::to_string(&sheet_with_settings).unwrap();
+        assert!(json.contains(r#""gridlines":false"#));
+        assert!(json.contains(r#""freeze_rows":2"#));
+        assert!(json.contains(r#""freeze_cols":1"#));
+        assert_eq!(
+            serde_json::from_str::<SheetMeta>(&json).unwrap(),
+            sheet_with_settings
+        );
+
         let reply = SheetReply::Sheet {
             sheet: sheet.clone(),
         };
@@ -435,12 +601,37 @@ mod tests {
             cells: vec![cell.clone()],
             col_widths: vec![(0, 150)],
             row_heights: Vec::new(),
+            merges: Vec::new(),
+            presence: Vec::new(),
             offline: true,
         };
         let json = serde_json::to_string(&reply).unwrap();
         assert!(json.contains(r#""offline":true"#));
         assert!(json.contains(r#""col_widths":[[0,150]]"#));
         assert!(!json.contains("row_heights"));
+        assert!(!json.contains("merges"));
+        assert!(!json.contains("presence"));
+        assert_eq!(serde_json::from_str::<SheetReply>(&json).unwrap(), reply);
+
+        let reply = SheetReply::CellsData {
+            sheet_id: "s1".to_string(),
+            cells: vec![cell.clone()],
+            col_widths: Vec::new(),
+            row_heights: Vec::new(),
+            merges: vec![SheetMerge {
+                row: 0,
+                col: 0,
+                row_span: 2,
+                col_span: 3,
+            }],
+            presence: vec![SheetPresencePeer {
+                name: "アリス".to_string(),
+                row: 1,
+                col: 1,
+            }],
+            offline: false,
+        };
+        let json = serde_json::to_string(&reply).unwrap();
         assert_eq!(serde_json::from_str::<SheetReply>(&json).unwrap(), reply);
 
         let msg = SheetEventMsg::SheetChanged { sheet };
@@ -468,6 +659,64 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<SheetEventMsg>(&json).unwrap(), msg);
+
+        let msg = SheetEventMsg::Merges {
+            sheet_id: "s1".to_string(),
+            merges: vec![SheetMerge {
+                row: 0,
+                col: 0,
+                row_span: 2,
+                col_span: 2,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<SheetEventMsg>(&json).unwrap(), msg);
+
+        let msg = SheetEventMsg::Presence {
+            sheet_id: "s1".to_string(),
+            peers: vec![SheetPresencePeer {
+                name: "ボブ".to_string(),
+                row: 2,
+                col: 3,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"presence","sheet_id":"s1","peers":[{"name":"ボブ","row":2,"col":3}]}"#
+        );
+        assert_eq!(serde_json::from_str::<SheetEventMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn sheet_merge_contains_and_overlaps() {
+        let m = SheetMerge {
+            row: 2,
+            col: 3,
+            row_span: 2,
+            col_span: 3,
+        };
+        assert!(m.contains(2, 3));
+        assert!(m.contains(3, 5));
+        assert!(!m.contains(4, 3));
+        assert!(!m.contains(2, 6));
+
+        let overlapping = SheetMerge {
+            row: 3,
+            col: 4,
+            row_span: 1,
+            col_span: 1,
+        };
+        assert!(m.overlaps(&overlapping));
+        assert!(overlapping.overlaps(&m));
+
+        let disjoint = SheetMerge {
+            row: 4,
+            col: 3,
+            row_span: 1,
+            col_span: 3,
+        };
+        assert!(!m.overlaps(&disjoint));
     }
 
     #[test]

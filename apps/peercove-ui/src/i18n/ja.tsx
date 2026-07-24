@@ -1260,5 +1260,29 @@ export const ja = {
     toolbarBorderGrid: "格子",
     toolbarBorderNone: "枠なし",
     resetToDefault: "既定のサイズに戻す(ダブルクリック)",
+    // セル結合(M6 H-5、ADR-0055 決定 6)
+    toolbarMerge: "結合",
+    toolbarUnmerge: "解除",
+    mergeConfirmDataLoss:
+      "結合すると左上以外のセルの内容が失われます。よろしいですか?",
+    // シート設定: 目盛線・固定枠(M6 H-5、ADR-0055 決定 6)
+    toolbarGridlines: "目盛線",
+    toolbarFreeze: "選択セルより上・左を固定",
+    toolbarUnfreeze: "固定を解除",
+    // 独自右クリックメニュー(M6 H-5、ADR-0055 決定 6)
+    ctxCopy: "コピー",
+    ctxPaste: "貼り付け",
+    ctxClear: "クリア",
+    ctxMerge: "結合",
+    ctxUnmerge: "結合を解除",
+    ctxResetColWidth: "列幅を既定に戻す",
+    ctxResetRowHeight: "行高を既定に戻す",
+    clipboardReadUnavailable: "クリップボードを読み取れません。Ctrl+V を使ってください",
+    // シート内検索(Ctrl+F、M6 H-5、ADR-0055 決定 6)
+    searchPlaceholder: "シート内を検索",
+    searchCount: (current: number, total: number) => `${current} / ${total}`,
+    searchNoMatch: "一致なし",
+    searchPrev: "前へ",
+    searchNext: "次へ",
   },
 };

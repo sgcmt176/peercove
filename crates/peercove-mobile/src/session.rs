@@ -1266,13 +1266,15 @@ impl SessionShared {
                         cells,
                         col_widths,
                         row_heights,
+                        merges,
                         ..
                     },
             } => {
                 let result = (|| -> anyhow::Result<()> {
                     let mut cache = self.open_memo_cache()?;
                     cache.sheet_cells_replace_all(&sheet_id, &cells)?;
-                    cache.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)
+                    cache.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights)?;
+                    cache.sheet_merges_replace_all(&sheet_id, &merges)
                 })();
                 if let Err(e) = result {
                     tracing::warn!("共有シートのセル同期に失敗しました: {e:#}");
@@ -1310,6 +1312,13 @@ impl SessionShared {
                         col_widths,
                         row_heights,
                     } => cache.sheet_layout_replace_all(&sheet_id, &col_widths, &row_heights),
+                    // M6 H-5(ADR-0055 決定 6)。結合はキャッシュへ最小追随
+                    // (表示は H-6)。プレゼンスは揮発情報で DB を持たないため
+                    // Android 側の表示配線も H-6 に送る(現状は無視するだけ)。
+                    SheetEventMsg::Merges { sheet_id, merges } => {
+                        cache.sheet_merges_replace_all(&sheet_id, &merges)
+                    }
+                    SheetEventMsg::Presence { .. } => Ok(()),
                 },
             }
         })();

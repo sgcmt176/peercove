@@ -629,6 +629,8 @@ pub async fn supervise(
                         // リビジョン変化を検知したときだけ DB を開くので、
                         // 毎周期呼んでも軽い
                         service.watch_groups();
+                        // シートのプレゼンス失効掃除(TTL 10 秒、ADR-0055 決定 6)
+                        service.sweep_sheet_presence();
                     }
                     // 受信サイズ上限(ADR-0015)を設定に追随させる(両ロール)
                     if let Some(config) = &config {
