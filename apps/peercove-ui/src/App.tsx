@@ -20,6 +20,7 @@ import {
   notifyFileEvents,
   notifyQualityEvents,
   notifyMemberEvents,
+  notifyReminderEvents,
 } from "./notify";
 import { clearChat, syncChat, totalUnread } from "./chat";
 import { clearHistory, recordStatus } from "./history";
@@ -135,6 +136,9 @@ export default function App() {
       );
       setConnection({ kind: "ok", status });
       recordStatus(status); // スパークライン用の時系列(M3-6)
+      // メモのリマインダー(端末ローカル、ネットワーク非依存。M5 F-5 Stage 5)。
+      // 内部で 30 秒に抑制される
+      void notifyReminderEvents();
       // ネットワークごとに前回の台帳と比べて参加・切断を通知する
       const seen = new Set<string>();
       for (const tunnel of status.tunnels) {

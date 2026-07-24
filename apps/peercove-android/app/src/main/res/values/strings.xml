@@ -217,6 +217,9 @@
 
     <!-- チャット通知(E-E 2) -->
     <string name="notif_chat_channel">チャット</string>
+    <!-- リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6) -->
+    <string name="notif_reminder_channel">メモのリマインダー</string>
+    <string name="notif_reminder_title">⏰ メモのリマインダー: %1$s</string>
     <string name="notif_reply">返信</string>
     <string name="notif_mark_read">既読にする</string>
     <string name="notif_chat_hidden">新着メッセージがあります</string>
@@ -307,6 +310,14 @@
     <!-- メモ間リンク・バックリンク(M5 F-5 Stage 2、ADR-0052 決定 2) -->
     <string name="memo_wikilink_missing">リンク先のメモが見つかりません</string>
     <string name="memo_backlinks_title">バックリンク (%1$d)</string>
+
+    <!-- リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)。
+         個人メモ・共有メモの両方のメニューから使う -->
+    <string name="memo_reminder">リマインダーを設定</string>
+    <string name="memo_reminder_set_at">⏰ リマインダー: %1$s</string>
+    <string name="memo_reminder_clear">リマインダーを解除</string>
+    <string name="memo_reminder_saved">リマインダーを設定しました</string>
+    <string name="memo_reminder_cleared">リマインダーを解除しました</string>
 
     <!-- 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは現在「メモ」
          のみ。今後スケジュール・表を足す際はここへキーを追加するだけでよい -->

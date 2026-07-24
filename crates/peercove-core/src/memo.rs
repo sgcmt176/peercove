@@ -215,6 +215,55 @@ pub enum MemoOp {
     FolderRename { id: String, name: String },
     /// フォルダー削除(中のメモは「フォルダーなし」へ移動する)。
     FolderDelete { id: String },
+    /// リマインダーの設定(端末ローカル、ADR-0052 決定 6)。共有メモに対する
+    /// 「自分用リマインダー」も個人 DB のこのテーブルで管理する(他人には
+    /// 見えない)。同じ対象への再設定は上書き。過去の日時は拒否される。
+    /// 応答は [`MemoReply::Done`]。
+    ReminderSet {
+        scope: ReminderScope,
+        /// 共有メモのときの設定識別子(デスクトップは設定ファイルパス、
+        /// Android はネットワーク slug)。個人メモは空文字。
+        #[serde(default)]
+        network: String,
+        memo_id: String,
+        /// 発火時刻(UNIX ミリ秒)。
+        remind_at: u64,
+    },
+    /// リマインダーの解除。無くても失敗にしない(応答は Done)。
+    ReminderClear {
+        scope: ReminderScope,
+        #[serde(default)]
+        network: String,
+        memo_id: String,
+    },
+    /// 未発火のリマインダー一覧(この端末のすべて。個人・共有の別を問わず)。
+    /// 応答は [`MemoReply::Reminders`]。
+    ReminderList,
+    /// 発火時刻を過ぎたリマインダーを取り出す(呼ぶと fired 済みになり、
+    /// 以後 [`MemoOp::ReminderList`] には出なくなる)。デスクトップ UI の
+    /// 周期確認、Android の再起動後の通知処理から使う。応答は
+    /// [`MemoReply::Reminders`]。
+    ReminderTakeDue,
+}
+
+/// リマインダー対象のメモの種別(ADR-0052 決定 6)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReminderScope {
+    Personal,
+    Shared,
+}
+
+/// メモのリマインダー 1 件(ADR-0052 決定 6、端末ローカル)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoReminder {
+    pub scope: ReminderScope,
+    /// 共有メモのときだけ意味を持つ設定識別子(個人メモは空文字)。
+    #[serde(default)]
+    pub network: String,
+    pub memo_id: String,
+    /// 発火時刻(UNIX ミリ秒)。
+    pub remind_at: u64,
 }
 
 /// [`MemoOp`] への応答。
@@ -233,6 +282,8 @@ pub enum MemoReply {
     Titles { map: HashMap<String, String> },
     /// FolderCreate への応答。
     Folder { folder: MemoFolder },
+    /// ReminderList / ReminderTakeDue への応答。
+    Reminders { reminders: Vec<MemoReminder> },
     /// 副作用のみの操作への応答。
     Done,
 }
@@ -919,5 +970,70 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(json, r#"{"op":"backlinks","id":"s1"}"#);
         assert_eq!(serde_json::from_str::<SharedMemoOp>(&json).unwrap(), op);
+    }
+
+    /// リマインダー(ADR-0052 決定 6)のワイヤ表現。
+    #[test]
+    fn reminder_ops_wire_format() {
+        let op = MemoOp::ReminderSet {
+            scope: ReminderScope::Personal,
+            network: String::new(),
+            memo_id: "m1".to_string(),
+            remind_at: 1_000,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"reminder_set","scope":"personal","network":"","memo_id":"m1","remind_at":1000}"#
+        );
+        assert_eq!(serde_json::from_str::<MemoOp>(&json).unwrap(), op);
+
+        let op = MemoOp::ReminderSet {
+            scope: ReminderScope::Shared,
+            network: "net.toml".to_string(),
+            memo_id: "s1".to_string(),
+            remind_at: 2_000,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"reminder_set","scope":"shared","network":"net.toml","memo_id":"s1","remind_at":2000}"#
+        );
+        assert_eq!(serde_json::from_str::<MemoOp>(&json).unwrap(), op);
+
+        // network 省略でも読める(個人メモの既定)
+        let parsed: MemoOp =
+            serde_json::from_str(r#"{"op":"reminder_clear","scope":"personal","memo_id":"m1"}"#)
+                .unwrap();
+        assert_eq!(
+            parsed,
+            MemoOp::ReminderClear {
+                scope: ReminderScope::Personal,
+                network: String::new(),
+                memo_id: "m1".to_string(),
+            }
+        );
+
+        let op = MemoOp::ReminderList;
+        assert_eq!(
+            serde_json::to_string(&op).unwrap(),
+            r#"{"op":"reminder_list"}"#
+        );
+        let op = MemoOp::ReminderTakeDue;
+        assert_eq!(
+            serde_json::to_string(&op).unwrap(),
+            r#"{"op":"reminder_take_due"}"#
+        );
+
+        let reply = MemoReply::Reminders {
+            reminders: vec![MemoReminder {
+                scope: ReminderScope::Shared,
+                network: "net.toml".to_string(),
+                memo_id: "s1".to_string(),
+                remind_at: 2_000,
+            }],
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<MemoReply>(&json).unwrap(), reply);
     }
 }

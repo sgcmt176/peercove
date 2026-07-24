@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use peercove_core::memo::{
-    MemoDetail, MemoFolder, MemoOp, MemoPatch, MemoQuery, MemoReply, MemoScope, MemoSort,
-    MemoSummary,
+    MemoDetail, MemoFolder, MemoOp, MemoPatch, MemoQuery, MemoReminder, MemoReply, MemoScope,
+    MemoSort, MemoSummary, ReminderScope,
 };
 use peercove_memo::MemoStore;
 
@@ -368,6 +368,116 @@ pub fn memo_folder_delete(base_dir: String, id: String) -> Result<(), MobileErro
 #[uniffi::export]
 pub fn memo_export_name(title: String) -> String {
     peercove_core::memo::sanitize_filename(&title)
+}
+
+// ---- リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6) --------
+//
+// 個人・共有どちらのメモに対するリマインダーも、この端末の個人メモ DB
+// (memos.db)で管理する(他人には見えない)。発火は AlarmManager が担い、
+// 発火時に `memo_reminder_take_due` を呼んで fired へ遷移させたうえで
+// 通知を組み立てる(Kotlin 側、`ReminderReceiver`)。
+
+#[derive(uniffi::Enum, Clone, Copy)]
+pub enum ReminderScopeArg {
+    Personal,
+    Shared,
+}
+
+impl From<ReminderScopeArg> for ReminderScope {
+    fn from(scope: ReminderScopeArg) -> Self {
+        match scope {
+            ReminderScopeArg::Personal => ReminderScope::Personal,
+            ReminderScopeArg::Shared => ReminderScope::Shared,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct MemoReminderInfo {
+    pub scope: ReminderScopeArg,
+    /// 共有メモのときだけ意味を持つネットワーク slug(個人メモは空文字)。
+    pub network: String,
+    pub memo_id: String,
+    /// 発火時刻(UNIX ミリ秒)。
+    pub remind_at: u64,
+}
+
+impl From<MemoReminder> for MemoReminderInfo {
+    fn from(reminder: MemoReminder) -> Self {
+        Self {
+            scope: match reminder.scope {
+                ReminderScope::Personal => ReminderScopeArg::Personal,
+                ReminderScope::Shared => ReminderScopeArg::Shared,
+            },
+            network: reminder.network,
+            memo_id: reminder.memo_id,
+            remind_at: reminder.remind_at,
+        }
+    }
+}
+
+fn expect_reminders(reply: MemoReply) -> Result<Vec<MemoReminderInfo>, MobileError> {
+    match reply {
+        MemoReply::Reminders { reminders } => Ok(reminders.into_iter().map(Into::into).collect()),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// リマインダーの設定(過去日時は拒否。既存があれば上書き)。
+#[uniffi::export]
+pub fn memo_reminder_set(
+    base_dir: String,
+    scope: ReminderScopeArg,
+    network: String,
+    memo_id: String,
+    remind_at: u64,
+) -> Result<(), MobileError> {
+    apply(
+        &base_dir,
+        MemoOp::ReminderSet {
+            scope: scope.into(),
+            network,
+            memo_id,
+            remind_at,
+        },
+    )
+    .map(|_| ())
+}
+
+/// リマインダーの解除。無くても失敗しない。
+#[uniffi::export]
+pub fn memo_reminder_clear(
+    base_dir: String,
+    scope: ReminderScopeArg,
+    network: String,
+    memo_id: String,
+) -> Result<(), MobileError> {
+    apply(
+        &base_dir,
+        MemoOp::ReminderClear {
+            scope: scope.into(),
+            network,
+            memo_id,
+        },
+    )
+    .map(|_| ())
+}
+
+/// 未発火のリマインダー一覧(この端末のすべて)。再起動後の
+/// AlarmManager 再登録(BOOT_COMPLETED)にも使う。
+#[uniffi::export]
+pub fn memo_reminder_list(base_dir: String) -> Result<Vec<MemoReminderInfo>, MobileError> {
+    expect_reminders(apply(&base_dir, MemoOp::ReminderList)?)
+}
+
+/// 発火時刻を過ぎたリマインダーを取り出す(呼ぶと fired 済みになる)。
+/// `ReminderReceiver`(AlarmManager の発火)から呼び、返ってきた分だけ
+/// 通知を組み立てる。
+#[uniffi::export]
+pub fn memo_reminder_take_due(base_dir: String) -> Result<Vec<MemoReminderInfo>, MobileError> {
+    expect_reminders(apply(&base_dir, MemoOp::ReminderTakeDue)?)
 }
 
 // ---- 共有メモ(M5 F-2、ADR-0049)-------------------------------------------
@@ -885,6 +995,45 @@ mod tests {
         memo_trash(base.clone(), memo.id.clone()).unwrap();
         memo_delete_forever(base.clone(), memo.id).unwrap();
         assert_eq!(memo_export_name("a/b".to_string()), "a_b");
+    }
+
+    /// リマインダー(ADR-0052 決定 6)の UniFFI 層の疎通。
+    #[test]
+    fn reminder_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().into_owned();
+        let memo = memo_create(base.clone(), "会議".to_string(), "".to_string(), None).unwrap();
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+
+        memo_reminder_set(
+            base.clone(),
+            ReminderScopeArg::Personal,
+            String::new(),
+            memo.id.clone(),
+            future,
+        )
+        .unwrap();
+        let list = memo_reminder_list(base.clone()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].memo_id, memo.id);
+
+        assert!(
+            memo_reminder_take_due(base.clone()).unwrap().is_empty(),
+            "まだ発火時刻前"
+        );
+
+        memo_reminder_clear(
+            base.clone(),
+            ReminderScopeArg::Personal,
+            String::new(),
+            memo.id,
+        )
+        .unwrap();
+        assert!(memo_reminder_list(base).unwrap().is_empty());
     }
 
     /// 履歴・差分の wire → UniFFI Record 変換(M5 F-3)。ネットワークは使わない。

@@ -18,14 +18,15 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use peercove_core::memo::{
     checklist_progress, excerpt, DiffLine, DiffLineKind, MemoDetail, MemoFolder, MemoOp, MemoPatch,
-    MemoQuery, MemoReply, MemoScope, MemoSort, MemoSummary, MemoTagCount, EXCERPT_CHARS,
-    MAX_BODY_BYTES, MAX_TITLE_CHARS, TRASH_RETENTION_DAYS,
+    MemoQuery, MemoReminder, MemoReply, MemoScope, MemoSort, MemoSummary, MemoTagCount,
+    ReminderScope, EXCERPT_CHARS, MAX_BODY_BYTES, MAX_TITLE_CHARS, TRASH_RETENTION_DAYS,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// スキーマ世代。互換性のない変更で上げ、`migrate` に移行を足す。
 /// - 2: FTS をかな折り畳み済みテキストの通常表に変更(ひらがな/カタカナ同一視)
-const SCHEMA_VERSION: i64 = 2;
+/// - 3: `reminders` テーブル追加(端末ローカルのリマインダー、ADR-0052 決定 6)
+const SCHEMA_VERSION: i64 = 3;
 
 /// 1 メモのタグ数の上限(異常な肥大を防ぐだけの緩い値)。
 const MAX_TAGS_PER_MEMO: usize = 30;
@@ -129,6 +130,24 @@ impl MemoStore {
                 "#,
             )?;
         }
+        if version < 3 {
+            // v3: リマインダー(端末ローカル、ADR-0052 決定 6)。共有メモに
+            // 対する「自分用リマインダー」もここへ入れる(network が識別子)。
+            // 個人メモへの外部キーは張らない(共有メモの行は memos に無いため。
+            // 個人メモの完全削除は呼び出し側で対の delete を行う)
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS reminders (
+                    scope TEXT NOT NULL,
+                    network TEXT NOT NULL DEFAULT '',
+                    memo_id TEXT NOT NULL,
+                    remind_at INTEGER NOT NULL,
+                    fired INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (scope, network, memo_id)
+                );
+                "#,
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -196,11 +215,23 @@ impl MemoStore {
                 if changed == 0 {
                     bail!("ゴミ箱にこのメモはありません(完全削除はゴミ箱からのみ)");
                 }
+                // 個人メモのリマインダーも連動削除(ADR-0052 決定 6。共有メモは
+                // 削除をローカルで知れないため、こちらの対象外)
+                self.conn.execute(
+                    "DELETE FROM reminders WHERE scope = 'personal' AND network = '' AND memo_id = ?1",
+                    params![id],
+                )?;
                 Ok(MemoReply::Done)
             }
             MemoOp::EmptyTrash => {
-                self.conn
-                    .execute("DELETE FROM memos WHERE deleted_at IS NOT NULL", [])?;
+                let tx = self.conn.transaction()?;
+                tx.execute(
+                    "DELETE FROM reminders WHERE scope = 'personal' AND network = ''
+                     AND memo_id IN (SELECT id FROM memos WHERE deleted_at IS NOT NULL)",
+                    [],
+                )?;
+                tx.execute("DELETE FROM memos WHERE deleted_at IS NOT NULL", [])?;
+                tx.commit()?;
                 Ok(MemoReply::Done)
             }
             MemoOp::FolderCreate { name } => self.folder_create(&name),
@@ -229,7 +260,121 @@ impl MemoStore {
                 tx.commit()?;
                 Ok(MemoReply::Done)
             }
+            MemoOp::ReminderSet {
+                scope,
+                network,
+                memo_id,
+                remind_at,
+            } => {
+                self.reminder_set(scope, &network, &memo_id, remind_at)?;
+                Ok(MemoReply::Done)
+            }
+            MemoOp::ReminderClear {
+                scope,
+                network,
+                memo_id,
+            } => {
+                self.reminder_clear(scope, &network, &memo_id)?;
+                Ok(MemoReply::Done)
+            }
+            MemoOp::ReminderList => Ok(MemoReply::Reminders {
+                reminders: self.reminders_all()?,
+            }),
+            MemoOp::ReminderTakeDue => Ok(MemoReply::Reminders {
+                reminders: self.reminders_take_due(unix_ms() as u64)?,
+            }),
         }
+    }
+
+    /// リマインダーの設定(ADR-0052 決定 6)。過去の日時は拒否、既存があれば
+    /// 上書き(fired もクリアされる)。
+    pub fn reminder_set(
+        &mut self,
+        scope: ReminderScope,
+        network: &str,
+        memo_id: &str,
+        remind_at_ms: u64,
+    ) -> anyhow::Result<()> {
+        if (remind_at_ms as i64) <= unix_ms() {
+            bail!("過去の日時は指定できません");
+        }
+        self.conn.execute(
+            "INSERT INTO reminders (scope, network, memo_id, remind_at, fired)
+             VALUES (?1, ?2, ?3, ?4, 0)
+             ON CONFLICT(scope, network, memo_id)
+             DO UPDATE SET remind_at = excluded.remind_at, fired = 0",
+            params![
+                reminder_scope_text(scope),
+                network,
+                memo_id,
+                remind_at_ms as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// リマインダーの解除。無くても失敗にしない。
+    pub fn reminder_clear(
+        &mut self,
+        scope: ReminderScope,
+        network: &str,
+        memo_id: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM reminders WHERE scope = ?1 AND network = ?2 AND memo_id = ?3",
+            params![reminder_scope_text(scope), network, memo_id],
+        )?;
+        Ok(())
+    }
+
+    /// 指定した対象の未発火のリマインダー時刻(あれば)。
+    pub fn reminder_for(
+        &self,
+        scope: ReminderScope,
+        network: &str,
+        memo_id: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let value: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT remind_at FROM reminders
+                 WHERE scope = ?1 AND network = ?2 AND memo_id = ?3 AND fired = 0",
+                params![reminder_scope_text(scope), network, memo_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.map(|v| v as u64))
+    }
+
+    /// 未発火のリマインダー全件(発火時刻の早い順)。
+    pub fn reminders_all(&self) -> anyhow::Result<Vec<MemoReminder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope, network, memo_id, remind_at FROM reminders
+             WHERE fired = 0 ORDER BY remind_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_reminder)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 発火時刻(`now_ms`)を過ぎた未発火のリマインダーを取り出し、fired にする。
+    pub fn reminders_take_due(&mut self, now_ms: u64) -> anyhow::Result<Vec<MemoReminder>> {
+        let tx = self.conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT scope, network, memo_id, remind_at FROM reminders
+             WHERE fired = 0 AND remind_at <= ?1 ORDER BY remind_at ASC",
+        )?;
+        let due: Vec<MemoReminder> = stmt
+            .query_map(params![now_ms as i64], row_to_reminder)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        tx.execute(
+            "UPDATE reminders SET fired = 1 WHERE fired = 0 AND remind_at <= ?1",
+            params![now_ms as i64],
+        )?;
+        tx.commit()?;
+        Ok(due)
     }
 
     fn get(&self, id: &str) -> anyhow::Result<MemoDetail> {
@@ -631,6 +776,31 @@ fn row_to_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoDetail> {
         deleted_at: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         tags: Vec::new(),
     })
+}
+
+fn row_to_reminder(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoReminder> {
+    let scope_text: String = row.get(0)?;
+    Ok(MemoReminder {
+        scope: reminder_scope_from_text(&scope_text),
+        network: row.get(1)?,
+        memo_id: row.get(2)?,
+        remind_at: row.get::<_, i64>(3)? as u64,
+    })
+}
+
+fn reminder_scope_text(scope: ReminderScope) -> &'static str {
+    match scope {
+        ReminderScope::Personal => "personal",
+        ReminderScope::Shared => "shared",
+    }
+}
+
+fn reminder_scope_from_text(text: &str) -> ReminderScope {
+    if text == "shared" {
+        ReminderScope::Shared
+    } else {
+        ReminderScope::Personal
+    }
 }
 
 fn ensure_folder_exists(conn: &Connection, folder_id: &str) -> anyhow::Result<()> {
@@ -1435,6 +1605,142 @@ mod tests {
                 (DiffLineKind::Same, "z"),
             ]
         );
+    }
+
+    /// リマインダー(ADR-0052 決定 6): 設定・上書き・解除・過去日時の拒否。
+    #[test]
+    fn reminder_set_overwrites_and_rejects_past() {
+        let (_dir, mut store) = open_temp();
+        let memo = create(&mut store, "買い物", "牛乳");
+        let future = unix_ms() + 60_000;
+
+        store
+            .reminder_set(ReminderScope::Personal, "", &memo.id, future as u64)
+            .unwrap();
+        assert_eq!(
+            store
+                .reminder_for(ReminderScope::Personal, "", &memo.id)
+                .unwrap(),
+            Some(future as u64)
+        );
+
+        // 上書き(再設定)
+        let future2 = future + 1_000;
+        store
+            .reminder_set(ReminderScope::Personal, "", &memo.id, future2 as u64)
+            .unwrap();
+        assert_eq!(
+            store
+                .reminder_for(ReminderScope::Personal, "", &memo.id)
+                .unwrap(),
+            Some(future2 as u64)
+        );
+        assert_eq!(store.reminders_all().unwrap().len(), 1, "1 メモ 1 件のまま");
+
+        // 過去日時は拒否
+        let err = store
+            .reminder_set(ReminderScope::Personal, "", &memo.id, 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("過去の日時"), "{err}");
+
+        // 共有メモの自分用リマインダーは network で区別される(同じ memo_id でも別行)
+        store
+            .reminder_set(ReminderScope::Shared, "net.toml", &memo.id, future as u64)
+            .unwrap();
+        assert_eq!(store.reminders_all().unwrap().len(), 2);
+
+        store
+            .reminder_clear(ReminderScope::Personal, "", &memo.id)
+            .unwrap();
+        assert_eq!(
+            store
+                .reminder_for(ReminderScope::Personal, "", &memo.id)
+                .unwrap(),
+            None
+        );
+        // 解除は無くても失敗しない
+        store
+            .reminder_clear(ReminderScope::Personal, "", &memo.id)
+            .unwrap();
+        assert_eq!(store.reminders_all().unwrap().len(), 1);
+    }
+
+    /// リマインダー: 発火時刻の到来で take_due が拾い、fired 済みは一覧から消える。
+    #[test]
+    fn reminder_take_due_fires_once() {
+        let (_dir, mut store) = open_temp();
+        let memo = create(&mut store, "会議", "資料を送る");
+        let due_at = unix_ms() + 100;
+        store
+            .reminder_set(ReminderScope::Personal, "", &memo.id, due_at as u64)
+            .unwrap();
+
+        // まだ到来していない
+        assert!(store
+            .reminders_take_due(due_at as u64 - 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.reminders_all().unwrap().len(), 1);
+
+        // 到来: 1 度だけ取れる(fired 済みは以後 all にも take_due にも出ない)
+        let due = store.reminders_take_due(due_at as u64).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].memo_id, memo.id);
+        assert!(store.reminders_all().unwrap().is_empty());
+        assert!(store
+            .reminders_take_due(due_at as u64 + 1_000)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 個人メモの完全削除・ゴミ箱を空にするでリマインダーも連動削除される。
+    #[test]
+    fn reminder_cascades_on_permanent_delete() {
+        let (_dir, mut store) = open_temp();
+        let memo = create(&mut store, "捨てる", "x");
+        let future = (unix_ms() + 60_000) as u64;
+        store
+            .reminder_set(ReminderScope::Personal, "", &memo.id, future)
+            .unwrap();
+        store
+            .apply(MemoOp::Trash {
+                id: memo.id.clone(),
+            })
+            .unwrap();
+        store
+            .apply(MemoOp::DeleteForever {
+                id: memo.id.clone(),
+            })
+            .unwrap();
+        assert!(store.reminders_all().unwrap().is_empty());
+
+        // EmptyTrash 経由でも連動削除される
+        let memo2 = create(&mut store, "捨てる2", "y");
+        store
+            .reminder_set(ReminderScope::Personal, "", &memo2.id, future)
+            .unwrap();
+        store.apply(MemoOp::Trash { id: memo2.id }).unwrap();
+        store.apply(MemoOp::EmptyTrash).unwrap();
+        assert!(store.reminders_all().unwrap().is_empty());
+    }
+
+    /// v2(reminders 表が無い)の DB を開くと v3 へ移行され、リマインダーが使える。
+    #[test]
+    fn v2_database_migrates_to_reminders_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memos.db");
+        let memo_id = {
+            let mut store = MemoStore::open(&path).unwrap();
+            let memo = create(&mut store, "移行前", "本文");
+            store.conn.pragma_update(None, "user_version", 2).unwrap();
+            memo.id
+        };
+        let mut store = MemoStore::open(&path).unwrap();
+        let future = (unix_ms() + 60_000) as u64;
+        store
+            .reminder_set(ReminderScope::Personal, "", &memo_id, future)
+            .unwrap();
+        assert_eq!(store.reminders_all().unwrap().len(), 1);
     }
 
     /// 安全弁: 共通の接頭辞・接尾辞を除いた行数の積が閾値を超えると

@@ -3016,6 +3016,18 @@ button.msg__ref:hover {
   align-self: flex-end;
 }
 
+/* リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6) */
+.memo__reminder-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.memo__reminder-label input[type="datetime-local"] {
+  font: inherit;
+}
+
 .memo__mention-suggest {
   position: absolute;
   bottom: 100%;

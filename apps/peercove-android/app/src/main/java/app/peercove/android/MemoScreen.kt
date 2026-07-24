@@ -72,11 +72,13 @@ import java.util.Locale
 import uniffi.peercove_mobile.MemoDetailInfo
 import uniffi.peercove_mobile.MemoFolderInfo
 import uniffi.peercove_mobile.MemoListResult
+import uniffi.peercove_mobile.MemoReminderInfo
 import uniffi.peercove_mobile.MemoScopeArg
 import uniffi.peercove_mobile.MemoSortArg
 import uniffi.peercove_mobile.MemoSummaryInfo
 import uniffi.peercove_mobile.MobileException
 import uniffi.peercove_mobile.NetworkInfo
+import uniffi.peercove_mobile.ReminderScopeArg
 import uniffi.peercove_mobile.listNetworks
 import uniffi.peercove_mobile.memoCreate
 import uniffi.peercove_mobile.memoDeleteForever
@@ -101,7 +103,12 @@ import uniffi.peercove_mobile.sharedMemoCreate
 private val dateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
 
 @Composable
-fun MemoScreen(onBack: () -> Unit, onNotice: (String) -> Unit) {
+fun MemoScreen(
+    onBack: () -> Unit,
+    onNotice: (String) -> Unit,
+    /** リマインダー通知タップから直接開くメモ(M5 F-5 Stage 5、ADR-0052 決定 6)。 */
+    initialMemoId: String? = null,
+) {
     val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
     val scope = rememberCoroutineScope()
@@ -112,7 +119,7 @@ fun MemoScreen(onBack: () -> Unit, onNotice: (String) -> Unit) {
     var folderId by remember { mutableStateOf<String?>(null) }
     var tag by remember { mutableStateOf<String?>(null) }
     var list by remember { mutableStateOf<MemoListResult?>(null) }
-    var editingId by remember { mutableStateOf<String?>(null) }
+    var editingId by remember { mutableStateOf(initialMemoId) }
     var refreshTick by remember { mutableIntStateOf(0) }
     var showFolders by remember { mutableStateOf(false) }
     var confirmEmptyTrash by remember { mutableStateOf(false) }
@@ -629,11 +636,15 @@ private fun MemoEditor(
     // メモ間リンク(ADR-0052 決定 2): タイトル → memo_id(見つかったものだけ)
     var wikiLinks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var backlinks by remember { mutableStateOf<List<MemoSummaryInfo>>(emptyList()) }
+    // リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)
+    var reminder by remember { mutableStateOf<MemoReminderInfo?>(null) }
 
     val exportDone = stringResource(R.string.memo_export_done)
     val exportFailed = stringResource(R.string.memo_export_failed)
     val copiedToShared = stringResource(R.string.memo_copied_to_shared)
     val wikilinkMissing = stringResource(R.string.memo_wikilink_missing)
+    val reminderSavedMsg = stringResource(R.string.memo_reminder_saved)
+    val reminderClearedMsg = stringResource(R.string.memo_reminder_cleared)
     val inTrash = detail?.deletedAt != null
 
     suspend fun refreshBacklinks() {
@@ -661,6 +672,7 @@ private fun MemoEditor(
             return@LaunchedEffect
         }
         refreshBacklinks()
+        reminder = fetchReminder(baseDir, ReminderScopeArg.PERSONAL, "", id)
     }
 
     // メモ間リンクの解決(本文のデバウンス、ADR-0052 決定 2)
@@ -972,6 +984,54 @@ private fun MemoEditor(
                             }
                         },
                     )
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                reminder?.let {
+                                    stringResource(
+                                        R.string.memo_reminder_set_at,
+                                        dateFmt.format(Date(it.remindAt.toLong())),
+                                    )
+                                } ?: stringResource(R.string.memo_reminder),
+                            )
+                        },
+                        onClick = {
+                            menuOpen = false
+                            pickReminderDateTime(
+                                context,
+                                reminder?.remindAt?.toLong() ?: (System.currentTimeMillis() + 3_600_000L),
+                            ) { picked ->
+                                scope.launch {
+                                    try {
+                                        applyReminder(
+                                            context, baseDir, ReminderScopeArg.PERSONAL, "", id, picked,
+                                        )
+                                        reminder = fetchReminder(baseDir, ReminderScopeArg.PERSONAL, "", id)
+                                        onNotice(reminderSavedMsg)
+                                    } catch (e: MobileException) {
+                                        onNotice(e.message ?: "")
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    if (reminder != null) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.memo_reminder_clear)) },
+                            onClick = {
+                                menuOpen = false
+                                scope.launch {
+                                    try {
+                                        clearReminder(context, baseDir, ReminderScopeArg.PERSONAL, "", id)
+                                        reminder = null
+                                        onNotice(reminderClearedMsg)
+                                    } catch (e: MobileException) {
+                                        onNotice(e.message ?: "")
+                                    }
+                                }
+                            },
+                        )
+                    }
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.memo_export)) },
                         onClick = {

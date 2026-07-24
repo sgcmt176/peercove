@@ -8,7 +8,7 @@
 // を frontend から使うと npm 依存が 1 つ増え、許可の問い合わせも要るため。
 
 import { invoke } from "@tauri-apps/api/core";
-import { ChatMessage, Group, Member, Transfer, Tunnel, api } from "./ipc";
+import { ChatMessage, Group, Member, MemoReminder, Transfer, Tunnel, api } from "./ipc";
 import { conversationOf, isMuted, isViewing } from "./chat";
 import { loadPrefs } from "./prefs";
 import { t } from "./i18n";
@@ -326,5 +326,62 @@ export async function notifyCommentEvents(tunnel: Tunnel): Promise<void> {
     }
   } catch {
     // 一覧取得に失敗しても次の周期で再試行する
+  }
+}
+
+// ---- メモのリマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6) ----
+//
+// 個人・共有どちらのリマインダーも個人メモ DB(memos.db)が正本。ネットワーク
+// 非依存なので、他の通知(notifyCommentEvents 等)のようにネットワークごとに
+// 呼ぶ必要はない — App.tsx の status ポーリング(2 秒)から毎回呼んでよいが、
+// ここで 30 秒に抑える(reminder_take_due はサーバー側で fired へ遷移する
+// 副作用があるため、呼びすぎても実害は無いが間隔を空けて負荷を抑える)。
+
+const REMINDER_POLL_MS = 30_000;
+let reminderCheckedAt = 0;
+
+/** タイトルはローカル通知への表示であり、ログではない(ADR-0049)。 */
+async function resolveReminderTitle(reminder: MemoReminder): Promise<string | null> {
+  try {
+    if (reminder.scope === "shared") {
+      const reply = await api.sharedMemoOp(reminder.network ?? "", {
+        op: "get",
+        id: reminder.memo_id,
+      });
+      return reply.kind === "memo" ? reply.memo.title || t.memo.untitled : null;
+    }
+    const reply = await api.memoOp({ op: "get", id: reminder.memo_id });
+    return reply.kind === "memo" ? reply.memo.title || t.memo.untitled : null;
+  } catch {
+    // 削除済み・ホスト未接続などで解決できない場合は黙って捨てる
+    // (共有メモの削除はローカルで知れないため — ADR-0052 決定 6)
+    return null;
+  }
+}
+
+/**
+ * 発火時刻を過ぎたリマインダーを取り出し、OS 通知を出す。呼ぶと該当分は
+ * fired になり(以後の一覧・take_due には出ない)、タイトル解決に失敗しても
+ * 再試行はされない(取り出し自体は一度きりのため)。
+ */
+export async function notifyReminderEvents(): Promise<void> {
+  const now = Date.now();
+  if (now - reminderCheckedAt < REMINDER_POLL_MS) return;
+  reminderCheckedAt = now;
+  if (!loadPrefs().notifications) return;
+  try {
+    const reply = await api.memoOp({ op: "reminder_take_due" });
+    if (reply.kind !== "reminders" || reply.reminders.length === 0) return;
+    for (const reminder of reply.reminders) {
+      const title = await resolveReminderTitle(reminder);
+      if (title === null) continue;
+      try {
+        await invoke("notify", { title: t.notify.reminderTitle(title), body: "" });
+      } catch {
+        // 通知の失敗で UI を止めない
+      }
+    }
+  } catch {
+    // reminder_take_due に失敗しても次の周期で再試行する(旧デーモン等)
   }
 }

@@ -526,7 +526,33 @@ export type MemoOp =
   | { op: "empty_trash" }
   | { op: "folder_create"; name: string }
   | { op: "folder_rename"; id: string; name: string }
-  | { op: "folder_delete"; id: string };
+  | { op: "folder_delete"; id: string }
+  // リマインダー(端末ローカル、ADR-0052 決定 6)。共有メモに対する
+  // 「自分用リマインダー」もここへ(network = 共有メモの configPath)。
+  | {
+      op: "reminder_set";
+      scope: ReminderScope;
+      network?: string;
+      memo_id: string;
+      remind_at: number;
+    }
+  | {
+      op: "reminder_clear";
+      scope: ReminderScope;
+      network?: string;
+      memo_id: string;
+    }
+  | { op: "reminder_list" }
+  | { op: "reminder_take_due" };
+
+export type ReminderScope = "personal" | "shared";
+
+export interface MemoReminder {
+  scope: ReminderScope;
+  network?: string;
+  memo_id: string;
+  remind_at: number;
+}
 
 export type MemoReply =
   | {
@@ -539,6 +565,8 @@ export type MemoReply =
   // ResolveTitles への応答(タイトル → memo_id、見つかったものだけ)。
   | { kind: "titles"; map: Record<string, string> }
   | { kind: "folder"; folder: MemoFolder }
+  // ReminderList / ReminderTakeDue への応答。
+  | { kind: "reminders"; reminders: MemoReminder[] }
   | { kind: "done" };
 
 // ---- 共有メモ (M5 F-2, ADR-0049)。個人メモと同じく serde 表現(snake_case) ----

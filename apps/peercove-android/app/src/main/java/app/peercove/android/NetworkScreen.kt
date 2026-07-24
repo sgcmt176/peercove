@@ -115,11 +115,14 @@ fun NetworkScreen(
     slug: String,
     networkName: String,
     initialConvId: String? = null,
+    /** リマインダー通知タップから「共有」タブの該当メモへ直接開く
+     * (M5 F-5 Stage 5、ADR-0052 決定 6)。 */
+    initialMemoFocus: String? = null,
     onBack: () -> Unit,
     onNotice: (String) -> Unit,
 ) {
     val context = LocalContext.current
-    var tab by remember { mutableStateOf(0) }
+    var tab by remember { mutableStateOf(if (initialMemoFocus != null) 2 else 0) }
     var state by remember { mutableStateOf<SessionState?>(null) }
     var tunnel by remember { mutableStateOf<TunnelStatus?>(null) }
     var memberList by remember { mutableStateOf<List<MemberInfo>>(emptyList()) }
@@ -127,9 +130,9 @@ fun NetworkScreen(
     var dnsList by remember { mutableStateOf<List<DnsEntry>>(emptyList()) }
     var messages by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
     var conv by remember { mutableStateOf<ConvKey?>(null) }
-    // チャットの `@memo:id` カード(ADR-0052 決定 1)から「共有」タブの
-    // 該当メモへ遷移するための一時状態。反映したら null に戻す
-    var memoFocus by remember { mutableStateOf<String?>(null) }
+    // チャットの `@memo:id` カード(ADR-0052 決定 1)・リマインダー通知タップ
+    // から「共有」タブの該当メモへ遷移するための一時状態。反映したら null に戻す
+    var memoFocus by remember { mutableStateOf(initialMemoFocus) }
     var showGroupDialog by remember { mutableStateOf(false) }
     var showGroupManage by remember { mutableStateOf(false) }
     var showFiles by remember { mutableStateOf(false) }

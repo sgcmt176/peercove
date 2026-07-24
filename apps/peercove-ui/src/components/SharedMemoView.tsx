@@ -11,6 +11,7 @@ import {
   DiffLine,
   MemoFolder,
   Member,
+  MemoReminder,
   PermGroup,
   SharedGroupPerm,
   SharedMemberPerm,
@@ -28,6 +29,7 @@ import {
 } from "../ipc";
 import { t } from "../i18n";
 import { Modal } from "./Modal";
+import { ReminderButton } from "./ReminderButton";
 import {
   useResolvedWikiLinks,
   wikiLinkify,
@@ -80,6 +82,8 @@ export function SharedMemoView({
   const [permsFor, setPermsFor] = useState<SharedMemoDetail | null>(null);
   // メモ間リンクのバックリンク欄(M5 F-5 Stage 2、ADR-0052 決定 2)。
   const [backlinks, setBacklinks] = useState<SharedMemoSummary[]>([]);
+  // このメモの自分用リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)。
+  const [reminder, setReminder] = useState<MemoReminder | null>(null);
   /** 変更履歴パネルを開いているか(本文領域を置き換える)。 */
   const [historyOpen, setHistoryOpen] = useState(false);
   const [limitsOpen, setLimitsOpen] = useState(false);
@@ -165,6 +169,26 @@ export function SharedMemoView({
     [op],
   );
 
+  // リマインダー(ADR-0052 決定 6): 保存先は個人メモ DB(このネットワークの
+  // 設定パスを network として識別)。専用の 1 件取得 op は無いので一覧から絞る
+  const fetchReminder = useCallback(
+    async (id: string) => {
+      try {
+        const reply = await api.memoOp({ op: "reminder_list" });
+        setReminder(
+          reply.kind === "reminders"
+            ? (reply.reminders.find(
+                (r) => r.scope === "shared" && r.network === configPath && r.memo_id === id,
+              ) ?? null)
+            : null,
+        );
+      } catch {
+        setReminder(null);
+      }
+    },
+    [configPath],
+  );
+
   // 選択中メモも配信に追随する(編集中は上書きしない)
   useEffect(() => {
     const current = selected?.id;
@@ -236,12 +260,13 @@ export function SharedMemoView({
           setDraft({ title: reply.memo.title, body: reply.memo.body });
           setMode("edit");
           void fetchBacklinks(id);
+          void fetchReminder(id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [op, stopEditing, fetchBacklinks],
+    [op, stopEditing, fetchBacklinks, fetchReminder],
   );
 
   // チャットの `@memo:id` カード(ADR-0052 決定 1)から開く。反映したら
@@ -272,12 +297,13 @@ export function SharedMemoView({
           setSaveState("saved");
           setSaveError("");
           void fetchBacklinks(id);
+          void fetchReminder(id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [op, fetchBacklinks],
+    [op, fetchBacklinks, fetchReminder],
   );
 
   // 自動保存(CAS)。編集中のみ
@@ -338,6 +364,7 @@ export function SharedMemoView({
         setSelected(reply.memo);
         setDraft({ title: "", body: "" });
         setBacklinks([]);
+        setReminder(null);
         await startEditing(reply.memo.id);
       }
     } catch (error) {
@@ -364,6 +391,7 @@ export function SharedMemoView({
     setEditing(false);
     setHistoryOpen(false);
     setBacklinks([]);
+    setReminder(null);
   }, []);
 
   /** 復元後: 最新内容を取り直して履歴パネルを閉じる。 */
@@ -710,6 +738,14 @@ export function SharedMemoView({
               >
                 ⧉
               </button>
+              <ReminderButton
+                scope="shared"
+                network={configPath}
+                memoId={selected.id}
+                reminder={reminder}
+                onChanged={setReminder}
+                onNotice={setNotice}
+              />
               <button
                 type="button"
                 className="button--icon"

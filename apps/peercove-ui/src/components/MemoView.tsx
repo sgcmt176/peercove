@@ -15,6 +15,7 @@ import {
   MemoFolder,
   MemoPatch,
   MemoQuery,
+  MemoReminder,
   MemoScope,
   MemoSort,
   MemoSummary,
@@ -24,6 +25,7 @@ import {
 } from "../ipc";
 import { t } from "../i18n";
 import { Modal } from "./Modal";
+import { ReminderButton } from "./ReminderButton";
 import {
   useResolvedWikiLinks,
   wikiLinkify,
@@ -65,6 +67,8 @@ export function MemoView({
   });
   // メモ間リンクのバックリンク欄(M5 F-5 Stage 2、ADR-0052 決定 2)。
   const [backlinks, setBacklinks] = useState<MemoSummary[]>([]);
+  // このメモのリマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)。
+  const [reminder, setReminder] = useState<MemoReminder | null>(null);
   const [mode, setMode] = useState<EditorMode>("edit");
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [saveError, setSaveError] = useState("");
@@ -125,6 +129,23 @@ export function MemoView({
     }
   }, []);
 
+  // リマインダー(ADR-0052 決定 6): 一覧から該当メモの分だけ取り出す
+  // (専用の 1 件取得 op は無い。個人の全件は少数なので十分軽い)。
+  const fetchReminder = useCallback(async (id: string) => {
+    try {
+      const reply = await api.memoOp({ op: "reminder_list" });
+      setReminder(
+        reply.kind === "reminders"
+          ? (reply.reminders.find(
+              (r) => r.scope === "personal" && r.memo_id === id,
+            ) ?? null)
+          : null,
+      );
+    } catch {
+      setReminder(null);
+    }
+  }, []);
+
   // 一時通知は数秒で消す
   useEffect(() => {
     if (notice === null) return;
@@ -182,12 +203,13 @@ export function MemoView({
           setSaveState("saved");
           setSaveError("");
           void fetchBacklinks(reply.memo.id);
+          void fetchReminder(reply.memo.id);
         }
       } catch (error) {
         setNotice(errorMessage(error));
       }
     },
-    [flush, fetchBacklinks],
+    [flush, fetchBacklinks, fetchReminder],
   );
 
   // 自動保存(タイトル・本文のデバウンス)
@@ -275,6 +297,7 @@ export function MemoView({
         savedRef.current = { id: reply.memo.id, title: "", body: "" };
         setSaveState("saved");
         setBacklinks([]);
+        setReminder(null);
         void refresh();
       }
     } catch (error) {
@@ -299,6 +322,7 @@ export function MemoView({
     setSelected(null);
     savedRef.current = null;
     setBacklinks([]);
+    setReminder(null);
   }, []);
 
   const [chooseSharedTarget, setChooseSharedTarget] = useState(false);
@@ -526,6 +550,9 @@ export function MemoView({
             bodyRef={bodyRef}
             resolvedTitles={resolvedTitles}
             backlinks={backlinks}
+            reminder={reminder}
+            onReminderChanged={setReminder}
+            onNotice={setNotice}
             onWikiLink={(id) => void open(id)}
             onWikiLinkMissing={() => setNotice(t.memo.wikilinkMissing)}
             onMode={setMode}
@@ -711,6 +738,9 @@ function Editor({
   bodyRef,
   resolvedTitles,
   backlinks,
+  reminder,
+  onReminderChanged,
+  onNotice,
   onWikiLink,
   onWikiLinkMissing,
   onMode,
@@ -734,6 +764,10 @@ function Editor({
   resolvedTitles: Record<string, string>;
   /** このメモへのバックリンク一覧(0 件なら欄自体を出さない)。 */
   backlinks: MemoSummary[];
+  /** このメモのリマインダー(端末ローカル、ADR-0052 決定 6)。 */
+  reminder: MemoReminder | null;
+  onReminderChanged: (reminder: MemoReminder | null) => void;
+  onNotice: (message: string) => void;
   onWikiLink: (id: string) => void;
   onWikiLinkMissing: () => void;
   onMode: (mode: EditorMode) => void;
@@ -857,6 +891,13 @@ function Editor({
             >
               ⧉
             </button>
+            <ReminderButton
+              scope="personal"
+              memoId={memo.id}
+              reminder={reminder}
+              onChanged={onReminderChanged}
+              onNotice={onNotice}
+            />
             {onCopyToShared && (
               <button
                 type="button"

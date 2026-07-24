@@ -84,6 +84,7 @@ class MainActivity : ComponentActivity() {
         // 余白が大きくなりすぎる
         enableEdgeToEdge()
         initLogging()
+        ReminderNotifier.ensureChannel(this) // 通知チャンネルは早めに用意しておく
         val shareUri = extractShareUri(intent)
         // チャット通知のタップ → 該当ネットワークの会話を開く
         val openSlug = intent?.getStringExtra(ChatNotifier.EXTRA_SLUG)
@@ -92,6 +93,9 @@ class MainActivity : ComponentActivity() {
             listNetworks(filesDir.absolutePath).firstOrNull { it.slug == slug }
                 ?.let { Triple(slug, it.name, openConv) }
         }
+        // リマインダー通知のタップ → 個人メモ or 共有メモの該当メモを開く
+        // (M5 F-5 Stage 5、ADR-0052 決定 6)
+        val reminderTarget = reminderTargetOf(intent, filesDir.absolutePath)
         setContent {
             val context = LocalContext.current
             var theme by remember { mutableStateOf(Prefs.theme(context)) }
@@ -114,6 +118,7 @@ class MainActivity : ComponentActivity() {
                     App(
                         shareUri = shareUri,
                         openTarget = openTarget,
+                        reminderTarget = reminderTarget,
                         theme = theme,
                         onThemeChange = {
                             theme = it
@@ -154,6 +159,28 @@ private sealed class Route {
     data class Net(val slug: String, val name: String) : Route()
 }
 
+/** リマインダー通知タップの遷移先(M5 F-5 Stage 5、ADR-0052 決定 6)。 */
+private sealed class ReminderTarget {
+    data class Personal(val memoId: String) : ReminderTarget()
+    data class Shared(val slug: String, val name: String, val memoId: String) : ReminderTarget()
+}
+
+/** リマインダー通知の Intent extras から遷移先を組み立てる。共有メモは
+ * ネットワークが既知(登録済み)のときだけ遷移する(削除済みネットワーク等は
+ * ホームへ)。 */
+private fun reminderTargetOf(intent: Intent?, baseDir: String): ReminderTarget? {
+    val scope = intent?.getStringExtra(ReminderNotifier.EXTRA_SCOPE) ?: return null
+    val memoId = intent.getStringExtra(ReminderNotifier.EXTRA_MEMO_ID) ?: return null
+    return when (scope) {
+        "shared" -> {
+            val network = intent.getStringExtra(ReminderNotifier.EXTRA_NETWORK) ?: return null
+            listNetworks(baseDir).firstOrNull { it.slug == network }
+                ?.let { ReminderTarget.Shared(network, it.name, memoId) }
+        }
+        else -> ReminderTarget.Personal(memoId)
+    }
+}
+
 fun startVpnService(context: Context, slug: String) {
     Prefs.setLastSlug(context, slug) // クイック設定タイルの接続先に使う
     val intent = Intent(context, PeercoveVpnService::class.java)
@@ -172,15 +199,28 @@ private fun stopVpnService(context: Context) {
 private fun App(
     shareUri: Uri?,
     openTarget: Triple<String, String, String?>?, // (slug, name, convId) 通知タップから
+    reminderTarget: ReminderTarget?, // リマインダー通知タップから
     theme: String,
     onThemeChange: (String) -> Unit,
 ) {
     var route by remember {
         mutableStateOf<Route>(
-            if (openTarget != null) Route.Net(openTarget.first, openTarget.second) else Route.Home,
+            when {
+                reminderTarget is ReminderTarget.Personal -> Route.Memos
+                reminderTarget is ReminderTarget.Shared ->
+                    Route.Net(reminderTarget.slug, reminderTarget.name)
+                openTarget != null -> Route.Net(openTarget.first, openTarget.second)
+                else -> Route.Home
+            },
         )
     }
     var pendingConv by remember { mutableStateOf(openTarget?.third) }
+    var pendingMemoId by remember {
+        mutableStateOf((reminderTarget as? ReminderTarget.Personal)?.memoId)
+    }
+    var pendingMemoFocus by remember {
+        mutableStateOf((reminderTarget as? ReminderTarget.Shared)?.memoId)
+    }
     var notice by remember { mutableStateOf<String?>(null) }
     var noticeCount by remember { mutableStateOf(0) }
     var pendingShare by remember { mutableStateOf(shareUri) }
@@ -232,15 +272,21 @@ private fun App(
                 onOpenMemos = { route = Route.Memos },
             )
             is Route.Memos -> MemoScreen(
-                onBack = { route = Route.Home },
+                onBack = {
+                    pendingMemoId = null
+                    route = Route.Home
+                },
                 onNotice = onNotice,
+                initialMemoId = pendingMemoId,
             )
             is Route.Net -> NetworkScreen(
                 slug = r.slug,
                 networkName = r.name,
                 initialConvId = pendingConv,
+                initialMemoFocus = pendingMemoFocus,
                 onBack = {
                     pendingConv = null
+                    pendingMemoFocus = null
                     route = Route.Home
                 },
                 onNotice = onNotice,

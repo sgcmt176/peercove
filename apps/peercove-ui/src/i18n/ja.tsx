@@ -942,6 +942,8 @@ export const ja = {
       `${from} が「${memoTitle}」にコメントしました`,
     mentionTitle: (from: string, memoTitle: string) =>
       `${from} があなたをメンションしました（「${memoTitle}」）`,
+    // メモのリマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)
+    reminderTitle: (memoTitle: string) => `⏰ メモのリマインダー: ${memoTitle}`,
   },
 
   // 個人メモ(M5 F-1、ADR-0049)
@@ -1023,6 +1025,17 @@ export const ja = {
     // メモ間リンク・バックリンク(M5 F-5 Stage 2、ADR-0052 決定 2)
     wikilinkMissing: "リンク先のメモが見つかりません",
     backlinksTitle: (n: number) => `バックリンク (${n})`,
+
+    // リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)。
+    // 共有メモ側(SharedMemoView)もこのキーを使う(t.memo.toTrash 等と同じ流儀)
+    reminder: "リマインダー",
+    reminderTitle: "リマインダーを設定",
+    reminderLabel: "日時",
+    reminderSave: "設定",
+    reminderClear: "解除",
+    reminderSaved: "リマインダーを設定しました",
+    reminderCleared: "リマインダーを解除しました",
+    reminderAt: (date: string) => `リマインダー: ${date}`,
   },
 
   // 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは現在「メモ」の
