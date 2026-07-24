@@ -105,9 +105,10 @@ private val sharedDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefau
 
 // 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。共有系機能をタブで増やし続け
 // ず「共有」1 か所にまとめる器。サブタブは「メモ」「スケジュール」
-// (M6 G-1、ADR-0053)。今後表を足すときは SHARED_HUB_TABS に 1 要素足す
-// だけでよい。チャットの `@種別:id` 参照カードからの遷移(ADR-0052 決定 1)
-// は種別(kind)を見て対応サブタブへ自動で切り替える(汎用化)。
+// (M6 G-1、ADR-0053)「表」(M6 G-2、ADR-0054)。今後表を足すときは
+// SHARED_HUB_TABS に 1 要素足すだけでよい。チャットの `@種別:id` 参照カード
+// からの遷移(ADR-0052 決定 1)は種別(kind)を見て対応サブタブへ自動で
+// 切り替える(汎用化)。
 private data class SharedHubTabSpec(
     val id: String,
     val labelRes: Int,
@@ -135,6 +136,14 @@ private val SHARED_HUB_TABS = listOf(
         kind = SharedRefKind.SCHEDULE,
         content = { slug, onNotice, focusId, onFocusConsumed ->
             ScheduleTab(slug, onNotice, focusId, onFocusConsumed)
+        },
+    ),
+    SharedHubTabSpec(
+        id = "sheet",
+        labelRes = R.string.shared_hub_tab_sheet,
+        kind = SharedRefKind.SHEET,
+        content = { slug, onNotice, focusId, onFocusConsumed ->
+            SheetTab(slug, onNotice, focusId, onFocusConsumed)
         },
     ),
 )

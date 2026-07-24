@@ -37,13 +37,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.peercove_mobile.MobileException
 import uniffi.peercove_mobile.ScheduleEventInfo
+import uniffi.peercove_mobile.SheetMetaInfo
 import uniffi.peercove_mobile.scheduleList
 import uniffi.peercove_mobile.sharedMemoGet
+import uniffi.peercove_mobile.sheetList
 
 /** 対応している種別のレジストリ。増やすときはここへ 1 エントリ足すだけでよい。 */
 enum class SharedRefKind(val prefix: String, val icon: String, val nounRes: Int) {
     MEMO("memo", "📝", R.string.shared_ref_noun_memo),
     SCHEDULE("schedule", "📅", R.string.shared_ref_noun_schedule),
+    SHEET("sheet", "📊", R.string.shared_ref_noun_sheet),
     ;
 
     companion object {
@@ -116,12 +119,29 @@ private fun scheduleExcerpt(event: ScheduleEventInfo, allDayLabel: String): Stri
     }
 }
 
+// 共有シート(M6 G-2、ADR-0054)。`get` 単体の op が無いため一覧(キャッシュ
+// 読み取り = 軽量)から id を引く(schedule と同じ TTL メモ化)。
+private const val SHEET_LIST_TTL_MS = 5000L
+private data class SheetListCacheEntry(val sheets: List<SheetMetaInfo>, val at: Long)
+private val sheetListCache = ConcurrentHashMap<String, SheetListCacheEntry>()
+private val sheetExcerptDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
+
+private suspend fun listSheetsCached(baseDir: String, slug: String): List<SheetMetaInfo> {
+    val now = System.currentTimeMillis()
+    val cached = sheetListCache[slug]
+    if (cached != null && now - cached.at < SHEET_LIST_TTL_MS) return cached.sheets
+    val sheets = withContext(Dispatchers.IO) { sheetList(baseDir, slug) }.sheets
+    sheetListCache[slug] = SheetListCacheEntry(sheets, now)
+    return sheets
+}
+
 /** 表示時に受信者自身の権限で解決する。キャッシュ経由 = オフラインでも出る。 */
 private suspend fun resolveSharedRef(
     baseDir: String,
     slug: String,
     token: SharedRefToken,
     allDayLabel: String,
+    updatedFmt: String,
 ): SharedRefResolved? = when (token.kind) {
     SharedRefKind.MEMO -> try {
         val memo = withContext(Dispatchers.IO) { sharedMemoGet(baseDir, slug, token.id) }
@@ -132,6 +152,15 @@ private suspend fun resolveSharedRef(
     SharedRefKind.SCHEDULE -> try {
         listScheduleEventsCached(baseDir, slug).firstOrNull { it.id == token.id }
             ?.let { SharedRefResolved(it.title, scheduleExcerpt(it, allDayLabel)) }
+    } catch (e: MobileException) {
+        null
+    }
+    SharedRefKind.SHEET -> try {
+        listSheetsCached(baseDir, slug).firstOrNull { it.id == token.id }
+            ?.let { sheet ->
+                val date = sheetExcerptDateFmt.format(Date(sheet.updatedAt.toLong()))
+                SharedRefResolved(sheet.name, updatedFmt.format(date))
+            }
     } catch (e: MobileException) {
         null
     }
@@ -153,13 +182,14 @@ fun SharedRefCard(
     var loading by remember(key) { mutableStateOf(!sharedRefCache.containsKey(key)) }
     var resolved by remember(key) { mutableStateOf(sharedRefCache[key]) }
     val allDayLabel = stringResource(R.string.schedule_all_day)
+    val updatedFmt = stringResource(R.string.sheet_ref_updated)
     LaunchedEffect(key) {
         if (sharedRefCache.containsKey(key)) {
             resolved = sharedRefCache[key]
             loading = false
             return@LaunchedEffect
         }
-        val value = resolveSharedRef(baseDir, slug, token, allDayLabel)
+        val value = resolveSharedRef(baseDir, slug, token, allDayLabel, updatedFmt)
         sharedRefCache[key] = value
         resolved = value
         loading = false

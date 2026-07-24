@@ -320,10 +320,11 @@
     <string name="memo_reminder_cleared">リマインダーを解除しました</string>
 
     <!-- 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは「メモ」
-         「スケジュール」(M6 G-1、ADR-0053)。今後表を足す際はここへ
-         キーを追加するだけでよい -->
+         「スケジュール」(M6 G-1、ADR-0053)「表」(M6 G-2、ADR-0054)。
+         今後表を足す際はここへキーを追加するだけでよい -->
     <string name="shared_hub_tab_memos">メモ</string>
     <string name="shared_hub_tab_schedule">スケジュール</string>
+    <string name="shared_hub_tab_sheet">表</string>
 
     <!-- 共有メモ(M5 F-2、ADR-0049) -->
     <string name="shared_memo_empty">共有メモがありません</string>
@@ -373,6 +374,7 @@
     <string name="shared_ref_inaccessible">アクセスできない%1$s</string>
     <string name="shared_ref_noun_memo">メモ</string>
     <string name="shared_ref_noun_schedule">予定</string>
+    <string name="shared_ref_noun_sheet">シート</string>
 
     <!-- 共有スケジュール表(M6 G-1、ADR-0053) -->
     <string-array name="schedule_weekdays">
@@ -408,4 +410,23 @@
     <string name="schedule_offline">オフライン(ホスト未接続)のため読み取り専用です</string>
     <string name="schedule_unsupported">ホストと同期できていません(ホストのバージョンが古い可能性があります)</string>
     <string name="schedule_conflict_notice">他の端末の変更が先に保存されています。読み込み直してください</string>
+
+    <!-- 共有シート(M6 G-2、ADR-0054)。V1 は閲覧 + セルタップ編集 -->
+    <string name="sheet_offline">オフライン(ホスト未接続)のため読み取り専用です</string>
+    <string name="sheet_unsupported">ホストと同期できていません(ホストのバージョンが古い可能性があります)</string>
+    <string name="sheet_empty">まだシートがありません</string>
+    <string name="sheet_add">シートを作成</string>
+    <string name="sheet_create_title">シートを作成</string>
+    <string name="sheet_name_label">シート名</string>
+    <string name="sheet_name_placeholder">シート名を入力</string>
+    <string name="sheet_menu">シートの操作</string>
+    <string name="sheet_copy_link">リンクをコピー</string>
+    <string name="sheet_rename">シート名を変更</string>
+    <string name="sheet_rename_title">シート名を変更</string>
+    <string name="sheet_delete">シートを削除</string>
+    <string name="sheet_delete_confirm">シート「%1$s」を削除しますか?(元に戻せません)</string>
+    <string name="sheet_cell_value_label">値</string>
+    <string name="sheet_clear_cell">空にする</string>
+    <string name="sheet_conflict_notice">他の端末が先に更新しました(最新の値を表示しています)</string>
+    <string name="sheet_ref_updated">更新: %1$s</string>
 </resources>
