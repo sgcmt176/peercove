@@ -103,6 +103,11 @@ export default function App() {
    */
   const [memoFocus, setMemoFocus] = useState<string | null>(null);
   /**
+   * チャットの `@schedule:id` カード(ADR-0053)から共有ハブの該当予定へ
+   * フォーカスする。一度反映したら(ScheduleView 側で)null に戻る。
+   */
+  const [scheduleFocus, setScheduleFocus] = useState<string | null>(null);
+  /**
    * ディープリンクで受けた招待トークン(M3-5)。オブジェクトで包むのは、
    * 同じリンクを 2 回クリックしても再度フォームを開くため(参照が変わる)。
    */
@@ -578,6 +583,8 @@ export default function App() {
               permGroups={openTunnel.permGroups ?? []}
               focusMemoId={memoFocus}
               onFocusConsumed={() => setMemoFocus(null)}
+              focusScheduleId={scheduleFocus}
+              onScheduleFocusConsumed={() => setScheduleFocus(null)}
             />
           ) : openTunnel !== null ? (
             <TunnelView
@@ -596,8 +603,12 @@ export default function App() {
                 setChatTarget({ peer });
                 setView("chat");
               }}
-              onOpenMemo={(id) => {
-                setMemoFocus(id);
+              onOpenRef={(kind, id) => {
+                if (kind === "schedule") {
+                  setScheduleFocus(id);
+                } else {
+                  setMemoFocus(id);
+                }
                 setView("net-memos");
               }}
               onView={setView}

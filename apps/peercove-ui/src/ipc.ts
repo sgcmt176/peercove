@@ -685,6 +685,57 @@ export interface DiffLine {
   text: string;
 }
 
+// ---- 共有スケジュール表(M6 G-1、ADR-0053)。SharedMemoOp/Reply に
+// additive な `schedule` variant として相乗りする(crates/peercove-core/
+// src/schedule.rs の serde 表現に一致させる)。 ----
+
+export interface ScheduleEvent {
+  id: string;
+  title: string;
+  note?: string;
+  start_unix_ms: number;
+  end_unix_ms?: number;
+  /** 終日予定は日付単位で扱う(ADR-0053 決定 2)。 */
+  all_day?: boolean;
+  /** 所有者(作成者)の member_id。空文字 = ホスト。 */
+  owner_id: string;
+  owner_name: string;
+  updated_by: string;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  /** 受信者視点: 編集・削除できるか(作成者 + ホスト)。 */
+  can_edit?: boolean;
+}
+
+export type ScheduleOp =
+  | { op: "list" }
+  | {
+      op: "create";
+      title: string;
+      note?: string;
+      start_unix_ms: number;
+      end_unix_ms?: number;
+      all_day?: boolean;
+    }
+  | {
+      op: "update";
+      id: string;
+      base_revision: number;
+      title: string;
+      note?: string;
+      start_unix_ms: number;
+      end_unix_ms?: number;
+      all_day?: boolean;
+    }
+  | { op: "delete"; id: string };
+
+export type ScheduleReply =
+  | { kind: "events"; events: ScheduleEvent[]; offline?: boolean }
+  | { kind: "event"; event: ScheduleEvent }
+  | { kind: "done" }
+  | { kind: "err"; message: string };
+
 export type SharedMemoOp =
   | { op: "list"; query: SharedMemoQuery }
   | { op: "get"; id: string }
@@ -731,7 +782,9 @@ export type SharedMemoOp =
   // 所有者・ホスト。メンバー経路は常時オンライン専用。
   | { op: "comment_list"; id: string }
   | { op: "comment_add"; id: string; body: string }
-  | { op: "comment_delete"; id: string; comment_id: string };
+  | { op: "comment_delete"; id: string; comment_id: string }
+  // 共有スケジュール表(M6 G-1、ADR-0053)。additive な相乗り。
+  | { op: "schedule"; schedule: ScheduleOp };
 
 export type SharedMemoReply =
   | {
@@ -752,7 +805,9 @@ export type SharedMemoReply =
   // CommentAdd への応答(追加した 1 件)。
   | { kind: "comment"; comment: SharedMemoComment }
   | { kind: "done" }
-  | { kind: "err"; message: string };
+  | { kind: "err"; message: string }
+  // 共有スケジュール表(M6 G-1、ADR-0053)。
+  | { kind: "schedule"; reply: ScheduleReply };
 
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =

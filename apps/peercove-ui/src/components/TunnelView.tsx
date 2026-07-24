@@ -14,6 +14,7 @@ import {
   formatRtt,
 } from "../ipc";
 import { rateSeries } from "../history";
+import { SharedRefKind } from "../sharedRefs";
 import { ConfirmModal, Modal } from "./Modal";
 import { InviteDialog, MemberInviteDialog } from "./InviteDialog";
 import { DnsView } from "./DnsDialog";
@@ -34,7 +35,7 @@ export function TunnelView({
   view,
   chatTarget,
   onOpenChat,
-  onOpenMemo,
+  onOpenRef,
   onView,
   onChanged,
 }: {
@@ -44,8 +45,9 @@ export function TunnelView({
   chatTarget: { peer: string } | null;
   /** 相手を指定してチャットを開く(1:1 会話を選ぶ)。 */
   onOpenChat: (peer: string) => void;
-  /** チャットの `@memo:id` カード(ADR-0052 決定 1)をクリックしたときの遷移先。 */
-  onOpenMemo: (id: string) => void;
+  /** チャットの `@memo:id` / `@schedule:id` カード(ADR-0052 決定 1、
+   * ADR-0053)をクリックしたときの遷移先。 */
+  onOpenRef: (kind: SharedRefKind, id: string) => void;
   /** 別のビューへ切り替える(送信後に受信へ 等)。 */
   onView: (view: "members" | "chat" | "stats" | "inbox" | "dns") => void;
   onChanged: () => void;
@@ -277,7 +279,7 @@ export function TunnelView({
         <ChatPanel
           tunnel={tunnel}
           initialConversation={chatTarget}
-          onOpenMemo={onOpenMemo}
+          onOpenRef={onOpenRef}
         />
       ) : view === "stats" ? (
         <QualityView tunnel={tunnel} />

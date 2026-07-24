@@ -581,7 +581,9 @@ export const ja = {
   // 共有オブジェクト参照 `@memo:id` のカード(M5 F-5 Stage 4、ADR-0052 決定 1)
   sharedRef: {
     loading: "読み込み中…",
-    inaccessible: "アクセスできないメモ",
+    inaccessible: (noun: string) => `アクセスできない${noun}`,
+    nounMemo: "メモ",
+    nounSchedule: "予定",
   },
 
   // ファイル送信・受信ボックス(M3-9b、ADR-0015)
@@ -1042,6 +1044,7 @@ export const ja = {
   // み。今後スケジュール・表を足す際はここへキーを追加するだけでよい
   sharedHub: {
     tabMemos: "メモ",
+    tabSchedule: "スケジュール",
   },
 
   // 共有メモ(M5 F-2、ADR-0049)
@@ -1133,5 +1136,43 @@ export const ja = {
     commentLoadFailed: "コメントを読み込めません",
     commentTooLong: (kib: number) => `コメントが長すぎます(上限 ${kib}KiB)`,
     commentBadge: (n: number) => `💬${n}`,
+  },
+
+  // 共有スケジュール表(M6 G-1、ADR-0053)
+  schedule: {
+    title: "スケジュール",
+    loadFailed:
+      "スケジュールを読み込めません。デーモンが起動しているか、バージョンが古くないか確認してください",
+    offline: "オフライン(ホスト未接続)のため読み取り専用です",
+    unsupported:
+      "ホストと同期できていません(ホストのバージョンが古い可能性があります)",
+    today: "今日",
+    weekdays: ["日", "月", "火", "水", "木", "金", "土"],
+    addEvent: "予定を追加",
+    editEvent: "編集",
+    deleteEvent: "削除",
+    deleteConfirm: "この予定を削除しますか?(元に戻せません)",
+    more: (n: number) => `+${n}`,
+    allDayLabel: "終日",
+    titleLabel: "タイトル",
+    titlePlaceholder: "タイトルを入力",
+    noteLabel: "詳細",
+    notePlaceholder: "詳細(任意)",
+    startLabel: "開始",
+    endLabel: "終了(任意)",
+    createTitle: "予定を追加",
+    editTitle: "予定を編集",
+    detailTitle: "予定の詳細",
+    ownerLabel: (name: string) => `作成者: ${name}`,
+    updatedByLabel: (name: string) => `更新者: ${name}`,
+    noEventsForDay: "この日の予定はありません",
+    selectDayPrompt: "カレンダーの日付を選ぶと、その日の予定が表示されます",
+    copyLink: "リンクをコピー",
+    copyLinkDone: "チャットに貼り付けられるリンクをコピーしました",
+    conflictNotice:
+      "他の端末の変更が先に保存されています。読み込み直してください",
+    excerptAllDay: (md: string) => `${md} 終日`,
+    excerptTimed: (md: string, hm: string) => `${md} ${hm}`,
+    viewerBadge: "閲覧のみ",
   },
 };

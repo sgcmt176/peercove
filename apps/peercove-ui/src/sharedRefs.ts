@@ -8,9 +8,10 @@
 // オフラインでも出る)。取得できなければ「アクセスできません」カードとし、
 // タイトル等は一切出さない。**メモのタイトル・本文はログへ出さない**。
 import { useEffect, useState } from "react";
-import { api } from "./ipc";
+import { ScheduleEvent, api } from "./ipc";
+import { t } from "./i18n";
 
-export type SharedRefKind = "memo";
+export type SharedRefKind = "memo" | "schedule";
 
 export interface SharedRefResolved {
   /** カードのタイトル(見出し)。 */
@@ -21,6 +22,8 @@ export interface SharedRefResolved {
 
 interface SharedRefKindSpec {
   icon: string;
+  /** 「アクセスできない◯◯」の◯◯部分(t.sharedRef.inaccessible へ渡す)。 */
+  noun: string;
   resolve: (
     configPath: string,
     id: string,
@@ -32,10 +35,46 @@ function firstBodyLine(body: string): string {
   return line.trim().slice(0, 80);
 }
 
+// 共有スケジュール表(M6 G-1、ADR-0053)。`Get` op が無いため一覧から id を
+// 引く。一覧は configPath ごとに短時間メモ化する(カードが並ぶ場面で 1 件
+// ごとに list を叩かないため)。TTL 切れ後は次の解決で取り直す = リアルタイム
+// 反映は `seq` を見ているカレンダー本体側に任せ、ここは近似で良い。
+const SCHEDULE_LIST_TTL_MS = 5000;
+const scheduleListCache = new Map<
+  string,
+  { events: ScheduleEvent[]; at: number }
+>();
+
+async function listScheduleEvents(configPath: string): Promise<ScheduleEvent[]> {
+  const cached = scheduleListCache.get(configPath);
+  const now = Date.now();
+  if (cached && now - cached.at < SCHEDULE_LIST_TTL_MS) return cached.events;
+  const reply = await api.sharedMemoOp(configPath, {
+    op: "schedule",
+    schedule: { op: "list" },
+  });
+  const events =
+    reply.kind === "schedule" && reply.reply.kind === "events"
+      ? reply.reply.events
+      : [];
+  scheduleListCache.set(configPath, { events, at: now });
+  return events;
+}
+
+/** 予定の抜粋文字列(例 "7/28 14:00" / 終日 "7/28 終日")。 */
+function scheduleExcerpt(event: ScheduleEvent): string {
+  const start = new Date(event.start_unix_ms);
+  const md = `${start.getMonth() + 1}/${start.getDate()}`;
+  if (event.all_day) return t.schedule.excerptAllDay(md);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return t.schedule.excerptTimed(md, `${pad(start.getHours())}:${pad(start.getMinutes())}`);
+}
+
 /** 対応している種別のレジストリ。増やすときはここへ 1 エントリ足すだけでよい。 */
 const SHARED_REF_KINDS: Record<SharedRefKind, SharedRefKindSpec> = {
   memo: {
     icon: "📝",
+    noun: t.sharedRef.nounMemo,
     resolve: async (configPath, id) => {
       const reply = await api.sharedMemoOp(configPath, { op: "get", id });
       if (reply.kind !== "memo") return null;
@@ -43,6 +82,16 @@ const SHARED_REF_KINDS: Record<SharedRefKind, SharedRefKindSpec> = {
         title: reply.memo.title,
         excerpt: firstBodyLine(reply.memo.body),
       };
+    },
+  },
+  schedule: {
+    icon: "📅",
+    noun: t.sharedRef.nounSchedule,
+    resolve: async (configPath, id) => {
+      const events = await listScheduleEvents(configPath);
+      const event = events.find((e) => e.id === id);
+      if (!event) return null;
+      return { title: event.title, excerpt: scheduleExcerpt(event) };
     },
   },
 };
@@ -53,6 +102,10 @@ function isKnownKind(kind: string): kind is SharedRefKind {
 
 export function sharedRefIcon(kind: SharedRefKind): string {
   return SHARED_REF_KINDS[kind].icon;
+}
+
+export function sharedRefNoun(kind: SharedRefKind): string {
+  return SHARED_REF_KINDS[kind].noun;
 }
 
 /** チャットへ貼る参照子の文字列(共有メモの「リンクをコピー」用)。 */

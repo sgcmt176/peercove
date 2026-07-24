@@ -17,8 +17,10 @@ import {
 } from "../ipc";
 import { loadPrefs } from "../prefs";
 import {
+  SharedRefKind,
   SharedRefTokenValue,
   sharedRefIcon,
+  sharedRefNoun,
   splitSharedRefs,
   useSharedRefResolve,
 } from "../sharedRefs";
@@ -76,13 +78,14 @@ interface ConversationItem {
 export function ChatPanel({
   tunnel,
   initialConversation,
-  onOpenMemo,
+  onOpenRef,
 }: {
   tunnel: Tunnel;
   /** メンバー行の 💬 から開くとき、その相手(仮想 IP)の 1:1 会話を選ぶ。 */
   initialConversation?: { peer: string } | null;
-  /** 本文中の `@memo:id` カード(ADR-0052 決定 1)をクリックしたときの遷移先。 */
-  onOpenMemo: (id: string) => void;
+  /** 本文中の `@memo:id` / `@schedule:id` カード(ADR-0052 決定 1、ADR-0053)を
+   * クリックしたときの遷移先。 */
+  onOpenRef: (kind: SharedRefKind, id: string) => void;
 }) {
   const [conversation, setConversation] = useState<ConversationKey>(
     initialConversation?.peer ?? NETWORK_CONVERSATION,
@@ -636,7 +639,7 @@ export function ChatPanel({
               transfers={tunnel.transfers}
               sendingSeqs={sendingSeqs}
               configPath={tunnel.config}
-              onOpenMemo={onOpenMemo}
+              onOpenRef={onOpenRef}
               onResend={(seq) =>
                 void api
                   .chatResend(tunnel.config, seq)
@@ -1180,7 +1183,7 @@ function linkify(text: string): ReactNode {
 function renderMessageBody(
   text: string,
   configPath: string,
-  onOpenMemo: (id: string) => void,
+  onOpenRef: (kind: SharedRefKind, id: string) => void,
 ): ReactNode {
   const parts = splitSharedRefs(text);
   if (!parts.some((part) => part.type === "ref")) return linkify(text);
@@ -1190,7 +1193,7 @@ function renderMessageBody(
         key={index}
         configPath={configPath}
         token={part.token}
-        onOpen={() => onOpenMemo(part.token.id)}
+        onOpen={() => onOpenRef(part.token.kind, part.token.id)}
       />
     ) : (
       <span key={index}>{linkify(part.value)}</span>
@@ -1229,7 +1232,9 @@ function SharedRefCard({
         <span className="msg__ref-icon" aria-hidden>
           🔒
         </span>
-        <span className="msg__ref-title">{t.sharedRef.inaccessible}</span>
+        <span className="msg__ref-title">
+          {t.sharedRef.inaccessible(sharedRefNoun(token.kind))}
+        </span>
       </span>
     );
   }
@@ -1344,7 +1349,7 @@ function Bubbles({
   onCancelSend,
   onOpenText,
   configPath,
-  onOpenMemo,
+  onOpenRef,
 }: {
   messages: ChatMessage[];
   selfIp: string;
@@ -1358,8 +1363,8 @@ function Bubbles({
   onEnlarge: (src: string, name: string) => void;
   onOpenText: (name: string, preview: TextPreview) => void;
   configPath: string;
-  /** 本文中の `@memo:id` カード(ADR-0052 決定 1)をクリックしたときの遷移先。 */
-  onOpenMemo: (id: string) => void;
+  /** 本文中の `@memo:id` / `@schedule:id` カードをクリックしたときの遷移先。 */
+  onOpenRef: (kind: SharedRefKind, id: string) => void;
 }) {
   let lastDate = "";
   // リンクプレビューはアプリ設定でオフにできる(M3-13e)
@@ -1421,7 +1426,7 @@ function Bubbles({
                         {renderMessageBody(
                           message.text,
                           configPath,
-                          onOpenMemo,
+                          onOpenRef,
                         )}
                       </span>
                     )}
