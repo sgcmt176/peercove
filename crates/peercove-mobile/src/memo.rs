@@ -490,6 +490,7 @@ use peercove_core::memo::{
     DiffLine, DiffLineKind, SharedMemoComment, SharedMemoDetail, SharedMemoHistoryDetail,
     SharedMemoHistoryEntry, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
 };
+use peercove_core::schedule::{ScheduleEvent, ScheduleOp, ScheduleReply};
 
 #[derive(uniffi::Record)]
 pub struct SharedMemoSummaryInfo {
@@ -835,6 +836,172 @@ pub fn shared_memo_save(
 #[uniffi::export]
 pub fn shared_memo_trash(slug: String, id: String) -> Result<(), MobileError> {
     session_request(&slug, SharedMemoOp::Trash { id }).map(|_| ())
+}
+
+// ---- 共有スケジュール表(M6 G-1、ADR-0053)-----------------------------------
+//
+// 共有メモと同じキャッシュ・generation を共用する(`<config>.memocache.db`、
+// `memo_generation`)。ネットワーク全員が閲覧・追加でき、編集・削除は
+// 作成者 + ホストのみ(権限判定はホスト正本の store 層)。読み取りは常に
+// キャッシュ、変更はオンライン専用(コントロールチャネル経由)。
+// **予定のタイトル・詳細はログへ出さない。**
+
+#[derive(uniffi::Record)]
+pub struct ScheduleEventInfo {
+    pub id: String,
+    pub title: String,
+    pub note: String,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: Option<u64>,
+    pub all_day: bool,
+    pub owner_name: String,
+    pub updated_by: String,
+    pub revision: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    /// 受信者視点: 編集・削除できるか(作成者 + ホスト)。
+    pub can_edit: bool,
+}
+
+impl From<ScheduleEvent> for ScheduleEventInfo {
+    fn from(event: ScheduleEvent) -> Self {
+        Self {
+            id: event.id,
+            title: event.title,
+            note: event.note,
+            start_unix_ms: event.start_unix_ms,
+            end_unix_ms: event.end_unix_ms,
+            all_day: event.all_day,
+            owner_name: event.owner_name,
+            updated_by: event.updated_by,
+            revision: event.revision,
+            created_at: event.created_at,
+            updated_at: event.updated_at,
+            can_edit: event.can_edit,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct ScheduleListResult {
+    pub events: Vec<ScheduleEventInfo>,
+    /// セッション未接続(キャッシュ表示 = 読み取り専用)。
+    pub offline: bool,
+    /// ホストが共有スケジュール表に応答済みか(共有メモと共通の判定)。
+    pub supported: bool,
+    /// キャッシュの変更世代(共有メモと共通。進んだら再取得する)。
+    pub generation: u64,
+}
+
+fn expect_schedule_event(reply: SharedMemoReply) -> Result<ScheduleEventInfo, MobileError> {
+    match reply {
+        SharedMemoReply::Schedule {
+            reply: ScheduleReply::Event { event },
+        } => Ok(event.into()),
+        SharedMemoReply::Schedule {
+            reply: ScheduleReply::Err { message },
+        } => Err(MobileError::Failure { msg: message }),
+        _ => Err(MobileError::Failure {
+            msg: "想定外の応答です".to_string(),
+        }),
+    }
+}
+
+/// 一覧(キャッシュから。オフラインでも使える。全員閲覧可 = ADR-0053 決定 3)。
+#[uniffi::export]
+pub fn schedule_list(base_dir: String, slug: String) -> Result<ScheduleListResult, MobileError> {
+    let cache = open_cache(&base_dir, &slug)?;
+    let events = cache.schedule_list()?;
+    let session = crate::session_of(&slug);
+    let online = session.as_ref().is_some_and(|s| {
+        s.control_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut events: Vec<ScheduleEventInfo> = events.into_iter().map(Into::into).collect();
+    if !online {
+        // オフライン中は読み取り専用(共有メモの List と同じ扱い)
+        for event in &mut events {
+            event.can_edit = false;
+        }
+    }
+    Ok(ScheduleListResult {
+        events,
+        offline: !online,
+        supported: session
+            .as_ref()
+            .is_some_and(|s| s.memo_supported.load(std::sync::atomic::Ordering::Relaxed)),
+        generation: session
+            .as_ref()
+            .map(|s| s.memo_generation.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
+    })
+}
+
+/// 新規作成(全員可、オンライン専用)。
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_create(
+    slug: String,
+    title: String,
+    note: String,
+    start_unix_ms: u64,
+    end_unix_ms: Option<u64>,
+    all_day: bool,
+) -> Result<ScheduleEventInfo, MobileError> {
+    expect_schedule_event(session_request(
+        &slug,
+        SharedMemoOp::Schedule {
+            schedule: ScheduleOp::Create {
+                title,
+                note,
+                start_unix_ms,
+                end_unix_ms,
+                all_day,
+            },
+        },
+    )?)
+}
+
+/// 更新(CAS)。`base_revision` が最新でなければ競合として拒否される
+/// (作成者 + ホストのみ、オンライン専用)。
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_update(
+    slug: String,
+    id: String,
+    base_revision: u64,
+    title: String,
+    note: String,
+    start_unix_ms: u64,
+    end_unix_ms: Option<u64>,
+    all_day: bool,
+) -> Result<ScheduleEventInfo, MobileError> {
+    expect_schedule_event(session_request(
+        &slug,
+        SharedMemoOp::Schedule {
+            schedule: ScheduleOp::Update {
+                id,
+                base_revision,
+                title,
+                note,
+                start_unix_ms,
+                end_unix_ms,
+                all_day,
+            },
+        },
+    )?)
+}
+
+/// 削除(物理削除、ゴミ箱なし。作成者 + ホストのみ、オンライン専用)。
+#[uniffi::export]
+pub fn schedule_delete(slug: String, id: String) -> Result<(), MobileError> {
+    session_request(
+        &slug,
+        SharedMemoOp::Schedule {
+            schedule: ScheduleOp::Delete { id },
+        },
+    )
+    .map(|_| ())
 }
 
 // ---- 変更履歴(M5 F-3、ADR-0049)---------------------------------------------

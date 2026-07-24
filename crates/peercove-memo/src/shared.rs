@@ -19,6 +19,9 @@ use peercove_core::memo::{
     SharedMemoLimits, SharedMemoQuery, SharedMemoSummary, SharedPermLevel, EXCERPT_CHARS,
     MAX_COMMENTS_PER_MEMO, MAX_COMMENT_BODY_BYTES,
 };
+use peercove_core::schedule::{
+    ScheduleEvent, MAX_SCHEDULE_EVENTS, MAX_SCHEDULE_NOTE_BYTES, MAX_SCHEDULE_TITLE_CHARS,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
@@ -84,7 +87,7 @@ impl Actor {
     }
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 4;
+const SHARED_SCHEMA_VERSION: i64 = 5;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -254,6 +257,8 @@ pub struct SharedMemoDbStats {
     pub history_count: u64,
     pub total_body_bytes: u64,
     pub limits: SharedMemoLimits,
+    /// 共有スケジュール表の予定件数(ADR-0053)。
+    pub schedule_count: u64,
 }
 
 /// ホスト正本の共有メモ DB。
@@ -388,6 +393,29 @@ impl SharedStore {
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_memo_comments ON memo_comments(memo_id, created_at);
+                "#,
+            )?;
+        }
+        if version < 5 {
+            // v5(M6 G-1、ADR-0053): 共有スケジュール表。ゴミ箱なし(物理削除)、
+            // 編集ロックも持たない(revision CAS のみ)。
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS schedule_events (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    start_at INTEGER NOT NULL,
+                    end_at INTEGER,
+                    all_day INTEGER NOT NULL DEFAULT 0,
+                    owner_id TEXT NOT NULL DEFAULT '',
+                    owner_name TEXT NOT NULL DEFAULT '',
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_schedule_events_start ON schedule_events(start_at);
                 "#,
             )?;
         }
@@ -1153,6 +1181,9 @@ impl SharedStore {
         let history_count: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM memo_history", [], |row| row.get(0))?;
+        let schedule_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM schedule_events", [], |row| row.get(0))?;
         Ok(SharedMemoDbStats {
             db_bytes,
             wal_bytes,
@@ -1161,6 +1192,7 @@ impl SharedStore {
             history_count: history_count as u64,
             total_body_bytes: self.total_body_bytes()?,
             limits: self.limits()?,
+            schedule_count: schedule_count as u64,
         })
     }
 
@@ -1441,6 +1473,227 @@ impl SharedStore {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(folders)
     }
+
+    // ---- 共有スケジュール表(M6 G-1、ADR-0053) ----
+    //
+    // 権限はメモよりずっと単純: ネットワーク全員が閲覧・追加でき、編集・
+    // 削除は作成者 + ホストだけ(決定 3)。ゴミ箱は持たず物理削除、編集
+    // ロックも持たず revision CAS のみで競合を検知する(決定 4)。
+
+    fn schedule_row(&self, id: &str) -> anyhow::Result<ScheduleRow> {
+        self.conn
+            .query_row(
+                &format!("SELECT {SCHEDULE_ROW_COLUMNS} FROM schedule_events WHERE id = ?1"),
+                params![id],
+                schedule_row_from_sql,
+            )
+            .optional()?
+            .context("予定が見つかりません(削除された可能性があります)")
+    }
+
+    /// 全件一覧(start_at 昇順)。V1 は 10,000 件上限のため全量で良い
+    /// (ADR-0053 決定 1)。
+    pub fn schedule_list(&self, actor: &Actor) -> anyhow::Result<Vec<ScheduleEvent>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SCHEDULE_ROW_COLUMNS} FROM schedule_events ORDER BY start_at ASC, id ASC"
+        ))?;
+        let rows = stmt
+            .query_map([], schedule_row_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().map(|row| row.into_event(actor)).collect())
+    }
+
+    pub fn schedule_get(&self, actor: &Actor, id: &str) -> anyhow::Result<ScheduleEvent> {
+        Ok(self.schedule_row(id)?.into_event(actor))
+    }
+
+    /// 新規作成(全員可)。
+    pub fn schedule_create(
+        &mut self,
+        actor: &Actor,
+        title: &str,
+        note: &str,
+        start_unix_ms: u64,
+        end_unix_ms: Option<u64>,
+        all_day: bool,
+    ) -> anyhow::Result<ScheduleEvent> {
+        validate_schedule_title(title)?;
+        validate_schedule_note(note)?;
+        validate_schedule_range(start_unix_ms, end_unix_ms)?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM schedule_events", [], |row| row.get(0))?;
+        if count as u32 >= MAX_SCHEDULE_EVENTS {
+            bail!(
+                "予定の件数が上限({} 件)に達しています。不要な予定を削除してください",
+                MAX_SCHEDULE_EVENTS
+            );
+        }
+        let id: String = self
+            .conn
+            .query_row("SELECT lower(hex(randomblob(8)))", [], |row| row.get(0))?;
+        let now = unix_ms();
+        self.conn.execute(
+            "INSERT INTO schedule_events
+                (id, title, note, start_at, end_at, all_day, owner_id, owner_name,
+                 updated_by, revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1, ?9, ?9)",
+            params![
+                id,
+                title,
+                note,
+                start_unix_ms as i64,
+                end_unix_ms.map(|v| v as i64),
+                all_day as i64,
+                actor.owner_id(),
+                actor.name,
+                now,
+            ],
+        )?;
+        self.schedule_get(actor, &id)
+    }
+
+    /// 更新(CAS)。作成者 + ホストのみ(ADR-0053 決定 3・4)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_update(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        base_revision: u64,
+        title: &str,
+        note: &str,
+        start_unix_ms: u64,
+        end_unix_ms: Option<u64>,
+        all_day: bool,
+    ) -> anyhow::Result<ScheduleEvent> {
+        validate_schedule_title(title)?;
+        validate_schedule_note(note)?;
+        validate_schedule_range(start_unix_ms, end_unix_ms)?;
+        let row = self.schedule_row(id)?;
+        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
+            bail!("この予定を編集できるのは作成者とホスト管理者だけです");
+        }
+        if row.revision as u64 != base_revision {
+            bail!("competing_edit: 他の端末の変更が先に保存されています(最新を読み込み直してください)");
+        }
+        self.conn.execute(
+            "UPDATE schedule_events SET title = ?1, note = ?2, start_at = ?3, end_at = ?4,
+                    all_day = ?5, updated_by = ?6, revision = revision + 1, updated_at = ?7
+             WHERE id = ?8",
+            params![
+                title,
+                note,
+                start_unix_ms as i64,
+                end_unix_ms.map(|v| v as i64),
+                all_day as i64,
+                actor.name,
+                unix_ms(),
+                id,
+            ],
+        )?;
+        self.schedule_get(actor, id)
+    }
+
+    /// 削除(物理削除、ゴミ箱なし = V1)。作成者 + ホストのみ。
+    pub fn schedule_delete(&mut self, actor: &Actor, id: &str) -> anyhow::Result<()> {
+        let row = self.schedule_row(id)?;
+        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
+            bail!("この予定を削除できるのは作成者とホスト管理者だけです");
+        }
+        self.conn
+            .execute("DELETE FROM schedule_events WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+}
+
+/// スケジュール 1 件分の生データ(受信者視点の計算前)。
+struct ScheduleRow {
+    id: String,
+    title: String,
+    note: String,
+    start_at: i64,
+    end_at: Option<i64>,
+    all_day: bool,
+    owner_id: String,
+    owner_name: String,
+    updated_by: String,
+    revision: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl ScheduleRow {
+    /// can_edit は作成者本人かホストなら真(ADR-0053 決定 3)。
+    fn into_event(self, actor: &Actor) -> ScheduleEvent {
+        let can_edit = actor.is_host() || self.owner_id == actor.owner_id();
+        ScheduleEvent {
+            id: self.id,
+            title: self.title,
+            note: self.note,
+            start_unix_ms: self.start_at as u64,
+            end_unix_ms: self.end_at.map(|v| v as u64),
+            all_day: self.all_day,
+            owner_id: self.owner_id,
+            owner_name: self.owner_name,
+            updated_by: self.updated_by,
+            revision: self.revision as u64,
+            created_at: self.created_at as u64,
+            updated_at: self.updated_at as u64,
+            can_edit,
+        }
+    }
+}
+
+const SCHEDULE_ROW_COLUMNS: &str = "id, title, note, start_at, end_at, all_day, owner_id,
+        owner_name, updated_by, revision, created_at, updated_at";
+
+fn schedule_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
+    Ok(ScheduleRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        note: row.get(2)?,
+        start_at: row.get(3)?,
+        end_at: row.get(4)?,
+        all_day: row.get::<_, i64>(5)? != 0,
+        owner_id: row.get(6)?,
+        owner_name: row.get(7)?,
+        updated_by: row.get(8)?,
+        revision: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+/// タイトルの検証(必須 + 上限文字数、ADR-0053 決定 6)。
+fn validate_schedule_title(title: &str) -> anyhow::Result<()> {
+    if title.trim().is_empty() {
+        bail!("タイトルを入力してください");
+    }
+    if title.chars().count() > MAX_SCHEDULE_TITLE_CHARS {
+        bail!("タイトルが長すぎます(上限 {MAX_SCHEDULE_TITLE_CHARS} 文字)");
+    }
+    Ok(())
+}
+
+/// 詳細(note)の検証(上限バイト数、ADR-0053 決定 6)。
+fn validate_schedule_note(note: &str) -> anyhow::Result<()> {
+    if note.len() > MAX_SCHEDULE_NOTE_BYTES {
+        bail!(
+            "詳細が長すぎます(上限 {} KiB)",
+            MAX_SCHEDULE_NOTE_BYTES / 1024
+        );
+    }
+    Ok(())
+}
+
+/// 終了日時は開始日時以降であること。
+fn validate_schedule_range(start_unix_ms: u64, end_unix_ms: Option<u64>) -> anyhow::Result<()> {
+    if let Some(end) = end_unix_ms {
+        if end < start_unix_ms {
+            bail!("終了日時は開始日時より後にしてください");
+        }
+    }
+    Ok(())
 }
 
 /// メモ行の共通 SELECT 列(この順で `row_from_sql` が読む)。呼び出し側は
@@ -1553,7 +1806,7 @@ pub struct CacheStore {
     conn: Connection,
 }
 
-const CACHE_SCHEMA_VERSION: i64 = 2;
+const CACHE_SCHEMA_VERSION: i64 = 3;
 
 impl CacheStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -1615,6 +1868,30 @@ impl CacheStore {
             // コメント本文自体はキャッシュに保存しない(一覧は都度取得)。
             tx.execute_batch(
                 "ALTER TABLE memos ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if version < 3 {
+            // v3(M6 G-1、ADR-0053): 共有スケジュール表のキャッシュ
+            // (can_edit はホストが計算済みの値をそのまま保存する)。
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS schedule_events (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    start_at INTEGER NOT NULL,
+                    end_at INTEGER,
+                    all_day INTEGER NOT NULL DEFAULT 0,
+                    owner_id TEXT NOT NULL DEFAULT '',
+                    owner_name TEXT NOT NULL DEFAULT '',
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    can_edit INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_schedule_events_start ON schedule_events(start_at);
+                "#,
             )?;
         }
         tx.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
@@ -1918,6 +2195,103 @@ impl CacheStore {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(memos)
     }
+
+    // ---- 共有スケジュール表のキャッシュ(M6 G-1、ADR-0053) ----
+
+    /// 接続時の同期(List 応答)で全量を置き換える。
+    pub fn schedule_replace_all(&mut self, events: &[ScheduleEvent]) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM schedule_events", [])?;
+        for event in events {
+            insert_cache_schedule_event(&tx, event)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 単発のイベント反映(Changed)。
+    pub fn schedule_upsert(&mut self, event: &ScheduleEvent) -> anyhow::Result<()> {
+        insert_cache_schedule_event(&self.conn, event)
+    }
+
+    /// 単発のイベント反映(Removed)。
+    pub fn schedule_remove(&mut self, id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM schedule_events WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// オフライン時の唯一のソース(start_at 昇順)。
+    pub fn schedule_list(&self) -> anyhow::Result<Vec<ScheduleEvent>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CACHE_SCHEDULE_COLUMNS} FROM schedule_events ORDER BY start_at ASC, id ASC"
+        ))?;
+        let events = stmt
+            .query_map([], cache_schedule_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(events)
+    }
+
+    pub fn schedule_get(&self, id: &str) -> anyhow::Result<ScheduleEvent> {
+        self.conn
+            .query_row(
+                &format!("SELECT {CACHE_SCHEDULE_COLUMNS} FROM schedule_events WHERE id = ?1"),
+                params![id],
+                cache_schedule_from_sql,
+            )
+            .optional()?
+            .context("予定が見つかりません(削除された可能性があります)")
+    }
+}
+
+const CACHE_SCHEDULE_COLUMNS: &str = "id, title, note, start_at, end_at, all_day, owner_id,
+        owner_name, updated_by, revision, created_at, updated_at, can_edit";
+
+fn insert_cache_schedule_event(conn: &Connection, event: &ScheduleEvent) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO schedule_events
+            (id, title, note, start_at, end_at, all_day, owner_id, owner_name,
+             updated_by, revision, created_at, updated_at, can_edit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(id) DO UPDATE SET
+            title = ?2, note = ?3, start_at = ?4, end_at = ?5, all_day = ?6, owner_id = ?7,
+            owner_name = ?8, updated_by = ?9, revision = ?10, created_at = ?11,
+            updated_at = ?12, can_edit = ?13",
+        params![
+            event.id,
+            event.title,
+            event.note,
+            event.start_unix_ms as i64,
+            event.end_unix_ms.map(|v| v as i64),
+            event.all_day as i64,
+            event.owner_id,
+            event.owner_name,
+            event.updated_by,
+            event.revision as i64,
+            event.created_at as i64,
+            event.updated_at as i64,
+            event.can_edit as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn cache_schedule_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleEvent> {
+    Ok(ScheduleEvent {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        note: row.get(2)?,
+        start_unix_ms: row.get::<_, i64>(3)? as u64,
+        end_unix_ms: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+        all_day: row.get::<_, i64>(5)? != 0,
+        owner_id: row.get(6)?,
+        owner_name: row.get(7)?,
+        updated_by: row.get(8)?,
+        revision: row.get::<_, i64>(9)? as u64,
+        created_at: row.get::<_, i64>(10)? as u64,
+        updated_at: row.get::<_, i64>(11)? as u64,
+        can_edit: row.get::<_, i64>(12)? != 0,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2927,5 +3301,262 @@ mod tests {
         assert_eq!(cache.get("m1").unwrap().comment_count, 3);
         let (memos, _) = cache.list(&SharedMemoQuery::default()).unwrap();
         assert_eq!(memos[0].comment_count, 3);
+    }
+
+    // ---- 共有スケジュール表(M6 G-1、ADR-0053) ----
+
+    /// CRUD の基本動作と、全員閲覧・全員追加可(決定 3)を確認する。
+    #[test]
+    fn schedule_crud_basic() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+
+        let created = store
+            .schedule_create(&alice, "定例会議", "議題未定", 1_000, Some(2_000), false)
+            .unwrap();
+        assert_eq!(created.title, "定例会議");
+        assert_eq!(created.owner_id, "id-alice");
+        assert_eq!(created.revision, 1);
+        assert!(created.can_edit, "作成者は編集できる");
+
+        // 全員が閲覧できる(ボブから見ても can_edit は偽)
+        let list = store.schedule_list(&bob).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].can_edit, "作成者以外は編集不可");
+
+        // ボブも作成できる(決定 3: 追加は全員可)
+        let bob_event = store
+            .schedule_create(&bob, "ボブの予定", "", 3_000, None, true)
+            .unwrap();
+        assert!(bob_event.can_edit);
+        assert_eq!(store.schedule_list(&alice).unwrap().len(), 2);
+
+        let updated = store
+            .schedule_update(
+                &alice,
+                &created.id,
+                created.revision,
+                "改題した定例会議",
+                "詳細を追加",
+                1_500,
+                Some(2_500),
+                false,
+            )
+            .unwrap();
+        assert_eq!(updated.title, "改題した定例会議");
+        assert_eq!(updated.revision, 2);
+
+        store.schedule_delete(&alice, &created.id).unwrap();
+        assert_eq!(store.schedule_list(&alice).unwrap().len(), 1);
+        assert!(store.schedule_get(&alice, &created.id).is_err());
+    }
+
+    /// 編集・削除は作成者 + ホストのみ(決定 3)。他人は拒否される。
+    #[test]
+    fn schedule_edit_delete_restricted_to_owner_and_host() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+        let host = Actor::host("ホスト");
+
+        let event = store
+            .schedule_create(&alice, "アリスの予定", "", 1_000, None, false)
+            .unwrap();
+
+        // ボブは編集も削除もできない
+        assert!(store
+            .schedule_update(
+                &bob,
+                &event.id,
+                event.revision,
+                "改ざん",
+                "",
+                1_000,
+                None,
+                false
+            )
+            .is_err());
+        assert!(store.schedule_delete(&bob, &event.id).is_err());
+
+        // ホストはできる
+        let by_host = store
+            .schedule_update(
+                &host,
+                &event.id,
+                event.revision,
+                "ホストが編集",
+                "",
+                1_000,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(by_host.title, "ホストが編集");
+        assert!(store.schedule_delete(&host, &event.id).is_ok());
+    }
+
+    /// revision CAS(決定 4): 古い revision での更新は拒否される。
+    #[test]
+    fn schedule_update_rejects_stale_revision() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let event = store
+            .schedule_create(&alice, "予定", "", 1_000, None, false)
+            .unwrap();
+        store
+            .schedule_update(
+                &alice,
+                &event.id,
+                event.revision,
+                "更新1",
+                "",
+                1_000,
+                None,
+                false,
+            )
+            .unwrap();
+        // event.revision はもう古い(1 →更新後は 2)
+        let err = store
+            .schedule_update(
+                &alice,
+                &event.id,
+                event.revision,
+                "更新2",
+                "",
+                1_000,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("competing_edit"));
+    }
+
+    /// 上限の検証(決定 6): タイトル必須・上限文字数、詳細のバイト上限、
+    /// 終了日時の整合性。
+    #[test]
+    fn schedule_validates_input() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+
+        assert!(
+            store
+                .schedule_create(&alice, "  ", "", 1_000, None, false)
+                .is_err(),
+            "空タイトルは拒否"
+        );
+        assert!(
+            store
+                .schedule_create(&alice, &"あ".repeat(201), "", 1_000, None, false)
+                .is_err(),
+            "201 文字は上限超過"
+        );
+        assert!(
+            store
+                .schedule_create(&alice, "t", &"x".repeat(4 * 1024 + 1), 1_000, None, false)
+                .is_err(),
+            "詳細 4KiB 超過"
+        );
+        assert!(
+            store
+                .schedule_create(&alice, "t", "", 2_000, Some(1_000), false)
+                .is_err(),
+            "終了が開始より前"
+        );
+        assert!(
+            store
+                .schedule_create(&alice, "t", "", 1_000, Some(1_000), false)
+                .is_ok(),
+            "終了 = 開始は許容"
+        );
+    }
+
+    /// 件数上限(決定 6)。
+    #[test]
+    fn schedule_enforces_event_count_limit() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        // 上限に達するまで直接 INSERT して高速化する(create の 1 件ずつは重い)
+        {
+            let tx = store.conn.transaction().unwrap();
+            for i in 0..MAX_SCHEDULE_EVENTS {
+                tx.execute(
+                    "INSERT INTO schedule_events
+                        (id, title, note, start_at, owner_id, owner_name, updated_by,
+                         revision, created_at, updated_at)
+                     VALUES (?1, 't', '', 0, '', '', '', 1, 0, 0)",
+                    params![format!("e{i}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let err = store
+            .schedule_create(&alice, "溢れる予定", "", 1_000, None, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("上限"));
+    }
+
+    /// v4 → v5 移行(ADR-0053): 既存の memos.db に schedule_events が
+    /// 追加され、以後の操作が問題なく行える。
+    #[test]
+    fn v4_database_migrates_to_v5_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        {
+            let mut store = SharedStore::open(&path).unwrap();
+            let host = Actor::host("ホスト");
+            store.create(&host, "既存メモ", "本文", None).unwrap();
+            // v4 相当に偽装
+            store.conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+        let mut store = SharedStore::open(&path).unwrap();
+        let host = Actor::host("ホスト");
+        let event = store
+            .schedule_create(&host, "移行後の予定", "", 1_000, None, false)
+            .unwrap();
+        assert_eq!(store.schedule_list(&host).unwrap().len(), 1);
+        assert_eq!(store.db_stats().unwrap().schedule_count, 1);
+        store.schedule_delete(&host, &event.id).unwrap();
+    }
+
+    /// キャッシュ往復(メンバー側): replace_all・upsert・remove・list・get。
+    #[test]
+    fn schedule_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheStore::open(&dir.path().join("m.memocache.db")).unwrap();
+        let make = |id: &str, start: u64| ScheduleEvent {
+            id: id.to_string(),
+            title: format!("予定{id}"),
+            note: String::new(),
+            start_unix_ms: start,
+            end_unix_ms: None,
+            all_day: false,
+            owner_id: String::new(),
+            owner_name: "ホスト".to_string(),
+            updated_by: "ホスト".to_string(),
+            revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            can_edit: true,
+        };
+        cache
+            .schedule_replace_all(&[make("e1", 2_000), make("e2", 1_000)])
+            .unwrap();
+        let list = cache.schedule_list().unwrap();
+        assert_eq!(list.len(), 2);
+        // start_at 昇順
+        assert_eq!(list[0].id, "e2");
+        assert_eq!(list[1].id, "e1");
+
+        let mut updated = make("e1", 2_000);
+        updated.title = "改題".to_string();
+        updated.revision = 2;
+        cache.schedule_upsert(&updated).unwrap();
+        assert_eq!(cache.schedule_get("e1").unwrap().title, "改題");
+
+        cache.schedule_remove("e2").unwrap();
+        assert_eq!(cache.schedule_list().unwrap().len(), 1);
+        assert!(cache.schedule_get("e2").is_err());
     }
 }

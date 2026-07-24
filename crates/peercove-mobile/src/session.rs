@@ -1134,6 +1134,17 @@ impl SessionShared {
                 query: Default::default(),
             },
         });
+        // 共有スケジュール表の初回同期(M6 G-1、ADR-0053)。メモの同期に相乗り。
+        // ホストが未対応(旧バージョン)なら応答が無いまま流れ、キャッシュは
+        // 温存される(既存の互換モデル)
+        let schedule_seq = self.next_memo_seq();
+        self.memo_sync_pending.lock().unwrap().insert(schedule_seq);
+        self.outbox.lock().unwrap().push(ControlMessage::MemoReq {
+            seq: schedule_seq,
+            op: peercove_core::memo::SharedMemoOp::Schedule {
+                schedule: peercove_core::schedule::ScheduleOp::List,
+            },
+        });
     }
 
     fn handle_memo_resp(&self, seq: u64, reply: peercove_core::memo::SharedMemoReply) {
@@ -1189,12 +1200,27 @@ impl SessionShared {
                 }
                 self.bump_memo();
             }
+            SharedMemoReply::Schedule {
+                reply: peercove_core::schedule::ScheduleReply::Events { events, .. },
+            } => {
+                let total = events.len();
+                let result = (|| -> anyhow::Result<()> {
+                    let mut cache = self.open_memo_cache()?;
+                    cache.schedule_replace_all(&events)
+                })();
+                match result {
+                    Ok(()) => tracing::info!("共有スケジュール表を同期しました({total} 件)"),
+                    Err(e) => tracing::warn!("共有スケジュール表の同期に失敗しました: {e:#}"),
+                }
+                self.bump_memo();
+            }
             _ => {}
         }
     }
 
     fn handle_memo_event(&self, event: peercove_core::memo::SharedMemoEvent) {
         use peercove_core::memo::SharedMemoEvent;
+        use peercove_core::schedule::ScheduleEventMsg;
         self.memo_supported.store(true, Ordering::Relaxed);
         let result = (|| -> anyhow::Result<()> {
             let mut cache = self.open_memo_cache()?;
@@ -1203,6 +1229,10 @@ impl SessionShared {
                 SharedMemoEvent::Removed { id } => cache.remove(&id),
                 SharedMemoEvent::Lock { id, holder } => cache.set_lock(&id, holder.as_deref()),
                 SharedMemoEvent::Folders { folders } => cache.replace_folders(&folders),
+                SharedMemoEvent::Schedule { schedule } => match schedule {
+                    ScheduleEventMsg::Changed { event } => cache.schedule_upsert(&event),
+                    ScheduleEventMsg::Removed { id } => cache.schedule_remove(&id),
+                },
             }
         })();
         if let Err(e) = result {

@@ -330,6 +330,7 @@ impl DaemonShared {
                 // キャッシュから、変更をコントロールチャネル経由で行う。
                 // メモの内容はログへ出さない(ADR-0049)
                 use peercove_core::memo::{SharedMemoOp, SharedMemoReply};
+                use peercove_core::schedule::{ScheduleOp, ScheduleReply};
                 let (memo, link) = {
                     let active = self.active.lock().await;
                     let active = active.get(&Self::key_for(&config)).with_context(|| {
@@ -384,6 +385,25 @@ impl DaemonShared {
                                     memos,
                                     folders: Vec::new(),
                                     offline: link.session().is_none(),
+                                },
+                            })
+                        }
+                        // 共有スケジュール表の一覧もキャッシュから(全員閲覧可、
+                        // オフラインでも読める — M6 G-1、ADR-0053)。変更系
+                        // (Create/Update/Delete)は下の wildcard 経由でホストへ
+                        SharedMemoOp::Schedule {
+                            schedule: ScheduleOp::List,
+                        } => {
+                            let mut events = cache.schedule_list().await?;
+                            let offline = link.session().is_none();
+                            if offline {
+                                for event in &mut events {
+                                    event.can_edit = false;
+                                }
+                            }
+                            Ok(IpcResponse::SharedMemo {
+                                reply: SharedMemoReply::Schedule {
+                                    reply: ScheduleReply::Events { events, offline },
                                 },
                             })
                         }
@@ -1820,6 +1840,7 @@ fn memo_db_status_check(db_path: &Path) -> DiagnosticCheck {
                     ("total_body_bytes", stats.total_body_bytes.to_string()),
                     ("max_total_bytes", stats.limits.max_total_bytes.to_string()),
                     ("max_memo_count", stats.limits.max_memo_count.to_string()),
+                    ("schedule_count", stats.schedule_count.to_string()),
                 ],
             )
         }

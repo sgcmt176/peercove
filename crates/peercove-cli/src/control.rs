@@ -1297,6 +1297,7 @@ async fn member_session(
 /// タイムアウトし、「ホスト未対応」のままにする(キャッシュは温存)。
 async fn memo_sync(link: Arc<MemberLink>, cache: Arc<crate::memoshare::MemberMemoCache>) {
     use peercove_core::memo::{SharedMemoOp, SharedMemoQuery, SharedMemoReply};
+    use peercove_core::schedule::{ScheduleOp, ScheduleReply};
     const SYNC_TIMEOUT: Duration = Duration::from_secs(20);
     let Some(rx) = link.request_memo(SharedMemoOp::List {
         query: SharedMemoQuery::default(),
@@ -1334,6 +1335,27 @@ async fn memo_sync(link: Arc<MemberLink>, cache: Arc<crate::memoshare::MemberMem
         {
             cache.upsert(memo).await;
         }
+    }
+
+    // 共有スケジュール表の初回同期(M6 G-1、ADR-0053)。メモの同期に相乗り。
+    // ホストが未対応(旧バージョン)なら応答が無いままタイムアウトし、
+    // 既存のキャッシュをそのまま温存する(既存の互換モデル)
+    let Some(rx) = link.request_memo(SharedMemoOp::Schedule {
+        schedule: ScheduleOp::List,
+    }) else {
+        return;
+    };
+    match tokio::time::timeout(SYNC_TIMEOUT, rx).await {
+        Ok(Ok(SharedMemoReply::Schedule {
+            reply: ScheduleReply::Events { events, .. },
+        })) => {
+            let total = events.len();
+            match cache.schedule_sync_from_list(events).await {
+                Ok(()) => tracing::info!("共有スケジュール表を同期しました({total} 件)"),
+                Err(e) => tracing::warn!("共有スケジュール表の同期に失敗しました: {e:#}"),
+            }
+        }
+        _ => tracing::debug!("共有スケジュール表の同期応答がありません(ホスト未対応の可能性)"),
     }
 }
 

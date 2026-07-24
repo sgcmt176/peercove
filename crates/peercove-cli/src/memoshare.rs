@@ -25,6 +25,7 @@ use peercove_core::memo::{
     SharedMemoSummary,
 };
 use peercove_core::proto::ControlMessage;
+use peercove_core::schedule::{ScheduleEvent, ScheduleEventMsg, ScheduleOp, ScheduleReply};
 use peercove_memo::shared::{Actor, CacheStore, SharedStore};
 
 use crate::control::Connections;
@@ -607,6 +608,102 @@ impl MemoService {
                 self.bump();
                 Ok(SharedMemoReply::Done)
             }
+            SharedMemoOp::Schedule { schedule } => {
+                let reply = self.handle_schedule(actor, schedule).await?;
+                Ok(SharedMemoReply::Schedule { reply })
+            }
+        }
+    }
+
+    /// 共有スケジュール表(M6 G-1、ADR-0053)。全員閲覧・追加可、編集・削除は
+    /// 作成者 + ホストのみ(権限判定は store 側)。編集ロックは持たない
+    /// (revision CAS のみ)。
+    async fn handle_schedule(
+        self: &Arc<Self>,
+        actor: Actor,
+        op: ScheduleOp,
+    ) -> anyhow::Result<ScheduleReply> {
+        match op {
+            ScheduleOp::List => {
+                let events = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| store.schedule_list(&actor)
+                    })
+                    .await?;
+                Ok(ScheduleReply::Events {
+                    events,
+                    offline: false,
+                })
+            }
+            ScheduleOp::Create {
+                title,
+                note,
+                start_unix_ms,
+                end_unix_ms,
+                all_day,
+            } => {
+                let event = self
+                    .blocking({
+                        let actor = actor.clone();
+                        move |store| {
+                            store.schedule_create(
+                                &actor,
+                                &title,
+                                &note,
+                                start_unix_ms,
+                                end_unix_ms,
+                                all_day,
+                            )
+                        }
+                    })
+                    .await?;
+                self.broadcast_schedule_changed(event.clone());
+                self.bump();
+                Ok(ScheduleReply::Event { event })
+            }
+            ScheduleOp::Update {
+                id,
+                base_revision,
+                title,
+                note,
+                start_unix_ms,
+                end_unix_ms,
+                all_day,
+            } => {
+                let event = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let id = id.clone();
+                        move |store| {
+                            store.schedule_update(
+                                &actor,
+                                &id,
+                                base_revision,
+                                &title,
+                                &note,
+                                start_unix_ms,
+                                end_unix_ms,
+                                all_day,
+                            )
+                        }
+                    })
+                    .await?;
+                self.broadcast_schedule_changed(event.clone());
+                self.bump();
+                Ok(ScheduleReply::Event { event })
+            }
+            ScheduleOp::Delete { id } => {
+                self.blocking({
+                    let actor = actor.clone();
+                    let id = id.clone();
+                    move |store| store.schedule_delete(&actor, &id)
+                })
+                .await?;
+                self.broadcast_schedule_removed(&id);
+                self.bump();
+                Ok(ScheduleReply::Done)
+            }
         }
     }
 
@@ -895,6 +992,47 @@ impl MemoService {
             }
         });
     }
+
+    /// 予定の作成・更新を全員へ配信する(**閲覧権限フィルタなし** —
+    /// ADR-0053 決定 3。可視性で振り分ける共有メモの broadcast_changed とは
+    /// 異なる)。受信者ごとに can_edit だけ計算し直して詰める。
+    fn broadcast_schedule_changed(self: &Arc<Self>, event: ScheduleEvent) {
+        let service = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let targets = service.memo_connections();
+            if targets.is_empty() {
+                return;
+            }
+            let Ok(config) = Config::load(&service.config_path) else {
+                return;
+            };
+            for (ip, connection) in targets {
+                let Ok(actor) = Self::actor_for_ip(&config, ip) else {
+                    continue;
+                };
+                let mut for_actor = event.clone();
+                for_actor.can_edit = actor.member_id.is_none()
+                    || actor.member_id.as_deref() == Some(event.owner_id.as_str());
+                connection.send(ControlMessage::MemoEvent {
+                    event: SharedMemoEvent::Schedule {
+                        schedule: ScheduleEventMsg::Changed { event: for_actor },
+                    },
+                });
+            }
+        });
+    }
+
+    /// 予定の削除を全員へ配信する(フィルタなし)。
+    fn broadcast_schedule_removed(self: &Arc<Self>, id: &str) {
+        let event = SharedMemoEvent::Schedule {
+            schedule: ScheduleEventMsg::Removed { id: id.to_string() },
+        };
+        for (_, connection) in self.memo_connections() {
+            connection.send(ControlMessage::MemoEvent {
+                event: event.clone(),
+            });
+        }
+    }
 }
 
 fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
@@ -981,6 +1119,15 @@ impl MemberMemoCache {
                 self.blocking(move |store| store.replace_folders(&folders))
                     .await
             }
+            SharedMemoEvent::Schedule { schedule } => match schedule {
+                ScheduleEventMsg::Changed { event } => {
+                    self.blocking(move |store| store.schedule_upsert(&event))
+                        .await
+                }
+                ScheduleEventMsg::Removed { id } => {
+                    self.blocking(move |store| store.schedule_remove(&id)).await
+                }
+            },
         };
         match result {
             Ok(()) => self.bump(),
@@ -1047,5 +1194,22 @@ impl MemberMemoCache {
             tracing::warn!("共有メモのキャッシュ書き込みに失敗しました: {e:#}");
         }
         self.bump();
+    }
+
+    /// 一覧(オフライン時はここが唯一のソース、M6 G-1)。
+    pub async fn schedule_list(self: &Arc<Self>) -> anyhow::Result<Vec<ScheduleEvent>> {
+        self.blocking(|store| store.schedule_list()).await
+    }
+
+    /// 接続時の同期: List 応答で全量を置き換える(メモと違い差分取得は
+    /// 行わない — 件数上限が小さく全量置き換えで十分軽い、ADR-0053)。
+    pub async fn schedule_sync_from_list(
+        self: &Arc<Self>,
+        events: Vec<ScheduleEvent>,
+    ) -> anyhow::Result<()> {
+        self.blocking(move |store| store.schedule_replace_all(&events))
+            .await?;
+        self.bump();
+        Ok(())
     }
 }

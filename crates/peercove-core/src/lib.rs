@@ -16,6 +16,7 @@ pub mod msg;
 pub mod names;
 pub mod proto;
 pub mod quality;
+pub mod schedule;
 pub mod token;
 
 use std::path::PathBuf;
