@@ -352,4 +352,9 @@
     <string name="shared_memo_comment_badge">💬%1$d</string>
     <string name="notif_memo_comment_title">%1$s が「%2$s」にコメントしました</string>
     <string name="notif_memo_mention_title">%1$s があなたをメンションしました(「%2$s」)</string>
+
+    <!-- 共有オブジェクト参照 `@memo:id`(M5 F-5 Stage 4、ADR-0052 決定 1) -->
+    <string name="shared_memo_copy_link">リンクをコピー</string>
+    <string name="shared_ref_loading">読み込み中…</string>
+    <string name="shared_ref_inaccessible">アクセスできないメモ</string>
 </resources>

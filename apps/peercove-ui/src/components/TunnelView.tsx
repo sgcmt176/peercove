@@ -34,6 +34,7 @@ export function TunnelView({
   view,
   chatTarget,
   onOpenChat,
+  onOpenMemo,
   onView,
   onChanged,
 }: {
@@ -43,6 +44,8 @@ export function TunnelView({
   chatTarget: { peer: string } | null;
   /** 相手を指定してチャットを開く(1:1 会話を選ぶ)。 */
   onOpenChat: (peer: string) => void;
+  /** チャットの `@memo:id` カード(ADR-0052 決定 1)をクリックしたときの遷移先。 */
+  onOpenMemo: (id: string) => void;
   /** 別のビューへ切り替える(送信後に受信へ 等)。 */
   onView: (view: "members" | "chat" | "stats" | "inbox" | "dns") => void;
   onChanged: () => void;
@@ -271,7 +274,11 @@ export function TunnelView({
           </section>
         </>
       ) : view === "chat" ? (
-        <ChatPanel tunnel={tunnel} initialConversation={chatTarget} />
+        <ChatPanel
+          tunnel={tunnel}
+          initialConversation={chatTarget}
+          onOpenMemo={onOpenMemo}
+        />
       ) : view === "stats" ? (
         <QualityView tunnel={tunnel} />
       ) : view === "inbox" ? (

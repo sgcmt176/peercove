@@ -1776,6 +1776,65 @@ select {
   color: var(--muted);
 }
 
+/* 共有オブジェクト参照カード `@memo:id`(M5 F-5 Stage 4、ADR-0052 決定 1) */
+.msg__ref {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 260px;
+  margin: 2px 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.msg__ref:hover {
+  border-color: var(--accent);
+}
+
+.msg__ref--loading,
+.msg__ref--locked {
+  cursor: default;
+}
+
+.msg__ref--locked {
+  color: var(--muted);
+}
+
+.msg__ref-icon {
+  flex-shrink: 0;
+  font-size: 1rem;
+}
+
+.msg__ref-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.msg__ref-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg__ref-excerpt {
+  font-size: 0.76rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- 左サイドバー + メイン(M3-15) ---- */
 
 .sidebar {

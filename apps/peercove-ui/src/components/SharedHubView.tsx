@@ -17,6 +17,9 @@ type SharedHubProps = {
   members: Member[];
   /** 権限ダイアログで選べるグループ(ADR-0051)。host は既知の全グループ、member は自分の所属グループだけ。 */
   permGroups: PermGroup[];
+  /** チャットの `@memo:id` カード(ADR-0052 決定 1)から開くメモ。 */
+  focusMemoId?: string | null;
+  onFocusConsumed?: () => void;
 };
 
 type SharedHubTab = {

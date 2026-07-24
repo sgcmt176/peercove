@@ -124,8 +124,11 @@ fun ConversationScreen(
     messages: List<ChatMessage>,
     members: List<MemberInfo>,
     onNotice: (String) -> Unit,
+    /** 本文中の `@memo:id` カード(ADR-0052 決定 1)をタップしたときの遷移先。 */
+    onOpenMemo: (String) -> Unit,
 ) {
     val context = LocalContext.current
+    val baseDir = context.filesDir.absolutePath
     val scope = rememberCoroutineScope()
     var input by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
@@ -208,11 +211,14 @@ fun ConversationScreen(
             items(convMessages, key = { it.seq.toLong() }) { message ->
                 when {
                     message.system -> SystemLine(message.text)
-                    message.outgoing -> OutgoingBubble(slug, message, onNotice)
+                    message.outgoing -> OutgoingBubble(slug, baseDir, message, onNotice, onOpenMemo)
                     else -> IncomingBubble(
+                        slug,
+                        baseDir,
                         message,
                         showName = conv !is ConvKey.Direct,
                         onNotice = onNotice,
+                        onOpenMemo = onOpenMemo,
                     )
                 }
             }
@@ -267,9 +273,12 @@ private fun SystemLine(text: String) {
 
 @Composable
 private fun IncomingBubble(
+    slug: String,
+    baseDir: String,
     message: ChatMessage,
     showName: Boolean,
     onNotice: (String) -> Unit,
+    onOpenMemo: (String) -> Unit,
 ) {
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         // アバター(名前の頭文字)
@@ -297,11 +306,14 @@ private fun IncomingBubble(
             }
             Row(verticalAlignment = Alignment.Bottom) {
                 Bubble(
+                    slug = slug,
+                    baseDir = baseDir,
                     message = message,
                     container = MaterialTheme.colorScheme.surfaceVariant,
                     content = MaterialTheme.colorScheme.onSurface,
                     shape = RoundedCornerShape(4.dp, 16.dp, 16.dp, 16.dp),
                     onNotice = onNotice,
+                    onOpenMemo = onOpenMemo,
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
@@ -317,8 +329,10 @@ private fun IncomingBubble(
 @Composable
 private fun OutgoingBubble(
     slug: String,
+    baseDir: String,
     message: ChatMessage,
     onNotice: (String) -> Unit,
+    onOpenMemo: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val resendFailed = stringResource(R.string.chat_send_failed)
@@ -391,11 +405,14 @@ private fun OutgoingBubble(
         Spacer(modifier = Modifier.width(4.dp))
         // LINE 風: 自分の吹き出しは緑
         Bubble(
+            slug = slug,
+            baseDir = baseDir,
             message = message,
             container = Color(0xFF8DE055),
             content = Color(0xFF102A00),
             shape = RoundedCornerShape(16.dp, 4.dp, 16.dp, 16.dp),
             onNotice = onNotice,
+            onOpenMemo = onOpenMemo,
         )
     }
 }
@@ -420,11 +437,14 @@ private fun decodeSampled(path: String, maxDim: Int): android.graphics.Bitmap? {
 
 @Composable
 private fun Bubble(
+    slug: String,
+    baseDir: String,
     message: ChatMessage,
     container: Color,
     content: Color,
     shape: RoundedCornerShape,
     onNotice: (String) -> Unit,
+    onOpenMemo: (String) -> Unit,
 ) {
     // ファイルのタップ = 操作シート(開く / 共有 / 保存 / SHA-256)
     var showSheet by remember { mutableStateOf(false) }
@@ -498,21 +518,55 @@ private fun Bubble(
                 }
             }
         } else {
-            val urls = remember(message.text) {
-                urlRegex.findAll(message.text).map { it.value }.toList()
-            }
-            Column(
-                modifier = Modifier
-                    .widthIn(max = 260.dp)
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            ) {
-                // URL はリンク化(タップでブラウザ)。無ければ素のテキスト
-                if (urls.isEmpty()) {
-                    Text(message.text, color = content)
-                } else {
-                    Text(linkifyText(message.text, content), color = content)
-                    // 最初の URL のプレビューカード(タイトル / og:image)
-                    LinkPreviewCard(urls.first(), content)
+            // 共有オブジェクト参照 `@memo:id`(ADR-0052 決定 1)。地の文はこれ
+            // まで通りの URL リンク化、トークン部分だけカード化する
+            val refParts = remember(message.text) { splitSharedRefs(message.text) }
+            if (refParts.any { it is SharedRefPart.Ref }) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 260.dp)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                ) {
+                    refParts.forEach { part ->
+                        when (part) {
+                            is SharedRefPart.Ref -> SharedRefCard(
+                                baseDir = baseDir,
+                                slug = slug,
+                                token = part.token,
+                                content = content,
+                                onOpen = { onOpenMemo(part.token.id) },
+                            )
+                            is SharedRefPart.PlainText -> if (part.value.isNotEmpty()) {
+                                val urls = remember(part.value) {
+                                    urlRegex.findAll(part.value).map { it.value }.toList()
+                                }
+                                if (urls.isEmpty()) {
+                                    Text(part.value, color = content)
+                                } else {
+                                    Text(linkifyText(part.value, content), color = content)
+                                    LinkPreviewCard(urls.first(), content)
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                val urls = remember(message.text) {
+                    urlRegex.findAll(message.text).map { it.value }.toList()
+                }
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 260.dp)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                ) {
+                    // URL はリンク化(タップでブラウザ)。無ければ素のテキスト
+                    if (urls.isEmpty()) {
+                        Text(message.text, color = content)
+                    } else {
+                        Text(linkifyText(message.text, content), color = content)
+                        // 最初の URL のプレビューカード(タイトル / og:image)
+                        LinkPreviewCard(urls.first(), content)
+                    }
                 }
             }
         }

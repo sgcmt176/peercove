@@ -3,8 +3,10 @@
 // 読める)。編集は「編集」ボタンでロックを取得してから。保存はリビジョン
 // CAS 付きでホストへ送られ、他の閲覧者へ数秒以内に配信される。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { sharedRefToken } from "../sharedRefs";
 import {
   DiffLine,
   MemoFolder,
@@ -41,6 +43,8 @@ export function SharedMemoView({
   seq,
   members,
   permGroups,
+  focusMemoId,
+  onFocusConsumed,
 }: {
   configPath: string;
   isHost: boolean;
@@ -51,6 +55,9 @@ export function SharedMemoView({
   members: Member[];
   /** 権限ダイアログで選べるグループ(ADR-0051)。host は既知の全グループ、member は自分の所属グループだけ。 */
   permGroups: PermGroup[];
+  /** チャットの `@memo:id` カード(ADR-0052 決定 1)から開くメモ。 */
+  focusMemoId?: string | null;
+  onFocusConsumed?: () => void;
 }) {
   const [folderId, setFolderId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -236,6 +243,15 @@ export function SharedMemoView({
     },
     [op, stopEditing, fetchBacklinks],
   );
+
+  // チャットの `@memo:id` カード(ADR-0052 決定 1)から開く。反映したら
+  // 呼び出し元(App)の状態を戻す(一度きり)
+  useEffect(() => {
+    if (!focusMemoId) return;
+    setTrashView(false);
+    void open(focusMemoId).finally(() => onFocusConsumed?.());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusMemoId]);
 
   /** 編集ロックを取得して編集を始める(最新内容が返る)。 */
   const startEditing = useCallback(
@@ -647,6 +663,20 @@ export function SharedMemoView({
                     {t.sharedMemo.saveVersion}
                   </button>
                 </>
+              )}
+              {!editing && (
+                <button
+                  type="button"
+                  className="button--icon"
+                  title={t.sharedMemo.copyLink}
+                  onClick={() =>
+                    void writeText(sharedRefToken("memo", selected.id)).then(
+                      () => setNotice(t.sharedMemo.copyLinkDone),
+                    )
+                  }
+                >
+                  🔗
+                </button>
               )}
               {!editing && (
                 <button

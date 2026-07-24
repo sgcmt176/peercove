@@ -578,6 +578,12 @@ export const ja = {
     textTruncated: "ファイルが大きいため先頭のみ表示しています。",
   },
 
+  // 共有オブジェクト参照 `@memo:id` のカード(M5 F-5 Stage 4、ADR-0052 決定 1)
+  sharedRef: {
+    loading: "読み込み中…",
+    inaccessible: "アクセスできないメモ",
+  },
+
   // ファイル送信・受信ボックス(M3-9b、ADR-0015)
   transfer: {
     head: "転送",
@@ -1067,6 +1073,10 @@ export const ja = {
     // メモ間リンク・バックリンク(M5 F-5 Stage 2、ADR-0052 決定 2)
     wikilinkMissing: "リンク先のメモが見つかりません",
     backlinksTitle: (n: number) => `バックリンク (${n})`,
+
+    // チャットへのリンクをコピー `@memo:id`(M5 F-5 Stage 4、ADR-0052 決定 1)
+    copyLink: "リンクをコピー",
+    copyLinkDone: "チャットに貼り付けられるリンクをコピーしました",
 
     // 変更履歴(M5 F-3、ADR-0049)
     history: "履歴",

@@ -127,6 +127,9 @@ fun NetworkScreen(
     var dnsList by remember { mutableStateOf<List<DnsEntry>>(emptyList()) }
     var messages by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
     var conv by remember { mutableStateOf<ConvKey?>(null) }
+    // チャットの `@memo:id` カード(ADR-0052 決定 1)から「共有」タブの
+    // 該当メモへ遷移するための一時状態。反映したら null に戻す
+    var memoFocus by remember { mutableStateOf<String?>(null) }
     var showGroupDialog by remember { mutableStateOf(false) }
     var showGroupManage by remember { mutableStateOf(false) }
     var showFiles by remember { mutableStateOf(false) }
@@ -327,7 +330,18 @@ fun NetworkScreen(
 
         val currentConv = conv
         if (currentConv != null) {
-            ConversationScreen(slug, currentConv, messages, memberList, onNotice)
+            ConversationScreen(
+                slug,
+                currentConv,
+                messages,
+                memberList,
+                onNotice,
+                onOpenMemo = { id ->
+                    memoFocus = id
+                    tab = 2
+                    conv = null
+                },
+            )
             return@Column
         }
         if (showFiles) {
@@ -363,7 +377,12 @@ fun NetworkScreen(
                 onOpen = { conv = it },
             )
             1 -> MemberList(memberList, slug, onCopy = ::copy)
-            2 -> SharedHubTab(slug, onNotice)
+            2 -> SharedHubTab(
+                slug,
+                onNotice,
+                focusMemoId = memoFocus,
+                onFocusConsumed = { memoFocus = null },
+            )
             3 -> DnsList(memberList, dnsList, onCopy = ::copy, onNotice = onNotice)
             else -> SettingsTab(slug, state, tunnel, onNotice, onChatCleared = { chatEpoch++ })
         }

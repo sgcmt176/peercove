@@ -97,6 +97,11 @@ export default function App() {
    */
   const [chatTarget, setChatTarget] = useState<{ peer: string } | null>(null);
   /**
+   * チャットの `@memo:id` カード(ADR-0052 決定 1)から共有ハブの該当メモへ
+   * フォーカスする。一度反映したら(SharedMemoView 側で)null に戻る。
+   */
+  const [memoFocus, setMemoFocus] = useState<string | null>(null);
+  /**
    * ディープリンクで受けた招待トークン(M3-5)。オブジェクトで包むのは、
    * 同じリンクを 2 回クリックしても再度フォームを開くため(参照が変わる)。
    */
@@ -567,6 +572,8 @@ export default function App() {
               seq={openTunnel.sharedMemoSeq}
               members={openTunnel.members}
               permGroups={openTunnel.permGroups ?? []}
+              focusMemoId={memoFocus}
+              onFocusConsumed={() => setMemoFocus(null)}
             />
           ) : openTunnel !== null ? (
             <TunnelView
@@ -584,6 +591,10 @@ export default function App() {
               onOpenChat={(peer) => {
                 setChatTarget({ peer });
                 setView("chat");
+              }}
+              onOpenMemo={(id) => {
+                setMemoFocus(id);
+                setView("net-memos");
               }}
               onView={setView}
               onChanged={changed}

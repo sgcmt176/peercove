@@ -25,6 +25,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
@@ -52,8 +53,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -101,19 +104,32 @@ private val sharedDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefau
 private data class SharedHubTabSpec(
     val id: String,
     val labelRes: Int,
-    val content: @Composable (slug: String, onNotice: (String) -> Unit) -> Unit,
+    val content: @Composable (
+        slug: String,
+        onNotice: (String) -> Unit,
+        focusMemoId: String?,
+        onFocusConsumed: () -> Unit,
+    ) -> Unit,
 )
 
 private val SHARED_HUB_TABS = listOf(
     SharedHubTabSpec(
         id = "memos",
         labelRes = R.string.shared_hub_tab_memos,
-        content = { slug, onNotice -> SharedMemoTab(slug, onNotice) },
+        content = { slug, onNotice, focusMemoId, onFocusConsumed ->
+            SharedMemoTab(slug, onNotice, focusMemoId, onFocusConsumed)
+        },
     ),
 )
 
 @Composable
-fun SharedHubTab(slug: String, onNotice: (String) -> Unit) {
+fun SharedHubTab(
+    slug: String,
+    onNotice: (String) -> Unit,
+    /** チャットの `@memo:id` カード(ADR-0052 決定 1)から開くメモ。反映後は呼び出し元で null に戻す。 */
+    focusMemoId: String? = null,
+    onFocusConsumed: () -> Unit = {},
+) {
     var tabId by remember { mutableStateOf(SHARED_HUB_TABS.first().id) }
     val active = SHARED_HUB_TABS.firstOrNull { it.id == tabId } ?: SHARED_HUB_TABS.first()
 
@@ -133,12 +149,18 @@ fun SharedHubTab(slug: String, onNotice: (String) -> Unit) {
                 )
             }
         }
-        active.content(slug, onNotice)
+        active.content(slug, onNotice, focusMemoId, onFocusConsumed)
     }
 }
 
 @Composable
-fun SharedMemoTab(slug: String, onNotice: (String) -> Unit) {
+fun SharedMemoTab(
+    slug: String,
+    onNotice: (String) -> Unit,
+    /** チャットの `@memo:id` カード(ADR-0052 決定 1)から開くメモ。 */
+    focusMemoId: String? = null,
+    onFocusConsumed: () -> Unit = {},
+) {
     val context = LocalContext.current
     val baseDir = context.filesDir.absolutePath
     val scope = rememberCoroutineScope()
@@ -147,6 +169,14 @@ fun SharedMemoTab(slug: String, onNotice: (String) -> Unit) {
     var result by remember { mutableStateOf<SharedMemoListResult?>(null) }
     var openId by remember { mutableStateOf<String?>(null) }
     var refreshTick by remember { mutableIntStateOf(0) }
+
+    // チャットからの遷移: 指定があればそのメモを直接開く(一覧のフィルタ
+    // に関係なく取得できる。反映したら呼び出し元の状態を戻す)
+    LaunchedEffect(focusMemoId) {
+        val id = focusMemoId ?: return@LaunchedEffect
+        openId = id
+        onFocusConsumed()
+    }
 
     // 世代ポーリング: ホストからの配信でキャッシュが進んだら再取得(リアルタイム)
     LaunchedEffect(Unit) {
@@ -355,6 +385,9 @@ private fun SharedMemoEditor(
     var confirmTrash by remember { mutableStateOf(false) }
     var historyOpen by remember { mutableStateOf(false) }
     val savedVersionMsg = stringResource(R.string.shared_memo_save_version_done)
+    // リンクをコピー(ADR-0052 決定 1): `@memo:id` をクリップボードへ
+    val clipboard = LocalClipboardManager.current
+    val copiedFmt = stringResource(R.string.notice_copied)
     // メモ間リンク(ADR-0052 決定 2): タイトル → memo_id(見つかったものだけ)
     var wikiLinks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var backlinks by remember { mutableStateOf<List<SharedMemoSummaryInfo>>(emptyList()) }
@@ -551,6 +584,16 @@ private fun SharedMemoEditor(
                 }
             }
             if (!editing) {
+                IconButton(onClick = {
+                    val token = sharedRefToken(SharedRefKind.MEMO, id)
+                    clipboard.setText(AnnotatedString(token))
+                    onNotice(copiedFmt.format(token))
+                }) {
+                    Icon(
+                        Icons.Filled.Link,
+                        contentDescription = stringResource(R.string.shared_memo_copy_link),
+                    )
+                }
                 IconButton(onClick = { historyOpen = true }) {
                     Icon(
                         Icons.Filled.History,

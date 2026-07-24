@@ -17,6 +17,12 @@ import {
 } from "../ipc";
 import { loadPrefs } from "../prefs";
 import {
+  SharedRefTokenValue,
+  sharedRefIcon,
+  splitSharedRefs,
+  useSharedRefResolve,
+} from "../sharedRefs";
+import {
   ConversationKey,
   NETWORK_CONVERSATION,
   appendLocal,
@@ -70,10 +76,13 @@ interface ConversationItem {
 export function ChatPanel({
   tunnel,
   initialConversation,
+  onOpenMemo,
 }: {
   tunnel: Tunnel;
   /** メンバー行の 💬 から開くとき、その相手(仮想 IP)の 1:1 会話を選ぶ。 */
   initialConversation?: { peer: string } | null;
+  /** 本文中の `@memo:id` カード(ADR-0052 決定 1)をクリックしたときの遷移先。 */
+  onOpenMemo: (id: string) => void;
 }) {
   const [conversation, setConversation] = useState<ConversationKey>(
     initialConversation?.peer ?? NETWORK_CONVERSATION,
@@ -626,6 +635,8 @@ export function ChatPanel({
               showNames={showNames}
               transfers={tunnel.transfers}
               sendingSeqs={sendingSeqs}
+              configPath={tunnel.config}
+              onOpenMemo={onOpenMemo}
               onResend={(seq) =>
                 void api
                   .chatResend(tunnel.config, seq)
@@ -1162,6 +1173,83 @@ function linkify(text: string): ReactNode {
   );
 }
 
+/**
+ * 本文を描画する(M5 F-5 Stage 4、ADR-0052 決定 1)。`@memo:id` トークンは
+ * その位置でカード化し、残りの地の文は従来どおり URL をリンク化する。
+ */
+function renderMessageBody(
+  text: string,
+  configPath: string,
+  onOpenMemo: (id: string) => void,
+): ReactNode {
+  const parts = splitSharedRefs(text);
+  if (!parts.some((part) => part.type === "ref")) return linkify(text);
+  return parts.map((part, index) =>
+    part.type === "ref" ? (
+      <SharedRefCard
+        key={index}
+        configPath={configPath}
+        token={part.token}
+        onOpen={() => onOpenMemo(part.token.id)}
+      />
+    ) : (
+      <span key={index}>{linkify(part.value)}</span>
+    ),
+  );
+}
+
+/**
+ * 共有オブジェクト参照のカード(M5 F-5 Stage 4、ADR-0052 決定 1)。表示時に
+ * 受信者自身の権限で解決する(メモはキャッシュ経由 = オフラインでも出る)。
+ * 取得できない場合は「アクセスできません」カード(タイトル等は出さない)。
+ */
+function SharedRefCard({
+  configPath,
+  token,
+  onOpen,
+}: {
+  configPath: string;
+  token: SharedRefTokenValue;
+  onOpen: () => void;
+}) {
+  const resolved = useSharedRefResolve(configPath, token);
+  if (resolved === undefined) {
+    return (
+      <span className="msg__ref msg__ref--loading">
+        <span className="msg__ref-icon" aria-hidden>
+          {sharedRefIcon(token.kind)}
+        </span>
+        <span className="msg__ref-title muted">{t.sharedRef.loading}</span>
+      </span>
+    );
+  }
+  if (resolved === null) {
+    return (
+      <span className="msg__ref msg__ref--locked">
+        <span className="msg__ref-icon" aria-hidden>
+          🔒
+        </span>
+        <span className="msg__ref-title">{t.sharedRef.inaccessible}</span>
+      </span>
+    );
+  }
+  return (
+    <button type="button" className="msg__ref" onClick={onOpen}>
+      <span className="msg__ref-icon" aria-hidden>
+        {sharedRefIcon(token.kind)}
+      </span>
+      <span className="msg__ref-text">
+        <span className="msg__ref-title">
+          {resolved.title || t.memo.untitled}
+        </span>
+        {resolved.excerpt && (
+          <span className="msg__ref-excerpt">{resolved.excerpt}</span>
+        )}
+      </span>
+    </button>
+  );
+}
+
 /** 表示用のホスト名。 */
 function hostOf(url: string): string {
   try {
@@ -1255,6 +1343,8 @@ function Bubbles({
   onResend,
   onCancelSend,
   onOpenText,
+  configPath,
+  onOpenMemo,
 }: {
   messages: ChatMessage[];
   selfIp: string;
@@ -1267,6 +1357,9 @@ function Bubbles({
   onSaveFile: (name: string) => void;
   onEnlarge: (src: string, name: string) => void;
   onOpenText: (name: string, preview: TextPreview) => void;
+  configPath: string;
+  /** 本文中の `@memo:id` カード(ADR-0052 決定 1)をクリックしたときの遷移先。 */
+  onOpenMemo: (id: string) => void;
 }) {
   let lastDate = "";
   // リンクプレビューはアプリ設定でオフにできる(M3-13e)
@@ -1325,7 +1418,11 @@ function Bubbles({
                       />
                     ) : (
                       <span className="msg__bubble">
-                        {linkify(message.text)}
+                        {renderMessageBody(
+                          message.text,
+                          configPath,
+                          onOpenMemo,
+                        )}
                       </span>
                     )}
                     <span className="msg__time muted">
