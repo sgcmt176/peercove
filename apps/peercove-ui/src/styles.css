@@ -1612,6 +1612,16 @@ select {
   font-size: 13px;
 }
 
+/* メンションサジェスト(ADR-0055 決定 1a)の位置決め用コンテナ。
+   .memo__mention-suggest は position: absolute; bottom: 100% で、この
+   直近の position: relative な祖先(このラッパー)を基準に浮く */
+.chat__textarea-wrap {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
 /* 入力欄は内容に合わせて伸びる(JS が高さを設定。上限は画面の 4 割) */
 .chat__textarea {
   max-height: 40vh;
@@ -1718,6 +1728,29 @@ select {
   color: inherit;
   text-decoration: underline;
   word-break: break-all;
+}
+
+/* チャットのメンション強調表示(ADR-0055 決定 1)。@名前 / @All を分かる
+   ようにする。自分宛(自分の名前 or @All)はより目立つ色にする */
+.msg__mention {
+  font-weight: 600;
+  border-radius: 4px;
+  padding: 0 3px;
+  background: rgba(127, 127, 127, 0.18);
+}
+
+.msg__mention--self {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.msg--own .msg__mention {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.msg--own .msg__mention--self {
+  background: #fff;
+  color: var(--accent);
 }
 
 /* リンクプレビューのカード(M3-13e、ADR-0017 — LINE 風) */

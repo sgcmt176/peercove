@@ -1755,6 +1755,13 @@ impl SessionShared {
         });
     }
 
+    /// 自分の端末のチャット履歴(全体タブ相当)へローカルなお知らせ行を足す
+    /// (ADR-0055 決定 1d)。他メンバーへは一切送信しない。メモコメントの
+    /// メンション・自メモコメント受信の通知(Kotlin 側のウォッチャー)から呼ぶ。
+    pub fn add_local_chat_note(&self, text: String) {
+        self.append_system_line(ChatScope::Network, None, None, text);
+    }
+
     /// ネットワークに居ない IP(置き換わった・台帳から消えた・過去の削除の
     /// 取りこぼし)を、自分がメンバーのグループから外して残りへ配る
     /// (デスクトップの reconcile と同じ規則。配布は best-effort — 各メンバーが

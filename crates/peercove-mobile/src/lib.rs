@@ -945,6 +945,24 @@ pub fn cancel_chat_send(slug: String, seq: u64) {
     }
 }
 
+/// 自分の端末のチャット履歴(全体タブ相当)へローカルなお知らせ行を足す
+/// (ADR-0055 決定 1d)。他メンバーへは一切送信しない(デスクトップの
+/// `IpcRequest::ChatLocalNote` の Android 版)。共有メモのコメント通知
+/// (メンション・自メモコメント受信)から呼ぶ。接続中(セッションあり)が必要。
+#[uniffi::export]
+pub fn chat_local_note(slug: String, text: String) -> Result<(), MobileError> {
+    let s = session_of(&slug).ok_or_else(|| MobileError::Failure {
+        msg: "接続していません".to_string(),
+    })?;
+    if text.trim().is_empty() {
+        return Err(MobileError::Failure {
+            msg: "本文が空です".to_string(),
+        });
+    }
+    s.add_local_chat_note(text);
+    Ok(())
+}
+
 /// ファイルを 1 人へ送る(チャットの文脈付き)。戻り値は転送 ID。
 /// ブロッキング(転送完了まで返らない)なので Kotlin 側は IO ディスパッチャで呼ぶ。
 #[uniffi::export]

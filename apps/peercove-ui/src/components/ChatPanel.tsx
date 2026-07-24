@@ -43,6 +43,13 @@ import {
 } from "../chat";
 import { Avatar } from "./Avatar";
 import { ConfirmModal, Modal } from "./Modal";
+import {
+  applyMention,
+  detectMentionQuery,
+  MentionSuggestList,
+  useMentionCandidates,
+} from "./MentionSuggest";
+import { splitMentions } from "../mentions";
 import { t } from "../i18n";
 
 /** ArrayBuffer を base64 文字列へ(貼り付け画像を Rust へ渡す用)。
@@ -100,6 +107,9 @@ export function ChatPanel({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** メンションサジェスト(ADR-0055 決定 1a)。SharedMemoView と共通の部品。 */
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const mentionCandidates = useMentionCandidates(mentionQuery, tunnel.members);
   /** グループ作成ダイアログ(M3-13c)。 */
   const [creating, setCreating] = useState(false);
   /** グループ管理ダイアログの対象。 */
@@ -293,11 +303,26 @@ export function ChatPanel({
     el.style.height = `${Math.min(el.scrollHeight, window.innerHeight * 0.4)}px`;
   }, [draft]);
 
+  /** メンションサジェスト(ADR-0055 決定 1a)。SharedMemoView のコメント欄と
+   *  同じ挙動(MentionSuggest.tsx 共通部品)。 */
+  const handleDraftChange = (target: HTMLTextAreaElement) => {
+    setDraft(target.value);
+    const caret = target.selectionStart ?? target.value.length;
+    setMentionQuery(detectMentionQuery(target.value, caret));
+  };
+  const insertMention = (name: string) => {
+    const caret = inputRef.current?.selectionStart ?? draft.length;
+    setDraft(applyMention(draft, caret, name));
+    setMentionQuery(null);
+    inputRef.current?.focus();
+  };
+
   // 自動スクロール: 最下部付近にいるときだけ追従する(遡り閲覧を邪魔しない)
   const listRef = useRef<HTMLDivElement>(null);
   const stickBottom = useRef(true);
   useEffect(() => {
     stickBottom.current = true;
+    setMentionQuery(null);
   }, [conversation]);
   useEffect(() => {
     const el = listRef.current;
@@ -360,6 +385,7 @@ export function ChatPanel({
       appendLocal(tunnel.config, message);
       markRead(tunnel.config, conversation, message.seq);
       setDraft("");
+      setMentionQuery(null);
       stickBottom.current = true;
       rerender();
     } catch (e) {
@@ -676,35 +702,38 @@ export function ChatPanel({
           >
             📎
           </button>
-          <textarea
-            ref={inputRef}
-            rows={1}
-            className="chat__textarea"
-            value={draft}
-            placeholder={
-              canSend
-                ? t.chat.placeholder
-                : groupIdOf(conversation) !== null
-                  ? t.chat.leftGroup
-                  : selectedBlocked
-                    ? t.chat.blocked
-                    : t.chat.offline
-            }
-            disabled={!canSend || sending}
-            onChange={(event) => setDraft(event.target.value)}
-            onPaste={(event) => void handlePaste(event)}
-            onKeyDown={(event) => {
-              // Enter で送信、Shift+Enter で改行。IME の変換確定では送らない
-              if (
-                event.key === "Enter" &&
-                !event.shiftKey &&
-                !event.nativeEvent.isComposing
-              ) {
-                event.preventDefault();
-                void send();
+          <div className="chat__textarea-wrap">
+            <textarea
+              ref={inputRef}
+              rows={1}
+              className="chat__textarea"
+              value={draft}
+              placeholder={
+                canSend
+                  ? t.chat.placeholder
+                  : groupIdOf(conversation) !== null
+                    ? t.chat.leftGroup
+                    : selectedBlocked
+                      ? t.chat.blocked
+                      : t.chat.offline
               }
-            }}
-          />
+              disabled={!canSend || sending}
+              onChange={(event) => handleDraftChange(event.target)}
+              onPaste={(event) => void handlePaste(event)}
+              onKeyDown={(event) => {
+                // Enter で送信、Shift+Enter で改行。IME の変換確定では送らない
+                if (
+                  event.key === "Enter" &&
+                  !event.shiftKey &&
+                  !event.nativeEvent.isComposing
+                ) {
+                  event.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <MentionSuggestList candidates={mentionCandidates} onPick={insertMention} />
+          </div>
           <button
             type="button"
             onClick={() => void send()}
@@ -1152,41 +1181,66 @@ function firstUrl(text: string): string | null {
   return splitLinks(text).find((part) => part.link)?.value ?? null;
 }
 
-/** URL をクリックできるリンクにして本文を描画する(既定ブラウザで開く)。 */
-function linkify(text: string): ReactNode {
+/**
+ * URL をクリックできるリンクにし、`@名前` / `@All` のメンションを強調表示
+ * して本文を描画する(既定ブラウザで開く、ADR-0055 決定 1)。`memberNames`
+ * に一致する名前(または自分の名前・All)だけをメンションとして認識する
+ * (無関係な `@example.com` 等を誤検知しないため)。
+ */
+function linkify(text: string, myName: string, memberNames: string[]): ReactNode {
   const parts = splitLinks(text);
-  if (!parts.some((part) => part.link)) return text;
-  return parts.map((part, index) =>
-    part.link ? (
-      <a
-        key={index}
-        className="msg__link"
-        href={part.value}
-        title={part.value}
-        onClick={(event) => {
-          event.preventDefault();
-          void api.openLink(part.value).catch(() => {});
-        }}
-      >
-        {part.value}
-      </a>
-    ) : (
-      <span key={index}>{part.value}</span>
-    ),
-  );
+  let key = 0;
+  const nodes: ReactNode[] = [];
+  for (const part of parts) {
+    if (part.link) {
+      nodes.push(
+        <a
+          key={key++}
+          className="msg__link"
+          href={part.value}
+          title={part.value}
+          onClick={(event) => {
+            event.preventDefault();
+            void api.openLink(part.value).catch(() => {});
+          }}
+        >
+          {part.value}
+        </a>,
+      );
+      continue;
+    }
+    for (const seg of splitMentions(part.value, myName, memberNames)) {
+      if (seg.mention) {
+        nodes.push(
+          <span
+            key={key++}
+            className={seg.self ? "msg__mention msg__mention--self" : "msg__mention"}
+          >
+            {seg.value}
+          </span>,
+        );
+      } else if (seg.value !== "") {
+        nodes.push(<span key={key++}>{seg.value}</span>);
+      }
+    }
+  }
+  return nodes;
 }
 
 /**
  * 本文を描画する(M5 F-5 Stage 4、ADR-0052 決定 1)。`@memo:id` トークンは
- * その位置でカード化し、残りの地の文は従来どおり URL をリンク化する。
+ * その位置でカード化し、残りの地の文は従来どおり URL のリンク化 + メンション
+ * (`@名前` / `@All`)の強調表示を行う(ADR-0055 決定 1)。
  */
 function renderMessageBody(
   text: string,
   configPath: string,
   onOpenRef: (kind: SharedRefKind, id: string) => void,
+  myName: string,
+  memberNames: string[],
 ): ReactNode {
   const parts = splitSharedRefs(text);
-  if (!parts.some((part) => part.type === "ref")) return linkify(text);
+  if (!parts.some((part) => part.type === "ref")) return linkify(text, myName, memberNames);
   return parts.map((part, index) =>
     part.type === "ref" ? (
       <SharedRefCard
@@ -1196,7 +1250,7 @@ function renderMessageBody(
         onOpen={() => onOpenRef(part.token.kind, part.token.id)}
       />
     ) : (
-      <span key={index}>{linkify(part.value)}</span>
+      <span key={index}>{linkify(part.value, myName, memberNames)}</span>
     ),
   );
 }
@@ -1369,6 +1423,12 @@ function Bubbles({
   let lastDate = "";
   // リンクプレビューはアプリ設定でオフにできる(M3-13e)
   const showLinkPreview = loadPrefs().linkPreview;
+  // メンション強調表示(ADR-0055 決定 1)用に自分の名前・全メンバー名を控える
+  const myName = memberByIp.get(selfIp)?.name ?? "";
+  const memberNames = [...memberByIp.values()]
+    .filter((m) => m.ip !== selfIp)
+    .map((m) => m.name)
+    .filter((name): name is string => Boolean(name));
   return (
     <>
       {messages.map((message) => {
@@ -1385,8 +1445,11 @@ function Bubbles({
           <div key={message.seq} className="chat__flow">
             {separator && <div className="chat__date">{date}</div>}
             {message.system ? (
-              // グループ操作のお知らせ(作成・追加・退出・改名 — LINE 風)
-              <div className="chat__system">{message.text}</div>
+              // グループ操作・メンションのお知らせ(ADR-0055 決定 1d の
+              // ローカルお知らせ行も同じ形。`@memo:id` はカード化される — LINE 風)
+              <div className="chat__system">
+                {renderMessageBody(message.text, configPath, onOpenRef, myName, memberNames)}
+              </div>
             ) : (
               <div className={own ? "msg msg--own" : "msg"}>
                 {!own && (
@@ -1427,6 +1490,8 @@ function Bubbles({
                           message.text,
                           configPath,
                           onOpenRef,
+                          myName,
+                          memberNames,
                         )}
                       </span>
                     )}

@@ -220,6 +220,12 @@
     <!-- リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6) -->
     <string name="notif_reminder_channel">メモのリマインダー</string>
     <string name="notif_reminder_title">⏰ メモのリマインダー: %1$s</string>
+    <!-- 共有メモのコメント・メンション通知(M6 H-2、ADR-0055 決定 1) -->
+    <string name="notif_comment_channel">メモのコメント</string>
+    <string name="notif_comment_title">%1$s が「%2$s」にコメントしました</string>
+    <string name="notif_mention_title">%1$s があなたをメンションしました（「%2$s」）</string>
+    <string name="chat_note_mention">📝 %1$s があなたをメモ「%2$s」でメンションしました %3$s</string>
+    <string name="chat_note_comment">📝 %1$s があなたのメモ「%2$s」にコメントしました %3$s</string>
     <string name="notif_reply">返信</string>
     <string name="notif_mark_read">既読にする</string>
     <string name="notif_chat_hidden">新着メッセージがあります</string>

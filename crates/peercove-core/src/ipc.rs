@@ -109,6 +109,11 @@ pub enum IpcRequest {
     ChatResend { config: PathBuf, seq: u64 },
     /// 送信待ちチャットの自動再送をやめる(履歴には失敗の印を残す)。応答は Done。
     ChatCancelSend { config: PathBuf, seq: u64 },
+    /// 自分の端末のチャット履歴(全体タブ相当)へローカルなお知らせ行を 1 行
+    /// 追記する(ADR-0055 決定 1d)。他メンバーへは一切送信しない
+    /// (メモコメントのメンション・自メモコメント受信を知らせる用途)。
+    /// 応答は Done。追加メソッドなので [`IPC_VERSION`] は上げない。
+    ChatLocalNote { config: PathBuf, text: String },
     /// グループを作る(ADR-0016、M3-13c)。`members` に自分は含めなくてよい
     /// (デーモンが必ず足す)。応答は [`IpcResponse::Group`]。
     GroupCreate {

@@ -595,6 +595,15 @@ async fn chat_cancel_send(config_path: String, seq: u64) -> Result<(), String> {
     }
 }
 
+/// 自分の端末のチャット履歴(全体タブ相当)へローカルなお知らせ行を足す
+/// (ADR-0055 決定 1d)。他メンバーへは送らない。メモコメントのメンション・
+/// 自メモコメント受信の通知と併せて notify.ts から呼ぶ。
+#[tauri::command]
+async fn chat_local_note(config_path: String, text: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::ChatLocalNote { config, text }).await
+}
+
 /// 仮想 IP 文字列の一覧を検証つきで変換する(グループ操作用)。
 fn parse_ips(list: Vec<String>) -> Result<Vec<std::net::Ipv4Addr>, String> {
     list.iter()
@@ -1640,6 +1649,7 @@ pub fn run() {
             chat_resend,
             chat_cancel_send,
             chat_fetch,
+            chat_local_note,
             group_create,
             group_update,
             group_leave,

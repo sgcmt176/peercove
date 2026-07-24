@@ -939,12 +939,22 @@ export const ja = {
     chatTitle: (from: string, network: string) => `${from}（${network}）`,
     chatBody: (text: string, isAll: boolean) =>
       isAll ? `[全体] ${text}` : text,
+    // チャットのメンション(ADR-0055 決定 1)。自分宛(@名前 / @All)の
+    // 新着はタイトルを差し替えて分かりやすくする
+    chatMentionTitle: (from: string, network: string) =>
+      `${from} があなたをメンションしました（${network}）`,
     // 共有メモのコメント・メンション(M5 F-5 Stage 3、ADR-0052 決定 4・5)。
     // 通知はローカル表示でありログではないため、メモタイトル・コメント本文を出してよい
     commentTitle: (from: string, memoTitle: string) =>
       `${from} が「${memoTitle}」にコメントしました`,
     mentionTitle: (from: string, memoTitle: string) =>
       `${from} があなたをメンションしました（「${memoTitle}」）`,
+    // チャットへのローカルお知らせ行(ADR-0055 決定 1d)。@memo:id トークンを
+    // 含めるとチャット上でカード化され、クリックで元のメモへ飛べる
+    chatNoteMention: (from: string, memoTitle: string, token: string) =>
+      `📝 ${from} があなたをメモ「${memoTitle}」でメンションしました ${token}`,
+    chatNoteComment: (from: string, memoTitle: string, token: string) =>
+      `📝 ${from} があなたのメモ「${memoTitle}」にコメントしました ${token}`,
     // メモのリマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6)
     reminderTitle: (memoTitle: string) => `⏰ メモのリマインダー: ${memoTitle}`,
   },

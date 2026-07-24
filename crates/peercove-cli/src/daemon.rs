@@ -184,6 +184,36 @@ impl DaemonShared {
                 self.chat_cancel_send(config, seq).await?;
                 Ok(IpcResponse::Done)
             }
+            IpcRequest::ChatLocalNote { config, text } => {
+                // 自分の端末のチャット履歴にのみ追記する(他メンバーへは送らない
+                // — ADR-0055 決定 1d)。既存の system 行(グループ操作の
+                // お知らせ等)と同じ形で足す
+                if text.trim().is_empty() {
+                    bail!("本文が空です");
+                }
+                let active = self.active.lock().await;
+                let active = active.get(&Self::key_for(&config)).with_context(|| {
+                    format!("この設定のトンネルは動いていません({})", config.display())
+                })?;
+                let sent_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                active.chat.lock().unwrap().append(ChatMessageInfo {
+                    seq: 0, // append が振る
+                    id: crate::msg::new_transfer_id(),
+                    scope: peercove_core::msg::ChatScope::Network,
+                    group_id: None,
+                    from: active.address,
+                    to: None,
+                    text,
+                    sent_at,
+                    failed: false,
+                    file: None,
+                    system: true,
+                });
+                Ok(IpcResponse::Done)
+            }
             IpcRequest::GroupCreate {
                 config,
                 name,

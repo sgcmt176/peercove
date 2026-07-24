@@ -12,6 +12,8 @@ import { ChatMessage, Group, Member, MemoReminder, Transfer, Tunnel, api } from 
 import { conversationOf, isMuted, isViewing } from "./chat";
 import { loadPrefs } from "./prefs";
 import { t } from "./i18n";
+import { isMentioned } from "./mentions";
+import { sharedRefToken } from "./sharedRefs";
 
 export interface MemberEvent {
   kind: "joined" | "left" | "approval_requested";
@@ -127,6 +129,7 @@ export async function notifyChatEvents(
   members: Member[],
 ): Promise<void> {
   if (!loadPrefs().notifications) return;
+  const myDisplayName = (members.find((m) => m.isSelf)?.name ?? "").trim();
   for (const message of fresh) {
     if (message.from === tunnel.address) continue;
     if (message.system) continue; // グループ操作のお知らせは鳴らさない
@@ -145,9 +148,13 @@ export async function notifyChatEvents(
     const text = message.file
       ? t.chat.filePreview(message.file.name)
       : message.text;
+    // 自分宛のメンション(@名前 / @All)はタイトルで分かるようにする(ADR-0055 決定 1)
+    const mentionsMe = !message.file && isMentioned(message.text, myDisplayName);
     try {
       await invoke("notify", {
-        title: t.notify.chatTitle(from, context),
+        title: mentionsMe
+          ? t.notify.chatMentionTitle(from, context)
+          : t.notify.chatTitle(from, context),
         body: t.notify.chatBody(text, message.scope === "network"),
       });
     } catch {
@@ -306,17 +313,28 @@ export async function notifyCommentEvents(tunnel: Tunnel): Promise<void> {
         for (const comment of fresh) {
           latestAt = Math.max(latestAt, comment.created_at_unix_ms);
           if (comment.author_id === myMemberId) continue; // 自分のコメントは通知しない
-          const mentionsMe =
-            myDisplayName !== "" && comment.body.includes(`@${myDisplayName}`);
+          const mentionsMe = isMentioned(comment.body, myDisplayName);
           const ownsMemo = memo.owner_id === (myMemberId ?? "");
           if (!mentionsMe && !ownsMemo) continue;
+          const memoTitle = memo.title || t.memo.untitled;
           const title = mentionsMe
-            ? t.notify.mentionTitle(comment.author_name, memo.title || t.memo.untitled)
-            : t.notify.commentTitle(comment.author_name, memo.title || t.memo.untitled);
+            ? t.notify.mentionTitle(comment.author_name, memoTitle)
+            : t.notify.commentTitle(comment.author_name, memoTitle);
           try {
             await invoke("notify", { title, body: comment.body });
           } catch {
             // 通知の失敗で UI を止めない
+          }
+          // チャットへローカルなお知らせ行も足す(ADR-0055 決定 1d)。他
+          // メンバーへは送らない。@memo:id トークンを含めるとカード化される
+          try {
+            const token = sharedRefToken("memo", memo.id);
+            const noteText = mentionsMe
+              ? t.notify.chatNoteMention(comment.author_name, memoTitle, token)
+              : t.notify.chatNoteComment(comment.author_name, memoTitle, token);
+            await api.chatLocalNote(tunnel.config, noteText);
+          } catch {
+            // お知らせ行の追記に失敗しても OS 通知は出ているので致命的ではない
           }
         }
         baseline.set(memo.id, { count, latestAt });

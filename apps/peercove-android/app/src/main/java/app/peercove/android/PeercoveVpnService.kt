@@ -15,15 +15,21 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import uniffi.peercove_mobile.MobileException
 import uniffi.peercove_mobile.SocketProtector
 import uniffi.peercove_mobile.chatFetch
 import uniffi.peercove_mobile.chatLatestSeq
+import uniffi.peercove_mobile.chatLocalNote
 import uniffi.peercove_mobile.commitPendingKey
 import uniffi.peercove_mobile.listNetworks
+import uniffi.peercove_mobile.members
 import uniffi.peercove_mobile.pendingKeyExists
 import uniffi.peercove_mobile.pokeTunnel
 import uniffi.peercove_mobile.rotateKey
 import uniffi.peercove_mobile.sessionState
+import uniffi.peercove_mobile.sharedMemoCommentList
+import uniffi.peercove_mobile.sharedMemoGeneration
+import uniffi.peercove_mobile.sharedMemoList
 import uniffi.peercove_mobile.startTunnel
 import uniffi.peercove_mobile.stopTunnel
 import uniffi.peercove_mobile.tunnelStatus
@@ -92,6 +98,7 @@ class PeercoveVpnService : VpnService() {
             ),
         )
         ChatNotifier.ensureChannel(this)
+        MemoCommentNotifier.ensureChannel(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -181,6 +188,7 @@ class PeercoveVpnService : VpnService() {
             watchNetworkChanges(slug)
             startKeyWatchdog(slug)
             startChatWatcher(slug, watchGeneration)
+            startCommentWatcher(slug, watchGeneration)
             handler.removeCallbacks(notifyTick)
             handler.post(notifyTick)
             QualityLog.event(this, slug, getString(R.string.quality_event_connected))
@@ -315,6 +323,95 @@ class PeercoveVpnService : VpnService() {
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "チャット通知の更新に失敗", e)
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * 共有メモのコメント・メンション通知(M6 H-2、ADR-0055 決定 1。F-5 で
+     * 見送っていた Android 側の解消)。デスクトップの notify.ts と同じ
+     * 「comment_count の差分ポーリング」方式: [sharedMemoGeneration] が
+     * 変わったときだけ一覧を取り直し、増えたメモだけコメントを取得して
+     * 前回チェック以降の新着を判定する。自分宛メンション(@表示名 / @All)
+     * または自分が所有するメモへの他人のコメントのとき、OS 通知に加えて
+     * チャットへローカルなお知らせ行を足す(ADR-0055 決定 1d)。VPN 接続中
+     * (このサービスが動いている間)しか検出できない — Android は常時稼働の
+     * デーモンを持たないため。
+     */
+    private fun startCommentWatcher(slug: String, gen: Int) {
+        Thread {
+            val baseDir = filesDir.absolutePath
+            var lastGeneration = 0uL
+            // memoId -> (直近確認した comment_count, 直近のコメント作成時刻)
+            val baseline = HashMap<String, Pair<Int, Long>>()
+            var myName = ""
+            while (gen == watchGeneration && currentSlug == slug) {
+                Thread.sleep(5000)
+                if (gen != watchGeneration || currentSlug != slug) break
+                try {
+                    val generation = sharedMemoGeneration(slug)
+                    if (generation == lastGeneration) continue
+                    lastGeneration = generation
+                    if (myName.isEmpty()) {
+                        myName = members(slug).firstOrNull { it.isSelf }?.name ?: ""
+                    }
+                    val list = sharedMemoList(baseDir, slug, null, null)
+                    for (memo in list.memos) {
+                        val count = memo.commentCount.toInt()
+                        val previous = baseline[memo.id]
+                        if (previous == null) {
+                            // 初めて見るメモは基準点を作るだけ(接続直後にまとめて鳴らさない)
+                            baseline[memo.id] = count to System.currentTimeMillis()
+                            continue
+                        }
+                        if (count <= previous.first) {
+                            baseline[memo.id] = count to previous.second
+                            continue
+                        }
+                        try {
+                            val comments = sharedMemoCommentList(slug, memo.id)
+                            val fresh = comments.filter { it.createdAtUnixMs.toLong() > previous.second }
+                            var latestAt = previous.second
+                            for (comment in fresh) {
+                                latestAt = maxOf(latestAt, comment.createdAtUnixMs.toLong())
+                                // 自分のコメントは通知しない(名前一致による近似判定。
+                                // SharedMemoScreen.kt の削除ボタン表示と同じ流儀)
+                                if (myName.isNotEmpty() && comment.authorName == myName) continue
+                                val mentionsMe = comment.body.contains("@All") ||
+                                    (myName.isNotEmpty() && comment.body.contains("@$myName"))
+                                val ownsMemo = myName.isNotEmpty() && memo.ownerName == myName
+                                if (!mentionsMe && !ownsMemo) continue
+                                val memoTitle = memo.title.ifEmpty { getString(R.string.memo_untitled) }
+                                val notifTitle = if (mentionsMe) {
+                                    getString(R.string.notif_mention_title, comment.authorName, memoTitle)
+                                } else {
+                                    getString(R.string.notif_comment_title, comment.authorName, memoTitle)
+                                }
+                                MemoCommentNotifier.show(
+                                    this, slug, memo.id, comment.commentId, notifTitle, comment.body,
+                                )
+                                // チャットへのローカルお知らせ行(ADR-0055 決定 1d)。
+                                // @memo:id を含めるとチャット上でカード化され、クリックで飛べる
+                                val token = "@memo:${memo.id}"
+                                val noteText = if (mentionsMe) {
+                                    getString(R.string.chat_note_mention, comment.authorName, memoTitle, token)
+                                } else {
+                                    getString(R.string.chat_note_comment, comment.authorName, memoTitle, token)
+                                }
+                                try {
+                                    chatLocalNote(slug, noteText)
+                                } catch (e: MobileException) {
+                                    Log.w(TAG, "チャットへのお知らせ行の追記に失敗", e)
+                                }
+                            }
+                            baseline[memo.id] = count to latestAt
+                        } catch (e: MobileException) {
+                            // コメント取得に失敗しても次の周期で再試行する(基準点は更新しない)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "コメント通知の更新に失敗", e)
                 }
             }
         }.start()

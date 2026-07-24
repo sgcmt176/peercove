@@ -960,6 +960,10 @@ export const api = {
     invoke<void>("chat_resend", { configPath, seq }),
   chatCancelSend: (configPath: string, seq: number) =>
     invoke<void>("chat_cancel_send", { configPath, seq }),
+  // メンション・自メモコメント受信のローカルお知らせ行(ADR-0055 決定 1d)。
+  // 他メンバーへは送らない
+  chatLocalNote: (configPath: string, text: string) =>
+    invoke<void>("chat_local_note", { configPath, text }),
   // グループ（M3-13c）。members / add は相手の仮想 IP（自分は不要）
   groupCreate: (configPath: string, name: string, members: string[]) =>
     invoke<Group>("group_create", { configPath, name, members }),
