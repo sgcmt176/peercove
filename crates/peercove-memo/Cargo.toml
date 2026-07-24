@@ -13,6 +13,8 @@ peercove-core = { workspace = true }
 # serialize/backup: DB スナップショット取得(暗号化バックアップ用、M5 F-3)に使う
 rusqlite = { version = "0.40", features = ["bundled", "functions", "serialize", "backup"] }
 anyhow = { workspace = true }
+# 予定の参加メンバー(JSON 文字列で列に格納、ADR-0055 決定 5)のシリアライズに使う
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

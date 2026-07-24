@@ -21,6 +21,20 @@ pub const MAX_SCHEDULE_NOTE_BYTES: usize = 4 * 1024;
 /// 1 ネットワークあたりの予定件数上限。
 pub const MAX_SCHEDULE_EVENTS: u32 = 10_000;
 
+/// 1 予定あたりの参加メンバー数上限(ADR-0055 決定 5)。
+pub const MAX_SCHEDULE_PARTICIPANTS: usize = 50;
+
+/// 予定の参加メンバー 1 名(Outlook 風、ADR-0055 決定 5)。作成・編集時に
+/// メンバー一覧から選ぶ表示・絞り込み用のメタ情報で、閲覧権限には影響しない
+/// (全員閲覧の方針は変えない)。`member_id` は検査しない(UI がメンバー
+/// 一覧から選ぶため。存在しない id が混ざっても表示だけの問題)。`name` は
+/// **保存時点のスナップショット**(改名に追従しない = V1)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleParticipant {
+    pub member_id: String,
+    pub name: String,
+}
+
 /// 共有スケジュール表の予定 1 件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleEvent {
@@ -42,6 +56,10 @@ pub struct ScheduleEvent {
     /// 最終更新者の表示名(スナップショット)。
     #[serde(default)]
     pub updated_by: String,
+    /// 参加メンバー(ADR-0055 決定 5、additive)。旧クライアントはこの
+    /// フィールドを無視するだけで互換動作する。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<ScheduleParticipant>,
     /// 単調増加リビジョン(CAS 用、ADR-0053 決定 4)。
     pub revision: u64,
     pub created_at: u64,
@@ -69,6 +87,9 @@ pub enum ScheduleOp {
         end_unix_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         all_day: bool,
+        /// 参加メンバー(ADR-0055 決定 5、additive)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        participants: Vec<ScheduleParticipant>,
     },
     /// 更新(CAS)。作成者・ホストのみ。`base_revision` が現在と一致しない
     /// 場合は競合として拒否される。応答は更新後の [`ScheduleReply::Event`]。
@@ -84,6 +105,9 @@ pub enum ScheduleOp {
         end_unix_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         all_day: bool,
+        /// 参加メンバー(ADR-0055 決定 5、additive)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        participants: Vec<ScheduleParticipant>,
     },
     /// 削除(物理削除、ゴミ箱なし = V1)。作成者・ホストのみ。
     Delete { id: String },
@@ -142,6 +166,7 @@ mod tests {
             start_unix_ms: 1_000,
             end_unix_ms: None,
             all_day: false,
+            participants: Vec::new(),
         };
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(
@@ -158,9 +183,31 @@ mod tests {
             start_unix_ms: 2_000,
             end_unix_ms: Some(3_000),
             all_day: true,
+            participants: vec![ScheduleParticipant {
+                member_id: "m1".to_string(),
+                name: "太郎".to_string(),
+            }],
         };
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(serde_json::from_str::<ScheduleOp>(&json).unwrap(), op);
+        assert!(
+            json.contains(r#""participants":[{"member_id":"m1","name":"太郎"}]"#),
+            "{json}"
+        );
+
+        // 旧クライアント互換: participants フィールドが無い JSON でも読める
+        let legacy = r#"{"op":"create","title":"t","start_unix_ms":1}"#;
+        assert!(
+            serde_json::from_str::<ScheduleOp>(legacy).unwrap()
+                == ScheduleOp::Create {
+                    title: "t".to_string(),
+                    note: String::new(),
+                    start_unix_ms: 1,
+                    end_unix_ms: None,
+                    all_day: false,
+                    participants: Vec::new(),
+                }
+        );
 
         let op = ScheduleOp::Delete {
             id: "e1".to_string(),
@@ -184,6 +231,7 @@ mod tests {
             owner_id: String::new(),
             owner_name: "ホスト".to_string(),
             updated_by: "ホスト".to_string(),
+            participants: Vec::new(),
             revision: 1,
             created_at: 1,
             updated_at: 1,

@@ -260,6 +260,9 @@ fun ScheduleTab(
         scope.launch {
             try {
                 val event = withContext(Dispatchers.IO) {
+                    // 参加メンバーの選択 UI は次工程(M6 H-3、ADR-0055 決定 5)。
+                    // ここでは Rust 層の新シグネチャに最小追随するだけで、
+                    // 空リスト(参加メンバーなし)を渡す。
                     if (state.mode == ScheduleDialogMode.CREATE) {
                         scheduleCreate(
                             slug,
@@ -268,6 +271,7 @@ fun ScheduleTab(
                             start.toULong(),
                             end?.toULong(),
                             state.allDay,
+                            emptyList(),
                         )
                     } else {
                         scheduleUpdate(
@@ -279,6 +283,7 @@ fun ScheduleTab(
                             start.toULong(),
                             end?.toULong(),
                             state.allDay,
+                            emptyList(),
                         )
                     }
                 }

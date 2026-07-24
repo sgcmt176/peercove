@@ -381,6 +381,9 @@ pub fn memo_export_name(title: String) -> String {
 pub enum ReminderScopeArg {
     Personal,
     Shared,
+    /// スケジュールの予定リマインダー(ADR-0055 決定 3)。`memo_id` には
+    /// 予定(`ScheduleEvent`)の id を入れる。
+    Schedule,
 }
 
 impl From<ReminderScopeArg> for ReminderScope {
@@ -388,6 +391,17 @@ impl From<ReminderScopeArg> for ReminderScope {
         match scope {
             ReminderScopeArg::Personal => ReminderScope::Personal,
             ReminderScopeArg::Shared => ReminderScope::Shared,
+            ReminderScopeArg::Schedule => ReminderScope::Schedule,
+        }
+    }
+}
+
+impl From<ReminderScope> for ReminderScopeArg {
+    fn from(scope: ReminderScope) -> Self {
+        match scope {
+            ReminderScope::Personal => ReminderScopeArg::Personal,
+            ReminderScope::Shared => ReminderScopeArg::Shared,
+            ReminderScope::Schedule => ReminderScopeArg::Schedule,
         }
     }
 }
@@ -395,23 +409,25 @@ impl From<ReminderScopeArg> for ReminderScope {
 #[derive(uniffi::Record)]
 pub struct MemoReminderInfo {
     pub scope: ReminderScopeArg,
-    /// 共有メモのときだけ意味を持つネットワーク slug(個人メモは空文字)。
+    /// 共有メモ・スケジュールのときだけ意味を持つネットワーク slug
+    /// (個人メモは空文字)。
     pub network: String,
     pub memo_id: String,
     /// 発火時刻(UNIX ミリ秒)。
     pub remind_at: u64,
+    /// 「開始 n 分前」設定の表示用メタ(ADR-0055 決定 3)。
+    /// `None` = 任意日時指定。
+    pub offset_minutes: Option<u32>,
 }
 
 impl From<MemoReminder> for MemoReminderInfo {
     fn from(reminder: MemoReminder) -> Self {
         Self {
-            scope: match reminder.scope {
-                ReminderScope::Personal => ReminderScopeArg::Personal,
-                ReminderScope::Shared => ReminderScopeArg::Shared,
-            },
+            scope: reminder.scope.into(),
             network: reminder.network,
             memo_id: reminder.memo_id,
             remind_at: reminder.remind_at,
+            offset_minutes: reminder.offset_minutes,
         }
     }
 }
@@ -425,7 +441,9 @@ fn expect_reminders(reply: MemoReply) -> Result<Vec<MemoReminderInfo>, MobileErr
     }
 }
 
-/// リマインダーの設定(過去日時は拒否。既存があれば上書き)。
+/// リマインダーの設定(過去日時は拒否)。同一 `remind_at` への再設定は
+/// 上書き、異なる `remind_at` は追加(1 対象につき複数件、ADR-0055 決定 3)。
+/// `offset_minutes` は「開始 n 分前」設定の表示用メタ(`None` = 任意日時)。
 #[uniffi::export]
 pub fn memo_reminder_set(
     base_dir: String,
@@ -433,10 +451,34 @@ pub fn memo_reminder_set(
     network: String,
     memo_id: String,
     remind_at: u64,
+    offset_minutes: Option<u32>,
 ) -> Result<(), MobileError> {
     apply(
         &base_dir,
         MemoOp::ReminderSet {
+            scope: scope.into(),
+            network,
+            memo_id,
+            remind_at,
+            offset_minutes,
+        },
+    )
+    .map(|_| ())
+}
+
+/// リマインダーの解除。無くても失敗しない。`remind_at` を省略(`None`)
+/// すると、その対象の全件を削除する(ADR-0055 決定 3)。
+#[uniffi::export]
+pub fn memo_reminder_clear(
+    base_dir: String,
+    scope: ReminderScopeArg,
+    network: String,
+    memo_id: String,
+    remind_at: Option<u64>,
+) -> Result<(), MobileError> {
+    apply(
+        &base_dir,
+        MemoOp::ReminderClear {
             scope: scope.into(),
             network,
             memo_id,
@@ -446,23 +488,18 @@ pub fn memo_reminder_set(
     .map(|_| ())
 }
 
-/// リマインダーの解除。無くても失敗しない。
+/// 指定した対象の未発火のリマインダー全件(発火時刻の早い順、ADR-0055
+/// 決定 3。1 対象で複数件になり得る)。
 #[uniffi::export]
-pub fn memo_reminder_clear(
+pub fn memo_reminders_for(
     base_dir: String,
     scope: ReminderScopeArg,
     network: String,
     memo_id: String,
-) -> Result<(), MobileError> {
-    apply(
-        &base_dir,
-        MemoOp::ReminderClear {
-            scope: scope.into(),
-            network,
-            memo_id,
-        },
-    )
-    .map(|_| ())
+) -> Result<Vec<MemoReminderInfo>, MobileError> {
+    let store = open(&base_dir)?;
+    let reminders = store.reminders_for(scope.into(), &network, &memo_id)?;
+    Ok(reminders.into_iter().map(Into::into).collect())
 }
 
 /// 未発火のリマインダー一覧(この端末のすべて)。再起動後の
@@ -490,7 +527,7 @@ use peercove_core::memo::{
     DiffLine, DiffLineKind, SharedMemoComment, SharedMemoDetail, SharedMemoHistoryDetail,
     SharedMemoHistoryEntry, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
 };
-use peercove_core::schedule::{ScheduleEvent, ScheduleOp, ScheduleReply};
+use peercove_core::schedule::{ScheduleEvent, ScheduleOp, ScheduleParticipant, ScheduleReply};
 use peercove_core::sheet::{CellWrite, SheetCell, SheetMeta, SheetOp, SheetReply};
 
 #[derive(uniffi::Record)]
@@ -847,6 +884,31 @@ pub fn shared_memo_trash(slug: String, id: String) -> Result<(), MobileError> {
 // キャッシュ、変更はオンライン専用(コントロールチャネル経由)。
 // **予定のタイトル・詳細はログへ出さない。**
 
+/// 予定の参加メンバー 1 名(ADR-0055 決定 5)。
+#[derive(uniffi::Record, Clone)]
+pub struct ScheduleParticipantInfo {
+    pub member_id: String,
+    pub name: String,
+}
+
+impl From<ScheduleParticipant> for ScheduleParticipantInfo {
+    fn from(p: ScheduleParticipant) -> Self {
+        Self {
+            member_id: p.member_id,
+            name: p.name,
+        }
+    }
+}
+
+impl From<ScheduleParticipantInfo> for ScheduleParticipant {
+    fn from(p: ScheduleParticipantInfo) -> Self {
+        Self {
+            member_id: p.member_id,
+            name: p.name,
+        }
+    }
+}
+
 #[derive(uniffi::Record)]
 pub struct ScheduleEventInfo {
     pub id: String,
@@ -857,6 +919,8 @@ pub struct ScheduleEventInfo {
     pub all_day: bool,
     pub owner_name: String,
     pub updated_by: String,
+    /// 参加メンバー(ADR-0055 決定 5)。
+    pub participants: Vec<ScheduleParticipantInfo>,
     pub revision: u64,
     pub created_at: u64,
     pub updated_at: u64,
@@ -875,6 +939,7 @@ impl From<ScheduleEvent> for ScheduleEventInfo {
             all_day: event.all_day,
             owner_name: event.owner_name,
             updated_by: event.updated_by,
+            participants: event.participants.into_iter().map(Into::into).collect(),
             revision: event.revision,
             created_at: event.created_at,
             updated_at: event.updated_at,
@@ -948,6 +1013,7 @@ pub fn schedule_create(
     start_unix_ms: u64,
     end_unix_ms: Option<u64>,
     all_day: bool,
+    participants: Vec<ScheduleParticipantInfo>,
 ) -> Result<ScheduleEventInfo, MobileError> {
     expect_schedule_event(session_request(
         &slug,
@@ -958,6 +1024,7 @@ pub fn schedule_create(
                 start_unix_ms,
                 end_unix_ms,
                 all_day,
+                participants: participants.into_iter().map(Into::into).collect(),
             },
         },
     )?)
@@ -976,6 +1043,7 @@ pub fn schedule_update(
     start_unix_ms: u64,
     end_unix_ms: Option<u64>,
     all_day: bool,
+    participants: Vec<ScheduleParticipantInfo>,
 ) -> Result<ScheduleEventInfo, MobileError> {
     expect_schedule_event(session_request(
         &slug,
@@ -988,6 +1056,7 @@ pub fn schedule_update(
                 start_unix_ms,
                 end_unix_ms,
                 all_day,
+                participants: participants.into_iter().map(Into::into).collect(),
             },
         },
     )?)
@@ -1423,11 +1492,22 @@ mod tests {
             String::new(),
             memo.id.clone(),
             future,
+            Some(15),
         )
         .unwrap();
         let list = memo_reminder_list(base.clone()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].memo_id, memo.id);
+        assert_eq!(list[0].offset_minutes, Some(15));
+
+        let for_memo = memo_reminders_for(
+            base.clone(),
+            ReminderScopeArg::Personal,
+            String::new(),
+            memo.id.clone(),
+        )
+        .unwrap();
+        assert_eq!(for_memo.len(), 1);
 
         assert!(
             memo_reminder_take_due(base.clone()).unwrap().is_empty(),
@@ -1439,6 +1519,7 @@ mod tests {
             ReminderScopeArg::Personal,
             String::new(),
             memo.id,
+            None,
         )
         .unwrap();
         assert!(memo_reminder_list(base).unwrap().is_empty());

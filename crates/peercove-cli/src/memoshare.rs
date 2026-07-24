@@ -647,6 +647,7 @@ impl MemoService {
                 start_unix_ms,
                 end_unix_ms,
                 all_day,
+                participants,
             } => {
                 let event = self
                     .blocking({
@@ -659,6 +660,7 @@ impl MemoService {
                                 start_unix_ms,
                                 end_unix_ms,
                                 all_day,
+                                &participants,
                             )
                         }
                     })
@@ -675,6 +677,7 @@ impl MemoService {
                 start_unix_ms,
                 end_unix_ms,
                 all_day,
+                participants,
             } => {
                 let event = self
                     .blocking({
@@ -690,6 +693,7 @@ impl MemoService {
                                 start_unix_ms,
                                 end_unix_ms,
                                 all_day,
+                                &participants,
                             )
                         }
                     })

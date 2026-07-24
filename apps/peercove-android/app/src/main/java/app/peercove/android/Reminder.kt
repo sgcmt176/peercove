@@ -14,9 +14,16 @@ package app.peercove.android
 //
 // ADR-0055 決定 3: メモ側の ⏰ 設定メニュー・アイコン(MemoScreen.kt /
 // SharedMemoScreen.kt からの呼び出し)は撤去した。この基盤(発火処理・
-// pickReminderDateTime/applyReminder/clearReminder/fetchReminder)自体は
+// pickReminderDateTime/applyReminder/clearReminder/fetchReminders)自体は
 // あえて残してある。スケジュールの予定リマインダー(実装順 H-3)で流用する
 // ため。既に設定済みのメモリマインダーは引き続き発火する(害はない)。
+//
+// H-3a(Rust 層)で 1 対象に複数件のリマインダーを許可した(offset_minutes
+// 付き)。ただし ReminderScheduler の AlarmManager PendingIntent は今も
+// (scope, network, memoId) だけを requestCode にしているため、同じ対象へ
+// 複数の remindAtMs を schedule() すると後勝ちで上書きされる。UI 実装
+// (H-3 次工程)で複数件を有効化する際は、requestCode に remindAtMs も
+// 含めるよう ReminderScheduler を拡張すること。
 
 import android.app.AlarmManager
 import android.app.DatePickerDialog
@@ -40,13 +47,16 @@ import uniffi.peercove_mobile.memoReminderClear
 import uniffi.peercove_mobile.memoReminderList
 import uniffi.peercove_mobile.memoReminderSet
 import uniffi.peercove_mobile.memoReminderTakeDue
+import uniffi.peercove_mobile.memoRemindersFor
 import uniffi.peercove_mobile.sharedMemoGet
 
-/** `ReminderScopeArg` ⇔ ワイヤ表現("personal"/"shared")。Intent extras・
- * AlarmManager の requestCode には文字列の方が扱いやすいための変換。 */
+/** `ReminderScopeArg` ⇔ ワイヤ表現("personal"/"shared"/"schedule")。
+ * Intent extras・AlarmManager の requestCode には文字列の方が扱いやすい
+ * ための変換。`SCHEDULE` はスケジュールの予定リマインダー(ADR-0055 決定 3)。 */
 fun ReminderScopeArg.wire(): String = when (this) {
     ReminderScopeArg.PERSONAL -> "personal"
     ReminderScopeArg.SHARED -> "shared"
+    ReminderScopeArg.SCHEDULE -> "schedule"
 }
 
 object ReminderNotifier {
@@ -182,36 +192,43 @@ class ReminderBootReceiver : BroadcastReceiver() {
     }
 }
 
-/** 発火時のタイトル解決。削除済み・アクセス不可なら null(通知しない)。 */
+/** 発火時のタイトル解決。削除済み・アクセス不可なら null(通知しない)。
+ *
+ * ADR-0055 決定 3: スケジュールの予定タイトル解決(共有スケジュールの
+ * キャッシュから引く処理)は次工程(UI 実装)で行う。現段階では
+ * `memo_untitled` と同じプレースホルダにフォールバックし、通知そのものは
+ * 壊さない。 */
 private fun resolveReminderTitle(
     context: Context,
     baseDir: String,
     reminder: MemoReminderInfo,
 ): String? = try {
-    val title = if (reminder.scope == ReminderScopeArg.SHARED) {
-        sharedMemoGet(baseDir, reminder.network, reminder.memoId).title
-    } else {
-        memoGet(baseDir, reminder.memoId).title
+    val title = when (reminder.scope) {
+        ReminderScopeArg.SHARED -> sharedMemoGet(baseDir, reminder.network, reminder.memoId).title
+        ReminderScopeArg.SCHEDULE -> context.getString(R.string.schedule_reminder_placeholder_title)
+        ReminderScopeArg.PERSONAL -> memoGet(baseDir, reminder.memoId).title
     }
     title.ifEmpty { context.getString(R.string.memo_untitled) }
 } catch (e: MobileException) {
     null
 }
 
-/** このメモ(個人 or 共有)に設定中のリマインダー(無ければ null)。 */
-suspend fun fetchReminder(
+/** このメモ・予定(個人・共有・スケジュール)に設定中のリマインダー全件
+ * (ADR-0055 決定 3: 1 対象に複数件になり得る)。 */
+suspend fun fetchReminders(
     baseDir: String,
     scope: ReminderScopeArg,
     network: String,
     memoId: String,
-): MemoReminderInfo? = try {
-    withContext(Dispatchers.IO) { memoReminderList(baseDir) }
-        .firstOrNull { it.scope == scope && it.network == network && it.memoId == memoId }
+): List<MemoReminderInfo> = try {
+    withContext(Dispatchers.IO) { memoRemindersFor(baseDir, scope, network, memoId) }
 } catch (e: MobileException) {
-    null
+    emptyList()
 }
 
-/** リマインダーの設定 + AlarmManager への登録。 */
+/** リマインダーの設定 + AlarmManager への登録。同一 `remindAtMs` への
+ * 再設定は上書き、異なる時刻は追加(1 対象につき複数件、ADR-0055 決定 3)。
+ * `offsetMinutes` は「開始 n 分前」設定の表示用メタ(null = 任意日時)。 */
 suspend fun applyReminder(
     context: Context,
     baseDir: String,
@@ -219,22 +236,27 @@ suspend fun applyReminder(
     network: String,
     memoId: String,
     remindAtMs: Long,
+    offsetMinutes: UInt? = null,
 ) {
     withContext(Dispatchers.IO) {
-        memoReminderSet(baseDir, scope, network, memoId, remindAtMs.toULong())
+        memoReminderSet(baseDir, scope, network, memoId, remindAtMs.toULong(), offsetMinutes)
     }
     ReminderScheduler.schedule(context, scope, network, memoId, remindAtMs)
 }
 
-/** リマインダーの解除 + AlarmManager からも取り消す。 */
+/** リマインダーの解除 + AlarmManager からも取り消す。`remindAtMs` を
+ * 省略(null)すると、その対象の全件を削除する(ADR-0055 決定 3)。 */
 suspend fun clearReminder(
     context: Context,
     baseDir: String,
     scope: ReminderScopeArg,
     network: String,
     memoId: String,
+    remindAtMs: Long? = null,
 ) {
-    withContext(Dispatchers.IO) { memoReminderClear(baseDir, scope, network, memoId) }
+    withContext(Dispatchers.IO) {
+        memoReminderClear(baseDir, scope, network, memoId, remindAtMs?.toULong())
+    }
     ReminderScheduler.cancel(context, scope, network, memoId)
 }
 

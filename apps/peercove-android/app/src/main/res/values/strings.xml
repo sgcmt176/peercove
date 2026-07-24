@@ -220,6 +220,10 @@
     <!-- リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6) -->
     <string name="notif_reminder_channel">メモのリマインダー</string>
     <string name="notif_reminder_title">⏰ メモのリマインダー: %1$s</string>
+    <!-- スケジュールの予定リマインダー(M6 H-3、ADR-0055 決定 3)。タイトル解決の
+         実装(共有スケジュールキャッシュからの取得)は UI 実装の次工程で行うため、
+         それまではこのプレースホルダで通知する -->
+    <string name="schedule_reminder_placeholder_title">(予定)</string>
     <!-- 共有メモのコメント・メンション通知(M6 H-2、ADR-0055 決定 1) -->
     <string name="notif_comment_channel">メモのコメント</string>
     <string name="notif_comment_title">%1$s が「%2$s」にコメントしました</string>

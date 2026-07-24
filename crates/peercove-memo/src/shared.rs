@@ -20,7 +20,8 @@ use peercove_core::memo::{
     MAX_COMMENTS_PER_MEMO, MAX_COMMENT_BODY_BYTES,
 };
 use peercove_core::schedule::{
-    ScheduleEvent, MAX_SCHEDULE_EVENTS, MAX_SCHEDULE_NOTE_BYTES, MAX_SCHEDULE_TITLE_CHARS,
+    ScheduleEvent, ScheduleParticipant, MAX_SCHEDULE_EVENTS, MAX_SCHEDULE_NOTE_BYTES,
+    MAX_SCHEDULE_PARTICIPANTS, MAX_SCHEDULE_TITLE_CHARS,
 };
 use peercove_core::sheet::{
     CellWrite, SheetCell, SheetMeta, MAX_CELL_VALUE_BYTES, MAX_SHEETS, MAX_SHEET_CELLS,
@@ -91,7 +92,19 @@ impl Actor {
     }
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 6;
+/// `ALTER TABLE ... ADD COLUMN` は非冪等(2 回実行すると `duplicate column`
+/// エラー)なので、テストのようにスキーマバージョンを巻き戻して migrate を
+/// 再実行するケースに備えて事前に列の有無を確認する。
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    Ok(has_column)
+}
+
+const SHARED_SCHEMA_VERSION: i64 = 7;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -452,6 +465,19 @@ impl SharedStore {
                 CREATE INDEX IF NOT EXISTS idx_sheet_cells_sheet ON sheet_cells(sheet_id);
                 "#,
             )?;
+        }
+        if version < 7 {
+            // v7(M6 H-3、ADR-0055 決定 5): 予定の参加メンバー。JSON 文字列で
+            // 格納する(ScheduleParticipant の配列)。旧クライアントはこの
+            // 列を知らないため additive フィールドとして無視するだけで
+            // 互換動作する。ALTER TABLE ADD COLUMN は非冪等なので、テストの
+            // ようにバージョンを巻き戻して再実行される場合に備えて存在確認
+            // してから実行する。
+            if !table_has_column(&tx, "schedule_events", "participants")? {
+                tx.execute_batch(
+                    "ALTER TABLE schedule_events ADD COLUMN participants TEXT NOT NULL DEFAULT '[]';",
+                )?;
+            }
         }
         tx.pragma_update(None, "user_version", SHARED_SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1546,6 +1572,7 @@ impl SharedStore {
     }
 
     /// 新規作成(全員可)。
+    #[allow(clippy::too_many_arguments)]
     pub fn schedule_create(
         &mut self,
         actor: &Actor,
@@ -1554,10 +1581,12 @@ impl SharedStore {
         start_unix_ms: u64,
         end_unix_ms: Option<u64>,
         all_day: bool,
+        participants: &[ScheduleParticipant],
     ) -> anyhow::Result<ScheduleEvent> {
         validate_schedule_title(title)?;
         validate_schedule_note(note)?;
         validate_schedule_range(start_unix_ms, end_unix_ms)?;
+        validate_schedule_participants(participants)?;
         let count: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM schedule_events", [], |row| row.get(0))?;
@@ -1571,11 +1600,13 @@ impl SharedStore {
             .conn
             .query_row("SELECT lower(hex(randomblob(8)))", [], |row| row.get(0))?;
         let now = unix_ms();
+        let participants_json =
+            serde_json::to_string(participants).context("participants の直列化に失敗しました")?;
         self.conn.execute(
             "INSERT INTO schedule_events
                 (id, title, note, start_at, end_at, all_day, owner_id, owner_name,
-                 updated_by, revision, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1, ?9, ?9)",
+                 updated_by, participants, revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, 1, ?10, ?10)",
             params![
                 id,
                 title,
@@ -1585,6 +1616,7 @@ impl SharedStore {
                 all_day as i64,
                 actor.owner_id(),
                 actor.name,
+                participants_json,
                 now,
             ],
         )?;
@@ -1603,10 +1635,12 @@ impl SharedStore {
         start_unix_ms: u64,
         end_unix_ms: Option<u64>,
         all_day: bool,
+        participants: &[ScheduleParticipant],
     ) -> anyhow::Result<ScheduleEvent> {
         validate_schedule_title(title)?;
         validate_schedule_note(note)?;
         validate_schedule_range(start_unix_ms, end_unix_ms)?;
+        validate_schedule_participants(participants)?;
         let row = self.schedule_row(id)?;
         if !(actor.is_host() || row.owner_id == actor.owner_id()) {
             bail!("この予定を編集できるのは作成者とホスト管理者だけです");
@@ -1614,10 +1648,13 @@ impl SharedStore {
         if row.revision as u64 != base_revision {
             bail!("competing_edit: 他の端末の変更が先に保存されています(最新を読み込み直してください)");
         }
+        let participants_json =
+            serde_json::to_string(participants).context("participants の直列化に失敗しました")?;
         self.conn.execute(
             "UPDATE schedule_events SET title = ?1, note = ?2, start_at = ?3, end_at = ?4,
-                    all_day = ?5, updated_by = ?6, revision = revision + 1, updated_at = ?7
-             WHERE id = ?8",
+                    all_day = ?5, updated_by = ?6, participants = ?7,
+                    revision = revision + 1, updated_at = ?8
+             WHERE id = ?9",
             params![
                 title,
                 note,
@@ -1625,6 +1662,7 @@ impl SharedStore {
                 end_unix_ms.map(|v| v as i64),
                 all_day as i64,
                 actor.name,
+                participants_json,
                 unix_ms(),
                 id,
             ],
@@ -1903,6 +1941,9 @@ struct ScheduleRow {
     owner_id: String,
     owner_name: String,
     updated_by: String,
+    /// JSON 文字列(`Vec<ScheduleParticipant>`)。壊れていれば空扱い
+    /// (表示上の問題にとどめ、一覧取得自体は失敗させない)。
+    participants: String,
     revision: i64,
     created_at: i64,
     updated_at: i64,
@@ -1912,6 +1953,8 @@ impl ScheduleRow {
     /// can_edit は作成者本人かホストなら真(ADR-0053 決定 3)。
     fn into_event(self, actor: &Actor) -> ScheduleEvent {
         let can_edit = actor.is_host() || self.owner_id == actor.owner_id();
+        let participants: Vec<ScheduleParticipant> =
+            serde_json::from_str(&self.participants).unwrap_or_default();
         ScheduleEvent {
             id: self.id,
             title: self.title,
@@ -1922,6 +1965,7 @@ impl ScheduleRow {
             owner_id: self.owner_id,
             owner_name: self.owner_name,
             updated_by: self.updated_by,
+            participants,
             revision: self.revision as u64,
             created_at: self.created_at as u64,
             updated_at: self.updated_at as u64,
@@ -1931,7 +1975,7 @@ impl ScheduleRow {
 }
 
 const SCHEDULE_ROW_COLUMNS: &str = "id, title, note, start_at, end_at, all_day, owner_id,
-        owner_name, updated_by, revision, created_at, updated_at";
+        owner_name, updated_by, participants, revision, created_at, updated_at";
 
 fn schedule_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
     Ok(ScheduleRow {
@@ -1944,10 +1988,22 @@ fn schedule_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRo
         owner_id: row.get(6)?,
         owner_name: row.get(7)?,
         updated_by: row.get(8)?,
-        revision: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        participants: row.get(9)?,
+        revision: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
+}
+
+/// 参加メンバーの検証(件数上限のみ、ADR-0055 決定 5。member_id は検査しない)。
+fn validate_schedule_participants(participants: &[ScheduleParticipant]) -> anyhow::Result<()> {
+    if participants.len() > MAX_SCHEDULE_PARTICIPANTS {
+        bail!(
+            "参加メンバーが多すぎます(上限 {} 名)",
+            MAX_SCHEDULE_PARTICIPANTS
+        );
+    }
+    Ok(())
 }
 
 /// タイトルの検証(必須 + 上限文字数、ADR-0053 決定 6)。
@@ -2156,7 +2212,7 @@ pub struct CacheStore {
     conn: Connection,
 }
 
-const CACHE_SCHEMA_VERSION: i64 = 4;
+const CACHE_SCHEMA_VERSION: i64 = 5;
 
 impl CacheStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -2271,6 +2327,16 @@ impl CacheStore {
                 CREATE INDEX IF NOT EXISTS idx_sheet_cells_sheet ON sheet_cells(sheet_id);
                 "#,
             )?;
+        }
+        if version < 5 {
+            // v5(M6 H-3、ADR-0055 決定 5): 予定の参加メンバーのキャッシュ
+            // (ホスト正本と同じく JSON 文字列で格納)。存在確認してから
+            // ALTER する理由は SharedStore 側と同じ(非冪等対策)。
+            if !table_has_column(&tx, "schedule_events", "participants")? {
+                tx.execute_batch(
+                    "ALTER TABLE schedule_events ADD COLUMN participants TEXT NOT NULL DEFAULT '[]';",
+                )?;
+            }
         }
         tx.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
         tx.commit()?;
@@ -2713,18 +2779,20 @@ impl CacheStore {
 }
 
 const CACHE_SCHEDULE_COLUMNS: &str = "id, title, note, start_at, end_at, all_day, owner_id,
-        owner_name, updated_by, revision, created_at, updated_at, can_edit";
+        owner_name, updated_by, revision, created_at, updated_at, can_edit, participants";
 
 fn insert_cache_schedule_event(conn: &Connection, event: &ScheduleEvent) -> anyhow::Result<()> {
+    let participants_json = serde_json::to_string(&event.participants)
+        .context("participants の直列化に失敗しました")?;
     conn.execute(
         "INSERT INTO schedule_events
             (id, title, note, start_at, end_at, all_day, owner_id, owner_name,
-             updated_by, revision, created_at, updated_at, can_edit)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             updated_by, revision, created_at, updated_at, can_edit, participants)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(id) DO UPDATE SET
             title = ?2, note = ?3, start_at = ?4, end_at = ?5, all_day = ?6, owner_id = ?7,
             owner_name = ?8, updated_by = ?9, revision = ?10, created_at = ?11,
-            updated_at = ?12, can_edit = ?13",
+            updated_at = ?12, can_edit = ?13, participants = ?14",
         params![
             event.id,
             event.title,
@@ -2739,12 +2807,16 @@ fn insert_cache_schedule_event(conn: &Connection, event: &ScheduleEvent) -> anyh
             event.created_at as i64,
             event.updated_at as i64,
             event.can_edit as i64,
+            participants_json,
         ],
     )?;
     Ok(())
 }
 
 fn cache_schedule_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleEvent> {
+    let participants_json: String = row.get(13)?;
+    let participants: Vec<ScheduleParticipant> =
+        serde_json::from_str(&participants_json).unwrap_or_default();
     Ok(ScheduleEvent {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -2759,6 +2831,7 @@ fn cache_schedule_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule
         created_at: row.get::<_, i64>(10)? as u64,
         updated_at: row.get::<_, i64>(11)? as u64,
         can_edit: row.get::<_, i64>(12)? != 0,
+        participants,
     })
 }
 
@@ -3835,24 +3908,55 @@ mod tests {
         let bob = Actor::member("id-bob", "ボブ");
 
         let created = store
-            .schedule_create(&alice, "定例会議", "議題未定", 1_000, Some(2_000), false)
+            .schedule_create(
+                &alice,
+                "定例会議",
+                "議題未定",
+                1_000,
+                Some(2_000),
+                false,
+                &[],
+            )
             .unwrap();
         assert_eq!(created.title, "定例会議");
         assert_eq!(created.owner_id, "id-alice");
         assert_eq!(created.revision, 1);
         assert!(created.can_edit, "作成者は編集できる");
+        assert!(created.participants.is_empty());
 
         // 全員が閲覧できる(ボブから見ても can_edit は偽)
         let list = store.schedule_list(&bob).unwrap();
         assert_eq!(list.len(), 1);
         assert!(!list[0].can_edit, "作成者以外は編集不可");
 
-        // ボブも作成できる(決定 3: 追加は全員可)
+        // ボブも作成できる(決定 3: 追加は全員可)。参加メンバー付き。
+        let participants = vec![
+            ScheduleParticipant {
+                member_id: "id-alice".to_string(),
+                name: "アリス".to_string(),
+            },
+            ScheduleParticipant {
+                member_id: "id-bob".to_string(),
+                name: "ボブ".to_string(),
+            },
+        ];
         let bob_event = store
-            .schedule_create(&bob, "ボブの予定", "", 3_000, None, true)
+            .schedule_create(&bob, "ボブの予定", "", 3_000, None, true, &participants)
             .unwrap();
         assert!(bob_event.can_edit);
+        assert_eq!(bob_event.participants, participants);
         assert_eq!(store.schedule_list(&alice).unwrap().len(), 2);
+        // 一覧経由でも参加メンバーが復元される
+        assert_eq!(
+            store
+                .schedule_list(&alice)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.id == bob_event.id)
+                .unwrap()
+                .participants,
+            participants
+        );
 
         let updated = store
             .schedule_update(
@@ -3864,14 +3968,33 @@ mod tests {
                 1_500,
                 Some(2_500),
                 false,
+                &participants,
             )
             .unwrap();
         assert_eq!(updated.title, "改題した定例会議");
         assert_eq!(updated.revision, 2);
+        assert_eq!(updated.participants, participants);
 
         store.schedule_delete(&alice, &created.id).unwrap();
         assert_eq!(store.schedule_list(&alice).unwrap().len(), 1);
         assert!(store.schedule_get(&alice, &created.id).is_err());
+    }
+
+    /// 参加メンバーの件数上限(決定 5)。
+    #[test]
+    fn schedule_enforces_participant_limit() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let too_many: Vec<ScheduleParticipant> = (0..MAX_SCHEDULE_PARTICIPANTS + 1)
+            .map(|i| ScheduleParticipant {
+                member_id: format!("m{i}"),
+                name: format!("name{i}"),
+            })
+            .collect();
+        let err = store
+            .schedule_create(&alice, "t", "", 1_000, None, false, &too_many)
+            .unwrap_err();
+        assert!(err.to_string().contains("上限"));
     }
 
     /// 編集・削除は作成者 + ホストのみ(決定 3)。他人は拒否される。
@@ -3883,7 +4006,7 @@ mod tests {
         let host = Actor::host("ホスト");
 
         let event = store
-            .schedule_create(&alice, "アリスの予定", "", 1_000, None, false)
+            .schedule_create(&alice, "アリスの予定", "", 1_000, None, false, &[])
             .unwrap();
 
         // ボブは編集も削除もできない
@@ -3896,7 +4019,8 @@ mod tests {
                 "",
                 1_000,
                 None,
-                false
+                false,
+                &[],
             )
             .is_err());
         assert!(store.schedule_delete(&bob, &event.id).is_err());
@@ -3912,6 +4036,7 @@ mod tests {
                 1_000,
                 None,
                 false,
+                &[],
             )
             .unwrap();
         assert_eq!(by_host.title, "ホストが編集");
@@ -3924,7 +4049,7 @@ mod tests {
         let (_dir, mut store) = open_temp();
         let alice = Actor::member("id-alice", "アリス");
         let event = store
-            .schedule_create(&alice, "予定", "", 1_000, None, false)
+            .schedule_create(&alice, "予定", "", 1_000, None, false, &[])
             .unwrap();
         store
             .schedule_update(
@@ -3936,6 +4061,7 @@ mod tests {
                 1_000,
                 None,
                 false,
+                &[],
             )
             .unwrap();
         // event.revision はもう古い(1 →更新後は 2)
@@ -3949,6 +4075,7 @@ mod tests {
                 1_000,
                 None,
                 false,
+                &[],
             )
             .unwrap_err();
         assert!(err.to_string().contains("competing_edit"));
@@ -3963,31 +4090,39 @@ mod tests {
 
         assert!(
             store
-                .schedule_create(&alice, "  ", "", 1_000, None, false)
+                .schedule_create(&alice, "  ", "", 1_000, None, false, &[])
                 .is_err(),
             "空タイトルは拒否"
         );
         assert!(
             store
-                .schedule_create(&alice, &"あ".repeat(201), "", 1_000, None, false)
+                .schedule_create(&alice, &"あ".repeat(201), "", 1_000, None, false, &[])
                 .is_err(),
             "201 文字は上限超過"
         );
         assert!(
             store
-                .schedule_create(&alice, "t", &"x".repeat(4 * 1024 + 1), 1_000, None, false)
+                .schedule_create(
+                    &alice,
+                    "t",
+                    &"x".repeat(4 * 1024 + 1),
+                    1_000,
+                    None,
+                    false,
+                    &[]
+                )
                 .is_err(),
             "詳細 4KiB 超過"
         );
         assert!(
             store
-                .schedule_create(&alice, "t", "", 2_000, Some(1_000), false)
+                .schedule_create(&alice, "t", "", 2_000, Some(1_000), false, &[])
                 .is_err(),
             "終了が開始より前"
         );
         assert!(
             store
-                .schedule_create(&alice, "t", "", 1_000, Some(1_000), false)
+                .schedule_create(&alice, "t", "", 1_000, Some(1_000), false, &[])
                 .is_ok(),
             "終了 = 開始は許容"
         );
@@ -4014,7 +4149,7 @@ mod tests {
             tx.commit().unwrap();
         }
         let err = store
-            .schedule_create(&alice, "溢れる予定", "", 1_000, None, false)
+            .schedule_create(&alice, "溢れる予定", "", 1_000, None, false, &[])
             .unwrap_err();
         assert!(err.to_string().contains("上限"));
     }
@@ -4035,11 +4170,51 @@ mod tests {
         let mut store = SharedStore::open(&path).unwrap();
         let host = Actor::host("ホスト");
         let event = store
-            .schedule_create(&host, "移行後の予定", "", 1_000, None, false)
+            .schedule_create(&host, "移行後の予定", "", 1_000, None, false, &[])
             .unwrap();
         assert_eq!(store.schedule_list(&host).unwrap().len(), 1);
         assert_eq!(store.db_stats().unwrap().schedule_count, 1);
         store.schedule_delete(&host, &event.id).unwrap();
+    }
+
+    /// v6 → v7 移行(M6 H-3、ADR-0055 決定 5): 既存の schedule_events に
+    /// participants 列が additive に足され、以後の操作が問題なく行える
+    /// (旧行は participants = '[]' として読める)。
+    #[test]
+    fn v6_database_migrates_to_v7_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.memos.db");
+        let host = Actor::host("ホスト");
+        let event_id = {
+            let mut store = SharedStore::open(&path).unwrap();
+            let event = store
+                .schedule_create(&host, "移行前の予定", "", 1_000, None, false, &[])
+                .unwrap();
+            // v6 相当に偽装(participants 列が無かった頃)
+            store.conn.pragma_update(None, "user_version", 6).unwrap();
+            event.id
+        };
+        let mut store = SharedStore::open(&path).unwrap();
+        let event = store.schedule_get(&host, &event_id).unwrap();
+        assert!(event.participants.is_empty(), "旧行は participants 空");
+        let participants = vec![ScheduleParticipant {
+            member_id: "id-alice".to_string(),
+            name: "アリス".to_string(),
+        }];
+        let updated = store
+            .schedule_update(
+                &host,
+                &event_id,
+                event.revision,
+                "移行後に編集",
+                "",
+                1_000,
+                None,
+                false,
+                &participants,
+            )
+            .unwrap();
+        assert_eq!(updated.participants, participants);
     }
 
     /// キャッシュ往復(メンバー側): replace_all・upsert・remove・list・get。
@@ -4057,6 +4232,10 @@ mod tests {
             owner_id: String::new(),
             owner_name: "ホスト".to_string(),
             updated_by: "ホスト".to_string(),
+            participants: vec![ScheduleParticipant {
+                member_id: "id-alice".to_string(),
+                name: "アリス".to_string(),
+            }],
             revision: 1,
             created_at: 1,
             updated_at: 1,
@@ -4070,6 +4249,7 @@ mod tests {
         // start_at 昇順
         assert_eq!(list[0].id, "e2");
         assert_eq!(list[1].id, "e1");
+        assert_eq!(list[0].participants.len(), 1, "participants も往復する");
 
         let mut updated = make("e1", 2_000);
         updated.title = "改題".to_string();
@@ -4446,7 +4626,7 @@ mod tests {
             let mut store = SharedStore::open(&path).unwrap();
             let host = Actor::host("ホスト");
             store
-                .schedule_create(&host, "既存予定", "", 1_000, None, false)
+                .schedule_create(&host, "既存予定", "", 1_000, None, false, &[])
                 .unwrap();
             // v5 相当に偽装
             store.conn.pragma_update(None, "user_version", 5).unwrap();

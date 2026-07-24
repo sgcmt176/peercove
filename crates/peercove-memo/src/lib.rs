@@ -26,7 +26,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// スキーマ世代。互換性のない変更で上げ、`migrate` に移行を足す。
 /// - 2: FTS をかな折り畳み済みテキストの通常表に変更(ひらがな/カタカナ同一視)
 /// - 3: `reminders` テーブル追加(端末ローカルのリマインダー、ADR-0052 決定 6)
-const SCHEMA_VERSION: i64 = 3;
+/// - 4: `reminders` の主キーに `remind_at` を足し 1 対象で複数件を許可、
+///   `offset_minutes` 列を追加(端末ローカル、ADR-0055 決定 3)
+const SCHEMA_VERSION: i64 = 4;
+
+/// 1 対象(scope・network・memo_id)あたりのリマインダー件数上限
+/// (ADR-0055 決定 3)。
+const MAX_REMINDERS_PER_TARGET: usize = 10;
 
 /// 1 メモのタグ数の上限(異常な肥大を防ぐだけの緩い値)。
 const MAX_TAGS_PER_MEMO: usize = 30;
@@ -148,6 +154,33 @@ impl MemoStore {
                 "#,
             )?;
         }
+        if version < 4 {
+            // v4(ADR-0055 決定 3): メモのリマインダーは UI から撤去され、
+            // スケジュールの予定リマインダーへ移設。予定は「5 分前」
+            // 「15 分前」等の複数オフセット + 任意日時を 1 予定に複数件
+            // 設定できる必要があるため、主キーに remind_at を足して
+            // 1 対象(scope・network・memo_id)で複数行を許可する。
+            // offset_minutes は表示用メタ(発火判定には remind_at を使う)。
+            // テーブル再作成マイグレーション(既存行は remind_at そのまま
+            // 引き継ぎ、offset_minutes は v3 に無かった情報なので NULL)。
+            tx.execute_batch(
+                r#"
+                CREATE TABLE reminders_new (
+                    scope TEXT NOT NULL,
+                    network TEXT NOT NULL DEFAULT '',
+                    memo_id TEXT NOT NULL,
+                    remind_at INTEGER NOT NULL,
+                    offset_minutes INTEGER,
+                    fired INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (scope, network, memo_id, remind_at)
+                );
+                INSERT INTO reminders_new (scope, network, memo_id, remind_at, fired)
+                    SELECT scope, network, memo_id, remind_at, fired FROM reminders;
+                DROP TABLE reminders;
+                ALTER TABLE reminders_new RENAME TO reminders;
+                "#,
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -265,16 +298,18 @@ impl MemoStore {
                 network,
                 memo_id,
                 remind_at,
+                offset_minutes,
             } => {
-                self.reminder_set(scope, &network, &memo_id, remind_at)?;
+                self.reminder_set(scope, &network, &memo_id, remind_at, offset_minutes)?;
                 Ok(MemoReply::Done)
             }
             MemoOp::ReminderClear {
                 scope,
                 network,
                 memo_id,
+                remind_at,
             } => {
-                self.reminder_clear(scope, &network, &memo_id)?;
+                self.reminder_clear(scope, &network, &memo_id, remind_at)?;
                 Ok(MemoReply::Done)
             }
             MemoOp::ReminderList => Ok(MemoReply::Reminders {
@@ -286,70 +321,108 @@ impl MemoStore {
         }
     }
 
-    /// リマインダーの設定(ADR-0052 決定 6)。過去の日時は拒否、既存があれば
-    /// 上書き(fired もクリアされる)。
+    /// リマインダーの設定(ADR-0052 決定 6 / ADR-0055 決定 3)。過去の日時は
+    /// 拒否。同一 `remind_at` への再設定は上書き(fired もクリアされる)。
+    /// 異なる `remind_at` は追加(1 対象につき複数件、上限
+    /// [`MAX_REMINDERS_PER_TARGET`])。
     pub fn reminder_set(
         &mut self,
         scope: ReminderScope,
         network: &str,
         memo_id: &str,
         remind_at_ms: u64,
+        offset_minutes: Option<u32>,
     ) -> anyhow::Result<()> {
         if (remind_at_ms as i64) <= unix_ms() {
             bail!("過去の日時は指定できません");
         }
-        self.conn.execute(
-            "INSERT INTO reminders (scope, network, memo_id, remind_at, fired)
-             VALUES (?1, ?2, ?3, ?4, 0)
-             ON CONFLICT(scope, network, memo_id)
-             DO UPDATE SET remind_at = excluded.remind_at, fired = 0",
+        // 上書き(同一 remind_at)はこの件数チェックの対象外
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reminders
+             WHERE scope = ?1 AND network = ?2 AND memo_id = ?3 AND remind_at != ?4",
             params![
                 reminder_scope_text(scope),
                 network,
                 memo_id,
                 remind_at_ms as i64
             ],
+            |row| row.get(0),
+        )?;
+        if existing as usize >= MAX_REMINDERS_PER_TARGET {
+            bail!(
+                "リマインダーの件数が上限({} 件)に達しています",
+                MAX_REMINDERS_PER_TARGET
+            );
+        }
+        self.conn.execute(
+            "INSERT INTO reminders (scope, network, memo_id, remind_at, offset_minutes, fired)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)
+             ON CONFLICT(scope, network, memo_id, remind_at)
+             DO UPDATE SET offset_minutes = excluded.offset_minutes, fired = 0",
+            params![
+                reminder_scope_text(scope),
+                network,
+                memo_id,
+                remind_at_ms as i64,
+                offset_minutes,
+            ],
         )?;
         Ok(())
     }
 
-    /// リマインダーの解除。無くても失敗にしない。
+    /// リマインダーの解除。無くても失敗にしない。`remind_at` を省略すると
+    /// その対象の全件を削除する(ADR-0055 決定 3)。
     pub fn reminder_clear(
         &mut self,
         scope: ReminderScope,
         network: &str,
         memo_id: &str,
+        remind_at: Option<u64>,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
-            "DELETE FROM reminders WHERE scope = ?1 AND network = ?2 AND memo_id = ?3",
-            params![reminder_scope_text(scope), network, memo_id],
-        )?;
+        match remind_at {
+            Some(at) => {
+                self.conn.execute(
+                    "DELETE FROM reminders
+                     WHERE scope = ?1 AND network = ?2 AND memo_id = ?3 AND remind_at = ?4",
+                    params![reminder_scope_text(scope), network, memo_id, at as i64],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM reminders WHERE scope = ?1 AND network = ?2 AND memo_id = ?3",
+                    params![reminder_scope_text(scope), network, memo_id],
+                )?;
+            }
+        }
         Ok(())
     }
 
-    /// 指定した対象の未発火のリマインダー時刻(あれば)。
-    pub fn reminder_for(
+    /// 指定した対象の未発火のリマインダー全件(発火時刻の早い順、ADR-0055
+    /// 決定 3。1 対象で複数件になり得る)。
+    pub fn reminders_for(
         &self,
         scope: ReminderScope,
         network: &str,
         memo_id: &str,
-    ) -> anyhow::Result<Option<u64>> {
-        let value: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT remind_at FROM reminders
-                 WHERE scope = ?1 AND network = ?2 AND memo_id = ?3 AND fired = 0",
+    ) -> anyhow::Result<Vec<MemoReminder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope, network, memo_id, remind_at, offset_minutes FROM reminders
+             WHERE scope = ?1 AND network = ?2 AND memo_id = ?3 AND fired = 0
+             ORDER BY remind_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(
                 params![reminder_scope_text(scope), network, memo_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(value.map(|v| v as u64))
+                row_to_reminder,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// 未発火のリマインダー全件(発火時刻の早い順)。
     pub fn reminders_all(&self) -> anyhow::Result<Vec<MemoReminder>> {
         let mut stmt = self.conn.prepare(
-            "SELECT scope, network, memo_id, remind_at FROM reminders
+            "SELECT scope, network, memo_id, remind_at, offset_minutes FROM reminders
              WHERE fired = 0 ORDER BY remind_at ASC",
         )?;
         let rows = stmt
@@ -362,7 +435,7 @@ impl MemoStore {
     pub fn reminders_take_due(&mut self, now_ms: u64) -> anyhow::Result<Vec<MemoReminder>> {
         let tx = self.conn.transaction()?;
         let mut stmt = tx.prepare(
-            "SELECT scope, network, memo_id, remind_at FROM reminders
+            "SELECT scope, network, memo_id, remind_at, offset_minutes FROM reminders
              WHERE fired = 0 AND remind_at <= ?1 ORDER BY remind_at ASC",
         )?;
         let due: Vec<MemoReminder> = stmt
@@ -785,6 +858,7 @@ fn row_to_reminder(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoReminder> {
         network: row.get(1)?,
         memo_id: row.get(2)?,
         remind_at: row.get::<_, i64>(3)? as u64,
+        offset_minutes: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
     })
 }
 
@@ -792,14 +866,15 @@ fn reminder_scope_text(scope: ReminderScope) -> &'static str {
     match scope {
         ReminderScope::Personal => "personal",
         ReminderScope::Shared => "shared",
+        ReminderScope::Schedule => "schedule",
     }
 }
 
 fn reminder_scope_from_text(text: &str) -> ReminderScope {
-    if text == "shared" {
-        ReminderScope::Shared
-    } else {
-        ReminderScope::Personal
+    match text {
+        "shared" => ReminderScope::Shared,
+        "schedule" => ReminderScope::Schedule,
+        _ => ReminderScope::Personal,
     }
 }
 
@@ -1615,54 +1690,146 @@ mod tests {
         let future = unix_ms() + 60_000;
 
         store
-            .reminder_set(ReminderScope::Personal, "", &memo.id, future as u64)
+            .reminder_set(ReminderScope::Personal, "", &memo.id, future as u64, None)
             .unwrap();
         assert_eq!(
             store
-                .reminder_for(ReminderScope::Personal, "", &memo.id)
-                .unwrap(),
-            Some(future as u64)
+                .reminders_for(ReminderScope::Personal, "", &memo.id)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.remind_at)
+                .collect::<Vec<_>>(),
+            vec![future as u64]
         );
 
-        // 上書き(再設定)
-        let future2 = future + 1_000;
+        // 同一 remind_at への再設定は上書き(件数は増えない)
         store
-            .reminder_set(ReminderScope::Personal, "", &memo.id, future2 as u64)
+            .reminder_set(
+                ReminderScope::Personal,
+                "",
+                &memo.id,
+                future as u64,
+                Some(15),
+            )
             .unwrap();
-        assert_eq!(
-            store
-                .reminder_for(ReminderScope::Personal, "", &memo.id)
-                .unwrap(),
-            Some(future2 as u64)
-        );
-        assert_eq!(store.reminders_all().unwrap().len(), 1, "1 メモ 1 件のまま");
+        let reminders = store
+            .reminders_for(ReminderScope::Personal, "", &memo.id)
+            .unwrap();
+        assert_eq!(reminders.len(), 1, "同一 remind_at は上書き");
+        assert_eq!(reminders[0].offset_minutes, Some(15));
 
         // 過去日時は拒否
         let err = store
-            .reminder_set(ReminderScope::Personal, "", &memo.id, 1)
+            .reminder_set(ReminderScope::Personal, "", &memo.id, 1, None)
             .unwrap_err();
         assert!(err.to_string().contains("過去の日時"), "{err}");
 
         // 共有メモの自分用リマインダーは network で区別される(同じ memo_id でも別行)
         store
-            .reminder_set(ReminderScope::Shared, "net.toml", &memo.id, future as u64)
+            .reminder_set(
+                ReminderScope::Shared,
+                "net.toml",
+                &memo.id,
+                future as u64,
+                None,
+            )
             .unwrap();
         assert_eq!(store.reminders_all().unwrap().len(), 2);
 
         store
-            .reminder_clear(ReminderScope::Personal, "", &memo.id)
+            .reminder_clear(ReminderScope::Personal, "", &memo.id, None)
             .unwrap();
-        assert_eq!(
-            store
-                .reminder_for(ReminderScope::Personal, "", &memo.id)
-                .unwrap(),
-            None
-        );
+        assert!(store
+            .reminders_for(ReminderScope::Personal, "", &memo.id)
+            .unwrap()
+            .is_empty());
         // 解除は無くても失敗しない
         store
-            .reminder_clear(ReminderScope::Personal, "", &memo.id)
+            .reminder_clear(ReminderScope::Personal, "", &memo.id, None)
             .unwrap();
         assert_eq!(store.reminders_all().unwrap().len(), 1);
+    }
+
+    /// リマインダーの複数化(ADR-0055 決定 3): 1 対象に複数件設定でき、
+    /// remind_at を指定した個別削除・全件削除がそれぞれ動く。
+    #[test]
+    fn reminder_multiple_per_target_and_targeted_clear() {
+        let (_dir, mut store) = open_temp();
+        let memo = create(&mut store, "会議", "資料を送る");
+        let base = unix_ms() + 60_000;
+        let at1 = base as u64;
+        let at2 = (base + 1_000) as u64;
+        let at3 = (base + 2_000) as u64;
+
+        store
+            .reminder_set(ReminderScope::Schedule, "net.toml", &memo.id, at1, Some(15))
+            .unwrap();
+        store
+            .reminder_set(ReminderScope::Schedule, "net.toml", &memo.id, at2, Some(5))
+            .unwrap();
+        store
+            .reminder_set(ReminderScope::Schedule, "net.toml", &memo.id, at3, None)
+            .unwrap();
+        let list = store
+            .reminders_for(ReminderScope::Schedule, "net.toml", &memo.id)
+            .unwrap();
+        assert_eq!(list.len(), 3, "1 対象に複数件");
+        assert_eq!(
+            list.iter().map(|r| r.remind_at).collect::<Vec<_>>(),
+            vec![at1, at2, at3],
+            "remind_at 昇順"
+        );
+
+        // remind_at 指定で個別削除
+        store
+            .reminder_clear(ReminderScope::Schedule, "net.toml", &memo.id, Some(at2))
+            .unwrap();
+        let list = store
+            .reminders_for(ReminderScope::Schedule, "net.toml", &memo.id)
+            .unwrap();
+        assert_eq!(
+            list.iter().map(|r| r.remind_at).collect::<Vec<_>>(),
+            vec![at1, at3]
+        );
+
+        // remind_at 省略で全件削除
+        store
+            .reminder_clear(ReminderScope::Schedule, "net.toml", &memo.id, None)
+            .unwrap();
+        assert!(store
+            .reminders_for(ReminderScope::Schedule, "net.toml", &memo.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// リマインダーの件数上限(ADR-0055 決定 3、1 対象あたり
+    /// [`MAX_REMINDERS_PER_TARGET`] 件)。
+    #[test]
+    fn reminder_enforces_per_target_limit() {
+        let (_dir, mut store) = open_temp();
+        let memo = create(&mut store, "会議", "");
+        let base = unix_ms() + 60_000;
+        for i in 0..MAX_REMINDERS_PER_TARGET {
+            store
+                .reminder_set(
+                    ReminderScope::Schedule,
+                    "net.toml",
+                    &memo.id,
+                    (base + i as i64 * 1_000) as u64,
+                    None,
+                )
+                .unwrap();
+        }
+        let err = store
+            .reminder_set(
+                ReminderScope::Schedule,
+                "net.toml",
+                &memo.id,
+                (base + MAX_REMINDERS_PER_TARGET as i64 * 1_000) as u64,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("上限"), "{err}");
     }
 
     /// リマインダー: 発火時刻の到来で take_due が拾い、fired 済みは一覧から消える。
@@ -1672,7 +1839,7 @@ mod tests {
         let memo = create(&mut store, "会議", "資料を送る");
         let due_at = unix_ms() + 100;
         store
-            .reminder_set(ReminderScope::Personal, "", &memo.id, due_at as u64)
+            .reminder_set(ReminderScope::Personal, "", &memo.id, due_at as u64, None)
             .unwrap();
 
         // まだ到来していない
@@ -1700,7 +1867,7 @@ mod tests {
         let memo = create(&mut store, "捨てる", "x");
         let future = (unix_ms() + 60_000) as u64;
         store
-            .reminder_set(ReminderScope::Personal, "", &memo.id, future)
+            .reminder_set(ReminderScope::Personal, "", &memo.id, future, None)
             .unwrap();
         store
             .apply(MemoOp::Trash {
@@ -1717,14 +1884,14 @@ mod tests {
         // EmptyTrash 経由でも連動削除される
         let memo2 = create(&mut store, "捨てる2", "y");
         store
-            .reminder_set(ReminderScope::Personal, "", &memo2.id, future)
+            .reminder_set(ReminderScope::Personal, "", &memo2.id, future, None)
             .unwrap();
         store.apply(MemoOp::Trash { id: memo2.id }).unwrap();
         store.apply(MemoOp::EmptyTrash).unwrap();
         assert!(store.reminders_all().unwrap().is_empty());
     }
 
-    /// v2(reminders 表が無い)の DB を開くと v3 へ移行され、リマインダーが使える。
+    /// v2(reminders 表が無い)の DB を開くと v4 へ移行され、リマインダーが使える。
     #[test]
     fn v2_database_migrates_to_reminders_table() {
         let dir = tempfile::tempdir().unwrap();
@@ -1738,9 +1905,39 @@ mod tests {
         let mut store = MemoStore::open(&path).unwrap();
         let future = (unix_ms() + 60_000) as u64;
         store
-            .reminder_set(ReminderScope::Personal, "", &memo_id, future)
+            .reminder_set(ReminderScope::Personal, "", &memo_id, future, None)
             .unwrap();
         assert_eq!(store.reminders_all().unwrap().len(), 1);
+    }
+
+    /// v3(reminders 表はあるが主キーに remind_at を含まない旧形式)から
+    /// v4 への移行で既存行が引き継がれる(ADR-0055 決定 3)。
+    #[test]
+    fn v3_database_migrates_reminders_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memos.db");
+        let future = (unix_ms() + 60_000) as u64;
+        let memo_id = {
+            let mut store = MemoStore::open(&path).unwrap();
+            let memo = create(&mut store, "移行前3", "本文");
+            store
+                .reminder_set(ReminderScope::Personal, "", &memo.id, future, None)
+                .unwrap();
+            // v4 移行前(旧形式)まで巻き戻す
+            store.conn.pragma_update(None, "user_version", 3).unwrap();
+            memo.id
+        };
+        let mut store = MemoStore::open(&path).unwrap();
+        let list = store.reminders_all().unwrap();
+        assert_eq!(list.len(), 1, "既存行が引き継がれる");
+        assert_eq!(list[0].memo_id, memo_id);
+        assert_eq!(list[0].remind_at, future);
+
+        // 移行後は 1 対象に複数件設定できる(新しい主キーが効いている)
+        store
+            .reminder_set(ReminderScope::Personal, "", &memo_id, future + 1_000, None)
+            .unwrap();
+        assert_eq!(store.reminders_all().unwrap().len(), 2);
     }
 
     /// 安全弁: 共通の接頭辞・接尾辞を除いた行数の積が閾値を超えると

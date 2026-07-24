@@ -218,26 +218,35 @@ pub enum MemoOp {
     FolderRename { id: String, name: String },
     /// フォルダー削除(中のメモは「フォルダーなし」へ移動する)。
     FolderDelete { id: String },
-    /// リマインダーの設定(端末ローカル、ADR-0052 決定 6)。共有メモに対する
-    /// 「自分用リマインダー」も個人 DB のこのテーブルで管理する(他人には
-    /// 見えない)。同じ対象への再設定は上書き。過去の日時は拒否される。
-    /// 応答は [`MemoReply::Done`]。
+    /// リマインダーの設定(端末ローカル、ADR-0052 決定 6 / ADR-0055 決定 3)。
+    /// 共有メモに対する「自分用リマインダー」も個人 DB のこのテーブルで
+    /// 管理する(他人には見えない)。**1 対象につき複数件**を許可する
+    /// (上限 [`crate::memo`] 側の実装定数、同一 `remind_at` は上書き)。
+    /// 過去の日時は拒否される。応答は [`MemoReply::Done`]。
     ReminderSet {
         scope: ReminderScope,
-        /// 共有メモのときの設定識別子(デスクトップは設定ファイルパス、
-        /// Android はネットワーク slug)。個人メモは空文字。
+        /// 共有メモ・スケジュールのときの設定識別子(デスクトップは設定
+        /// ファイルパス、Android はネットワーク slug)。個人メモは空文字。
         #[serde(default)]
         network: String,
         memo_id: String,
         /// 発火時刻(UNIX ミリ秒)。
         remind_at: u64,
+        /// 「開始 n 分前」設定の表示用メタ(ADR-0055 決定 3)。
+        /// `None` = 任意日時指定(表示用途のみで発火判定には使わない)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_minutes: Option<u32>,
     },
     /// リマインダーの解除。無くても失敗にしない(応答は Done)。
+    /// `remind_at` を省略(`None`)すると、その対象の全件を削除する
+    /// (ADR-0055 決定 3、additive)。
     ReminderClear {
         scope: ReminderScope,
         #[serde(default)]
         network: String,
         memo_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remind_at: Option<u64>,
     },
     /// 未発火のリマインダー一覧(この端末のすべて。個人・共有の別を問わず)。
     /// 応答は [`MemoReply::Reminders`]。
@@ -249,24 +258,30 @@ pub enum MemoOp {
     ReminderTakeDue,
 }
 
-/// リマインダー対象のメモの種別(ADR-0052 決定 6)。
+/// リマインダー対象の種別(ADR-0052 決定 6)。`Schedule` はスケジュールの
+/// 予定リマインダー(ADR-0055 決定 3、additive)。この場合 `memo_id` には
+/// 予定(`ScheduleEvent`)の id を入れる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReminderScope {
     Personal,
     Shared,
+    Schedule,
 }
 
-/// メモのリマインダー 1 件(ADR-0052 決定 6、端末ローカル)。
+/// メモ・予定のリマインダー 1 件(ADR-0052 決定 6 / ADR-0055 決定 3、端末ローカル)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoReminder {
     pub scope: ReminderScope,
-    /// 共有メモのときだけ意味を持つ設定識別子(個人メモは空文字)。
+    /// 共有メモ・スケジュールのときだけ意味を持つ設定識別子(個人メモは空文字)。
     #[serde(default)]
     pub network: String,
     pub memo_id: String,
     /// 発火時刻(UNIX ミリ秒)。
     pub remind_at: u64,
+    /// 「開始 n 分前」設定の表示用メタ(ADR-0055 決定 3、additive)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_minutes: Option<u32>,
 }
 
 /// [`MemoOp`] への応答。
@@ -1011,6 +1026,7 @@ mod tests {
             network: String::new(),
             memo_id: "m1".to_string(),
             remind_at: 1_000,
+            offset_minutes: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(
@@ -1024,6 +1040,7 @@ mod tests {
             network: "net.toml".to_string(),
             memo_id: "s1".to_string(),
             remind_at: 2_000,
+            offset_minutes: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(
@@ -1032,7 +1049,22 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<MemoOp>(&json).unwrap(), op);
 
-        // network 省略でも読める(個人メモの既定)
+        // スケジュールの予定リマインダー(ADR-0055 決定 3): offset_minutes 付き
+        let op = MemoOp::ReminderSet {
+            scope: ReminderScope::Schedule,
+            network: "net.toml".to_string(),
+            memo_id: "e1".to_string(),
+            remind_at: 3_000,
+            offset_minutes: Some(15),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"reminder_set","scope":"schedule","network":"net.toml","memo_id":"e1","remind_at":3000,"offset_minutes":15}"#
+        );
+        assert_eq!(serde_json::from_str::<MemoOp>(&json).unwrap(), op);
+
+        // network 省略でも読める(個人メモの既定)。remind_at 省略 = 全件削除
         let parsed: MemoOp =
             serde_json::from_str(r#"{"op":"reminder_clear","scope":"personal","memo_id":"m1"}"#)
                 .unwrap();
@@ -1042,8 +1074,19 @@ mod tests {
                 scope: ReminderScope::Personal,
                 network: String::new(),
                 memo_id: "m1".to_string(),
+                remind_at: None,
             }
         );
+
+        // remind_at 指定ありの解除(個別削除、ADR-0055 決定 3)
+        let op = MemoOp::ReminderClear {
+            scope: ReminderScope::Schedule,
+            network: "net.toml".to_string(),
+            memo_id: "e1".to_string(),
+            remind_at: Some(3_000),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(serde_json::from_str::<MemoOp>(&json).unwrap(), op);
 
         let op = MemoOp::ReminderList;
         assert_eq!(
@@ -1062,6 +1105,7 @@ mod tests {
                 network: "net.toml".to_string(),
                 memo_id: "s1".to_string(),
                 remind_at: 2_000,
+                offset_minutes: None,
             }],
         };
         let json = serde_json::to_string(&reply).unwrap();

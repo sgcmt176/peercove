@@ -635,7 +635,7 @@ private fun MemoEditor(
     var wikiLinks by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var backlinks by remember { mutableStateOf<List<MemoSummaryInfo>>(emptyList()) }
     // ⏰ リマインダーのメニュー・アイコンはここから撤去(ADR-0055 決定 3)。
-    // Reminder.kt の基盤(fetchReminder/applyReminder/clearReminder/
+    // Reminder.kt の基盤(fetchReminders/applyReminder/clearReminder/
     // pickReminderDateTime)自体はスケジュールの予定リマインダー(H-3)で
     // 流用するため残してある。既に設定済みのリマインダーは(このメニューを
     // 経由せず)引き続き発火する。

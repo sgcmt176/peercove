@@ -1336,6 +1336,7 @@ dependencies = [
  "anyhow",
  "peercove-core",
  "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 
