@@ -67,7 +67,7 @@ export const ja = {
   sidebar: {
     networks: "ネットワーク",
     memos: "メモ",
-    sharedMemos: "メモ",
+    sharedMemos: "共有",
     members: "メンバー",
     chat: "チャット",
     stats: "品質",
@@ -1008,6 +1008,12 @@ export const ja = {
     copyToShared: "共有メモへコピー",
     copyToSharedChoose: "コピー先のネットワークを選択",
     copiedToShared: "共有メモへコピーしました",
+  },
+
+  // 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは現在「メモ」の
+  // み。今後スケジュール・表を足す際はここへキーを追加するだけでよい
+  sharedHub: {
+    tabMemos: "メモ",
   },
 
   // 共有メモ(M5 F-2、ADR-0049)

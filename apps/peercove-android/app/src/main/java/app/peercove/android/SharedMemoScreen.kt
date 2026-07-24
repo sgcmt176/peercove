@@ -85,6 +85,48 @@ import uniffi.peercove_mobile.sharedMemoTrash
 
 private val sharedDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
 
+// 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。共有系機能をタブで増やし続け
+// ず「共有」1 か所にまとめる器。サブタブは現在「メモ」のみだが、今後
+// スケジュール・表を足すときは SHARED_HUB_TABS に 1 要素足すだけでよい
+private data class SharedHubTabSpec(
+    val id: String,
+    val labelRes: Int,
+    val content: @Composable (slug: String, onNotice: (String) -> Unit) -> Unit,
+)
+
+private val SHARED_HUB_TABS = listOf(
+    SharedHubTabSpec(
+        id = "memos",
+        labelRes = R.string.shared_hub_tab_memos,
+        content = { slug, onNotice -> SharedMemoTab(slug, onNotice) },
+    ),
+)
+
+@Composable
+fun SharedHubTab(slug: String, onNotice: (String) -> Unit) {
+    var tabId by remember { mutableStateOf(SHARED_HUB_TABS.first().id) }
+    val active = SHARED_HUB_TABS.firstOrNull { it.id == tabId } ?: SHARED_HUB_TABS.first()
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            SHARED_HUB_TABS.forEach { tab ->
+                FilterChip(
+                    selected = tab.id == active.id,
+                    onClick = { tabId = tab.id },
+                    label = { Text(stringResource(tab.labelRes)) },
+                )
+            }
+        }
+        active.content(slug, onNotice)
+    }
+}
+
 @Composable
 fun SharedMemoTab(slug: String, onNotice: (String) -> Unit) {
     val context = LocalContext.current

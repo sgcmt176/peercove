@@ -23,7 +23,7 @@ import { clearChat, syncChat, totalUnread } from "./chat";
 import { clearHistory, recordStatus } from "./history";
 import { Theme, applyTheme, loadTheme, nextTheme } from "./theme";
 import { MemoView } from "./components/MemoView";
-import { SharedMemoView } from "./components/SharedMemoView";
+import { SharedHubView } from "./components/SharedHubView";
 import { NetworksView } from "./components/NetworksView";
 import { TunnelView } from "./components/TunnelView";
 import { LogsView } from "./components/LogsDialog";
@@ -326,7 +326,7 @@ export default function App() {
                 onClick={() => setView("chat")}
               />
               <SidebarItem
-                icon="📝"
+                icon="🗂"
                 label={t.sidebar.sharedMemos}
                 active={view === "net-memos"}
                 disabled={openTunnel === null}
@@ -556,7 +556,7 @@ export default function App() {
           ) : view === "acl" && detailHost && openTunnel !== null ? (
             <AclView configPath={openTunnel.config} members={openTunnel.members} />
           ) : view === "net-memos" && openTunnel !== null ? (
-            <SharedMemoView
+            <SharedHubView
               configPath={openTunnel.config}
               isHost={detailHost}
               supported={openTunnel.sharedMemo}

@@ -2945,6 +2945,50 @@ select {
   }
 }
 
+/* ---- 共有ハブ (M5 F-5 Stage 1, ADR-0052 決定 3) ----
+   ネットワーク詳細の「共有」タブの中身。今後スケジュール・表を足しても
+   ここへサブタブを 1 つ足すだけで収まる器。.tabs (L984 付近) と同じ流儀
+   だが、外枠 1 か所に集約する分、高さは控えめにする */
+.shared-hub {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.shared-hub__tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin: 0 0 10px;
+}
+
+.shared-hub__tab {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 3px 10px;
+  margin-bottom: -1px;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.shared-hub__tab:hover {
+  filter: none;
+  color: var(--text);
+}
+
+.shared-hub__tab--active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.shared-hub__body {
+  flex: 1;
+  min-height: 0;
+}
+
 /* ---- 共有メモ (M5 F-2) ---- */
 
 .memo__item-lock {

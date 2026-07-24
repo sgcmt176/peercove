@@ -56,6 +56,7 @@
     <string name="session_waiting">ホストと同期待ち…</string>
     <string name="tab_talk">トーク</string>
     <string name="tab_members">メンバー</string>
+    <string name="tab_shared">共有</string>
     <string name="tab_dns">DNS</string>
     <string name="tab_settings">設定</string>
     <string name="talk_all">全体</string>
@@ -303,8 +304,11 @@
     <string name="memo_copy_to_shared_choose">コピー先のネットワークを選択</string>
     <string name="memo_copied_to_shared">共有メモへコピーしました</string>
 
+    <!-- 共有ハブ(M5 F-5 Stage 1、ADR-0052 決定 3)。サブタブは現在「メモ」
+         のみ。今後スケジュール・表を足す際はここへキーを追加するだけでよい -->
+    <string name="shared_hub_tab_memos">メモ</string>
+
     <!-- 共有メモ(M5 F-2、ADR-0049) -->
-    <string name="tab_memos">メモ</string>
     <string name="shared_memo_empty">共有メモがありません</string>
     <string name="shared_memo_offline">オフライン(ホスト未接続)のため読み取り専用です</string>
     <string name="shared_memo_unsupported">ホストと同期できていません(ホストのバージョンが古い可能性があります)</string>
