@@ -528,7 +528,9 @@ use peercove_core::memo::{
     SharedMemoHistoryEntry, SharedMemoOp, SharedMemoQuery, SharedMemoReply, SharedMemoSummary,
 };
 use peercove_core::schedule::{ScheduleEvent, ScheduleOp, ScheduleParticipant, ScheduleReply};
-use peercove_core::sheet::{CellFormat, CellWrite, SheetCell, SheetMeta, SheetOp, SheetReply};
+use peercove_core::sheet::{
+    CellFormat, CellWrite, SheetCell, SheetMerge, SheetMeta, SheetOp, SheetReply,
+};
 
 #[derive(uniffi::Record)]
 pub struct SharedMemoSummaryInfo {
@@ -917,6 +919,9 @@ pub struct ScheduleEventInfo {
     pub start_unix_ms: u64,
     pub end_unix_ms: Option<u64>,
     pub all_day: bool,
+    /// 所有者(作成者)の member_id(空文字 = ホスト、M6 H-6 で additive 追加)。
+    /// 「自分の予定」フィルタ(ADR-0055 決定 5)の判定に使う。
+    pub owner_id: String,
     pub owner_name: String,
     pub updated_by: String,
     /// 参加メンバー(ADR-0055 決定 5)。
@@ -937,6 +942,7 @@ impl From<ScheduleEvent> for ScheduleEventInfo {
             start_unix_ms: event.start_unix_ms,
             end_unix_ms: event.end_unix_ms,
             all_day: event.all_day,
+            owner_id: event.owner_id,
             owner_name: event.owner_name,
             updated_by: event.updated_by,
             participants: event.participants.into_iter().map(Into::into).collect(),
@@ -1091,6 +1097,13 @@ pub struct SheetMetaInfo {
     pub updated_at: u64,
     /// 受信者視点: 改名・削除できるか(作成者 + ホスト)。
     pub can_manage: bool,
+    /// 目盛線の表示(既定 true、ADR-0055 決定 6、M6 H-6 で additive 追加)。
+    pub gridlines: bool,
+    /// ウインドウ枠を固定する先頭行数(既定 0 = 固定なし)。表示対応は
+    /// Android では見送り(スマホ幅では意味が薄いため無視する、M6 H-6 判断)。
+    pub freeze_rows: u32,
+    /// ウインドウ枠を固定する先頭列数(既定 0 = 固定なし)。
+    pub freeze_cols: u32,
 }
 
 impl From<SheetMeta> for SheetMetaInfo {
@@ -1102,6 +1115,9 @@ impl From<SheetMeta> for SheetMetaInfo {
             created_at: sheet.created_at,
             updated_at: sheet.updated_at,
             can_manage: sheet.can_manage,
+            gridlines: sheet.gridlines,
+            freeze_rows: sheet.freeze_rows,
+            freeze_cols: sheet.freeze_cols,
         }
     }
 }
@@ -1202,13 +1218,36 @@ fn layout_to_entries(layout: Vec<(u32, u16)>) -> Vec<SheetLayoutEntry> {
         .collect()
 }
 
+/// セル結合の 1 件(左上セル座標 + 縦横スパン、ADR-0055 決定 6、M6 H-6 で
+/// additive 追加)。
+#[derive(uniffi::Record)]
+pub struct SheetMergeInfo {
+    pub row: u32,
+    pub col: u32,
+    pub row_span: u32,
+    pub col_span: u32,
+}
+
+impl From<SheetMerge> for SheetMergeInfo {
+    fn from(merge: SheetMerge) -> Self {
+        Self {
+            row: merge.row,
+            col: merge.col,
+            row_span: merge.row_span,
+            col_span: merge.col_span,
+        }
+    }
+}
+
 #[derive(uniffi::Record)]
 pub struct SheetCellsResult {
     pub cells: Vec<SheetCellInfo>,
-    /// 既定でない列幅(表示対応は H-6)。
+    /// 既定でない列幅。
     pub col_widths: Vec<SheetLayoutEntry>,
-    /// 既定でない行高(表示対応は H-6)。
+    /// 既定でない行高。
     pub row_heights: Vec<SheetLayoutEntry>,
+    /// セル結合(ADR-0055 決定 6、M6 H-6 で additive 追加)。
+    pub merges: Vec<SheetMergeInfo>,
     pub offline: bool,
     pub generation: u64,
 }
@@ -1261,6 +1300,7 @@ pub fn sheet_cells(
     let cache = open_cache(&base_dir, &slug)?;
     let cells = cache.sheet_cells(&sheet_id)?;
     let (col_widths, row_heights) = cache.sheet_layout(&sheet_id)?;
+    let merges = cache.sheet_merges(&sheet_id)?;
     let session = crate::session_of(&slug);
     let online = session.as_ref().is_some_and(|s| {
         s.control_connected
@@ -1270,6 +1310,7 @@ pub fn sheet_cells(
         cells: cells.into_iter().map(Into::into).collect(),
         col_widths: layout_to_entries(col_widths),
         row_heights: layout_to_entries(row_heights),
+        merges: merges.into_iter().map(Into::into).collect(),
         offline: !online,
         generation: session
             .as_ref()

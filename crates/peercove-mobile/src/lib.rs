@@ -576,6 +576,11 @@ pub struct MemberInfo {
     pub can_invite: bool,
     /// このメンバーを招待した発行者の表示名(ADR-0048)。ホスト発行は None。
     pub invited_by: Option<String>,
+    /// メンバーの同一性 ID(ホスト側 invite_id)。デスクトップの
+    /// `Member.memberId` に相当し、共有スケジュールの参加メンバー選択
+    /// (ADR-0055 決定 5、M6 H-6)で使う。旧版ホスト・招待 v3 以前の
+    /// メンバー・ホスト自身は None。
+    pub member_id: Option<String>,
 }
 
 /// チャット 1 通(UI 表示用)。
@@ -685,6 +690,7 @@ pub fn members(slug: String) -> Vec<MemberInfo> {
                 platform: m.platform.clone(),
                 can_invite: m.can_invite,
                 invited_by: m.invited_by.clone(),
+                member_id: m.member_id.clone(),
             }
         })
         .collect()
