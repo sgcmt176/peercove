@@ -1934,7 +1934,13 @@ mod tests {
             .await
         });
 
-        // 接続登録を待って Removed を送る
+        // クライアントが hello を終えて初回台帳を受信するまで待ってから
+        // Removed を送る。接続登録の直後に送ると、遅い環境(CI の共有
+        // ランナー)では hello 応答より先に Removed が届き、クライアントが
+        // 「hello 失敗」としてセッションを終えて削除フラグが立たない
+        // (flaky の原因だった)。初回台帳の受信 = hello 完了後の主ループに
+        // 入っている確実な目印。
+        wait_for(&latest, |l| l.is_some()).await;
         let sender = loop {
             if let Some(tx) = connections.lock().unwrap().values().next().cloned() {
                 break tx;
