@@ -1037,7 +1037,9 @@ function CommentsPanel({
   const [sending, setSending] = useState(false);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   // 開閉状態(既定で開)。details を使わない理由は下の JSX 側コメント参照。
-  const [open, setOpen] = useState(true);
+  // 既定は閉じる(M6 H-9 追補、依頼者指摘: 本文の表示領域を優先し、
+  // コメントは見たいときに開く)。
+  const [open, setOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const load = useCallback(async () => {

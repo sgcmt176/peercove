@@ -2025,8 +2025,15 @@ mod tests {
         assert!(connections.lock().unwrap().is_empty());
     }
 
+    /// テストの条件待ちの上限。ローカルでは数十 ms で満たされるが、CI の
+    /// 共有ランナーはワークスペース全体の並列実行で大きく遅くなることが
+    /// あり、以前の 2 秒(20ms × 100 回)では稀に間に合わず flaky だった。
+    /// 成功時は即座に返るので、上限は大きくしてもテスト時間は延びない。
+    const WAIT_DEADLINE: Duration = Duration::from_secs(30);
+
     async fn wait_for<T>(value: &Arc<Mutex<Option<T>>>, predicate: impl Fn(&Option<T>) -> bool) {
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + WAIT_DEADLINE;
+        while tokio::time::Instant::now() < deadline {
             if predicate(&value.lock().unwrap()) {
                 return;
             }
@@ -2036,7 +2043,8 @@ mod tests {
     }
 
     async fn wait_until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + WAIT_DEADLINE;
+        while tokio::time::Instant::now() < deadline {
             if let Some(value) = probe() {
                 return value;
             }

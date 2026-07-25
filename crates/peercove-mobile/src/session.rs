@@ -2614,7 +2614,7 @@ mod tests {
 
     fn bound_addr(session: &NetSession) -> SocketAddr {
         assert!(
-            wait_until(Duration::from_secs(5), || session
+            wait_until(Duration::from_secs(30), || session
                 .shared
                 .bound_listen
                 .lock()
@@ -2658,7 +2658,7 @@ mod tests {
         writer
             .write_all((serde_json::to_string(&ledger).unwrap() + "\n").as_bytes())
             .unwrap();
-        assert!(wait_until(Duration::from_secs(5), || {
+        assert!(wait_until(Duration::from_secs(30), || {
             session
                 .shared
                 .ledger
@@ -2670,7 +2670,7 @@ mod tests {
         assert!(session.shared.control_connected.load(Ordering::Relaxed));
         // ネットワーク表示名(ADR-0058)が member.toml へ永続化される
         assert!(
-            wait_until(Duration::from_secs(5), || {
+            wait_until(Duration::from_secs(30), || {
                 peercove_core::config::Config::load(&session.shared.cfg.config_path)
                     .map(|c| c.interface.network_display_name.as_deref() == Some("うちの LAN"))
                     .unwrap_or(false)
@@ -2763,7 +2763,7 @@ mod tests {
         writer
             .write_all((serde_json::to_string(&removed).unwrap() + "\n").as_bytes())
             .unwrap();
-        assert!(wait_until(Duration::from_secs(5), || session
+        assert!(wait_until(Duration::from_secs(30), || session
             .shared
             .removed
             .load(Ordering::Relaxed)));
@@ -3075,12 +3075,12 @@ mod tests {
         seed_ledger(&a, both.clone());
         seed_ledger(&b, both);
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(Duration::from_secs(30), || {
                 a.shared.chat.lock().unwrap().fetch(0, 10).len() == 1
             }),
             "自動再送で届くはず"
         );
-        assert!(wait_until(Duration::from_secs(5), || {
+        assert!(wait_until(Duration::from_secs(30), || {
             !b.shared.chat.lock().unwrap().fetch(0, 10)[0].failed
                 && b.shared.sending_seqs().is_empty()
         }));

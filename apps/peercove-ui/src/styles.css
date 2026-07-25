@@ -1699,6 +1699,9 @@ select {
   word-break: break-all;
   cursor: zoom-in;
   border: 1px solid var(--border);
+  /* 背景が --bg(.msg__media)なので文字色も背景に対して確定させる
+     (自分の吹き出し内で白文字を継承しない。M6 H-9 追補)。 */
+  color: var(--text);
 }
 
 /* 画像の拡大表示(クリックで開くモーダル) */
@@ -1779,7 +1782,9 @@ select {
   border-radius: 9px;
   overflow: hidden;
   background: var(--bg);
-  color: inherit;
+  /* .msg__ref と同じ理由で、文字色は吹き出しから継承せず背景に対して
+     確定させる(M6 H-9 追補)。 */
+  color: var(--text);
   text-decoration: none;
   cursor: pointer;
 }
@@ -1837,7 +1842,10 @@ select {
   border: 1px solid var(--border);
   border-radius: 9px;
   background: var(--bg);
-  color: inherit;
+  /* 自分の吹き出し(.msg--own、青地に白文字)の中でも読めるよう、文字色は
+     継承ではなくカードの背景(--bg)に対して確定させる(M6 H-9 追補)。
+     inherit だとライトモードで白地に白文字になっていた。 */
+  color: var(--text);
   text-align: left;
   font: inherit;
   cursor: pointer;
