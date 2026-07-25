@@ -2935,11 +2935,13 @@ button.msg__ref:hover {
 .memo__panes {
   display: flex;
   gap: 10px;
-  /* コメントを開いている間は本文とコメント欄で残り高さを 2:1 に分け合う
-     (M6 H-8c)。.memo__comments[open] 側の flex: 1 1 0 と対になる指定。
-     コメントを閉じているとき(.memo__comments が flex: none)は、本文が
-     単独の flex アイテムとして残り高さを全部取る(従来どおり)。 */
-  flex: 2 1 0;
+  /* コメントを開いている間は本文とコメント欄で残り高さを 1:1 に分け合う
+     (M6 H-8c、H-9 追補で 2:1 → 1:1 へ。2:1 ではコメント欄側が入力欄と
+     ヘッダーに食われて一覧が数十 px しか残らず「読めない」と指摘された)。
+     .memo__comments--open 側の flex: 1 1 0 と対になる指定。コメントを
+     閉じているとき(.memo__comments が flex: none)は、本文が単独の
+     flex アイテムとして残り高さを全部取る(従来どおり)。 */
+  flex: 1 1 0;
   min-height: 120px;
 }
 
@@ -3079,7 +3081,8 @@ button.msg__ref:hover {
 
 .memo__comments--open {
   flex: 1 1 0;
-  min-height: 160px;
+  /* ヘッダー(~26px)+ 入力行(~60px)を引いても一覧に 110px 以上残す */
+  min-height: 200px;
 }
 
 .memo__comments-toggle {
@@ -3151,19 +3154,26 @@ button.msg__ref:hover {
 
 .memo__comment-input {
   position: relative;
+  /* 送信ボタンを入力欄の右に横並びにして、コメント一覧の縦スペースを
+     ボタン行の分(約 40px)確保する(M6 H-9 追補、依頼者指摘)。
+     メンションサジェスト(.memo__mention-suggest)は absolute で
+     この要素の上端基準なので、横並びでも位置は変わらない。 */
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: flex-end;
   gap: 6px;
   flex: none;
 }
 
 .memo__comment-input textarea {
+  flex: 1;
+  min-width: 0;
   resize: vertical;
   font: inherit;
 }
 
 .memo__comment-send {
-  align-self: flex-end;
+  flex: none;
 }
 
 /* リマインダー(端末ローカル、M5 F-5 Stage 5、ADR-0052 決定 6) */
