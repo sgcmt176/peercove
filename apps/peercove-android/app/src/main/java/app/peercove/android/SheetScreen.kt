@@ -91,11 +91,17 @@ import uniffi.peercove_mobile.sheetList
 import uniffi.peercove_mobile.sheetRename
 import uniffi.peercove_mobile.sheetWrite
 
-// crates/peercove-core/src/sheet.rs の上限と同期(ADR-0054 決定 7)。
-private const val MAX_SHEET_ROWS = 1000
+// crates/peercove-core/src/sheet.rs の上限と同期(ADR-0054 決定 7、ADR-0056 決定 4)。
+private const val MAX_SHEET_ROWS = 1024
 private const val MAX_SHEET_COLS = 200
 
 // スマホの幅ではデスクトップより控えめな最小表示範囲(仕様どおり最低 10 行 × 5 列)。
+// ADR-0056 は「LazyColumn なら 1024/26 へ引き上げ」としていたが、本画面は
+// LazyColumn ではなく Column + verticalScroll(このファイル冒頭の SheetTab
+// 参照)で全行を一度に composition しているため、表示既定を引き上げると
+// 1024 行 × 26 列 ≒ 2.6 万セルを常時 compose して確実に固まる。そのため
+// ここは上限(MAX_SHEET_ROWS/MAX_SHEET_COLS)だけ追随させ、表示既定は
+// 据え置く(実装時の判断: 作業報告参照。Android 側の行仮想化は別タスク)。
 private const val MIN_DISPLAY_ROWS = 10
 private const val MIN_DISPLAY_COLS = 5
 private const val DISPLAY_MARGIN = 2

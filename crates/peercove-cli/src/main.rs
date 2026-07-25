@@ -1,3 +1,4 @@
+mod autostart;
 mod backend;
 mod chat;
 mod commands;

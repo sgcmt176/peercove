@@ -550,6 +550,8 @@ pub struct SharedMemoSummaryInfo {
     pub checklist_total: u32,
     /// コメント件数(ADR-0052 決定 4)。一覧の 💬 バッジ用。
     pub comment_count: u32,
+    /// ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
+    pub pinned: bool,
 }
 
 impl From<SharedMemoSummary> for SharedMemoSummaryInfo {
@@ -570,6 +572,7 @@ impl From<SharedMemoSummary> for SharedMemoSummaryInfo {
             checklist_done: memo.checklist_done,
             checklist_total: memo.checklist_total,
             comment_count: memo.comment_count,
+            pinned: memo.pinned,
         }
     }
 }
@@ -590,6 +593,8 @@ pub struct SharedMemoDetailInfo {
     pub locked_by: Option<String>,
     /// コメント件数(ADR-0052 決定 4)。
     pub comment_count: u32,
+    /// ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
+    pub pinned: bool,
 }
 
 impl From<SharedMemoDetail> for SharedMemoDetailInfo {
@@ -608,6 +613,7 @@ impl From<SharedMemoDetail> for SharedMemoDetailInfo {
             can_manage: memo.can_manage,
             locked_by: memo.locked_by,
             comment_count: memo.comment_count,
+            pinned: memo.pinned,
         }
     }
 }
@@ -870,6 +876,17 @@ pub fn shared_memo_save(
             body,
         },
     )?)
+}
+
+/// ピン止めの切り替え(全員に見える共有フラグ)。編集権限(editor)以上
+/// またはホストのみ(M6 H-8c、ADR-0052 追補)。
+#[uniffi::export]
+pub fn shared_memo_set_pin(
+    slug: String,
+    id: String,
+    pinned: bool,
+) -> Result<SharedMemoDetailInfo, MobileError> {
+    expect_shared_memo(session_request(&slug, SharedMemoOp::SetPin { id, pinned })?)
 }
 
 /// ゴミ箱へ(所有者のみ。復元・完全削除はホスト UI から)。

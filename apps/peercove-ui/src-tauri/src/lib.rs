@@ -21,7 +21,7 @@ use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 
 use peercove_core::diagnostics::DiagnosticReport;
-use peercove_core::ipc::{IpcRequest, IpcResponse};
+use peercove_core::ipc::{IpcRequest, IpcResponse, TunnelRole};
 use peercove_ops::peers::Selector;
 use tauri::Manager;
 
@@ -366,6 +366,21 @@ async fn start_host(config_path: String, upnp: bool) -> Result<(), String> {
 async fn start_member(config_path: String) -> Result<(), String> {
     let config = canonical(&config_path)?;
     send(IpcRequest::StartMember { config }).await
+}
+
+/// 起動時の自動接続復旧の台帳へ登録する(ADR-0057、M6 H-8e)。設定
+/// ダイアログで「起動時に自動接続する」を ON にした時点で呼ぶ。一度も
+/// 接続していないネットワークでも、デーモンが次回起動時にこの設定パスを
+/// 見つけられるようにするため。
+#[tauri::command]
+async fn register_autostart(config_path: String, is_member: bool) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    let role = if is_member {
+        TunnelRole::Member
+    } else {
+        TunnelRole::Host
+    };
+    send(IpcRequest::RegisterAutostart { config, role }).await
 }
 
 /// トンネルを停止する(デーモンは常駐継続)。複数ネットワーク対応(ADR-0012)の
@@ -1649,6 +1664,7 @@ pub fn run() {
             quality_history,
             start_host,
             start_member,
+            register_autostart,
             stop_tunnel,
             rotate_key,
             notify,

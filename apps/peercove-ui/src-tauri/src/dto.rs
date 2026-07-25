@@ -783,6 +783,8 @@ pub struct Settings {
     pub require_invite_approval: bool,
     /// (host のみ)メンバーによる招待発行を許可する(ADR-0048、既定 true)。
     pub member_invites: bool,
+    /// OS 起動時にこのネットワークを自動で接続する(ADR-0057)。
+    pub auto_connect: bool,
     /// 既定値。UI の入力欄のプレースホルダに使う。
     pub default_mtu: u16,
     pub default_listen_port: u16,
@@ -804,6 +806,7 @@ impl From<peercove_ops::settings::Settings> for Settings {
             max_recv_file_mb: settings.max_recv_file_mb,
             require_invite_approval: settings.require_invite_approval,
             member_invites: settings.member_invites,
+            auto_connect: settings.auto_connect,
             default_mtu: peercove_core::config::DEFAULT_MTU,
             default_listen_port: peercove_core::config::DEFAULT_LISTEN_PORT,
             default_max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
@@ -828,6 +831,9 @@ pub struct SettingsUpdate {
     /// (host のみ)メンバーによる招待発行を許可する(ADR-0048)。
     #[serde(default = "default_member_invites")]
     pub member_invites: bool,
+    /// OS 起動時にこのネットワークを自動で接続する(ADR-0057)。
+    #[serde(default)]
+    pub auto_connect: bool,
 }
 
 fn default_member_invites() -> bool {
@@ -846,6 +852,7 @@ impl From<SettingsUpdate> for peercove_ops::settings::Update {
             max_recv_file_mb: update.max_recv_file_mb,
             require_invite_approval: update.require_invite_approval,
             member_invites: update.member_invites,
+            auto_connect: update.auto_connect,
         }
     }
 }
@@ -1153,6 +1160,7 @@ mod tests {
             max_recv_file_mb: 100,
             require_invite_approval: false,
             member_invites: true,
+            auto_connect: false,
         }))
         .unwrap();
         assert_eq!(json["hostEndpoint"], "203.0.113.5:51820");
@@ -1162,6 +1170,7 @@ mod tests {
         assert_eq!(json["defaultMtu"], 1420);
         assert_eq!(json["maxRecvFileMb"], 100);
         assert_eq!(json["defaultMaxRecvFileMb"], 100);
+        assert_eq!(json["autoConnect"], false);
 
         let update: SettingsUpdate = serde_json::from_value(serde_json::json!({
             "displayName": "bob",
@@ -1174,6 +1183,7 @@ mod tests {
         .unwrap();
         let update: peercove_ops::settings::Update = update.into();
         assert_eq!(update.display_name.as_deref(), Some("bob"));
+        assert!(!update.auto_connect, "省略時は既定 false");
         assert_eq!(update.listen_port, Some(51900));
         assert_eq!(update.host_endpoint, None);
         assert!(!update.direct);

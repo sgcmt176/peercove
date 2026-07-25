@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   InboxItem,
@@ -63,6 +63,8 @@ export function TunnelView({
   // メンバー詳細ページ(ADR-0048)。一覧の ℹ から開く
   const [detail, setDetail] = useState<Member | null>(null);
   const [removing, setRemoving] = useState<Member | null>(null);
+  /** メンバーの一括削除ダイアログ(M6 H-8d)。 */
+  const [bulkRemoving, setBulkRemoving] = useState(false);
   /** ファイル送信ダイアログ(M3-13e: 宛先をチェックボックスで選ぶ)。 */
   const [sendingFile, setSendingFile] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -215,6 +217,15 @@ export function TunnelView({
                     {t.transfer.sendButton}
                   </button>
                 )}
+                {isHost && tunnel.members.some((m) => !m.isSelf && !m.isHost) && (
+                  <button
+                    type="button"
+                    className="button--ghost small"
+                    onClick={() => setBulkRemoving(true)}
+                  >
+                    {t.tunnel.bulkRemove.open}
+                  </button>
+                )}
                 {isHost && (
                   <button type="button" onClick={() => setInviting(true)}>
                     {t.tunnel.invite}
@@ -353,6 +364,19 @@ export function TunnelView({
           onClose={() => setRemoving(null)}
           onConfirm={() => void remove(removing)}
           message={t.tunnel.remove.message(removing.name ?? removing.ip)}
+        />
+      )}
+
+      {bulkRemoving && (
+        <BulkRemoveDialog
+          tunnel={tunnel}
+          onClose={() => setBulkRemoving(false)}
+          onDone={(ok, failed) => {
+            setBulkRemoving(false);
+            if (ok > 0) onChanged();
+            setNotice(t.tunnel.bulkRemove.result(ok, failed));
+            setTimeout(() => setNotice(null), 8000);
+          }}
         />
       )}
 
@@ -506,6 +530,176 @@ function SendFileDialog({
           {busy ? t.common.running : t.transfer.sendTo(checked.size)}
         </button>
       </div>
+    </Modal>
+  );
+}
+
+/**
+ * メンバーの一括削除ダイアログ(M6 H-8d)。ファイル送信ダイアログと同じ作法で、
+ * チェックボックスで選んだメンバーへ `removeMember` を逐次実行する。
+ * オンラインのメンバーは既定では対象にできず(「オンラインのメンバーも削除する」
+ * が OFF のまま実行しようとすると 1 件も削除せずエラーを出す)、ON にすると
+ * 選択したメンバー全員を削除できる(依頼者の要望)。ホスト自身と自分の行は
+ * 候補から除外する。
+ */
+function BulkRemoveDialog({
+  tunnel,
+  onClose,
+  onDone,
+}: {
+  tunnel: Tunnel;
+  onClose: () => void;
+  /** 実行後(ok = 成功件数、failed = 失敗件数)。0 件実行(ガードで弾いた場合)は呼ばない。 */
+  onDone: (ok: number, failed: number) => void;
+}) {
+  const candidates = tunnel.members.filter(
+    (member) => !member.isSelf && !member.isHost,
+  );
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [allowOnline, setAllowOnline] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const selectAllRef = useRef<HTMLInputElement>(null);
+
+  const allChecked =
+    candidates.length > 0 && candidates.every((m) => checked.has(m.publicKey));
+  const someChecked = candidates.some((m) => checked.has(m.publicKey));
+
+  // 一部だけ選択されている状態を示す indeterminate は React の props に無いため
+  // ref 経由で DOM プロパティへ直接設定する
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = someChecked && !allChecked;
+    }
+  }, [someChecked, allChecked]);
+
+  const toggle = (key: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setChecked(
+      allChecked ? new Set() : new Set(candidates.map((m) => m.publicKey)),
+    );
+  };
+
+  const selected = candidates.filter((m) => checked.has(m.publicKey));
+
+  // 「実行」押下: オンライン保護のガード。ここで弾いた場合は1件も削除しない
+  const submit = () => {
+    setError(null);
+    const onlineSelected = selected.filter((m) => m.online);
+    if (!allowOnline && onlineSelected.length > 0) {
+      setError(
+        t.tunnel.bulkRemove.onlineBlocked(
+          onlineSelected.map((m) => m.name ?? m.ip),
+        ),
+      );
+      return;
+    }
+    setConfirming(true);
+  };
+
+  const run = async () => {
+    setBusy(true);
+    let ok = 0;
+    let failed = 0;
+    for (const member of selected) {
+      try {
+        await api.removeMember(tunnel.config, member.publicKey);
+        ok++;
+      } catch {
+        failed++;
+      }
+    }
+    setBusy(false);
+    setConfirming(false);
+    onDone(ok, failed);
+  };
+
+  return (
+    <Modal title={t.tunnel.bulkRemove.title} onClose={onClose}>
+      <div className="modal__body">
+        {candidates.length === 0 ? (
+          <p className="muted small">{t.transfer.noCandidates}</p>
+        ) : (
+          <ul className="chat__pick">
+            <li>
+              <label className="chat__pick-row">
+                <input
+                  type="checkbox"
+                  ref={selectAllRef}
+                  checked={allChecked}
+                  onChange={toggleAll}
+                />
+                <span>{t.tunnel.bulkRemove.selectAll}</span>
+              </label>
+            </li>
+            {candidates.map((member) => (
+              <li key={member.publicKey}>
+                <label className="chat__pick-row">
+                  <input
+                    type="checkbox"
+                    checked={checked.has(member.publicKey)}
+                    onChange={() => toggle(member.publicKey)}
+                  />
+                  <Avatar
+                    publicKey={member.publicKey}
+                    name={member.name}
+                    online={member.online}
+                    onlineLabel={
+                      member.online
+                        ? t.tunnel.member.online
+                        : t.tunnel.member.offline
+                    }
+                  />
+                  <span className="ellipsis">{member.name ?? member.ip}</span>
+                  <span className="mono muted small">{member.ip}</span>
+                  <span className="muted small">
+                    {member.online
+                      ? t.tunnel.member.online
+                      : t.tunnel.member.offline}
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        )}
+        <label className="chat__pick-row">
+          <input
+            type="checkbox"
+            checked={allowOnline}
+            onChange={(event) => setAllowOnline(event.target.checked)}
+          />
+          <span>{t.tunnel.bulkRemove.allowOnline}</span>
+        </label>
+        {error && <p className="error-text small">{error}</p>}
+      </div>
+      <div className="modal__actions">
+        <button type="button" className="button--ghost" onClick={onClose}>
+          {t.common.cancel}
+        </button>
+        <button type="button" onClick={submit} disabled={busy || checked.size === 0}>
+          {busy ? t.common.running : t.tunnel.bulkRemove.submit(checked.size)}
+        </button>
+      </div>
+
+      {confirming && (
+        <ConfirmModal
+          title={t.tunnel.bulkRemove.title}
+          confirmLabel={t.tunnel.remove.confirm}
+          busy={busy}
+          onClose={() => setConfirming(false)}
+          onConfirm={() => void run()}
+          message={t.tunnel.bulkRemove.confirmMessage(selected.length)}
+        />
+      )}
     </Modal>
   );
 }

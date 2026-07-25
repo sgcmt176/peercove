@@ -187,6 +187,13 @@ pub enum IpcRequest {
         config: PathBuf,
         op: crate::memo::SharedMemoOp,
     },
+    /// 起動時の自動接続復旧の台帳へ登録する(ADR-0057、M6 H-8e)。設定
+    /// ダイアログで `auto_connect` を ON にした時点で呼ぶ。一度も接続して
+    /// いないネットワークでも、デーモンが次回起動時にこの設定パスを
+    /// 見つけられるようにするため。応答は Done。台帳には秘密を書かない
+    /// (パス・role・upnp のみ)。追加メソッドなので [`IPC_VERSION`] は
+    /// 上げない(旧デーモンは解析エラーを返す)。
+    RegisterAutostart { config: PathBuf, role: TunnelRole },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -514,6 +521,10 @@ mod tests {
             IpcRequest::SetDisplayName {
                 config: PathBuf::from("member.toml"),
                 name: "山田のノート".to_string(),
+            },
+            IpcRequest::RegisterAutostart {
+                config: PathBuf::from("member.toml"),
+                role: TunnelRole::Member,
             },
         ];
         for (i, req) in requests.into_iter().enumerate() {
@@ -947,6 +958,32 @@ mod tests {
         assert_eq!(
             json,
             r#"{"id":16,"ok":{"type":"group","group":{"id":"g1","name":"開発","members":["10.83.19.1"],"revision":1,"updated_by":"10.83.19.1"}}}"#
+        );
+    }
+
+    /// RegisterAutostart(ADR-0057、M6 H-8e)のワイヤ表現。role は既存の
+    /// TunnelRole と同じ snake_case。
+    #[test]
+    fn register_autostart_wire_format() {
+        let json = serde_json::to_string(&IpcEnvelope {
+            id: 20,
+            req: IpcRequest::RegisterAutostart {
+                config: PathBuf::from("host.toml"),
+                role: TunnelRole::Host,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":20,"req":{"method":"register_autostart","config":"host.toml","role":"host"}}"#
+        );
+        let parsed: IpcEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.req,
+            IpcRequest::RegisterAutostart {
+                config: PathBuf::from("host.toml"),
+                role: TunnelRole::Host,
+            }
         );
     }
 

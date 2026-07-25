@@ -3150,6 +3150,7 @@ mod tests {
                 max_recv_file_mb: 1,
                 require_invite_approval: current.require_invite_approval,
                 member_invites: current.member_invites,
+                auto_connect: current.auto_connect,
             },
         )
         .unwrap();

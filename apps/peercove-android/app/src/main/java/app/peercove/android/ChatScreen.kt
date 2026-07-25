@@ -63,6 +63,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import java.net.HttpURLConnection
 import java.net.URL
@@ -133,6 +134,11 @@ fun ConversationScreen(
     var input by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     val convMessages = remember(messages, conv) { messages.filter { it.belongsTo(conv) } }
+    // メンション色分け(ADR-0055 決定 1、M6 H-8c でデスクトップに追随)
+    val myName = remember(members) { members.firstOrNull { it.isSelf }?.name ?: "" }
+    val memberNames = remember(members) {
+        members.filter { !it.isSelf && it.name.isNotEmpty() }.map { it.name }
+    }
     val listState = rememberLazyListState()
     val sendFailed = stringResource(R.string.chat_send_failed)
     val fileSending = stringResource(R.string.share_sending)
@@ -211,12 +217,22 @@ fun ConversationScreen(
             items(convMessages, key = { it.seq.toLong() }) { message ->
                 when {
                     message.system -> SystemLine(message.text)
-                    message.outgoing -> OutgoingBubble(slug, baseDir, message, onNotice, onOpenRef)
+                    message.outgoing -> OutgoingBubble(
+                        slug,
+                        baseDir,
+                        message,
+                        myName,
+                        memberNames,
+                        onNotice,
+                        onOpenRef,
+                    )
                     else -> IncomingBubble(
                         slug,
                         baseDir,
                         message,
                         showName = conv !is ConvKey.Direct,
+                        myName = myName,
+                        memberNames = memberNames,
                         onNotice = onNotice,
                         onOpenRef = onOpenRef,
                     )
@@ -277,6 +293,8 @@ private fun IncomingBubble(
     baseDir: String,
     message: ChatMessage,
     showName: Boolean,
+    myName: String,
+    memberNames: List<String>,
     onNotice: (String) -> Unit,
     onOpenRef: (SharedRefToken) -> Unit,
 ) {
@@ -312,6 +330,8 @@ private fun IncomingBubble(
                     container = MaterialTheme.colorScheme.surfaceVariant,
                     content = MaterialTheme.colorScheme.onSurface,
                     shape = RoundedCornerShape(4.dp, 16.dp, 16.dp, 16.dp),
+                    myName = myName,
+                    memberNames = memberNames,
                     onNotice = onNotice,
                     onOpenRef = onOpenRef,
                 )
@@ -331,6 +351,8 @@ private fun OutgoingBubble(
     slug: String,
     baseDir: String,
     message: ChatMessage,
+    myName: String,
+    memberNames: List<String>,
     onNotice: (String) -> Unit,
     onOpenRef: (SharedRefToken) -> Unit,
 ) {
@@ -411,6 +433,8 @@ private fun OutgoingBubble(
             container = Color(0xFF8DE055),
             content = Color(0xFF102A00),
             shape = RoundedCornerShape(16.dp, 4.dp, 16.dp, 16.dp),
+            myName = myName,
+            memberNames = memberNames,
             onNotice = onNotice,
             onOpenRef = onOpenRef,
         )
@@ -443,9 +467,17 @@ private fun Bubble(
     container: Color,
     content: Color,
     shape: RoundedCornerShape,
+    myName: String,
+    memberNames: List<String>,
     onNotice: (String) -> Unit,
     onOpenRef: (SharedRefToken) -> Unit,
 ) {
+    // 他人宛メンションの配色(テーマの accent 系。自分宛は固定の黄色 —
+    // デスクトップと同じ、M6 H-8c)。自分の吹き出し(緑背景)の上でも
+    // 読めるよう、地の文の色ではなくテーマの primary/primaryContainer の
+    // 組を使う(バブルの背景色に関わらず一定のコントラストを保つ)。
+    val otherMentionBackground = MaterialTheme.colorScheme.primaryContainer
+    val otherMentionForeground = MaterialTheme.colorScheme.primary
     // ファイルのタップ = 操作シート(開く / 共有 / 保存 / SHA-256)
     var showSheet by remember { mutableStateOf(false) }
     val fileTap: () -> Unit = { showSheet = true }
@@ -540,12 +572,18 @@ private fun Bubble(
                                 val urls = remember(part.value) {
                                     urlRegex.findAll(part.value).map { it.value }.toList()
                                 }
-                                if (urls.isEmpty()) {
-                                    Text(part.value, color = content)
-                                } else {
-                                    Text(linkifyText(part.value, content), color = content)
-                                    LinkPreviewCard(urls.first(), content)
-                                }
+                                Text(
+                                    chatMessageText(
+                                        part.value,
+                                        content,
+                                        myName,
+                                        memberNames,
+                                        otherMentionBackground,
+                                        otherMentionForeground,
+                                    ),
+                                    color = content,
+                                )
+                                if (urls.isNotEmpty()) LinkPreviewCard(urls.first(), content)
                             }
                         }
                     }
@@ -559,11 +597,20 @@ private fun Bubble(
                         .widthIn(max = 260.dp)
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                 ) {
-                    // URL はリンク化(タップでブラウザ)。無ければ素のテキスト
-                    if (urls.isEmpty()) {
-                        Text(message.text, color = content)
-                    } else {
-                        Text(linkifyText(message.text, content), color = content)
+                    // URL はリンク化(タップでブラウザ)、@名前 / @All はメンション
+                    // として色分け(ADR-0055 決定 1、M6 H-8c)
+                    Text(
+                        chatMessageText(
+                            message.text,
+                            content,
+                            myName,
+                            memberNames,
+                            otherMentionBackground,
+                            otherMentionForeground,
+                        ),
+                        color = content,
+                    )
+                    if (urls.isNotEmpty()) {
                         // 最初の URL のプレビューカード(タイトル / og:image)
                         LinkPreviewCard(urls.first(), content)
                     }
@@ -701,8 +748,36 @@ private fun SheetAction(label: String, onClick: () -> Unit) {
 /** チャット本文から URL を拾う(日本語の句読点や空白で区切る)。 */
 private val urlRegex = Regex("""https?://[^\s　<>"「」]+""")
 
-/** URL をタップ可能なリンクにした AnnotatedString を作る。 */
-private fun linkifyText(text: String, content: Color) = buildAnnotatedString {
+/**
+ * チャット本文を描画する AnnotatedString を作る: URL はタップ可能なリンクに、
+ * `@名前` / `@All` はメンションとして色分けする(ADR-0055 決定 1、M6 H-8c で
+ * デスクトップ・共有メモのコメントに追随)。両者は独立(メンション地の文の
+ * 内側で URL を探す)なので、どちらか一方だけの本文でも自然に動く。
+ */
+private fun chatMessageText(
+    text: String,
+    content: Color,
+    myName: String,
+    memberNames: List<String>,
+    otherMentionBackground: Color,
+    otherMentionForeground: Color,
+) = buildAnnotatedString {
+    for (seg in splitMentions(text, myName, memberNames)) {
+        when (seg) {
+            is MentionSegment.Plain -> appendLinkified(seg.value, content)
+            is MentionSegment.Mention -> {
+                val background = if (seg.self) MENTION_SELF_BACKGROUND else otherMentionBackground
+                val foreground = if (seg.self) MENTION_SELF_FOREGROUND else otherMentionForeground
+                withStyle(SpanStyle(background = background, color = foreground)) {
+                    append(seg.value)
+                }
+            }
+        }
+    }
+}
+
+/** URL 部分だけタップ可能なリンクスタイルを付けて追記する。 */
+private fun AnnotatedString.Builder.appendLinkified(text: String, content: Color) {
     var last = 0
     for (match in urlRegex.findAll(text)) {
         append(text.substring(last, match.range.first))

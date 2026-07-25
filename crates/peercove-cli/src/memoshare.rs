@@ -357,6 +357,21 @@ impl MemoService {
                 self.bump();
                 Ok(SharedMemoReply::Memo { memo })
             }
+            SharedMemoOp::SetPin { id, pinned } => {
+                // 編集ロックは不要(本文を変更しないため)
+                let mut memo = self
+                    .blocking({
+                        let actor = actor.clone();
+                        let id = id.clone();
+                        move |store| store.set_pin(&actor, &id, pinned)
+                    })
+                    .await?;
+                memo.locked_by = self.lock_holder(&memo.id);
+                self.refresh_group_names(&mut memo);
+                self.broadcast_changed(id);
+                self.bump();
+                Ok(SharedMemoReply::Memo { memo })
+            }
             SharedMemoOp::AcquireLock { id } => {
                 let mut memo = self
                     .blocking({

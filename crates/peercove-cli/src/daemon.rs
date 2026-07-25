@@ -48,7 +48,11 @@ pub struct DaemonShared {
     /// [`Self::refresh_zones`] が台帳の更新に合わせて書き換える。
     zones: crate::dns::SharedZones,
     /// OS のスプリット DNS 設定(NRPT / resolvectl)を触るか。
-    /// serve()(実デーモン)だけ true。テストでは OS を触らない
+    /// serve()(実デーモン)だけ true。テストでは OS を触らない。
+    /// 起動時の自動接続復旧の台帳(ADR-0057、M6 H-8e、[`crate::autostart`])を
+    /// 読み書きするかもこれで兼用する(同じく「実デーモンでだけ実環境へ
+    /// 副作用を及ぼす」区別のため。テストで `%ProgramData%` / `/var/lib/peercove`
+    /// を汚さない)。
     manage_os_dns: bool,
 }
 
@@ -514,6 +518,21 @@ impl DaemonShared {
                 .await
                 .context("メモ処理がクラッシュしました")??;
                 Ok(IpcResponse::Memo { reply })
+            }
+            IpcRequest::RegisterAutostart { config, role } => {
+                // 起動時の自動接続復旧の台帳へ登録する(ADR-0057、M6 H-8e)。
+                // manage_os_dns(= 実デーモンかどうか)で兼用してテストでは
+                // 実環境の状態ディレクトリを触らない。台帳の読み書きに失敗
+                // しても機能が無効になるだけなので、ここは常に成功を返す
+                // (UI に不要なエラーを出さない)
+                if self.manage_os_dns {
+                    tokio::task::spawn_blocking(move || {
+                        crate::autostart::upsert_keep_upnp(&config, role);
+                    })
+                    .await
+                    .context("自動接続の登録に失敗しました")?;
+                }
+                Ok(IpcResponse::Done)
             }
         }
     }
@@ -1402,6 +1421,20 @@ impl DaemonShared {
             supervise_result.and(down_result)
         });
         tracing::info!("トンネルを開始しました(network={network})");
+        // 起動時の自動接続復旧の台帳へ記録する(ADR-0057、M6 H-8e)。
+        // manage_os_dns(= 実デーモンかどうか)で兼用してテストでは実環境の
+        // 状態ディレクトリを触らない。ディスク I/O なので blocking スレッドへ
+        // 逃がす(失敗しても致命的ではないため await の結果は見ない)
+        if self.manage_os_dns {
+            let tunnel_role = match role {
+                Role::Host => TunnelRole::Host,
+                Role::Member => TunnelRole::Member,
+            };
+            let autostart_config = config.clone();
+            drop(tokio::task::spawn_blocking(move || {
+                crate::autostart::upsert(&autostart_config, tunnel_role, upnp);
+            }));
+        }
         active.insert(
             key,
             Active {
@@ -1434,6 +1467,107 @@ impl DaemonShared {
         let shared = Arc::clone(self);
         tokio::spawn(async move { shared.sync_os_dns().await });
         Ok(())
+    }
+
+    /// 起動時の自動接続復旧(ADR-0057、M6 H-8e)。台帳を読み、設定ファイルが
+    /// 存在せず消えたエントリは掃除してから、`auto_connect = true` の
+    /// ネットワークだけ接続を試みる。
+    ///
+    /// エントリごとに `tokio::spawn` して**並行**に処理する: 1 本目が
+    /// 失敗して 15 秒間隔の再試行(最大 3 回、= 最大 45 秒)に入っても、
+    /// 2 本目以降の接続がそれに道連れで待たされないようにするため
+    /// (OS 起動直後はネットワークインターフェースの初期化が遅れがちで、
+    /// 複数ネットワークを持つ利用者ほど直列だと復旧が遅くなる)。
+    async fn recover_autostart(self: &Arc<Self>) {
+        // 台帳の読み書きはディスク I/O なので blocking スレッドへ
+        let entries = tokio::task::spawn_blocking(|| {
+            let loaded = crate::autostart::load();
+            tracing::info!("自動接続台帳を読み込みました({} 件)", loaded.len());
+            crate::autostart::prune_missing()
+        })
+        .await
+        .unwrap_or_default();
+        for entry in entries {
+            let shared = Arc::clone(self);
+            tokio::spawn(async move { shared.recover_one_autostart(entry).await });
+        }
+    }
+
+    /// [`Self::recover_autostart`] の 1 エントリ分。失敗時は 15 秒間隔で
+    /// 最大 3 回まで再試行し、それでも失敗したらログに残して諦める。
+    async fn recover_one_autostart(self: &Arc<Self>, entry: crate::autostart::AutostartEntry) {
+        const MAX_ATTEMPTS: u32 = 3;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let config = entry.config.clone();
+        // 設定ファイルの中身(auto_connect)を確認する。読めない設定は
+        // 警告して諦める(壊れている・権限がない等)。秘密は出さない
+        let auto_connect = match tokio::task::spawn_blocking({
+            let config = config.clone();
+            move || peercove_core::config::Config::load(&config)
+        })
+        .await
+        {
+            Ok(Ok(cfg)) => cfg.interface.auto_connect,
+            Ok(Err(e)) => {
+                tracing::warn!("自動接続: 設定を読めません({}): {e:#}", config.display());
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "自動接続: 設定の読み込みに失敗しました({}): {e}",
+                    config.display()
+                );
+                return;
+            }
+        };
+        if !auto_connect {
+            return;
+        }
+        let role = match entry.role {
+            TunnelRole::Host => Role::Host,
+            TunnelRole::Member => Role::Member,
+        };
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            // UI が先に接続していれば何もしない(先行トンネルを壊さない)
+            if self
+                .active
+                .lock()
+                .await
+                .contains_key(&Self::key_for(&config))
+            {
+                tracing::info!(
+                    "自動接続: 既に接続済みのためスキップします({})",
+                    config.display()
+                );
+                return;
+            }
+            tracing::info!(
+                "自動接続を開始します({}、role={:?}、{attempt}/{MAX_ATTEMPTS} 回目)",
+                config.display(),
+                entry.role,
+            );
+            match self.start(config.clone(), role, entry.upnp).await {
+                Ok(()) => {
+                    tracing::info!("自動接続に成功しました({})", config.display());
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "自動接続に失敗しました({}、{attempt}/{MAX_ATTEMPTS} 回目): {e:#}",
+                        config.display(),
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+        tracing::error!(
+            "自動接続を諦めました({}、{MAX_ATTEMPTS} 回とも失敗)",
+            config.display()
+        );
     }
 
     /// OS のスプリット DNS 設定を現在の稼働トンネル一覧に同期する
@@ -2311,6 +2445,12 @@ pub fn serve(external_stop: Option<watch::Receiver<bool>>) -> anyhow::Result<()>
     runtime.block_on(async {
         // 前回異常終了の NRPT 残骸を掃除する(Linux は per-link なので残骸なし)
         shared.sync_os_dns().await;
+        // 起動時の自動接続復旧(ADR-0057、M6 H-8e)。IPC 待受(accept_loop)を
+        // ブロックしないよう spawn する
+        tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { shared.recover_autostart().await }
+        });
         // DNS ゾーンを台帳の更新(5 秒周期)に合わせて作り直すループ(M3-1)
         let zone_refresher = tokio::spawn({
             let shared = Arc::clone(&shared);

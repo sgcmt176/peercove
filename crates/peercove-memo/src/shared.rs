@@ -105,7 +105,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Res
     Ok(has_column)
 }
 
-const SHARED_SCHEMA_VERSION: i64 = 9;
+const SHARED_SCHEMA_VERSION: i64 = 10;
 
 fn level_to_str(level: SharedPermLevel) -> &'static str {
     match level {
@@ -138,6 +138,7 @@ struct Row {
     everyone: SharedPermLevel,
     deleted_at: Option<i64>,
     comment_count: u32,
+    pinned: bool,
 }
 
 /// 1 メモ分の権限計算に要る材料(メンバー個別 + グループ)。ホスト 1 回の
@@ -218,6 +219,7 @@ impl Row {
             checklist_done: done,
             checklist_total: total,
             comment_count: self.comment_count,
+            pinned: self.pinned,
         }
     }
 
@@ -260,6 +262,7 @@ impl Row {
                 Vec::new()
             },
             comment_count: self.comment_count,
+            pinned: self.pinned,
         }
     }
 }
@@ -527,6 +530,17 @@ impl SharedStore {
                 "#,
             )?;
         }
+        if version < 10 {
+            // v10(M6 H-8c、ADR-0052 追補): 共有メモのピン止め。個人メモの
+            // pinned 列と同じ形だが、こちらは全員に見える共有フラグ
+            // (個人ごとではない)。ALTER TABLE の非冪等対策は既存の
+            // sheets.gridlines などと同じ。
+            if !table_has_column(&tx, "memos", "pinned")? {
+                tx.execute_batch(
+                    "ALTER TABLE memos ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+        }
         tx.pragma_update(None, "user_version", SHARED_SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -648,9 +662,10 @@ impl SharedStore {
             push_search_clause(&mut clauses, &mut args, search);
         }
         sql.push_str(&clauses.join(" AND "));
+        // ピン止めは既存の並び順より前(M6 H-8c)。ゴミ箱ビューでも同じ。
         sql.push_str(match query.trash {
-            true => " ORDER BY m.deleted_at DESC",
-            false => " ORDER BY m.updated_at DESC",
+            true => " ORDER BY m.pinned DESC, m.deleted_at DESC",
+            false => " ORDER BY m.pinned DESC, m.updated_at DESC",
         });
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -860,6 +875,28 @@ impl SharedStore {
                     updated_at = ?3, updated_by = ?4
              WHERE id = ?5",
             params![title, body, unix_ms(), actor.name, id],
+        )?;
+        self.get(actor, id)
+    }
+
+    /// ピン止めの切り替え(全員に見える共有フラグ。個人ごとではない)。
+    /// `updated_at` と本文リビジョンは動かさない(個人メモの pinned と
+    /// 同じく、並べ替え操作で「更新: 」表示を汚さないため)。変更できるのは
+    /// 編集権限(editor)以上またはホスト(閲覧のみは拒否)。
+    pub fn set_pin(
+        &mut self,
+        actor: &Actor,
+        id: &str,
+        pinned: bool,
+    ) -> anyhow::Result<SharedMemoDetail> {
+        let row = self.row(id)?;
+        let ctx = self.perm_context(id)?;
+        if !row.can_edit(actor, &ctx) {
+            bail!("このメモを編集する権限がありません(閲覧のみ)");
+        }
+        self.conn.execute(
+            "UPDATE memos SET pinned = ?1 WHERE id = ?2",
+            params![pinned as i64, id],
         )?;
         self.get(actor, id)
     }
@@ -2560,12 +2597,14 @@ fn replace_sheet_layout(
 /// 十分速い)。
 const ROW_COLUMNS: &str = "id, title, body, folder_id, revision, owner_id, owner_name,
         created_at, updated_at, updated_by, everyone, deleted_at,
-        (SELECT COUNT(*) FROM memo_comments c WHERE c.memo_id = memos.id) AS comment_count";
+        (SELECT COUNT(*) FROM memo_comments c WHERE c.memo_id = memos.id) AS comment_count,
+        pinned";
 
 /// [`ROW_COLUMNS`] の別名(`m`)版。`FROM memos m` で使う。
 const ROW_COLUMNS_ALIASED: &str = "id, title, body, folder_id, revision, owner_id, owner_name,
         created_at, updated_at, updated_by, everyone, deleted_at,
-        (SELECT COUNT(*) FROM memo_comments c WHERE c.memo_id = m.id) AS comment_count";
+        (SELECT COUNT(*) FROM memo_comments c WHERE c.memo_id = m.id) AS comment_count,
+        pinned";
 
 fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok(Row {
@@ -2582,6 +2621,8 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         everyone: level_from_str(&row.get::<_, String>(10)?),
         deleted_at: row.get(11)?,
         comment_count: row.get::<_, i64>(12)? as u32,
+        // 末尾に追加(M6 H-8c)。既存インデックス(0-12)はずらさない。
+        pinned: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -2699,7 +2740,7 @@ pub struct CacheStore {
     conn: Connection,
 }
 
-const CACHE_SCHEMA_VERSION: i64 = 7;
+const CACHE_SCHEMA_VERSION: i64 = 8;
 
 impl CacheStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -2868,6 +2909,15 @@ impl CacheStore {
                 "#,
             )?;
         }
+        if version < 8 {
+            // v8(M6 H-8c、ADR-0052 追補): 共有メモのピン止めのキャッシュ
+            // (ホスト正本と同じ形。理由は SharedStore 側と同じ)。
+            if !table_has_column(&tx, "memos", "pinned")? {
+                tx.execute_batch(
+                    "ALTER TABLE memos ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+        }
         tx.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -2878,12 +2928,13 @@ impl CacheStore {
         self.conn.execute(
             "INSERT INTO memos (id, title, body, folder_id, revision, owner_id, owner_name,
                                 created_at, updated_at, updated_by, can_edit, can_manage,
-                                locked_by, comment_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                                locked_by, comment_count, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                 title = ?2, body = ?3, folder_id = ?4, revision = ?5, owner_id = ?6,
                 owner_name = ?7, created_at = ?8, updated_at = ?9, updated_by = ?10,
-                can_edit = ?11, can_manage = ?12, locked_by = ?13, comment_count = ?14",
+                can_edit = ?11, can_manage = ?12, locked_by = ?13, comment_count = ?14,
+                pinned = ?15",
             params![
                 memo.id,
                 memo.title,
@@ -2899,6 +2950,7 @@ impl CacheStore {
                 memo.can_manage as i64,
                 memo.locked_by,
                 memo.comment_count as i64,
+                memo.pinned as i64,
             ],
         )?;
         self.enforce_limit()?;
@@ -3011,7 +3063,7 @@ impl CacheStore {
         let mut sql = String::from(
             "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
                     created_at, updated_at, updated_by, can_edit, can_manage, locked_by,
-                    comment_count
+                    comment_count, pinned
              FROM memos m WHERE 1 = 1",
         );
         let mut clauses: Vec<String> = Vec::new();
@@ -3032,7 +3084,8 @@ impl CacheStore {
             sql.push_str(" AND ");
             sql.push_str(clause);
         }
-        sql.push_str(" ORDER BY m.updated_at DESC");
+        // ピン止めは既存の並び順より前(M6 H-8c、SharedStore::list と同じ)。
+        sql.push_str(" ORDER BY m.pinned DESC, m.updated_at DESC");
         let mut stmt = self.conn.prepare(&sql)?;
         let params_ref: Vec<&dyn rusqlite::ToSql> = args.iter().map(AsRef::as_ref).collect();
         let memos = stmt
@@ -3052,6 +3105,7 @@ impl CacheStore {
                     row.get::<_, i64>(11)? != 0,
                     row.get(12)?,
                     row.get::<_, i64>(13)? as u32,
+                    row.get::<_, i64>(14)? != 0,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3076,7 +3130,7 @@ impl CacheStore {
             .query_row(
                 "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
                         created_at, updated_at, updated_by, can_edit, can_manage, locked_by,
-                        comment_count
+                        comment_count, pinned
                  FROM memos WHERE id = ?1",
                 params![id],
                 |row| {
@@ -3099,6 +3153,7 @@ impl CacheStore {
                         members: Vec::new(),
                         groups: Vec::new(),
                         comment_count: row.get::<_, i64>(13)? as u32,
+                        pinned: row.get::<_, i64>(14)? != 0,
                     })
                 },
             )
@@ -3143,7 +3198,7 @@ impl CacheStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, body, folder_id, revision, owner_id, owner_name,
                     created_at, updated_at, updated_by, can_edit, can_manage, locked_by,
-                    comment_count
+                    comment_count, pinned
              FROM memos WHERE id != ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY updated_at DESC",
         )?;
@@ -3164,6 +3219,7 @@ impl CacheStore {
                     row.get::<_, i64>(11)? != 0,
                     row.get(12)?,
                     row.get::<_, i64>(13)? as u32,
+                    row.get::<_, i64>(14)? != 0,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3486,6 +3542,7 @@ fn cache_summary(
     can_manage: bool,
     locked_by: Option<String>,
     comment_count: u32,
+    pinned: bool,
 ) -> SharedMemoSummary {
     let (done, total) = checklist_progress(&body);
     SharedMemoSummary {
@@ -3506,6 +3563,7 @@ fn cache_summary(
         checklist_done: done,
         checklist_total: total,
         comment_count,
+        pinned,
     }
 }
 
@@ -3569,6 +3627,48 @@ mod tests {
         assert!(store
             .set_perms(&bob, &memo.id, SharedPermLevel::Editor, &[], None)
             .is_err());
+    }
+
+    /// ピン止め(M6 H-8c、ADR-0052 追補): 全員に見える共有フラグで、一覧の
+    /// 先頭に来る。updated_at・revision は動かさない。viewer には拒否される。
+    #[test]
+    fn set_pin_orders_first_and_rejects_viewer() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+
+        let m1 = store.create(&alice, "1件目", "本文", None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let m2 = store.create(&alice, "2件目", "本文", None).unwrap();
+
+        // 既定(更新時刻降順)では後から作った m2 が先頭
+        let (memos, _) = store.list(&alice, &SharedMemoQuery::default()).unwrap();
+        assert_eq!(memos[0].id, m2.id);
+
+        // m1 をピン止めすると、更新時刻に関わらず先頭へ来る
+        let pinned = store.set_pin(&alice, &m1.id, true).unwrap();
+        assert!(pinned.pinned);
+        assert_eq!(
+            pinned.revision, m1.revision,
+            "ピンの変更で revision は動かない"
+        );
+        assert_eq!(
+            pinned.updated_at, m1.updated_at,
+            "ピンの変更で updated_at は動かない"
+        );
+        let (memos, _) = store.list(&alice, &SharedMemoQuery::default()).unwrap();
+        assert_eq!(memos[0].id, m1.id, "ピン止めしたメモが先頭に来る");
+        assert!(memos[0].pinned);
+
+        // 閲覧のみ(viewer、既定の everyone)は拒否される
+        assert!(store.set_pin(&bob, &m1.id, false).is_err());
+        // 拒否されてもピンの状態は変わらない
+        assert!(store.get(&alice, &m1.id).unwrap().pinned);
+
+        // ピンを外すと元の並びに戻る
+        store.set_pin(&alice, &m1.id, false).unwrap();
+        let (memos, _) = store.list(&alice, &SharedMemoQuery::default()).unwrap();
+        assert_eq!(memos[0].id, m2.id);
     }
 
     /// グループ権限(ADR-0051): 優先順位「メンバー個別 > グループ(該当する
@@ -4350,6 +4450,7 @@ mod tests {
             members: vec![],
             groups: vec![],
             comment_count: 0,
+            pinned: false,
         };
         cache.upsert(&make("m1", "共有資料", "本文")).unwrap();
         cache
@@ -4391,6 +4492,7 @@ mod tests {
             members: vec![],
             groups: vec![],
             comment_count: 0,
+            pinned: false,
         };
         cache.upsert(&detail).unwrap();
         assert_eq!(cache.revision("m1").unwrap(), Some(3));
@@ -4435,6 +4537,7 @@ mod tests {
             members: vec![],
             groups: vec![],
             comment_count: 0,
+            pinned: false,
         };
         cache.upsert(&make("m1", 1, "a".repeat(1000))).unwrap();
         cache.upsert(&make("m2", 2, "b".repeat(1000))).unwrap();
@@ -4472,6 +4575,7 @@ mod tests {
             members: vec![],
             groups: vec![],
             comment_count: 3,
+            pinned: false,
         };
         cache.upsert(&detail).unwrap();
         assert_eq!(cache.get("m1").unwrap().comment_count, 3);

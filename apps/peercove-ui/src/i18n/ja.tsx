@@ -445,6 +445,32 @@ export const ja = {
         </>
       ),
     },
+    // メンバーの一括削除(M6 H-8d)。ファイル送信のチェックボックス選択と同じ作法
+    bulkRemove: {
+      open: "一括削除",
+      title: "メンバーを一括削除",
+      selectAll: "すべて選択",
+      // 既定 OFF。ON にしないとオンラインのメンバーは削除できない(依頼者の要望)
+      allowOnline: "オンラインのメンバーも削除する",
+      onlineBlocked: (names: string[]) =>
+        `オンラインのメンバーは削除できません: ${names.join("、")}。「オンラインのメンバーも削除する」にチェックを入れてください。`,
+      confirmMessage: (n: number): ReactNode => (
+        <>
+          <p>
+            選択した <strong>{n} 人</strong> をネットワークから削除します。
+          </p>
+          <p className="muted">
+            本人へ通知され、約 10 秒でトンネルから外れます。渡した招待トークンも
+            使えなくなります。もう一度参加してもらうには招待をやり直してください。
+          </p>
+        </>
+      ),
+      submit: (n: number) => (n === 0 ? "削除" : `${n} 人を削除`),
+      result: (ok: number, failed: number) =>
+        failed > 0
+          ? `${ok} 件削除しました（${failed} 件失敗）。`
+          : `${ok} 件削除しました。`,
+    },
     member: {
       online: "オンライン",
       offline: "オフライン",
@@ -900,8 +926,9 @@ export const ja = {
     directLabel: "メンバーと直接通信する（推奨）",
     directHint:
       "— 可能なら相手と直接つなぎます（速く・ホスト回線の負荷なし）。あなたのグローバル IP がネットワーク内のメンバーに共有されます。オフにすると常にホスト経由。約 10 秒で反映されます",
-    inviteApprovalLabel: "新しい端末の参加を承認する",
-    inviteApprovalHint: "— 承認まではコントロール通信以外を隔離します",
+    inviteApprovalLabel: "新しい端末の参加を承認制にする",
+    inviteApprovalHint:
+      "— チェックを入れると、招待リンクで接続してきた新しい端末は、ホストが承認するまでホストとの承認用通信以外は一切できません(他のメンバーやホストの他サービスへも到達できません)。ホストが「承認」するまで待機します",
     // メンバーによる招待発行(ADR-0048)
     memberInvitesLabel: "メンバーによる招待発行を許可",
     memberInvitesHint:
@@ -911,6 +938,10 @@ export const ja = {
     maxFileHint: (defaultMb: number) =>
       ` — 既定 ${defaultMb}。0 で無制限。これを超えるファイルの受信は拒否されます（約 10 秒で反映）`,
     maxFileInteger: "受信ファイルの上限には 0 以上の整数を入力してください",
+    // 起動時の自動接続復旧(ADR-0057、M6 H-8e)
+    autoConnectLabel: "起動時に自動接続する",
+    autoConnectHint:
+      "— このマシンが起動したとき（PeerCove のサービス起動時）に、このネットワークへ自動で接続します。今の接続状態には影響しません。",
     restartHint: (isMember: boolean) =>
       `待受ポート・MTU${
         isMember ? "・ホストのエンドポイント" : ""
@@ -1244,6 +1275,9 @@ export const ja = {
     conflictNotice: (n: number) =>
       `他の端末が先に更新したセルがあります(${n} 件)`,
     pasteRejected: "貼り付け範囲が表の上限を超えています",
+    // 列全体・行全体など広い範囲への書式適用(M6 H-8a、ADR-0055 決定 6 追補)
+    formatLargeSelectionNotice:
+      "選択範囲が広いため、値のあるセルにのみ書式を適用しました",
     ownerLabel: (name: string) => `作成者: ${name}`,
     // 書式ツールバー(M6 H-4、ADR-0055 決定 6)
     toolbarBold: "太字",
@@ -1262,6 +1296,8 @@ export const ja = {
     toolbarBorderGrid: "格子",
     toolbarBorderNone: "枠なし",
     resetToDefault: "既定のサイズに戻す(ダブルクリック)",
+    // 左上角クリックで全セル選択(M6 H-8a、ADR-0055 決定 6 追補)
+    selectAllTitle: "すべて選択",
     // セル結合(M6 H-5、ADR-0055 決定 6)
     toolbarMerge: "結合",
     toolbarUnmerge: "解除",

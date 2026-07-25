@@ -56,6 +56,10 @@ pub struct Settings {
     /// (host のみ)メンバーによる招待発行を許可する(ADR-0048、既定 true)。
     /// 端末単位の指名(`[[peer]].can_invite`)と両方有効なメンバーだけ発行できる。
     pub member_invites: bool,
+    /// OS 起動時(デーモン起動時)にこのネットワークを自動で接続する
+    /// (ADR-0057、既定 false)。ホスト・メンバー共通。反映は次回のデーモン
+    /// 起動時のみ(今の接続には影響しない)。
+    pub auto_connect: bool,
 }
 
 impl Settings {
@@ -91,6 +95,8 @@ pub struct Update {
     pub require_invite_approval: bool,
     /// (host のみ)メンバーによる招待発行を許可する(ADR-0048)。
     pub member_invites: bool,
+    /// OS 起動時にこのネットワークを自動で接続する(ADR-0057)。
+    pub auto_connect: bool,
 }
 
 /// 現在の設定を読む。
@@ -115,6 +121,7 @@ pub fn read(config_path: &Path) -> anyhow::Result<Settings> {
         max_recv_file_mb: config.interface.max_recv_file_mb,
         require_invite_approval: config.interface.require_invite_approval,
         member_invites: config.interface.member_invites,
+        auto_connect: config.interface.auto_connect,
     })
 }
 
@@ -206,6 +213,11 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
             toml_edit::value(i64::try_from(update.max_recv_file_mb).unwrap_or(i64::MAX)),
         );
     }
+    // auto_connect(ADR-0057)は既定(false)なら書かない。host / member 共通
+    match update.auto_connect {
+        true => interface.insert("auto_connect", toml_edit::value(true)),
+        false => interface.remove("auto_connect"),
+    };
     if !current.is_member {
         match update.require_invite_approval {
             true => interface.insert("require_invite_approval", toml_edit::value(true)),
@@ -304,6 +316,7 @@ allowed_ips = ["10.119.96.2/32"]
                 max_recv_file_mb: 500,
                 require_invite_approval: false,
                 member_invites: true,
+                auto_connect: true,
             },
         )
         .unwrap();
@@ -316,6 +329,7 @@ allowed_ips = ["10.119.96.2/32"]
             text.contains("max_recv_file_mb = 500"),
             "既定以外なら書かれる"
         );
+        assert!(text.contains("auto_connect = true"), "true なら書かれる");
 
         let after = read(&path).unwrap();
         assert_eq!(after.display_name.as_deref(), Some("alice2"), "trim される");
@@ -324,6 +338,7 @@ allowed_ips = ["10.119.96.2/32"]
         assert_eq!(after.host_endpoint.as_deref(), Some("198.51.100.7:51820"));
         assert!(!after.direct);
         assert_eq!(after.max_recv_file_mb, 500);
+        assert!(after.auto_connect);
 
         // 既定値に戻すと行ごと消える(既定なので書かない)
         update(
@@ -338,18 +353,21 @@ allowed_ips = ["10.119.96.2/32"]
                 max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
                 require_invite_approval: false,
                 member_invites: true,
+                auto_connect: false,
             },
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("direct"), "既定値なら書かない");
         assert!(!text.contains("max_recv_file_mb"), "既定値なら書かない");
+        assert!(!text.contains("auto_connect"), "既定値なら書かない");
         let after = read(&path).unwrap();
         assert!(after.direct);
         assert_eq!(
             after.max_recv_file_mb,
             peercove_core::config::DEFAULT_MAX_RECV_FILE_MB
         );
+        assert!(!after.auto_connect);
     }
 
     /// ホスト自身の DNS 名(ADR-0021): 正規化して書き込み、空で削除。
@@ -367,6 +385,7 @@ allowed_ips = ["10.119.96.2/32"]
             max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
             require_invite_approval: false,
             member_invites: true,
+            auto_connect: false,
         };
         update(
             &path,
@@ -430,6 +449,7 @@ allowed_ips = ["10.119.96.2/32"]
                 max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
                 require_invite_approval: false,
                 member_invites: true,
+                auto_connect: false,
             },
         )
         .unwrap();
@@ -452,6 +472,7 @@ allowed_ips = ["10.119.96.2/32"]
             max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
             require_invite_approval: false,
             member_invites: true,
+            auto_connect: false,
         };
 
         let bad_mtu = Update {
@@ -498,6 +519,7 @@ allowed_ips = ["10.119.96.2/32"]
             max_recv_file_mb: current.max_recv_file_mb,
             require_invite_approval: current.require_invite_approval,
             member_invites: true,
+            auto_connect: current.auto_connect,
         };
         assert!(!current.restart_required(&same));
         assert!(
@@ -506,6 +528,13 @@ allowed_ips = ["10.119.96.2/32"]
                 ..same.clone()
             }),
             "direct は約 5 秒で反映されるので再起動不要"
+        );
+        assert!(
+            !current.restart_required(&Update {
+                auto_connect: true,
+                ..same.clone()
+            }),
+            "auto_connect は次回のデーモン起動時のみ効くので再起動不要"
         );
         assert!(
             !current.restart_required(&Update {

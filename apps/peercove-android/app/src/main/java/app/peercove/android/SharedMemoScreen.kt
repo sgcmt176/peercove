@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -94,6 +95,7 @@ import uniffi.peercove_mobile.sharedMemoRelease
 import uniffi.peercove_mobile.sharedMemoResolveTitles
 import uniffi.peercove_mobile.sharedMemoSave
 import uniffi.peercove_mobile.sharedMemoSaveVersion
+import uniffi.peercove_mobile.sharedMemoSetPin
 import uniffi.peercove_mobile.sharedMemoTrash
 
 private val sharedDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
@@ -320,6 +322,15 @@ fun SharedMemoTab(
                     Card(onClick = { openId = memo.id }, modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (memo.pinned) {
+                                    Icon(
+                                        Icons.Filled.PushPin,
+                                        contentDescription = stringResource(R.string.memo_pin),
+                                        modifier = Modifier.width(16.dp),
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                }
                                 Text(
                                     memo.title.ifEmpty { stringResource(R.string.memo_untitled) },
                                     style = MaterialTheme.typography.titleMedium,
@@ -683,7 +694,7 @@ private fun SharedMemoEditor(
                     label = { Text(stringResource(R.string.shared_memo_finish)) },
                 )
             }
-            if (detail?.canManage == true) {
+            if (detail?.canEdit == true || detail?.canManage == true) {
                 IconButton(onClick = { menuOpen = true }) {
                     Icon(
                         Icons.Filled.MoreVert,
@@ -691,18 +702,46 @@ private fun SharedMemoEditor(
                     )
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    DropdownMenuItem(
-                        text = {
-                            Text(
-                                stringResource(R.string.memo_trash_action),
-                                color = MaterialTheme.colorScheme.error,
-                            )
-                        },
-                        onClick = {
-                            menuOpen = false
-                            confirmTrash = true
-                        },
-                    )
+                    // ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
+                    // 変更できるのは編集権限(editor)以上またはホスト。
+                    if (detail?.canEdit == true) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    stringResource(
+                                        if (detail?.pinned == true) R.string.memo_unpin
+                                        else R.string.memo_pin,
+                                    ),
+                                )
+                            },
+                            onClick = {
+                                menuOpen = false
+                                scope.launch {
+                                    try {
+                                        detail = withContext(Dispatchers.IO) {
+                                            sharedMemoSetPin(slug, id, detail?.pinned != true)
+                                        }
+                                    } catch (e: MobileException) {
+                                        onNotice(e.message ?: "")
+                                    }
+                                }
+                            },
+                        )
+                    }
+                    if (detail?.canManage == true) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    stringResource(R.string.memo_trash_action),
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            },
+                            onClick = {
+                                menuOpen = false
+                                confirmTrash = true
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -886,7 +925,19 @@ private fun CommentsSection(
                     }
                 }
             }
-            Text(comment.body, style = MaterialTheme.typography.bodyMedium)
+            // @名前 / @All はメンションとして色分け(ADR-0055 決定 1、M6 H-8c で
+            // チャット・デスクトップの共有メモコメントに追随。URL リンク化は
+            // デスクトップの renderCommentBody と同じく範囲外)
+            Text(
+                mentionAnnotatedString(
+                    comment.body,
+                    myName,
+                    memberNames,
+                    otherMentionBackground = MaterialTheme.colorScheme.primaryContainer,
+                    otherMentionForeground = MaterialTheme.colorScheme.primary,
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
     Spacer(modifier = Modifier.height(4.dp))

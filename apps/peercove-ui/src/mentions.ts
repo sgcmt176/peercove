@@ -7,16 +7,36 @@
 /** `@All` の挿入トークン(英語固定)。表示ラベルは i18n 側(mentionAllLabel)。 */
 export const MENTION_ALL_TOKEN = "All";
 
+/** `@<name>` が語として現れるか(語境界の判定は splitMentions と同一)。 */
+function hasMentionToken(text: string, name: string): boolean {
+  const token = `@${name}`;
+  let from = 0;
+  for (;;) {
+    const at = text.indexOf(token, from);
+    if (at < 0) return false;
+    from = at + token.length;
+    const before = at > 0 ? text[at - 1] : "";
+    const after = text[at + token.length] ?? "";
+    if (before !== "" && !/\s/.test(before)) continue;
+    if (/[\w]/.test(after)) continue;
+    return true;
+  }
+}
+
 /**
  * 本文に自分宛のメンション(`@<myName>` または `@All`)が含まれるか。
- * 既存のメモコメント通知(`@${myDisplayName}` の部分一致)と同じ判定方式
- * (単純な部分文字列一致。語境界は見ない)に `@All` を足しただけ。
  * `myName` が空文字なら名前メンションは判定しない(`@All` だけ見る)。
+ *
+ * M6 H-8c: 以前は単純な部分文字列一致で、語境界を見る強調表示
+ * (splitMentions)と結果が食い違っていた(例: 表示名が "All" でない人に
+ * 宛てた `@Allen` が、強調はされないのに通知だけ出る)。Android 側の移植
+ * (Mentions.kt)を機に、判定を splitMentions と同じ語境界規則へ揃えた。
+ * ロジックを変えるときは Mentions.kt も直すこと。
  */
 export function isMentioned(text: string, myName: string): boolean {
-  if (text.includes(`@${MENTION_ALL_TOKEN}`)) return true;
+  if (hasMentionToken(text, MENTION_ALL_TOKEN)) return true;
   const trimmed = myName.trim();
-  return trimmed !== "" && text.includes(`@${trimmed}`);
+  return trimmed !== "" && hasMentionToken(text, trimmed);
 }
 
 export type MentionSegment =

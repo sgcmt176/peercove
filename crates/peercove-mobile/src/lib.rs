@@ -278,6 +278,7 @@ fn update_settings_with(
         max_recv_file_mb: current.max_recv_file_mb,
         require_invite_approval: current.require_invite_approval,
         member_invites: current.member_invites,
+        auto_connect: current.auto_connect,
     };
     apply(&current, &mut update);
     let restart = current.restart_required(&update);

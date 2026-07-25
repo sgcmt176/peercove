@@ -247,6 +247,11 @@ pub struct InterfaceConfig {
     /// 読めない)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_source: Option<KeySource>,
+    /// ホスト・メンバー共通。OS 起動時(デーモン起動時)にこのネットワークを
+    /// 自動で接続する(ADR-0057)。既定 false。注意: `deny_unknown_fields` の
+    /// ため、true を書いた設定は旧バージョンでは読めない(明示エラーになる)。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_connect: bool,
 }
 
 /// デバイス秘密鍵の出どころ(ADR-0020)。

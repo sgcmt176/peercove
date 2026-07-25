@@ -340,6 +340,8 @@ export interface Settings {
   requireInviteApproval: boolean;
   /** ホストのみ。メンバーによる招待発行を許可する（ADR-0048、既定 true）。 */
   memberInvites: boolean;
+  /** 起動時（デーモン起動時）にこのネットワークを自動で接続する（ADR-0057）。 */
+  autoConnect: boolean;
   defaultMtu: number;
   defaultListenPort: number;
   defaultMaxRecvFileMb: number;
@@ -357,6 +359,8 @@ export interface SettingsUpdate {
   requireInviteApproval: boolean;
   /** ホストのみ。メンバーによる招待発行を許可する（ADR-0048）。 */
   memberInvites: boolean;
+  /** 起動時（デーモン起動時）にこのネットワークを自動で接続する（ADR-0057）。 */
+  autoConnect: boolean;
 }
 
 export interface SaveResult {
@@ -624,6 +628,8 @@ export interface SharedMemoSummary {
   checklist_total?: number;
   /** コメント件数(ADR-0052 決定 4)。一覧の 💬 バッジ用。 */
   comment_count?: number;
+  /** ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。 */
+  pinned?: boolean;
 }
 
 export interface SharedMemoDetail {
@@ -646,6 +652,8 @@ export interface SharedMemoDetail {
   groups?: SharedGroupPerm[];
   /** コメント件数(ADR-0052 決定 4)。 */
   comment_count?: number;
+  /** ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。 */
+  pinned?: boolean;
 }
 
 /** 共有メモのコメント 1 件(ADR-0052 決定 4)。単層(返信ツリーなし)。 */
@@ -897,6 +905,9 @@ export type SharedMemoOp =
       title: string;
       body: string;
     }
+  // ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
+  // 変更できるのは編集権限(editor)以上またはホスト。
+  | { op: "set_pin"; id: string; pinned: boolean }
   | { op: "acquire_lock"; id: string }
   | { op: "release_lock"; id: string }
   | { op: "force_unlock"; id: string }
@@ -1146,6 +1157,10 @@ export const api = {
     invoke<Settings>("read_settings", { configPath }),
   saveSettings: (configPath: string, update: SettingsUpdate) =>
     invoke<SaveResult>("save_settings", { configPath, update }),
+  // 起動時の自動接続復旧の台帳への登録（ADR-0057、M6 H-8e）。auto_connect を
+  // ON にした時点で呼ぶ（一度も接続していないネットワークの取りこぼし防止）
+  registerAutostart: (configPath: string, isMember: boolean) =>
+    invoke<void>("register_autostart", { configPath, isMember }),
   // 個人メモ(M5 F-1、ADR-0049)。デーモンが DB を所有し IPC で操作する
   memoOp: (op: MemoOp) => invoke<MemoReply>("memo_op", { op }),
   memoExport: (id: string) => invoke<string | null>("memo_export", { id }),
@@ -1156,6 +1171,12 @@ export const api = {
     invoke<SharedMemoReply>("shared_memo_op", { configPath, op }),
   sharedMemoExport: (configPath: string, id: string) =>
     invoke<string | null>("shared_memo_export", { configPath, id }),
+  // ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
+  sharedMemoSetPin: (configPath: string, id: string, pinned: boolean) =>
+    invoke<SharedMemoReply>("shared_memo_op", {
+      configPath,
+      op: { op: "set_pin", id, pinned },
+    }),
 };
 
 // ---- 表示ヘルパ ----

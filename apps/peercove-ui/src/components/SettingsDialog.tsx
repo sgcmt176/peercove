@@ -83,6 +83,8 @@ function SettingsForm({
   );
   // メンバーによる招待発行(ADR-0048)。端末指名はメンバー詳細から行う
   const [memberInvites, setMemberInvites] = useState(settings.memberInvites);
+  // 起動時の自動接続復旧(ADR-0057、M6 H-8e)。host / member 共通
+  const [autoConnect, setAutoConnect] = useState(settings.autoConnect);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -135,7 +137,15 @@ function SettingsForm({
         maxRecvFileMb: maxFileValue,
         requireInviteApproval,
         memberInvites,
+        autoConnect,
       });
+      // auto_connect を ON にしたときだけ、デーモンに設定パスを明示登録する
+      // (一度も接続していないネットワークでも次回起動時に見つけられるように
+      // する — ADR-0057 決定 2)。OFF なら次回のデーモン起動時にフラグを
+      // 見ないので登録不要
+      if (autoConnect) {
+        await api.registerAutostart(configPath, settings.isMember);
+      }
       setNotice(
         result.restartRequired
           ? t.settings.savedRestart
@@ -265,6 +275,18 @@ function SettingsForm({
             </span>
           </label>
         )}
+
+        <label className="field field--check">
+          <input
+            type="checkbox"
+            checked={autoConnect}
+            onChange={(event) => setAutoConnect(event.target.checked)}
+          />
+          <span>
+            {t.settings.autoConnectLabel}
+            <small className="muted"> {t.settings.autoConnectHint}</small>
+          </span>
+        </label>
 
         {settings.isMember && (
           <div className="field">

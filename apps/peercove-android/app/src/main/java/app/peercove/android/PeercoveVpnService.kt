@@ -346,6 +346,7 @@ class PeercoveVpnService : VpnService() {
             // memoId -> (直近確認した comment_count, 直近のコメント作成時刻)
             val baseline = HashMap<String, Pair<Int, Long>>()
             var myName = ""
+            var memberNames = emptyList<String>()
             while (gen == watchGeneration && currentSlug == slug) {
                 Thread.sleep(5000)
                 if (gen != watchGeneration || currentSlug != slug) break
@@ -354,7 +355,9 @@ class PeercoveVpnService : VpnService() {
                     if (generation == lastGeneration) continue
                     lastGeneration = generation
                     if (myName.isEmpty()) {
-                        myName = members(slug).firstOrNull { it.isSelf }?.name ?: ""
+                        val list = members(slug)
+                        myName = list.firstOrNull { it.isSelf }?.name ?: ""
+                        memberNames = list.filter { !it.isSelf && it.name.isNotEmpty() }.map { it.name }
                     }
                     val list = sharedMemoList(baseDir, slug, null, null)
                     for (memo in list.memos) {
@@ -378,8 +381,11 @@ class PeercoveVpnService : VpnService() {
                                 // 自分のコメントは通知しない(名前一致による近似判定。
                                 // SharedMemoScreen.kt の削除ボタン表示と同じ流儀)
                                 if (myName.isNotEmpty() && comment.authorName == myName) continue
-                                val mentionsMe = comment.body.contains("@All") ||
-                                    (myName.isNotEmpty() && comment.body.contains("@$myName"))
+                                // Mentions.kt(mentions.ts の移植)の語境界つき判定を使う。
+                                // 素朴な contains("@$myName") だと、自分の名前が別の
+                                // 誰か宛の長い名前の接頭辞のとき(例: 自分が「Al」で
+                                // 本文が「@Allen ...」)誤って自分宛と判定してしまう
+                                val mentionsMe = isMentionedIn(comment.body, myName, memberNames)
                                 val ownsMemo = myName.isNotEmpty() && memo.ownerName == myName
                                 if (!mentionsMe && !ownsMemo) continue
                                 val memoTitle = memo.title.ifEmpty { getString(R.string.memo_untitled) }

@@ -36,6 +36,7 @@ import { DiagnosticsView } from "./components/DiagnosticsView";
 import { AclView } from "./components/AclDialog";
 import { loadPrefs } from "./prefs";
 import { checkForUpdate } from "./update";
+import logoUrl from "./assets/logo.png";
 
 /** サイドバーで選ぶ表示。openConfig の有無で有効な値が決まる(M3-16)。 */
 type View =
@@ -325,9 +326,7 @@ export default function App() {
     <div className="app">
       <nav className="sidebar">
         <div className="sidebar__brand">
-          <span className="app__logo" aria-hidden>
-            P
-          </span>
+          <img className="app__logo" src={logoUrl} alt="" />
           <span className="sidebar__brand-name">PeerCove</span>
         </div>
         <ul className="sidebar__nav">

@@ -33,8 +33,8 @@ pub const MAX_SHEETS: u32 = 100;
 /// 1 シートあたりの非空セル数上限。
 pub const MAX_SHEET_CELLS: u32 = 10_000;
 
-/// 行番号の上限(0-indexed。この値未満のみ許可)。
-pub const MAX_SHEET_ROWS: u32 = 1_000;
+/// 行番号の上限(0-indexed。この値未満のみ許可、ADR-0056 決定 4)。
+pub const MAX_SHEET_ROWS: u32 = 1_024;
 
 /// 列番号の上限(0-indexed。この値未満のみ許可)。
 pub const MAX_SHEET_COLS: u32 = 200;

@@ -560,6 +560,7 @@ export function SharedMemoView({
                 onClick={() => void open(memo.id)}
               >
                 <span className="memo__item-title">
+                  {memo.pinned && <span aria-hidden>📌 </span>}
                   {memo.title || t.memo.untitled}
                 </span>
                 {memo.locked_by && (
@@ -668,6 +669,24 @@ export function SharedMemoView({
                 </button>
               )}
               <span className="memo__actions-sep" />
+              {/* ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
+                  編集権限が無い(閲覧のみ)人には出さない。 */}
+              {!trashView && selected.can_edit && (
+                <button
+                  type="button"
+                  className="button--icon"
+                  title={selected.pinned ? t.memo.unpin : t.memo.pin}
+                  onClick={() =>
+                    void run({
+                      op: "set_pin",
+                      id: selected.id,
+                      pinned: !selected.pinned,
+                    })
+                  }
+                >
+                  {selected.pinned ? "📌" : "📍"}
+                </button>
+              )}
               {editing && (
                 <>
                   <ModeBtn label={t.memo.modeEdit} value="edit" mode={mode} onMode={setMode} />

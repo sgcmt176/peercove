@@ -4,7 +4,9 @@
 // 作成・改名・削除は作成者 + ホストだけ(`can_manage` で判定)。競合はセル単位の
 // revision CAS(ADR-0054 決定 4)。**シート名・セル値は console に出さないこと。**
 import {
+  ChangeEvent,
   ClipboardEvent,
+  CompositionEvent,
   CSSProperties,
   KeyboardEvent,
   MouseEvent as ReactMouseEvent,
@@ -15,7 +17,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { flushSync } from "react-dom";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   CellFormat,
@@ -32,8 +33,9 @@ import { t } from "../i18n";
 import { sharedRefToken } from "../sharedRefs";
 import { ContextMenu, ContextMenuEntry } from "./ContextMenu";
 
-// crates/peercove-core/src/sheet.rs の上限と同期(ADR-0054 決定 7、ADR-0055 決定 6)。
-const MAX_SHEET_ROWS = 1000;
+// crates/peercove-core/src/sheet.rs の上限と同期(ADR-0054 決定 7、ADR-0055 決定 6、
+// ADR-0056 決定 4)。
+const MAX_SHEET_ROWS = 1024;
 const MAX_SHEET_COLS = 200;
 const MIN_COL_WIDTH = 20;
 const MAX_COL_WIDTH = 600;
@@ -42,9 +44,17 @@ const MAX_ROW_HEIGHT = 400;
 const DEFAULT_COL_WIDTH = 90;
 const DEFAULT_ROW_HEIGHT = 26;
 
-const MIN_DISPLAY_ROWS = 30;
-const MIN_DISPLAY_COLS = 12;
+// 既定表示は A〜Z 列(26)× 1024 行(ADR-0056 決定 4)。MIN_DISPLAY_ROWS が
+// MAX_SHEET_ROWS と同値のため、displayRows は常に上限いっぱいになる
+// (行数がデータ量に応じて縮む必要はない = 仮想化で描画コストを抑える方針、
+// ADR-0056 決定 5)。
+const MIN_DISPLAY_ROWS = 1024;
+const MIN_DISPLAY_COLS = 26;
 const DISPLAY_MARGIN = 2;
+
+// 行の仮想化(ADR-0056 決定 5)の上下オーバースキャン行数。ドラッグ選択や
+// キーボード移動で 1 行だけ範囲外に出てもすぐ描画済みになるようにする。
+const ROW_OVERSCAN = 10;
 
 const NUMERIC_RE = /^-?\d+(\.\d+)?$/;
 
@@ -67,11 +77,30 @@ function numberArraysEqual(a: number[], b: number[]): boolean {
   return true;
 }
 
+/** rowOffsets[i] <= y を満たす最大の行番号を返す(行の仮想化用、ADR-0056
+ * 決定 5)。1024 行程度なら二分探索にするほどのコストではないため線形走査
+ * で済ませる。 */
+function rowIndexAtOffset(rowOffsets: number[], displayRows: number, y: number): number {
+  let idx = 0;
+  for (let r = 0; r < displayRows; r++) {
+    if (rowOffsets[r] > y) break;
+    idx = r;
+  }
+  return idx;
+}
+
 // プレゼンス送信のスロットル間隔(ADR-0055 決定 6: 選択位置の共有 ~4 回/秒)。
 const PRESENCE_THROTTLE_MS = 250;
 
 // Undo 履歴の最大件数(ADR-0055 決定 6)。
 const MAX_UNDO_STACK = 50;
+
+// 書式適用(applyFormatToSelection)で空セルも対象にする選択範囲の上限
+// (面積 = 行数 × 列数、ADR-0055 決定 6 追補 H-8a)。これ以下なら ADR-0055
+// 決定 6 の「値が空でも書式だけのセルは保存する」という従来挙動を保つ。
+// これを超える(列全体・行全体選択など)場合だけ既存セルに絞り、1 回の
+// 書き込みリクエストを現実的なサイズに保つ。
+const FORMAT_EXISTING_ONLY_THRESHOLD = 500;
 
 /** FNV-1a(32bit)。Avatar.tsx と同じ手法で、名前からプレゼンス色の色相を
  * 決定的に決める(暗号用途ではない)。 */
@@ -133,6 +162,31 @@ function rangeOf(sel: Selection): SelectionRect {
 
 function isSingleCell(rect: SelectionRect): boolean {
   return rect.r0 === rect.r1 && rect.c0 === rect.c1;
+}
+
+/** 選択矩形を実データ(cellsByKey に存在するセル)のある範囲へ切り詰める。
+ * 列全体・行全体選択でのコピーが、空セル分の大量のタブ区切り行をクリップ
+ * ボードへ入れてしまわないようにする(ADR-0055 決定 6 追補 H-8a)。矩形内に
+ * データが 1 件も無ければ null。 */
+function trimRectToData(
+  rect: SelectionRect,
+  cellsByKey: Map<string, SheetCell>,
+): SelectionRect | null {
+  let r0 = Infinity;
+  let r1 = -Infinity;
+  let c0 = Infinity;
+  let c1 = -Infinity;
+  for (let r = rect.r0; r <= rect.r1; r++) {
+    for (let c = rect.c0; c <= rect.c1; c++) {
+      if (!cellsByKey.has(keyOf(r, c))) continue;
+      if (r < r0) r0 = r;
+      if (r > r1) r1 = r;
+      if (c < c0) c0 = c;
+      if (c > c1) c1 = c;
+    }
+  }
+  if (r0 === Infinity) return null;
+  return { r0, r1, c0, c1 };
 }
 
 interface EditingState {
@@ -249,6 +303,11 @@ export function SheetView({
   const [searchQuery, setSearchQuery] = useState("");
   const [searchIndex, setSearchIndex] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  // 行の仮想化(ADR-0056 決定 5)。.sheet__table-wrap のスクロール位置と
+  // 表示高さ。scrollTop は onScroll を requestAnimationFrame で間引いて
+  // 反映する(ドラッグや慣性スクロールでの過剰な再計算を防ぐ)。
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
 
   const activeSheetIdRef = useRef<string | null>(null);
   const cellRefs = useRef<Map<string, HTMLTableCellElement>>(new Map());
@@ -261,6 +320,10 @@ export function SheetView({
   const isComposingRef = useRef(false);
   // マウスドラッグによる複数セル選択中か(ADR-0055 決定 6)。
   const isSelectingRef = useRef(false);
+  // 上のドラッグが「セル単位」「列全体」「行全体」のどれかを覚えておく
+  // (ADR-0055 決定 6 追補 H-8a)。既存の mouseup グローバルリスナーに
+  // 相乗りするため、モードだけをここで持ち回す。
+  const dragModeRef = useRef<"cell" | "col" | "row">("cell");
   // 列幅・行高のドラッグリサイズ中の状態(ADR-0055 決定 6)。
   const resizingRef = useRef<{
     kind: "col" | "row";
@@ -276,10 +339,29 @@ export function SheetView({
   // プレゼンス送信のスロットル(ADR-0055 決定 6)。
   const presenceThrottleRef = useRef<number | null>(null);
   const lastSentPresenceRef = useRef<string | null>(null);
-  // 文字キーでの編集開始時、直後の自動 focus+select(既存 useEffect)を
-  // 1 回だけ止める(ADR-0055 決定 6 追補 H-7a: IME バグ修正)。true の間は
-  // その useEffect が select() で IME 変換中の状態を壊さないようにする。
-  const skipAutoFocusSelectRef = useRef(false);
+  // 編集開始時の自動 focus+select(下の useEffect)を、既存値からの編集
+  // (F2/Enter/ダブルクリック)のときだけ明示的に有効にするフラグ(ADR-0056
+  // 決定 2/3)。既定は false = 何もしない。文字入力や IME 変換で編集が
+  // 始まったときに select() すると変換中の状態を壊すため、そちらの経路
+  // ではこのフラグを立てない(常設 input が既に文字を受けているだけで、
+  // 明示的な select() は不要かつ有害)。
+  const selectOnEditStartRef = useRef(false);
+  // 選択セルへの自動 focus(下の useEffect)を、グリッド操作(セル/ヘッダー
+  // の mousedown、角クリック、input 上のキー操作)のときだけ有効にする
+  // フラグ(ADR-0056 決定 1 追補)。既定 false のままだと、検索バーやシート
+  // 名の入力にフォーカスがある状態で selection state だけが変わっても
+  // フォーカスを奪わない。
+  const shouldFocusCellRef = useRef(false);
+  // 常設 input が実際に focus を持っていたか(ADR-0056 決定 5 追補)。行の
+  // 仮想化でフォーカス行が描画対象から外れて input がアンマウントされた
+  // ときに、テーブル容器へ focus を逃がすかどうかの判定に使う。
+  const gridInputFocusedRef = useRef(false);
+  // .sheet__table-wrap(スクロール容器)。行の仮想化のスクロール監視と、
+  // フォーカス行が仮想化ウィンドウ外へ出たときの focus 退避先(ADR-0056
+  // 決定 5)。
+  const tableWrapRef = useRef<HTMLDivElement | null>(null);
+  const tableWrapResizeObserverRef = useRef<ResizeObserver | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
   // シートへの write を直列化する送信キュー(ADR-0055 決定 6 追補 H-7a:
   // SQLite 側の locking protocol エラー対策)。前の write の応答を待って
   // から次を送る。書式適用・編集確定・貼り付け・Undo すべて writeCells
@@ -403,24 +485,27 @@ export function SheetView({
     return () => window.clearTimeout(timer);
   }, [notice]);
 
-  // 選択中の focus セルへフォーカスを追従させる(矢印キー操作を継続できるように)
+  // 選択中の focus セルへフォーカスを追従させる(矢印キー操作を継続できる
+  // ように)。ADR-0056 決定 1: 選択セルには常設 input があるので、editing
+  // の有無に関わらずその input へ focus する(以前は <td> へ focus してい
+  // たが、IME の 1 打鍵目問題の根治のため <input> へ一本化した)。
+  // shouldFocusCellRef が false のとき(検索バー等、グリッド外の操作で
+  // selection が変わっただけのとき)は何もしない = 他の入力欄からフォーカ
+  // スを奪わない。
   useEffect(() => {
-    if (!selection || editing) return;
-    const el = cellRefs.current.get(keyOf(selection.focus.row, selection.focus.col));
-    el?.focus();
-  }, [selection, editing]);
+    if (!selection || !shouldFocusCellRef.current) return;
+    inputRef.current?.focus();
+  }, [selection]);
 
-  // 編集開始時だけ input へフォーカス + 全選択(打鍵のたびには再実行しない)。
-  // 文字キーでの編集開始(startTypedEdit)は既に同期的に focus 済みで、
-  // かつ IME 変換中にここで select() すると変換が壊れうるため 1 回だけ
-  // 飛ばす(ADR-0055 決定 6 追補 H-7a)。F2/ダブルクリック(startEdit)は
-  // このガードを通らないので従来どおり focus+select する。
+  // 編集開始時だけ input を全選択する(打鍵のたびには再実行しない)。
+  // selectOnEditStartRef が立っているとき(F2/Enter/ダブルクリックで既存値
+  // から編集を始めたとき)だけ select() する。文字入力や IME 変換で編集が
+  // 始まったときにここで select() すると変換中の状態を壊すため、その経路
+  // では立てない(ADR-0056 決定 2/3)。
   useEffect(() => {
     if (!editing) return;
-    if (skipAutoFocusSelectRef.current) {
-      skipAutoFocusSelectRef.current = false;
-      return;
-    }
+    if (!selectOnEditStartRef.current) return;
+    selectOnEditStartRef.current = false;
     inputRef.current?.focus();
     inputRef.current?.select();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -431,6 +516,7 @@ export function SheetView({
   useEffect(() => {
     const onWindowMouseUp = () => {
       isSelectingRef.current = false;
+      dragModeRef.current = "cell";
       if (resizingRef.current) {
         const { kind, index } = resizingRef.current;
         resizingRef.current = null;
@@ -558,6 +644,82 @@ export function SheetView({
     // editing.value(打鍵ごと)は範囲計算に無関係なので row/col だけを見る
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cells, merges, editing?.row, editing?.col]);
+
+  // ---- 行の仮想化(ADR-0056 決定 5) ----
+  // 各行の上端 y 座標(tbody 先頭からの相対、prefix sum)。1024 要素なので
+  // 線形走査で構築して十分軽い。rowOffsets[displayRows] が全行の合計高さ。
+  const rowOffsets = useMemo(() => {
+    const offsets: number[] = new Array(displayRows + 1);
+    let acc = 0;
+    for (let r = 0; r < displayRows; r++) {
+      offsets[r] = acc;
+      acc += rowHeights.get(r) ?? DEFAULT_ROW_HEIGHT;
+    }
+    offsets[displayRows] = acc;
+    return offsets;
+  }, [displayRows, rowHeights]);
+
+  // 指定行が(必要最小限のスクロールで)可視範囲に入るよう .sheet__table-wrap
+  // の scrollTop を調整する(検索ジャンプ・フォーカス行の virtualization
+  // ウィンドウ外への退避からの復帰で使う、ADR-0056 決定 5)。
+  const scrollRowIntoView = useCallback(
+    (row: number) => {
+      const el = tableWrapRef.current;
+      if (!el || row < 0 || row >= displayRows) return;
+      const headerH = theadRowRef.current?.offsetHeight ?? HEADER_ROW_HEIGHT;
+      const rowTop = headerH + rowOffsets[row];
+      const rowBottom = headerH + rowOffsets[row + 1];
+      const viewTop = el.scrollTop + headerH;
+      const viewBottom = el.scrollTop + el.clientHeight;
+      if (rowTop < viewTop) {
+        el.scrollTop = rowTop - headerH;
+      } else if (rowBottom > viewBottom) {
+        el.scrollTop = rowBottom - el.clientHeight;
+      }
+    },
+    [displayRows, rowOffsets],
+  );
+
+  // .sheet__table-wrap の scrollTop/表示高さを追跡する(callback ref +
+  // ResizeObserver。要素が activeSheet の有無でマウント/アンマウントされる
+  // ため、useEffect の cleanup より callback ref の方が素直)。
+  const setTableWrapRef = useCallback((el: HTMLDivElement | null) => {
+    tableWrapRef.current = el;
+    if (tableWrapResizeObserverRef.current) {
+      tableWrapResizeObserverRef.current.disconnect();
+      tableWrapResizeObserverRef.current = null;
+    }
+    if (el) {
+      setViewportHeight(el.clientHeight);
+      setScrollTop(el.scrollTop);
+      const ro = new ResizeObserver(() => setViewportHeight(el.clientHeight));
+      ro.observe(el);
+      tableWrapResizeObserverRef.current = ro;
+    }
+  }, []);
+
+  // scrollTop の反映は requestAnimationFrame で 1 フレーム 1 回に間引く
+  // (ドラッグ選択中の連続スクロールで毎ピクセル再計算しないように)。
+  const handleTableScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const el = tableWrapRef.current;
+      if (el) setScrollTop(el.scrollTop);
+    });
+  }, []);
+
+  // フォーカス行が virtualization ウィンドウ外へ出て常設 input がアンマウント
+  // されたとき、矢印キー操作を継続できるようテーブル容器へ focus を逃がす
+  // (ADR-0056 決定 5)。input 自身は useRef オブジェクトではなく callback ref
+  // にして、アンマウント(el === null)を検知できるようにする。
+  const setInputRef = useCallback((el: HTMLInputElement | null) => {
+    inputRef.current = el;
+    if (el === null && gridInputFocusedRef.current) {
+      gridInputFocusedRef.current = false;
+      tableWrapRef.current?.focus();
+    }
+  }, []);
 
   // 結合セルの検索用マップ(ADR-0055 決定 6)。mergeCovered は結合範囲内の
   // 全セル(左上を含む)→ その結合。mergeByTopLeft は左上セルだけの索引。
@@ -767,41 +929,28 @@ export function SheetView({
     [rowHeights],
   );
 
+  /** F2 / Enter(既存値編集)/ ダブルクリックで編集を開始する。選択セルには
+   * 常設 input があるため(ADR-0056 決定 1)、ここではフォーカス移動や
+   * flushSync は不要 — selection/editing の state を立てるだけで、下の
+   * useEffect 2 本(選択追従 focus・編集開始時の select)が反応する。
+   * shouldFocusCellRef/selectOnEditStartRef を立てるのは、この経路(既存値
+   * からの明示的な編集開始)だけ input を focus + 全選択したいため。文字
+   * キーでの編集開始(常設 input への直接入力、下の handleGridKeyDown 参照)
+   * はここを通らない = select() されない(ADR-0056 決定 2/3)。 */
   const startEdit = useCallback(
     (row: number, col: number, value: string | null) => {
       if (readOnlyReason) return;
       // 結合セルは左上のみ編集可(選択は結合全体を 1 単位として扱う、
-      // ADR-0055 決定 6)。value が null なら既存値をそこから読み直す
-      // (直接文字入力で上書き開始する場合は呼び出し側が実値を渡す)。
+      // ADR-0055 決定 6)。value が null なら既存値をそこから読み直す。
       const anchor = resolveMergeAnchor(row, col);
+      shouldFocusCellRef.current = true;
+      selectOnEditStartRef.current = true;
       setSelection({ anchor, focus: anchor });
       const resolvedValue =
         value ?? cellsByKey.get(keyOf(anchor.row, anchor.col))?.value ?? "";
       setEditing({ row: anchor.row, col: anchor.col, value: resolvedValue });
     },
     [readOnlyReason, resolveMergeAnchor, cellsByKey],
-  );
-
-  /** 文字キーで編集を開始する(ADR-0055 決定 6 追補 H-7a: IME バグ修正)。
-   * 空値で編集モードへ入り、その場で input へ同期的に focus する。呼び
-   * 出し側(handleGridKeyDown)は該当 keydown を preventDefault しないので、
-   * ブラウザはこの直後の既定動作(文字挿入 / IME 変換開始)をこの時点で
-   * focus されている要素、つまりここで作った input に対して行う。結果、
-   * 1 打鍵目が生のキー文字として注入されることも、IME の変換開始が
-   * 素通しされて "a" が混ざることもなくなる。
-   * React 18+ はイベントハンドラ内の setState を自動バッチするため、
-   * flushSync で同期コミットしないと inputRef.current がこの時点でまだ
-   * 古い(または null の)ままになる。 */
-  const startTypedEdit = useCallback(
-    (row: number, col: number) => {
-      if (readOnlyReason) return;
-      skipAutoFocusSelectRef.current = true;
-      flushSync(() => {
-        startEdit(row, col, "");
-      });
-      inputRef.current?.focus();
-    },
-    [readOnlyReason, startEdit],
   );
 
   const cancelEdit = useCallback(() => setEditing(null), []);
@@ -842,8 +991,12 @@ export function SheetView({
         if (extend && prev) return { anchor: prev.anchor, focus: landed };
         return { anchor: landed, focus: landed };
       });
+      // 行の仮想化(ADR-0056 決定 5)で着地行がまだ描画範囲外のことがある
+      // ため、キーボード移動のたびに可視範囲へ引き込む(既に見えていれば
+      // 何もしない)。
+      scrollRowIntoView(landed.row);
     },
-    [displayRows, displayCols, resolveMergeAnchor],
+    [displayRows, displayCols, resolveMergeAnchor, scrollRowIntoView],
   );
 
   /** 選択範囲の全セルへ書式を適用する(値は現値を維持したまま送る、
@@ -852,10 +1005,17 @@ export function SheetView({
     (patchFor: (current: CellFormat, row: number, col: number) => CellFormat) => {
       if (!selection || readOnlyReason) return;
       const { r0, r1, c0, c1 } = rangeOf(selection);
+      // 列全体・行全体選択(ADR-0055 決定 6 追補 H-8a)では選択矩形に大量の
+      // 空セルが含まれうる。空セルへ書式だけ書き込むと 1 シート 10,000
+      // セルの上限にすぐ当たるため、閾値を超える範囲だけ既存セルに絞る
+      // (閾値以下は ADR-0055 決定 6 の「空セルにも書式だけ保存する」を維持)。
+      const area = (r1 - r0 + 1) * (c1 - c0 + 1);
+      const restrictToExisting = area > FORMAT_EXISTING_ONLY_THRESHOLD;
       const writes: CellWrite[] = [];
       for (let r = r0; r <= r1; r++) {
         for (let c = c0; c <= c1; c++) {
           const current = cellsByKey.get(keyOf(r, c));
+          if (restrictToExisting && !current) continue;
           const format = patchFor(current?.format ?? {}, r, c);
           writes.push({
             row: r,
@@ -866,6 +1026,7 @@ export function SheetView({
           });
         }
       }
+      if (restrictToExisting) setNotice(t.sheet.formatLargeSelectionNotice);
       void writeCells(writes);
     },
     [selection, readOnlyReason, cellsByKey, writeCells],
@@ -1125,7 +1286,15 @@ export function SheetView({
 
   const copySelectionToClipboard = useCallback(() => {
     if (!selectionRect) return;
-    const { r0, r1, c0, c1 } = selectionRect;
+    // 列全体・行全体選択のコピーで、空セル分の大量のタブ区切り行を
+    // クリップボードへ入れないよう、実データのある範囲へ切り詰める
+    // (ADR-0055 決定 6 追補 H-8a)。
+    const rect = trimRectToData(selectionRect, cellsByKey);
+    if (!rect) {
+      void writeText("");
+      return;
+    }
+    const { r0, r1, c0, c1 } = rect;
     const lines: string[] = [];
     for (let r = r0; r <= r1; r++) {
       const line: string[] = [];
@@ -1237,14 +1406,22 @@ export function SheetView({
       setSearchIndex(clamped);
       const target = searchMatches[clamped];
       const anchor = resolveMergeAnchor(target.row, target.col);
+      // 検索バーを操作している間はフォーカスを奪わない(ADR-0056 決定 1
+      // 追補)。Enter/前後ボタンを連打して検索バーに居続けられるように。
+      shouldFocusCellRef.current = false;
       setSelection({ anchor, focus: anchor });
-      window.setTimeout(() => {
+      // 行の仮想化(ADR-0056 決定 5)により対象セルの <td> がまだ描画されて
+      // いないことがある。まず rowOffsets から scrollTop を直接設定して
+      // 縦方向を該当行の描画範囲に含め、再描画で <td> が実際に描画されて
+      // から(次フレーム)横方向は従来どおり scrollIntoView に任せる。
+      scrollRowIntoView(anchor.row);
+      window.requestAnimationFrame(() => {
         cellRefs.current
           .get(keyOf(anchor.row, anchor.col))
           ?.scrollIntoView({ block: "nearest", inline: "nearest" });
-      }, 0);
+      });
     },
-    [searchMatches, resolveMergeAnchor],
+    [searchMatches, resolveMergeAnchor, scrollRowIntoView],
   );
 
   // 検索文字列が変わるたびに先頭の一致へジャンプする
@@ -1264,6 +1441,9 @@ export function SheetView({
         if (!activeSheetIdRef.current) return;
         event.preventDefault();
         setSearchOpen(true);
+        // 検索バーへ focus を渡すので、セル選択の追従 focus には奪わせない
+        // (ADR-0056 決定 1 追補)。
+        shouldFocusCellRef.current = false;
         window.setTimeout(() => searchInputRef.current?.focus(), 0);
       }
     };
@@ -1271,20 +1451,26 @@ export function SheetView({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  /** 選択セルに常設した <input>(ADR-0056 決定 1)の onKeyDown。以前は
+   * <td> に付けていたが、<td> は編集不可要素のため 1 打鍵目が IME に渡らず
+   * 生のローマ字が入る不具合の根本原因だった(ADR-0056 背景)。<input> を
+   * 常設してその input 自身でキー操作を受けることで、この経路自体を無く
+   * している。 */
   const handleGridKeyDown = useCallback(
-    (event: KeyboardEvent<HTMLTableCellElement>, row: number, col: number) => {
+    (event: KeyboardEvent<HTMLInputElement>, row: number, col: number) => {
+      // IME 変換中は一切横取りしない(preventDefault もしない)。変換確定の
+      // Enter や変換候補選びの矢印キーまでセル操作として奪うと変換そのもの
+      // が壊れる(ADR-0055 決定 6 由来のバグ修正を ADR-0056 でも維持)。
+      // isComposing の他に keyCode 229 も見て古いブラウザの実装差を吸収する。
+      if (isComposingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) {
+        return;
+      }
+      // この時点でキー操作がグリッドに向いていることが確定するので、選択
+      // 追従の focus useEffect を働かせる(検索バー等からフォーカスを奪わ
+      // ないためのガード、ADR-0056 決定 1 追補)。
+      shouldFocusCellRef.current = true;
       const isEditingThis = editing && editing.row === row && editing.col === col;
       if (isEditingThis) {
-        // IME 変換中の Enter/Tab/Escape はセルの確定・移動に横取りしない
-        // (ADR-0055 決定 6: バグ修正)。isComposing の他に keyCode 229 も
-        // 見て古い挙動のブラウザを吸収する。
-        if (
-          isComposingRef.current ||
-          event.nativeEvent.isComposing ||
-          event.keyCode === 229
-        ) {
-          return;
-        }
         if (event.key === "Enter") {
           event.preventDefault();
           skipNextBlurCommit.current = true;
@@ -1298,7 +1484,9 @@ export function SheetView({
           skipNextBlurCommit.current = true;
           cancelEdit();
         }
-        // それ以外のキー(文字入力・カーソル移動)は input の既定動作に任せる
+        // 矢印・Home/End を含め、それ以外のキーはテキストカーソル移動 /
+        // 通常の文字入力として input の既定動作に任せる(ADR-0056 決定 3:
+        // 編集中の矢印キーはセル移動ではなくカーソル移動)。
         return;
       }
       const arrowMap: Record<string, "up" | "down" | "left" | "right"> = {
@@ -1312,6 +1500,11 @@ export function SheetView({
         moveActiveCell(arrowMap[event.key], row, col, event.shiftKey);
         return;
       }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        moveActiveCell(event.shiftKey ? "left" : "right", row, col, false);
+        return;
+      }
       // Undo(Ctrl+Z / Cmd+Z、ローカル、ADR-0055 決定 6)。編集中でないときだけ
       // 横取りする(input 自身のネイティブ undo は妨げない)。
       if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z") {
@@ -1320,7 +1513,7 @@ export function SheetView({
         return;
       }
       if (readOnlyReason) return;
-      if (event.key === "Enter") {
+      if (event.key === "Enter" || event.key === "F2") {
         event.preventDefault();
         startEdit(row, col, null);
         return;
@@ -1338,16 +1531,12 @@ export function SheetView({
         if (writes.length > 0) void writeCells(writes);
         return;
       }
-      if (
-        event.key.length === 1 &&
-        !event.ctrlKey &&
-        !event.metaKey &&
-        !event.altKey
-      ) {
-        // ここでは preventDefault しない(ADR-0055 決定 6 追補 H-7a: IME
-        // バグ修正)。詳細は startTypedEdit のコメント参照。
-        startTypedEdit(row, col);
-      }
+      // 印字可能な 1 文字キー(Ctrl/Meta 併用のショートカットも含め)は
+      // ここでは何もしない。preventDefault しなければ、文字はそのまま常設
+      // input(このセル)に入り、下の handleCellInputChange の onChange が
+      // 非編集 → 編集への遷移を行う(ADR-0056 決定 1)。この input は最初
+      // からこのセルに focus されているため、IME もこの 1 打鍵目から正しい
+      // 変換コンテキストに乗る — <td> 経由の入力経路はもう存在しない。
     },
     [
       editing,
@@ -1358,25 +1547,17 @@ export function SheetView({
       cancelEdit,
       moveActiveCell,
       startEdit,
-      startTypedEdit,
       writeCells,
       undo,
     ],
   );
 
-  // 入力バグの根本原因(ADR-0055 決定 6): このハンドラは以前 <td> に付けて
-  // いた。フォーカスが <td> からその子である <input> へ移ると、ブラウザは
-  // (子孫であっても)<td> 自身の blur/focusout を発火させる。編集開始時に
-  // input へ focus() する実装と組み合わさり、「1 文字入力 → 即座に
-  // handleGridBlur が発火 → commitEdit でその 1 文字だけを書き込んで
-  // 編集終了 → 選択セルの focus 復帰で <td> にフォーカスが戻る」というサイ
-  // クルが**打鍵のたびに**回っていた。結果、複数文字(IME 変換中の文字列も
-  // 含む)を打っても直前の内容が毎回上書きされ、最後の 1 文字しか残らない
-  // (日本語 IME は変換確定の Enter でも同じ経路から即終了するため入力不可
-  // だった)。<input> 自身に付け替えることで、フォーカスが本当にセルの外へ
-  // 出たときだけ blur が発火するようにする。
   const handleInputBlur = useCallback(
     (row: number, col: number) => {
+      // 非編集(idle)セルの input からの blur では何もしない。idle 状態は
+      // 常に value="" のため誤って書き込まれる心配はないが、そもそも
+      // editing が一致しないので下の commitEdit まで到達しない
+      // (ADR-0056 決定 1)。
       if (!(editing && editing.row === row && editing.col === col)) return;
       if (skipNextBlurCommit.current) {
         skipNextBlurCommit.current = false;
@@ -1387,11 +1568,50 @@ export function SheetView({
     [editing, commitEdit],
   );
 
+  /** 常設 input の onChange(ADR-0056 決定 1/2)。非編集(idle)状態でこれが
+   * 呼ばれるのは、文字キーが input の既定動作でそのまま入力された場合
+   * (= 編集開始のきっかけ)。ここで初めて editing state を立てる。**入力値
+   * を一切加工しない**(制御 input の props と DOM 値を常に一致させ、React
+   * が変換中の preedit を消さないようにする、ADR-0056 決定 2)。 */
+  const handleCellInputChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>, row: number, col: number) => {
+      const value = event.target.value;
+      setEditing((prev) =>
+        prev && prev.row === row && prev.col === col ? { ...prev, value } : { row, col, value },
+      );
+    },
+    [],
+  );
+
+  /** IME 変換開始(ADR-0056 決定 2)。compositionstart の時点では input の
+   * DOM 値はまだ空(変換前の文字はこの直後にブラウザが挿入する)なので、
+   * ここで editing を立てても(まだ立っていなければ)変換中の文字を壊さ
+   * ない。 */
+  const handleCompositionStart = useCallback((row: number, col: number) => {
+    isComposingRef.current = true;
+    setEditing((prev) => (prev && prev.row === row && prev.col === col ? prev : { row, col, value: "" }));
+  }, []);
+
+  /** IME 変換確定(ADR-0056 決定 2)。確定後の input の DOM 値をそのまま
+   * editing.value へ反映する。 */
+  const handleCompositionEnd = useCallback(
+    (event: CompositionEvent<HTMLInputElement>) => {
+      isComposingRef.current = false;
+      const value = event.currentTarget.value;
+      setEditing((prev) => (prev ? { ...prev, value } : prev));
+    },
+    [],
+  );
+
   const handleGridCopy = useCallback(
     (event: ClipboardEvent<HTMLTableCellElement>, row: number, col: number) => {
       if (editing && editing.row === row && editing.col === col) return;
       event.preventDefault();
-      const rect = selection ? rangeOf(selection) : { r0: row, r1: row, c0: col, c1: col };
+      const selRect = selection ? rangeOf(selection) : { r0: row, r1: row, c0: col, c1: col };
+      // コピーは selectionRect(ブラウザのテキスト選択ではない)から TSV を
+      // 組み立てている。列全体・行全体選択では空セル分の大量行を入れない
+      // よう実データ範囲へ切り詰める(ADR-0055 決定 6 追補 H-8a)。
+      const rect = trimRectToData(selRect, cellsByKey) ?? { r0: row, r1: row, c0: col, c1: col };
       const lines: string[] = [];
       for (let r = rect.r0; r <= rect.r1; r++) {
         const line: string[] = [];
@@ -1449,12 +1669,14 @@ export function SheetView({
     (event: ReactMouseEvent<HTMLTableCellElement>, row: number, col: number) => {
       if (event.button !== 0) return;
       if (editing) return;
+      shouldFocusCellRef.current = true;
       const anchor = resolveMergeAnchor(row, col);
       if (event.shiftKey && selection) {
         setSelection({ anchor: selection.anchor, focus: anchor });
       } else {
         setSelection({ anchor, focus: anchor });
       }
+      dragModeRef.current = "cell";
       isSelectingRef.current = true;
     },
     [editing, selection, resolveMergeAnchor],
@@ -1462,12 +1684,81 @@ export function SheetView({
 
   const handleCellMouseEnter = useCallback(
     (row: number, col: number) => {
-      if (!isSelectingRef.current) return;
+      if (!isSelectingRef.current || dragModeRef.current !== "cell") return;
       const focus = resolveMergeAnchor(row, col);
       setSelection((prev) => (prev ? { anchor: prev.anchor, focus } : { anchor: focus, focus }));
     },
     [resolveMergeAnchor],
   );
+
+  // ---- 列全体・行全体の選択(ヘッダークリック/ドラッグ、ADR-0055 決定 6
+  // 追補 H-8a)。既存のセルドラッグ選択と同じ「mousedown で開始 → window の
+  // mouseup で終了」の仕組みに相乗りし、新しいグローバルリスナーは増やさ
+  // ない(dragModeRef でモードだけ切り替える)。 ----
+
+  const handleColHeadMouseDown = useCallback(
+    (event: ReactMouseEvent<HTMLTableCellElement>, col: number) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      shouldFocusCellRef.current = true;
+      if (event.shiftKey && selection) {
+        setSelection({
+          anchor: { row: 0, col: selection.anchor.col },
+          focus: { row: displayRows - 1, col },
+        });
+      } else {
+        setSelection({ anchor: { row: 0, col }, focus: { row: displayRows - 1, col } });
+      }
+      dragModeRef.current = "col";
+      isSelectingRef.current = true;
+    },
+    [selection, displayRows],
+  );
+
+  const handleColHeadMouseEnter = useCallback(
+    (col: number) => {
+      if (!isSelectingRef.current || dragModeRef.current !== "col") return;
+      setSelection((prev) =>
+        prev ? { anchor: prev.anchor, focus: { row: displayRows - 1, col } } : prev,
+      );
+    },
+    [displayRows],
+  );
+
+  const handleRowHeadMouseDown = useCallback(
+    (event: ReactMouseEvent<HTMLTableCellElement>, row: number) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      shouldFocusCellRef.current = true;
+      if (event.shiftKey && selection) {
+        setSelection({
+          anchor: { row: selection.anchor.row, col: 0 },
+          focus: { row, col: displayCols - 1 },
+        });
+      } else {
+        setSelection({ anchor: { row, col: 0 }, focus: { row, col: displayCols - 1 } });
+      }
+      dragModeRef.current = "row";
+      isSelectingRef.current = true;
+    },
+    [selection, displayCols],
+  );
+
+  const handleRowHeadMouseEnter = useCallback(
+    (row: number) => {
+      if (!isSelectingRef.current || dragModeRef.current !== "row") return;
+      setSelection((prev) =>
+        prev ? { anchor: prev.anchor, focus: { row, col: displayCols - 1 } } : prev,
+      );
+    },
+    [displayCols],
+  );
+
+  // 左上角クリックで全セル選択(Excel と同様、ADR-0055 決定 6 追補 H-8a)。
+  const selectAllCells = useCallback(() => {
+    shouldFocusCellRef.current = true;
+    setSelection({ anchor: { row: 0, col: 0 }, focus: { row: displayRows - 1, col: displayCols - 1 } });
+  }, [displayRows, displayCols]);
 
   const createSheet = useCallback(() => {
     const name = window.prompt(t.sheet.newSheetNamePrompt, t.sheet.newSheetDefaultName);
@@ -1561,7 +1852,6 @@ export function SheetView({
     );
   }
 
-  const rowIndexes = Array.from({ length: displayRows }, (_, i) => i);
   const colIndexes = Array.from({ length: displayCols }, (_, i) => i);
 
   const gridlines = activeSheet?.gridlines ?? true;
@@ -1573,6 +1863,229 @@ export function SheetView({
   // 参照、ADR-0055 決定 6 追補 H-7a)。
   const rowTopOffsets = measuredRowTopOffsets;
   const colLeftOffsets = measuredColLeftOffsets;
+
+  // 行の仮想化(ADR-0056 決定 5)。可視範囲 + オーバースキャンだけを描画
+  // する。列は最大 200 なので仮想化しない。
+  const headerHForWindow = theadRowRef.current?.offsetHeight ?? HEADER_ROW_HEIGHT;
+  const visibleTop = Math.max(0, scrollTop - headerHForWindow);
+  const visibleBottom = Math.max(0, scrollTop - headerHForWindow + viewportHeight);
+  let windowStart = rowIndexAtOffset(rowOffsets, displayRows, visibleTop);
+  let windowEnd = rowIndexAtOffset(rowOffsets, displayRows, visibleBottom) + 1;
+  windowStart = Math.max(0, windowStart - ROW_OVERSCAN);
+  windowEnd = Math.min(displayRows, windowEnd + ROW_OVERSCAN);
+  // 可視範囲に掛かる結合セルがあれば、その起点行まで含める・終点行まで
+  // 広げる(rowSpan がスペーサー行を食って崩れるのを防ぐ)。
+  for (const merge of merges) {
+    const mergeEnd = merge.row + merge.row_span;
+    if (merge.row < windowStart && mergeEnd > windowStart) windowStart = merge.row;
+    if (merge.row < windowEnd && mergeEnd > windowEnd) windowEnd = mergeEnd;
+  }
+  // 固定行([0, freezeRows) は下で別枠に常に描画するので、通常ウィンドウと
+  // 重複させない。
+  const renderStart = Math.max(windowStart, freezeRows);
+  const renderEnd = Math.max(windowEnd, renderStart);
+  const topSpacerHeight = rowOffsets[renderStart] - rowOffsets[freezeRows];
+  const bottomSpacerHeight = rowOffsets[displayRows] - rowOffsets[renderEnd];
+
+  // ステータスバーの選択範囲表示(ADR-0055 決定 6 追補 H-8a)。列全体選択
+  // なら "A:A"(複数列は "A:C")、行全体選択なら "1:1" と Excel 風に出す。
+  // それ以外(通常のセル範囲、全セル選択)は従来どおり "F3:F6" 形式。
+  let statusRangeText = "";
+  if (selectionRect) {
+    const spansAllRows = selectionRect.r0 === 0 && selectionRect.r1 === displayRows - 1;
+    const spansAllCols = selectionRect.c0 === 0 && selectionRect.c1 === displayCols - 1;
+    if (spansAllRows && !spansAllCols) {
+      statusRangeText = `${colLabel(selectionRect.c0)}:${colLabel(selectionRect.c1)}`;
+    } else if (spansAllCols && !spansAllRows) {
+      statusRangeText = `${selectionRect.r0 + 1}:${selectionRect.r1 + 1}`;
+    } else if (hasRangeSelection) {
+      statusRangeText = `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}:${colLabel(
+        selectionRect.c1,
+      )}${selectionRect.r1 + 1}`;
+    } else {
+      statusRangeText = `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}`;
+    }
+  }
+
+  /** 行 1 本分の <tr> を描画する(行の仮想化、ADR-0056 決定 5)。固定行の
+   * 常時描画・可視ウィンドウの両方から呼ばれる。 */
+  function renderRow(r: number) {
+    return (
+      <tr
+        key={r}
+        ref={(el) => {
+          if (el) rowElRefs.current.set(r, el);
+          else rowElRefs.current.delete(r);
+        }}
+        style={{ height: rowHeights.get(r) }}
+      >
+        <th
+          className={[
+            "sheet__row-head",
+            r < freezeRows && "sheet__row-head--frozen",
+            selectionRect !== null &&
+              r >= selectionRect.r0 &&
+              r <= selectionRect.r1 &&
+              "sheet__row-head--active",
+          ]
+            .filter(Boolean)
+            .join(" ")}
+          style={r < freezeRows ? { top: rowTopOffsets[r] } : undefined}
+          onMouseDown={(event) => handleRowHeadMouseDown(event, r)}
+          onMouseEnter={() => handleRowHeadMouseEnter(r)}
+        >
+          {r + 1}
+          <span
+            className="sheet__row-resize-handle"
+            title={t.sheet.resetToDefault}
+            onMouseDown={(event) => startRowResize(event, r)}
+            onDoubleClick={() => void resetLayout("row", r)}
+          />
+        </th>
+        {colIndexes.map((c) => {
+          const key = keyOf(r, c);
+          // 結合範囲内で左上以外のセルは td を描画しない
+          // (左上セルの colSpan/rowSpan がその領域を覆う)。
+          const merge = mergeCovered.get(key);
+          if (merge && (merge.row !== r || merge.col !== c)) return null;
+
+          const cell = cellsByKey.get(key);
+          const value = cell?.value ?? "";
+          const isFocusCell = selection?.focus.row === r && selection?.focus.col === c;
+          const inRange =
+            selectionRect !== null &&
+            r >= selectionRect.r0 &&
+            r <= selectionRect.r1 &&
+            c >= selectionRect.c0 &&
+            c <= selectionRect.c1;
+          const isEditingThis = editing?.row === r && editing?.col === c;
+          const isConflict = conflictHighlight.has(key);
+          const numeric = !isEditingThis && NUMERIC_RE.test(value);
+          const peersHere = presenceByCell.get(key);
+          const isSearchMatch = searchOpen && searchMatchKeys.has(key);
+          const isCurrentSearchMatch = searchOpen && currentSearchKey === key;
+          const isFrozenRow = r < freezeRows;
+          const isFrozenCol = c < freezeCols;
+          const cellStyle: CSSProperties = {
+            ...boxStyle(cell?.format, colWidths.get(c)),
+          };
+          if (isFrozenRow || isFrozenCol) {
+            cellStyle.position = "sticky";
+            if (isFrozenRow) cellStyle.top = rowTopOffsets[r];
+            if (isFrozenCol) cellStyle.left = colLeftOffsets[c];
+            // 固定行かつ固定列の交差セルは、片軸だけ固定のセル
+            // (.sheet__cell--frozen、CSS で z-index:3)より手前に
+            // 出す(ADR-0055 決定 6 追補 H-8a、下部の z-index 階層
+            // 表を参照)。
+            if (isFrozenRow && isFrozenCol) cellStyle.zIndex = 4;
+          }
+          if (peersHere && peersHere.length > 0) {
+            (cellStyle as Record<string, string>)["--presence-color"] =
+              presenceColor(peersHere[0].name);
+          }
+          return (
+            <td
+              key={c}
+              ref={(el) => {
+                if (el) cellRefs.current.set(key, el);
+                else cellRefs.current.delete(key);
+              }}
+              rowSpan={merge?.row_span}
+              colSpan={merge?.col_span}
+              style={cellStyle}
+              className={[
+                "sheet__cell",
+                isFocusCell && "sheet__cell--selected",
+                inRange && !isFocusCell && "sheet__cell--in-range",
+                numeric && "sheet__cell--numeric",
+                isConflict && "sheet__cell--conflict",
+                (isFrozenRow || isFrozenCol) && "sheet__cell--frozen",
+                peersHere && peersHere.length > 0 && "sheet__cell--presence",
+                isSearchMatch && "sheet__cell--search-match",
+                isCurrentSearchMatch && "sheet__cell--search-current",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              onMouseDown={(event) => handleCellMouseDown(event, r, c)}
+              onMouseEnter={() => handleCellMouseEnter(r, c)}
+              onDoubleClick={() => startEdit(r, c, null)}
+              onCopy={(event) => handleGridCopy(event, r, c)}
+              onPaste={(event) => handleGridPaste(event, r, c)}
+              onContextMenu={(event) => openCellMenu(event, r, c)}
+            >
+              {/* 選択セルには常設 input を置く(ADR-0056 決定 1)。編集中か
+                  どうかに関わらずマウントし、非編集時は opacity:0 +
+                  pointer-events:none で値の <span> の上に重ねる。IME の
+                  変換コンテキストはキー押下時にフォーカスしている要素に
+                  対して確立されるため、この input が常に存在することで
+                  1 打鍵目から正しく IME に渡る(<td> 経由で入力を受ける
+                  経路はもう存在しない)。 */}
+              {isFocusCell && (
+                <input
+                  ref={setInputRef}
+                  className={
+                    isEditingThis
+                      ? "sheet__cell-input"
+                      : "sheet__cell-input sheet__cell-input--idle"
+                  }
+                  style={isEditingThis ? textStyle(cell?.format) : undefined}
+                  value={isEditingThis ? editing.value : ""}
+                  readOnly={readOnlyReason !== null}
+                  onFocus={() => {
+                    gridInputFocusedRef.current = true;
+                  }}
+                  onChange={(event) => handleCellInputChange(event, r, c)}
+                  onKeyDown={(event) => handleGridKeyDown(event, r, c)}
+                  // blur は <td> ではなく <input> 自身に付ける(理由は
+                  // handleInputBlur 定義側のコメント参照)
+                  onBlur={() => handleInputBlur(r, c)}
+                  onCompositionStart={() => handleCompositionStart(r, c)}
+                  onCompositionEnd={handleCompositionEnd}
+                />
+              )}
+              {!isEditingThis && (
+                <span className="sheet__cell-value" style={textStyle(cell?.format)}>
+                  {value}
+                </span>
+              )}
+              {peersHere && peersHere.length > 0 && (
+                <span className="sheet__presence-badge">
+                  {peersHere.map((peer) => peer.name).join(", ")}
+                </span>
+              )}
+            </td>
+          );
+        })}
+      </tr>
+    );
+  }
+
+  // フォーカス行が virtualization ウィンドウ外へ出て常設 input がアンマウント
+  // されたとき、テーブル容器(tabIndex=-1)へ focus が退避してくる
+  // (setInputRef 参照)。ここでは矢印キーだけを拾って選択を動かし、選択が
+  // 可視範囲へ戻れば input が再マウントされて通常の focus 追従に復帰する
+  // (ADR-0056 決定 5)。
+  function handleTableWrapKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (!selection) return;
+    const arrowMap: Record<string, "up" | "down" | "left" | "right"> = {
+      ArrowUp: "up",
+      ArrowDown: "down",
+      ArrowLeft: "left",
+      ArrowRight: "right",
+    };
+    if (!(event.key in arrowMap)) return;
+    event.preventDefault();
+    shouldFocusCellRef.current = true;
+    moveActiveCell(arrowMap[event.key], selection.focus.row, selection.focus.col, event.shiftKey);
+    // scrollRowIntoView(moveActiveCell 内)で設定した scrollTop が scroll
+    // イベント経由で state に反映され、仮想化ウィンドウが再計算されて着地
+    // セルの input が実際にマウントされるまで 1 フレーム遅れることがある。
+    // 遅れた場合に備え、次フレームでも focus を試みる(間に合っていれば
+    // 二重に focus() するだけで無害)。
+    window.requestAnimationFrame(() => {
+      if (shouldFocusCellRef.current) inputRef.current?.focus();
+    });
+  }
 
   /** 右クリックメニューの項目(ADR-0055 決定 6)。 */
   function buildCellMenuItems(menu: { row: number; col: number }): ContextMenuEntry[] {
@@ -1903,6 +2416,12 @@ export function SheetView({
             className="sheet__search-input"
             placeholder={t.sheet.searchPlaceholder}
             value={searchQuery}
+            // 検索バーへ手動でクリックしたときも、セル選択の追従 focus に
+            // 奪われないようにする(ADR-0056 決定 1 追補、Ctrl+F ハンドラの
+            // 対処と同じ理由)。
+            onFocus={() => {
+              shouldFocusCellRef.current = false;
+            }}
             onChange={(event) => setSearchQuery(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
@@ -1959,7 +2478,16 @@ export function SheetView({
           </button>
         </div>
       ) : activeSheet ? (
-        <div className="sheet__table-wrap card">
+        <div
+          className="sheet__table-wrap card"
+          ref={setTableWrapRef}
+          onScroll={handleTableScroll}
+          // 常設 input が仮想化ウィンドウ外へ出てアンマウントされたときの
+          // focus 退避先(setInputRef 参照、ADR-0056 決定 5)。Tab 順には
+          // 出さず(-1)、プログラムからの focus() だけ受け付ける。
+          tabIndex={-1}
+          onKeyDown={handleTableWrapKeyDown}
+        >
           <table
             className={
               gridlines ? "sheet__table" : "sheet__table sheet__table--no-gridlines"
@@ -1967,7 +2495,12 @@ export function SheetView({
           >
             <thead>
               <tr ref={theadRowRef}>
-                <th className="sheet__corner" ref={cornerRef} />
+                <th
+                  className="sheet__corner"
+                  ref={cornerRef}
+                  onClick={selectAllCells}
+                  title={t.sheet.selectAllTitle}
+                />
                 {colIndexes.map((c) => (
                   <th
                     key={c}
@@ -1975,8 +2508,22 @@ export function SheetView({
                       if (el) colHeadElRefs.current.set(c, el);
                       else colHeadElRefs.current.delete(c);
                     }}
-                    className="sheet__col-head"
-                    style={boxStyle(undefined, colWidths.get(c))}
+                    className={[
+                      "sheet__col-head",
+                      c < freezeCols && "sheet__col-head--frozen",
+                      selectionRect !== null &&
+                        c >= selectionRect.c0 &&
+                        c <= selectionRect.c1 &&
+                        "sheet__col-head--active",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    style={{
+                      ...boxStyle(undefined, colWidths.get(c)),
+                      ...(c < freezeCols ? { left: colLeftOffsets[c] } : {}),
+                    }}
+                    onMouseDown={(event) => handleColHeadMouseDown(event, c)}
+                    onMouseEnter={() => handleColHeadMouseEnter(c)}
                   >
                     {colLabel(c)}
                     <span
@@ -1990,129 +2537,25 @@ export function SheetView({
               </tr>
             </thead>
             <tbody>
-              {rowIndexes.map((r) => (
-                <tr
-                  key={r}
-                  ref={(el) => {
-                    if (el) rowElRefs.current.set(r, el);
-                    else rowElRefs.current.delete(r);
-                  }}
-                  style={{ height: rowHeights.get(r) }}
-                >
-                  <th className="sheet__row-head">
-                    {r + 1}
-                    <span
-                      className="sheet__row-resize-handle"
-                      title={t.sheet.resetToDefault}
-                      onMouseDown={(event) => startRowResize(event, r)}
-                      onDoubleClick={() => void resetLayout("row", r)}
-                    />
-                  </th>
-                  {colIndexes.map((c) => {
-                    const key = keyOf(r, c);
-                    // 結合範囲内で左上以外のセルは td を描画しない
-                    // (左上セルの colSpan/rowSpan がその領域を覆う)。
-                    const merge = mergeCovered.get(key);
-                    if (merge && (merge.row !== r || merge.col !== c)) return null;
-
-                    const cell = cellsByKey.get(key);
-                    const value = cell?.value ?? "";
-                    const isFocusCell =
-                      selection?.focus.row === r && selection?.focus.col === c;
-                    const inRange =
-                      selectionRect !== null &&
-                      r >= selectionRect.r0 &&
-                      r <= selectionRect.r1 &&
-                      c >= selectionRect.c0 &&
-                      c <= selectionRect.c1;
-                    const isEditingThis = editing?.row === r && editing?.col === c;
-                    const isConflict = conflictHighlight.has(key);
-                    const numeric = !isEditingThis && NUMERIC_RE.test(value);
-                    const peersHere = presenceByCell.get(key);
-                    const isSearchMatch = searchOpen && searchMatchKeys.has(key);
-                    const isCurrentSearchMatch = searchOpen && currentSearchKey === key;
-                    const isFrozenRow = r < freezeRows;
-                    const isFrozenCol = c < freezeCols;
-                    const cellStyle: CSSProperties = {
-                      ...boxStyle(cell?.format, colWidths.get(c)),
-                    };
-                    if (isFrozenRow || isFrozenCol) {
-                      cellStyle.position = "sticky";
-                      if (isFrozenRow) cellStyle.top = rowTopOffsets[r];
-                      if (isFrozenCol) cellStyle.left = colLeftOffsets[c];
-                    }
-                    if (peersHere && peersHere.length > 0) {
-                      (cellStyle as Record<string, string>)["--presence-color"] =
-                        presenceColor(peersHere[0].name);
-                    }
-                    return (
-                      <td
-                        key={c}
-                        ref={(el) => {
-                          if (el) cellRefs.current.set(key, el);
-                          else cellRefs.current.delete(key);
-                        }}
-                        tabIndex={0}
-                        rowSpan={merge?.row_span}
-                        colSpan={merge?.col_span}
-                        style={cellStyle}
-                        className={[
-                          "sheet__cell",
-                          isFocusCell && "sheet__cell--selected",
-                          inRange && !isFocusCell && "sheet__cell--in-range",
-                          numeric && "sheet__cell--numeric",
-                          isConflict && "sheet__cell--conflict",
-                          (isFrozenRow || isFrozenCol) && "sheet__cell--frozen",
-                          peersHere && peersHere.length > 0 && "sheet__cell--presence",
-                          isSearchMatch && "sheet__cell--search-match",
-                          isCurrentSearchMatch && "sheet__cell--search-current",
-                        ]
-                          .filter(Boolean)
-                          .join(" ")}
-                        onMouseDown={(event) => handleCellMouseDown(event, r, c)}
-                        onMouseEnter={() => handleCellMouseEnter(r, c)}
-                        onDoubleClick={() => startEdit(r, c, null)}
-                        onKeyDown={(event) => handleGridKeyDown(event, r, c)}
-                        onCopy={(event) => handleGridCopy(event, r, c)}
-                        onPaste={(event) => handleGridPaste(event, r, c)}
-                        onContextMenu={(event) => openCellMenu(event, r, c)}
-                      >
-                        {isEditingThis ? (
-                          <input
-                            ref={inputRef}
-                            className="sheet__cell-input"
-                            style={textStyle(cell?.format)}
-                            value={editing.value}
-                            onChange={(event) =>
-                              setEditing((prev) =>
-                                prev ? { ...prev, value: event.target.value } : prev,
-                              )
-                            }
-                            // blur は <td> ではなく <input> 自身に付ける(理由は
-                            // handleInputBlur 定義側のコメント参照)
-                            onBlur={() => handleInputBlur(r, c)}
-                            onCompositionStart={() => {
-                              isComposingRef.current = true;
-                            }}
-                            onCompositionEnd={() => {
-                              isComposingRef.current = false;
-                            }}
-                          />
-                        ) : (
-                          <span className="sheet__cell-value" style={textStyle(cell?.format)}>
-                            {value}
-                          </span>
-                        )}
-                        {peersHere && peersHere.length > 0 && (
-                          <span className="sheet__presence-badge">
-                            {peersHere.map((peer) => peer.name).join(", ")}
-                          </span>
-                        )}
-                      </td>
-                    );
-                  })}
+              {/* 固定行は仮想化の対象外で常に描画する(ADR-0056 決定 5)。 */}
+              {Array.from({ length: freezeRows }, (_, r) => renderRow(r))}
+              {topSpacerHeight > 0 && (
+                <tr className="sheet__spacer">
+                  <td
+                    colSpan={displayCols + 1}
+                    style={{ height: topSpacerHeight, padding: 0, border: "none" }}
+                  />
                 </tr>
-              ))}
+              )}
+              {Array.from({ length: renderEnd - renderStart }, (_, i) => renderRow(renderStart + i))}
+              {bottomSpacerHeight > 0 && (
+                <tr className="sheet__spacer">
+                  <td
+                    colSpan={displayCols + 1}
+                    style={{ height: bottomSpacerHeight, padding: 0, border: "none" }}
+                  />
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -2124,15 +2567,7 @@ export function SheetView({
         // 複数選択との切り替えでツールバーが出たり消えたりして
         // グリッドが上下にずれる問題を無くす。
         <div className="sheet__status-bar">
-          <span className="sheet__status-bar-range">
-            {selectionRect
-              ? hasRangeSelection
-                ? `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}:${colLabel(
-                    selectionRect.c1,
-                  )}${selectionRect.r1 + 1}`
-                : `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}`
-              : ""}
-          </span>
+          <span className="sheet__status-bar-range">{statusRangeText}</span>
         </div>
       )}
 
