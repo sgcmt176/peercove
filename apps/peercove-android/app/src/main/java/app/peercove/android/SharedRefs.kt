@@ -166,8 +166,16 @@ private suspend fun resolveSharedRef(
     }
 }
 
-// 解決結果は slug::種別:id ごとに使い回す(表示のたびに引き直さない)。
-private val sharedRefCache = ConcurrentHashMap<String, SharedRefResolved?>()
+// 解決結果は slug::種別:id ごとに使い回すが、TTL を超えたら引き直す
+// (M6 H-9 追補)。以前は無期限キャッシュだったため、メモを改名しても
+// カードが旧タイトルのまま/ゴミ箱から復元しても「アクセスできない」の
+// ままになる不整合が起きていた(デスクトップは変更世代ベースで失効させて
+// いるが、モバイルは世代の配線が無いので TTL で近似する。失効後も旧値を
+// 表示したまま裏で再解決し、ちらつきは出さない)。
+private data class SharedRefCacheEntry(val value: SharedRefResolved?, val at: Long)
+
+private const val SHARED_REF_TTL_MS = 15_000L
+private val sharedRefCache = ConcurrentHashMap<String, SharedRefCacheEntry>()
 
 /** チャットの `@memo:id` カード(M5 F-5 Stage 4、ADR-0052 決定 1)。 */
 @Composable
@@ -180,17 +188,21 @@ fun SharedRefCard(
 ) {
     val key = "$slug::${token.kind.prefix}:${token.id}"
     var loading by remember(key) { mutableStateOf(!sharedRefCache.containsKey(key)) }
-    var resolved by remember(key) { mutableStateOf(sharedRefCache[key]) }
+    var resolved by remember(key) { mutableStateOf(sharedRefCache[key]?.value) }
     val allDayLabel = stringResource(R.string.schedule_all_day)
     val updatedFmt = stringResource(R.string.sheet_ref_updated)
     LaunchedEffect(key) {
-        if (sharedRefCache.containsKey(key)) {
-            resolved = sharedRefCache[key]
+        val cached = sharedRefCache[key]
+        if (cached != null) {
+            resolved = cached.value
             loading = false
-            return@LaunchedEffect
+            if (System.currentTimeMillis() - cached.at < SHARED_REF_TTL_MS) {
+                return@LaunchedEffect
+            }
+            // TTL 切れ: 旧値を出したまま下で再解決する
         }
         val value = resolveSharedRef(baseDir, slug, token, allDayLabel, updatedFmt)
-        sharedRefCache[key] = value
+        sharedRefCache[key] = SharedRefCacheEntry(value, System.currentTimeMillis())
         resolved = value
         loading = false
     }

@@ -677,6 +677,7 @@ export function ChatPanel({
               transfers={tunnel.transfers}
               sendingSeqs={sendingSeqs}
               configPath={tunnel.config}
+              refSeq={tunnel.sharedMemoSeq}
               onOpenRef={onOpenRef}
               onResend={(seq) =>
                 void api
@@ -1247,6 +1248,7 @@ function linkify(text: string, myName: string, memberNames: string[]): ReactNode
 function renderMessageBody(
   text: string,
   configPath: string,
+  refSeq: number,
   onOpenRef: (kind: SharedRefKind, id: string) => void,
   myName: string,
   memberNames: string[],
@@ -1259,6 +1261,7 @@ function renderMessageBody(
         key={index}
         configPath={configPath}
         token={part.token}
+        seq={refSeq}
         onOpen={() => onOpenRef(part.token.kind, part.token.id)}
       />
     ) : (
@@ -1275,13 +1278,16 @@ function renderMessageBody(
 function SharedRefCard({
   configPath,
   token,
+  seq,
   onOpen,
 }: {
   configPath: string;
   token: SharedRefTokenValue;
+  /** 共有データの変更世代(キャッシュ失効用、M6 H-9 追補)。 */
+  seq: number;
   onOpen: () => void;
 }) {
-  const resolved = useSharedRefResolve(configPath, token);
+  const resolved = useSharedRefResolve(configPath, token, seq);
   if (resolved === undefined) {
     return (
       <span className="msg__ref msg__ref--loading">
@@ -1415,6 +1421,7 @@ function Bubbles({
   onCancelSend,
   onOpenText,
   configPath,
+  refSeq,
   onOpenRef,
 }: {
   messages: ChatMessage[];
@@ -1429,6 +1436,9 @@ function Bubbles({
   onEnlarge: (src: string, name: string) => void;
   onOpenText: (name: string, preview: TextPreview) => void;
   configPath: string;
+  /** 共有データの変更世代(Tunnel.sharedMemoSeq)。カードの解決キャッシュの
+   * 失効判定に使う(M6 H-9 追補)。 */
+  refSeq: number;
   /** 本文中の `@memo:id` / `@schedule:id` カードをクリックしたときの遷移先。 */
   onOpenRef: (kind: SharedRefKind, id: string) => void;
 }) {
@@ -1460,7 +1470,7 @@ function Bubbles({
               // グループ操作・メンションのお知らせ(ADR-0055 決定 1d の
               // ローカルお知らせ行も同じ形。`@memo:id` はカード化される — LINE 風)
               <div className="chat__system">
-                {renderMessageBody(message.text, configPath, onOpenRef, myName, memberNames)}
+                {renderMessageBody(message.text, configPath, refSeq, onOpenRef, myName, memberNames)}
               </div>
             ) : (
               <div className={own ? "msg msg--own" : "msg"}>
@@ -1501,6 +1511,7 @@ function Bubbles({
                         {renderMessageBody(
                           message.text,
                           configPath,
+                          refSeq,
                           onOpenRef,
                           myName,
                           memberNames,

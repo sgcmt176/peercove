@@ -181,41 +181,54 @@ export function splitSharedRefs(text: string): SharedRefPart[] {
   return parts;
 }
 
-// 解決結果は configPath::種別:id ごとに使い回す(表示のたびに引き直さない)。
-const resolveCache = new Map<string, SharedRefResolved | null>();
+// 解決結果は configPath::種別:id ごとに使い回すが、共有データの変更世代
+// (Tunnel.sharedMemoSeq)が進んだら引き直す(M6 H-9 追補)。以前は無期限
+// キャッシュだったため、(1) メモを改名してもチャットのカードが旧タイトル
+// のまま、(2) ゴミ箱から復元しても「アクセスできない」表示のまま、という
+// 不整合が起きていた。世代が進んだときは旧値を表示したまま裏で再解決する
+// (カードが一瞬「読み込み中」に戻るちらつきを避ける)。
+const resolveCache = new Map<string, { gen: number; value: SharedRefResolved | null }>();
+// 進行中の解決は「キー + 世代」単位で共有する(古い世代の取得結果を新しい
+// 世代のキャッシュとして保存しないため)。
 const resolvePending = new Map<string, Promise<SharedRefResolved | null>>();
 
-/** 参照子カードの内容を解決する(表示時に自分の権限で。失敗・権限なしは null)。 */
+/** 参照子カードの内容を解決する(表示時に自分の権限で。失敗・権限なしは null)。
+ * `generation` には Tunnel.sharedMemoSeq を渡す。 */
 export function useSharedRefResolve(
   configPath: string,
   token: SharedRefTokenValue,
+  generation: number,
 ): SharedRefResolved | null | undefined {
   const key = `${configPath}::${token.kind}:${token.id}`;
-  const [data, setData] = useState<SharedRefResolved | null | undefined>(() =>
-    resolveCache.get(key),
+  const [data, setData] = useState<SharedRefResolved | null | undefined>(
+    () => resolveCache.get(key)?.value,
   );
   useEffect(() => {
-    if (resolveCache.has(key)) {
-      setData(resolveCache.get(key));
-      return;
-    }
+    const cached = resolveCache.get(key);
+    if (cached) setData(cached.value);
+    if (cached && cached.gen === generation) return;
     let alive = true;
-    let pending = resolvePending.get(key);
+    const pendingKey = `${key}@@${generation}`;
+    let pending = resolvePending.get(pendingKey);
     if (!pending) {
       pending = SHARED_REF_KINDS[token.kind]
         .resolve(configPath, token.id)
         .catch(() => null);
-      resolvePending.set(key, pending);
+      resolvePending.set(pendingKey, pending);
     }
     void pending.then((resolved) => {
-      resolveCache.set(key, resolved);
-      resolvePending.delete(key);
-      if (alive) setData(resolved);
+      // 既により新しい世代の結果が入っていたら上書きしない
+      const latest = resolveCache.get(key);
+      if (!latest || latest.gen <= generation) {
+        resolveCache.set(key, { gen: generation, value: resolved });
+      }
+      resolvePending.delete(pendingKey);
+      if (alive) setData(resolveCache.get(key)?.value);
     });
     return () => {
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
+  }, [key, generation]);
   return data;
 }
