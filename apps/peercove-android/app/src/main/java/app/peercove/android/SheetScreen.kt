@@ -33,8 +33,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.MoreVert
@@ -95,15 +96,12 @@ import uniffi.peercove_mobile.sheetWrite
 private const val MAX_SHEET_ROWS = 1024
 private const val MAX_SHEET_COLS = 200
 
-// スマホの幅ではデスクトップより控えめな最小表示範囲(仕様どおり最低 10 行 × 5 列)。
-// ADR-0056 は「LazyColumn なら 1024/26 へ引き上げ」としていたが、本画面は
-// LazyColumn ではなく Column + verticalScroll(このファイル冒頭の SheetTab
-// 参照)で全行を一度に composition しているため、表示既定を引き上げると
-// 1024 行 × 26 列 ≒ 2.6 万セルを常時 compose して確実に固まる。そのため
-// ここは上限(MAX_SHEET_ROWS/MAX_SHEET_COLS)だけ追随させ、表示既定は
-// 据え置く(実装時の判断: 作業報告参照。Android 側の行仮想化は別タスク)。
-private const val MIN_DISPLAY_ROWS = 10
-private const val MIN_DISPLAY_COLS = 5
+// ADR-0056 の既定(1024 行 × 26 列)。以前は Column + verticalScroll で全行を
+// 一度に composition しており、既定を引き上げると 2.6 万セルを常時 compose
+// して固まるため据え置いていたが、行を LazyColumn 化(下記 SheetTab 参照)
+// して可視行だけを compose するようにしたため解消した(M6 H-10b)。
+private const val MIN_DISPLAY_ROWS = 1024
+private const val MIN_DISPLAY_COLS = 26
 private const val DISPLAY_MARGIN = 2
 
 private val HEADER_COL_WIDTH = 40.dp
@@ -605,13 +603,24 @@ fun SheetTab(
             }
         } else if (activeSheet != null) {
             val gridlines = activeSheet.gridlines
+            // 総幅 = 行番号列 + 表示列の幅の合計(列ヘッダー行・LazyColumn の
+            // 両方をこの幅に固定し、外側の 1 個の horizontalScroll で両方を
+            // 一緒にスクロールさせる = 行ごとに horizontalScroll を付けない)。
+            val totalWidth = remember(colWidthPx, displayCols) {
+                (0 until displayCols).fold(HEADER_COL_WIDTH) { acc, c -> acc + colWidthFor(c) }
+            }
+            // 列ヘッダーは LazyColumn の「外」(上)に置いて常時表示にする。
+            // stickyHeader(LazyListScope)も選択肢だが、@OptIn(ExperimentalFoundationApi)
+            // が要ることに対し、こちらは Column で縦に並べるだけで済み実装・
+            // 可読性ともに簡単なためこちらを採用(M6 H-10b 実装時の判断)。
+            // ヘッダーと本体(LazyColumn)を同じ horizontalScroll の Column に
+            // 収めることで、横スクロール位置は常に一致する。
             Column(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
                     .padding(top = 4.dp)
                     .background(SHEET_PAPER_BG)
-                    .verticalScroll(rememberScrollState())
                     .horizontalScroll(rememberScrollState()),
             ) {
                 Row {
@@ -626,117 +635,137 @@ fun SheetTab(
                         )
                     }
                 }
-                for (r in 0 until displayRows) {
-                    val rowHeight = rowHeightFor(r)
-                    Row {
-                        SheetGridCell(
-                            text = (r + 1).toString(),
-                            width = HEADER_COL_WIDTH,
-                            height = rowHeight,
-                            isHeader = true,
-                            gridlines = gridlines,
-                        )
-                        // 検証観点(タップ→セル編集の対応):
-                        // 1) 先頭行・先頭列(A1)タップで row=0,col=0 が開くこと
-                        // 2) 結合セル内側・周辺のタップで結合の左上セルの row/col になること
-                        // 3) 横スクロール後のタップでも(ピクセル座標からの逆算を行わないため)
-                        //    ずれが生じないこと
-                        // いずれも各セル生成時に val で固定した row/col をラムダに
-                        // キャプチャさせる方式(下記 cellRow/cellCol)で担保している。
-                        var c = 0
-                        while (c < displayCols) {
-                            val merge = mergeCovered[r to c]
-                            when {
-                                merge != null && merge.row.toInt() == r && merge.col.toInt() == c -> {
-                                    // 結合の左上セル: スパン分の幅・高さを与える(簡易実装)
-                                    val spanEndCol = (merge.col + merge.colSpan).toInt().coerceAtMost(displayCols)
-                                    val spanWidth = (merge.col.toInt() until spanEndCol).fold(0.dp) { acc, col ->
-                                        acc + colWidthFor(col)
+                // 行の仮想化(M6 H-10b、ADR-0056 の Android 追随)。可視行だけを
+                // compose するため、1024 行 × 26 列でもスクロール中に固まらない。
+                // 幅は totalWidth に固定(fillMaxWidth にすると horizontalScroll の
+                // 無限幅制約でクラッシュするため)。
+                // weight(1f)(fillMaxHeight ではなく): Column は非 weight の子(ヘッダー Row)を
+                // 先に測ってから、残りの縦幅を weight の子に配分する。fillMaxHeight だと
+                // ヘッダー分の高さがはみ出し、グリッド下端が見切れてしまうため weight を使う。
+                LazyColumn(modifier = Modifier.width(totalWidth).weight(1f)) {
+                    items(count = displayRows, key = { it }) { r ->
+                        val rowHeight = rowHeightFor(r)
+                        Row {
+                            SheetGridCell(
+                                text = (r + 1).toString(),
+                                width = HEADER_COL_WIDTH,
+                                height = rowHeight,
+                                isHeader = true,
+                                gridlines = gridlines,
+                            )
+                            // 検証観点(タップ→セル編集の対応):
+                            // 1) 先頭行・先頭列(A1)タップで row=0,col=0 が開くこと
+                            // 2) 結合セル内側・周辺のタップで結合の左上セルの row/col になること
+                            // 3) 横スクロール後のタップでも(ピクセル座標からの逆算を行わないため)
+                            //    ずれが生じないこと
+                            // いずれも各セル生成時に val で固定した row/col をラムダに
+                            // キャプチャさせる方式(下記 cellRow/cellCol)で担保している。
+                            var c = 0
+                            while (c < displayCols) {
+                                val merge = mergeCovered[r to c]
+                                when {
+                                    merge != null && merge.row.toInt() == r && merge.col.toInt() == c -> {
+                                        // 結合の左上セル: スパン分の幅・高さを与える(簡易実装)。
+                                        // 行またぎ(rowSpan)の場合、LazyColumn では行アイテムの外へ
+                                        // 描画できないため、内容はこの先頭行の左上セルにだけ表示し、
+                                        // 2 行目以降の被結合セルは下の分岐で「上辺の罫線を消した
+                                        // 空セル」として描画する(既知の制限。docs/user-guide.md 参照)。
+                                        val spanEndCol = (merge.col + merge.colSpan).toInt().coerceAtMost(displayCols)
+                                        val spanWidth = (merge.col.toInt() until spanEndCol).fold(0.dp) { acc, col ->
+                                            acc + colWidthFor(col)
+                                        }
+                                        val spanEndRow = (merge.row + merge.rowSpan).toInt()
+                                        val spanHeight = (merge.row.toInt() until spanEndRow).fold(0.dp) { acc, row ->
+                                            acc + rowHeightFor(row)
+                                        }
+                                        // バグ修正: r は items のラムダ引数として行ごとに新しい
+                                        // val なので安全だが、c は while ループの外で
+                                        // `var c = 0` として宣言され、以後 `c += 1` / `c = spanEndCol`
+                                        // で使い回される単一の可変変数。以前は onClick ラムダが
+                                        // この c を直接キャプチャしていたため、Compose がラムダを
+                                        // 実際に呼び出す(タップされた)時点では、その行の while ループが
+                                        // 既に完走して c は行内の最終列まで進んだ後の値になっており、
+                                        // 行内のどのセルをタップしても同じ(誤った)列が編集されていた。
+                                        // 修正: 各セルの生成時点の row/col を val に固定してからラムダに
+                                        // キャプチャさせることで、後続のループ進行の影響を受けないようにする。
+                                        val cellRow = r
+                                        val cellCol = c
+                                        val cell = cellsByKey[r.toUInt() to c.toUInt()]
+                                        val value = cell?.value ?: ""
+                                        // JSON 解析(parseCellFormat)は書式が変わらない限り
+                                        // 再実行しない(スクロールで行が再 compose されるたびに
+                                        // 全セル分パースし直すのを避ける = M6 H-10b 性能対応)。
+                                        val format = remember(cell?.format) { parseCellFormat(cell?.format ?: "") }
+                                        SheetGridCell(
+                                            text = value,
+                                            width = spanWidth,
+                                            height = spanHeight,
+                                            numeric = value.isNotEmpty() && SHEET_NUMERIC_RE.matches(value),
+                                            format = format,
+                                            gridlines = gridlines,
+                                            onClick = {
+                                                cellDialog = SheetCellDialogState(
+                                                    row = cellRow.toUInt(),
+                                                    col = cellCol.toUInt(),
+                                                    revision = cell?.revision ?: 0uL,
+                                                    value = value,
+                                                )
+                                            },
+                                        )
+                                        c = spanEndCol
                                     }
-                                    val spanEndRow = (merge.row + merge.rowSpan).toInt()
-                                    val spanHeight = (merge.row.toInt() until spanEndRow).fold(0.dp) { acc, row ->
-                                        acc + rowHeightFor(row)
+                                    merge != null && merge.row.toInt() == r -> {
+                                        // 同じ行の内包セル(左上セルの幅に含まれるためスキップ)
+                                        c += 1
                                     }
-                                    // バグ修正: r は for ループの反復ごとに新しい val として
-                                    // 束縛されるため安全だが、c は while ループの外で
-                                    // `var c = 0` として宣言され、以後 `c += 1` / `c = spanEndCol`
-                                    // で使い回される単一の可変変数。以前は onClick ラムダが
-                                    // この c を直接キャプチャしていたため、Compose がラムダを
-                                    // 実際に呼び出す(タップされた)時点では、その行の while ループが
-                                    // 既に完走して c は行内の最終列まで進んだ後の値になっており、
-                                    // 行内のどのセルをタップしても同じ(誤った)列が編集されていた。
-                                    // 修正: 各セルの生成時点の row/col を val に固定してからラムダに
-                                    // キャプチャさせることで、後続のループ進行の影響を受けないようにする。
-                                    val cellRow = r
-                                    val cellCol = c
-                                    val cell = cellsByKey[r.toUInt() to c.toUInt()]
-                                    val value = cell?.value ?: ""
-                                    val format = parseCellFormat(cell?.format ?: "")
-                                    SheetGridCell(
-                                        text = value,
-                                        width = spanWidth,
-                                        height = spanHeight,
-                                        numeric = value.isNotEmpty() && SHEET_NUMERIC_RE.matches(value),
-                                        format = format,
-                                        gridlines = gridlines,
-                                        onClick = {
-                                            cellDialog = SheetCellDialogState(
-                                                row = cellRow.toUInt(),
-                                                col = cellCol.toUInt(),
-                                                revision = cell?.revision ?: 0uL,
-                                                value = value,
-                                            )
-                                        },
-                                    )
-                                    c = spanEndCol
-                                }
-                                merge != null && merge.row.toInt() == r -> {
-                                    // 同じ行の内包セル(左上セルの幅に含まれるためスキップ)
-                                    c += 1
-                                }
-                                merge != null -> {
-                                    // 結合範囲内・別の行(縦方向の内包セル): 空欄で埋める(簡易実装)
-                                    SheetGridCell(
-                                        text = "",
-                                        width = colWidthFor(c),
-                                        height = rowHeight,
-                                        gridlines = gridlines,
-                                    )
-                                    c += 1
-                                }
-                                else -> {
-                                    // 上の結合セル分岐と同じ理由(c は while ループを跨いで
-                                    // 使い回される可変変数)で、タップ時に確定させたい
-                                    // row/col を val に固定してからラムダにキャプチャさせる。
-                                    val cellRow = r
-                                    val cellCol = c
-                                    val cell = cellsByKey[r.toUInt() to c.toUInt()]
-                                    val value = cell?.value ?: ""
-                                    val format = parseCellFormat(cell?.format ?: "")
-                                    SheetGridCell(
-                                        text = value,
-                                        width = colWidthFor(c),
-                                        height = rowHeight,
-                                        numeric = value.isNotEmpty() && SHEET_NUMERIC_RE.matches(value),
-                                        format = format,
-                                        gridlines = gridlines,
-                                        onClick = {
-                                            cellDialog = SheetCellDialogState(
-                                                row = cellRow.toUInt(),
-                                                col = cellCol.toUInt(),
-                                                revision = cell?.revision ?: 0uL,
-                                                value = value,
-                                            )
-                                        },
-                                    )
-                                    c += 1
+                                    merge != null -> {
+                                        // 結合範囲内・別の行(縦方向の内包セル、行またぎ結合の
+                                        // 2 行目以降): 空欄で埋める(簡易実装、既知の制限)
+                                        SheetGridCell(
+                                            text = "",
+                                            width = colWidthFor(c),
+                                            height = rowHeight,
+                                            gridlines = gridlines,
+                                        )
+                                        c += 1
+                                    }
+                                    else -> {
+                                        // 上の結合セル分岐と同じ理由(c は while ループを跨いで
+                                        // 使い回される可変変数)で、タップ時に確定させたい
+                                        // row/col を val に固定してからラムダにキャプチャさせる。
+                                        val cellRow = r
+                                        val cellCol = c
+                                        val cell = cellsByKey[r.toUInt() to c.toUInt()]
+                                        val value = cell?.value ?: ""
+                                        val format = remember(cell?.format) { parseCellFormat(cell?.format ?: "") }
+                                        SheetGridCell(
+                                            text = value,
+                                            width = colWidthFor(c),
+                                            height = rowHeight,
+                                            numeric = value.isNotEmpty() && SHEET_NUMERIC_RE.matches(value),
+                                            format = format,
+                                            gridlines = gridlines,
+                                            onClick = {
+                                                cellDialog = SheetCellDialogState(
+                                                    row = cellRow.toUInt(),
+                                                    col = cellCol.toUInt(),
+                                                    revision = cell?.revision ?: 0uL,
+                                                    value = value,
+                                                )
+                                            },
+                                        )
+                                        c += 1
+                                    }
                                 }
                             }
                         }
                     }
+                    item {
+                        // 表の下端の余白(以前は横スクロール Column 直下の Spacer だったが、
+                        // 縦スクロールが LazyColumn に移ったため最終行アイテムとして追加する)
+                        Spacer(modifier = Modifier.height(24.dp))
+                    }
                 }
-                // 横スクロール表の下端の余白
-                Spacer(modifier = Modifier.height(24.dp))
             }
         }
     }

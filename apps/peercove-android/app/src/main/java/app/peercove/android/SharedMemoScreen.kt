@@ -6,6 +6,7 @@ package app.peercove.android
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -50,6 +51,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -837,6 +839,9 @@ private fun CommentsSection(
     var myName by remember { mutableStateOf("") }
     var memberNames by remember { mutableStateOf<List<String>>(emptyList()) }
     var pendingDelete by remember { mutableStateOf<String?>(null) }
+    // デスクトップ(M6 H-9)に追随し、既定で閉じる + 見出しタップで開閉。
+    // メモを切り替えたら閉じた状態に戻す(rememberSaveable のキーに memoId)。
+    var open by rememberSaveable(memoId) { mutableStateOf(false) }
     val hostLabel = stringResource(R.string.shared_memo_host)
 
     LaunchedEffect(slug) {
@@ -889,11 +894,25 @@ private fun CommentsSection(
     Spacer(modifier = Modifier.height(8.dp))
     HorizontalDivider()
     Spacer(modifier = Modifier.height(4.dp))
-    Text(
-        stringResource(R.string.shared_memo_comments_title, comments.size),
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
+    // 見出しタップで開閉(▶ = 閉、▼ = 開)。一覧・入力欄はこの下で開いている
+    // ときだけ compose する。
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().clickable { open = !open },
+    ) {
+        Text(
+            if (open) "▼" else "▶",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(end = 4.dp),
+        )
+        Text(
+            stringResource(R.string.shared_memo_comments_title, comments.size),
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    if (!open) return
     if (comments.isEmpty()) {
         Text(
             stringResource(R.string.shared_memo_comments_empty),

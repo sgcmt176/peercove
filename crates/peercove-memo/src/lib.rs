@@ -913,7 +913,7 @@ fn validate_title(title: &str) -> anyhow::Result<()> {
 fn validate_body_bytes(body: &str, max_bytes: usize) -> anyhow::Result<()> {
     if body.len() > max_bytes {
         bail!(
-            "本文が大きすぎます(上限 {} KiB)。メモを分割してください",
+            "本文が大きすぎます(上限 {} KB)。メモを分割してください",
             max_bytes / 1024
         );
     }

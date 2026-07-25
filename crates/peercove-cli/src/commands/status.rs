@@ -121,7 +121,8 @@ pub fn write_status_file(
 }
 
 fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    // 表記は KB/MB(依頼者指定で KiB/MiB から統一、M6 H-10)。計算は従来どおり 1024 進。
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -163,7 +164,7 @@ mod tests {
         let text = render(&stats, None);
         assert!(text.contains("endpoint: 203.0.113.5:51820"));
         assert!(text.contains("latest handshake: 12 秒前"));
-        assert!(text.contains("transfer: rx 42 B, tx 1.50 KiB"));
+        assert!(text.contains("transfer: rx 42 B, tx 1.50 KB"));
         assert!(text.contains("endpoint: (未接続)"));
         assert!(text.contains("latest handshake: なし"));
         assert!(!text.contains("members:"));
@@ -228,8 +229,8 @@ mod tests {
     fn human_bytes_units() {
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(1023), "1023 B");
-        assert_eq!(human_bytes(1024), "1.00 KiB");
-        assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.50 MiB");
+        assert_eq!(human_bytes(1024), "1.00 KB");
+        assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.50 MB");
     }
 
     #[test]

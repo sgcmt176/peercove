@@ -1153,7 +1153,7 @@ impl SharedStore {
         let current = self.total_body_bytes()?;
         if current + added_bytes > limits.max_total_bytes {
             bail!(
-                "共有メモの全体容量が上限({} MiB)に達しています。不要なメモや履歴を整理するか、ホストの上限設定を変更してください",
+                "共有メモの全体容量が上限({} MB)に達しています。不要なメモや履歴を整理するか、ホストの上限設定を変更してください",
                 limits.max_total_bytes / (1024 * 1024)
             );
         }
@@ -2070,7 +2070,7 @@ impl SharedStore {
             }
             if write.value.len() > MAX_CELL_VALUE_BYTES {
                 bail!(
-                    "セルの値が長すぎます(上限 {} KiB)",
+                    "セルの値が長すぎます(上限 {} KB)",
                     MAX_CELL_VALUE_BYTES / 1024
                 );
             }
@@ -2305,7 +2305,7 @@ fn validate_schedule_title(title: &str) -> anyhow::Result<()> {
 fn validate_schedule_note(note: &str) -> anyhow::Result<()> {
     if note.len() > MAX_SCHEDULE_NOTE_BYTES {
         bail!(
-            "詳細が長すぎます(上限 {} KiB)",
+            "詳細が長すぎます(上限 {} KB)",
             MAX_SCHEDULE_NOTE_BYTES / 1024
         );
     }

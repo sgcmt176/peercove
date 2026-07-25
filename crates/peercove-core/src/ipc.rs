@@ -194,6 +194,17 @@ pub enum IpcRequest {
     /// (パス・role・upnp のみ)。追加メソッドなので [`IPC_VERSION`] は
     /// 上げない(旧デーモンは解析エラーを返す)。
     RegisterAutostart { config: PathBuf, role: TunnelRole },
+    /// チャット履歴を全消去する(ストレージ管理、M6 H-10a)。1:1 だけを狙う
+    /// clear_direct と違い scope を問わずすべて消す。**接続中(active)の
+    /// ときだけ**実行できる(履歴はデーモンのメモリが正本のため、未接続時に
+    /// ファイルだけ消すと次回接続時に不整合になる)。応答は Done。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    ChatClearAll { config: PathBuf },
+    /// 通信品質履歴を全消去する(ストレージ管理、M6 H-10a)。ディレクトリの
+    /// 日次ファイルを削除し、稼働中ならメモリ上の集計も破棄する。確認なしで
+    /// 呼ばれる想定(デスクトップ UI 側で Android と同じ扱い)。応答は Done。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。
+    QualityClear { config: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

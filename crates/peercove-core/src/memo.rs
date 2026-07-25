@@ -701,13 +701,13 @@ impl SharedMemoLimits {
     /// 収めるため本文サイズは 256KiB までしか許可しない)。
     pub fn validate(&self) -> Result<(), String> {
         if !(1024..=256 * 1024).contains(&self.max_body_bytes) {
-            return Err("本文サイズの上限は 1KiB〜256KiB の範囲で指定してください".to_string());
+            return Err("本文サイズの上限は 1KB〜256KB の範囲で指定してください".to_string());
         }
         if !(1..=100_000).contains(&self.max_memo_count) {
             return Err("メモ件数の上限は 1〜100,000 件の範囲で指定してください".to_string());
         }
         if !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.max_total_bytes) {
-            return Err("全体容量の上限は 1MiB〜1GiB の範囲で指定してください".to_string());
+            return Err("全体容量の上限は 1MB〜1GB の範囲で指定してください".to_string());
         }
         if !(1..=1_000).contains(&self.max_versions) {
             return Err("変更履歴の保持件数は 1〜1,000 の範囲で指定してください".to_string());

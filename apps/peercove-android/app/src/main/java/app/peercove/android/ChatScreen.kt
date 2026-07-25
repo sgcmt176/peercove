@@ -896,9 +896,12 @@ private fun LinkPreviewCard(url: String, content: Color) {
     }
 }
 
+// 表記は KB/MB/GB(計算は 1024 進のまま。デスクトップと共通の方針 = M6 H-10)。
+// GB 段が無いと 1GB 超が「1024.0 MB」のように出るため追加した。
 fun formatBytesLong(bytes: ULong): String {
     val b = bytes.toLong()
     return when {
+        b >= 1_073_741_824 -> "%.1f GB".format(b / 1_073_741_824.0)
         b >= 1_048_576 -> "%.1f MB".format(b / 1_048_576.0)
         b >= 1_024 -> "%.1f KB".format(b / 1_024.0)
         else -> "$b B"

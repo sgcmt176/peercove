@@ -262,6 +262,28 @@ impl QualityStore {
         self.previous_routes.retain(|key, _| live.contains(key));
     }
 
+    /// 履歴を全消去する(ストレージ管理、M6 H-10a)。ディレクトリ内の日次
+    /// ファイルを削除し、メモリ上の履歴・進行中の集計も破棄する(ファイルだけ
+    /// 消すと report() がメモリの残骸を返し続けてしまうため)。ファイルは
+    /// 書きっぱなしで保持しない設計(append は毎回開いて閉じる)なので、
+    /// Windows でも稼働中に安全に削除できる。
+    pub fn clear_all(&mut self) {
+        if let Ok(entries) = std::fs::read_dir(&self.directory) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        self.entries.clear();
+        self.current.clear();
+        self.current_window = None;
+        self.previous_bytes.clear();
+        self.previous_routes.clear();
+        self.skipped_corrupt_lines = 0;
+    }
+
     pub fn report(&self, since_unix_ms: u64) -> QualityReport {
         let now = now_unix_ms();
         let mut samples: Vec<QualitySample> = self
@@ -599,6 +621,36 @@ mod tests {
         let report = loaded.lock().unwrap().report(now.saturating_sub(1));
         assert_eq!(report.samples.len(), 1);
         assert_eq!(report.skipped_corrupt_lines, 1);
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    /// clear_all はファイルとメモリ上の履歴を両方消す(ストレージ管理、M6 H-10a)。
+    #[test]
+    fn clear_all_removes_files_and_memory() {
+        let config = temp_config("clearall");
+        let now = now_unix_ms() / WINDOW_MS * WINDOW_MS;
+        let store = QualityStore::load(&config);
+        store
+            .lock()
+            .unwrap()
+            .append(&persisted_sample(now))
+            .unwrap();
+        {
+            let mut guard = store.lock().unwrap();
+            guard.entries.push(persisted_sample(now));
+            assert!(!guard.report(0).samples.is_empty());
+            guard.clear_all();
+            assert!(guard.report(0).samples.is_empty());
+        }
+        let directory = config.with_extension("quality");
+        assert!(
+            std::fs::read_dir(&directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .all(|entry| entry.path().extension().and_then(|v| v.to_str()) != Some("jsonl")),
+            "jsonl ファイルが残っていない"
+        );
         let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 

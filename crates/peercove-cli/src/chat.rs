@@ -456,6 +456,18 @@ impl ChatLog {
         true
     }
 
+    /// 履歴を全消去する(ストレージ管理、M6 H-10a)。1:1 だけを狙い撃つ
+    /// clear_direct と異なり scope を問わずすべて消す。seq は据え置き
+    /// (以後の新着は続きの seq)。空でも generation は進める(呼び出し元は
+    /// 常に「消去した」ことを UI に伝えたいため)。
+    pub fn clear_all(&mut self) {
+        self.entries.clear();
+        self.generation += 1;
+        if let Err(e) = self.rewrite() {
+            tracing::warn!("履歴の全消去書き出しに失敗しました: {e:#}");
+        }
+    }
+
     /// メッセージ ID が既に履歴にあるか。モバイルの再送キュー(E-E 3)は
     /// ack を取り損ねると同じ ID で再送してくるため、受信側で重複を弾く。
     pub fn contains_id(&self, id: &str) -> bool {
@@ -692,6 +704,33 @@ mod tests {
         // もう一度回しても何も起きない(記録は落ちている)
         let outcome = reconcile_identities(&config, self_ip, &[], &log, &queue);
         assert!(outcome.all().is_empty(), "検知は一度きり");
+        let _ = std::fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    /// clear_all は scope を問わずすべて消し、generation を進める
+    /// (ストレージ管理、M6 H-10a)。
+    #[test]
+    fn clear_all_removes_everything_and_bumps_generation() {
+        let config = temp_config("clearall");
+        let log = ChatLog::load(&config);
+        let mut log = log.lock().unwrap();
+        log.append(entry("a"));
+        log.append(ChatMessageInfo {
+            to: Some("10.0.0.9".parse().unwrap()),
+            ..entry("b")
+        });
+        assert_eq!(log.generation(), 0);
+        log.clear_all();
+        assert_eq!(log.generation(), 1);
+        let (seq, messages) = log.fetch(0);
+        assert_eq!(seq, 2, "seq は据え置き");
+        assert!(messages.is_empty());
+        // 新着は続きの seq
+        assert_eq!(log.append(entry("next")).seq, 3);
+        drop(log);
+        // 再読込しても消えたまま(ファイルも詰め直されている)
+        let reloaded = ChatLog::load(&config);
+        assert_eq!(reloaded.lock().unwrap().fetch(0).1.len(), 1);
         let _ = std::fs::remove_dir_all(config.parent().unwrap());
     }
 

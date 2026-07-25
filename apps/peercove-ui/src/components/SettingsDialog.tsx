@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Settings, api, errorMessage } from "../ipc";
+import { Settings, StorageUsage, api, errorMessage, formatBytes } from "../ipc";
 import { ConfirmModal } from "./Modal";
 import { t } from "../i18n";
 
@@ -20,10 +20,14 @@ import { t } from "../i18n";
 export function NetworkSettingsView({
   configPath,
   liveInterfaceName,
+  isConnected,
 }: {
   configPath: string;
   /** 接続中の実アダプタ名(自動採番後）。未接続なら null で設定値を出す。 */
   liveInterfaceName: string | null;
+  /** このネットワークに接続中か(ストレージ管理: チャット履歴のクリアは
+   *  接続中のみ実行できる — M6 H-10a)。省略時は未接続扱い。 */
+  isConnected?: boolean;
 }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +47,7 @@ export function NetworkSettingsView({
           configPath={configPath}
           settings={settings}
           liveInterfaceName={liveInterfaceName}
+          isConnected={isConnected ?? false}
         />
       ) : (
         <div className="page-body">
@@ -61,10 +66,12 @@ function SettingsForm({
   configPath,
   settings,
   liveInterfaceName,
+  isConnected,
 }: {
   configPath: string;
   settings: Settings;
   liveInterfaceName: string | null;
+  isConnected: boolean;
 }) {
   // 接続中は実際に使われているアダプタ名を出す(既定名が衝突すると自動採番で
   // peercove1 等になるため、設定ファイルの値と食い違いうる — ADR-0028、M3-20)
@@ -312,6 +319,8 @@ function SettingsForm({
 
         {error && <p className="error-text">{error}</p>}
         {notice && <p className="notice">{notice}</p>}
+
+        <StorageManagement configPath={configPath} isConnected={isConnected} />
       </div>
       <div className="page-actions">
         <button type="button" onClick={() => void save()} disabled={busy}>
@@ -329,5 +338,178 @@ function SettingsForm({
         />
       )}
     </>
+  );
+}
+
+/**
+ * ストレージ管理(M6 H-10a)。Android の設定タブ末尾の節をデスクトップへ
+ * 移植したもの。受信ボックス・チャット履歴・品質履歴はクリアでき、共有メモは
+ * サイズ表示のみ(容量管理は共有メモ画面の上限設定で行う)。
+ */
+function StorageManagement({
+  configPath,
+  isConnected,
+}: {
+  configPath: string;
+  /** チャット履歴のクリアは接続中のみ実行できる(履歴はデーモンのメモリが
+   *  正本のため — M6 H-10a)。 */
+  isConnected: boolean;
+}) {
+  const [usage, setUsage] = useState<StorageUsage | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [confirmKind, setConfirmKind] = useState<"inbox" | "chat" | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () => {
+    api
+      .storageUsage(configPath)
+      .then(setUsage)
+      .catch((e) => setError(errorMessage(e)));
+  };
+  useEffect(load, [configPath]);
+
+  const runClear = async (action: () => Promise<string>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setNotice(await action());
+      load();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+      setConfirmKind(null);
+    }
+  };
+
+  const clearQuality = () => {
+    setError(null);
+    setNotice(null);
+    api
+      .qualityClear(configPath)
+      .then(() => {
+        setNotice(t.settings.storageCleared);
+        load();
+      })
+      .catch((e) => setError(errorMessage(e)));
+  };
+
+  return (
+    <div className="field">
+      <h3 className="section-head">{t.settings.storageTitle}</h3>
+      {!usage ? (
+        error ? (
+          <p className="error-text">{error}</p>
+        ) : (
+          <p className="muted small">{t.common.loading}</p>
+        )
+      ) : (
+        <>
+          <StorageRow
+            label={t.settings.storageInbox}
+            bytes={usage.inboxBytes}
+            actionLabel={t.settings.storageClear}
+            onClick={() => setConfirmKind("inbox")}
+          />
+          <StorageRow
+            label={t.settings.storageChat}
+            bytes={usage.chatBytes}
+            actionLabel={t.settings.storageClear}
+            onClick={() => setConfirmKind("chat")}
+            disabled={!isConnected}
+            disabledHint={isConnected ? undefined : t.settings.storageChatDisabledHint}
+          />
+          <StorageRow
+            label={t.settings.storageQuality}
+            bytes={usage.qualityBytes}
+            actionLabel={t.settings.storageClear}
+            onClick={clearQuality}
+          />
+          <StorageRow
+            label={t.settings.storageMemo}
+            bytes={usage.memoBytes}
+            hint={t.settings.storageMemoHint}
+          />
+          {error && <p className="error-text">{error}</p>}
+          {notice && <p className="notice">{notice}</p>}
+        </>
+      )}
+      {confirmKind && (
+        <ConfirmModal
+          title={
+            confirmKind === "inbox"
+              ? t.settings.storageConfirmInboxTitle
+              : t.settings.storageConfirmChatTitle
+          }
+          message={
+            <p>
+              {confirmKind === "inbox"
+                ? t.settings.storageConfirmInbox
+                : t.settings.storageConfirmChat}
+            </p>
+          }
+          confirmLabel={t.settings.storageClear}
+          busy={busy}
+          onConfirm={() =>
+            void runClear(
+              confirmKind === "inbox"
+                ? async () => t.settings.storageClearedInbox(await api.clearInbox(configPath))
+                : async () => {
+                    await api.chatClearAll(configPath);
+                    return t.settings.storageCleared;
+                  },
+            )
+          }
+          onClose={() => setConfirmKind(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** ストレージ管理の 1 行(ラベル + サイズ + 任意のクリアボタン)。 */
+function StorageRow({
+  label,
+  bytes,
+  hint,
+  actionLabel,
+  onClick,
+  disabled,
+  disabledHint,
+}: {
+  label: string;
+  bytes: number;
+  /** クリア操作を持たない行(共有メモ)向けの注記。 */
+  hint?: string;
+  actionLabel?: string;
+  onClick?: () => void;
+  disabled?: boolean;
+  disabledHint?: string;
+}) {
+  return (
+    <div className="field">
+      <span>
+        {label}
+        <small className="muted">
+          {" "}
+          — {formatBytes(bytes)}
+          {hint ? ` ${hint}` : ""}
+        </small>
+      </span>
+      {onClick && actionLabel && (
+        <div>
+          <button
+            type="button"
+            className="button--ghost"
+            disabled={disabled}
+            title={disabled ? disabledHint : undefined}
+            onClick={onClick}
+          >
+            {actionLabel}
+          </button>
+        </div>
+      )}
+    </div>
   );
 }

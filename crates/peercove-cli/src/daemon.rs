@@ -534,6 +534,52 @@ impl DaemonShared {
                 }
                 Ok(IpcResponse::Done)
             }
+            IpcRequest::ChatClearAll { config } => {
+                // ストレージ管理からの全消去(M6 H-10a)。履歴はデーモンの
+                // メモリが正本のため、**接続中(active)のときだけ**実行できる
+                // (未接続時にファイルだけ消すと次回接続時に不整合になる —
+                // Android の clearChatHistory と同じ制約)。
+                let active = self.active.lock().await;
+                let active = active.get(&Self::key_for(&config)).with_context(|| {
+                    "チャット履歴の削除は、このネットワークに接続中のときだけ実行できます"
+                        .to_string()
+                })?;
+                active.chat.lock().unwrap().clear_all();
+                active.chat_queue.lock().unwrap().clear();
+                crate::chat::save_queue(&active.config, &active.chat_queue);
+                // 消去したことを自分の端末のチャット履歴にだけ残す
+                // (ChatLocalNote と同じ作法。他メンバーへは送らない)
+                let sent_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                active.chat.lock().unwrap().append(ChatMessageInfo {
+                    seq: 0, // append が振る
+                    id: crate::msg::new_transfer_id(),
+                    scope: peercove_core::msg::ChatScope::Network,
+                    group_id: None,
+                    from: active.address,
+                    to: None,
+                    text: "チャット履歴を削除しました".to_string(),
+                    sent_at,
+                    failed: false,
+                    file: None,
+                    system: true,
+                });
+                Ok(IpcResponse::Done)
+            }
+            IpcRequest::QualityClear { config } => {
+                // 稼働中はメモリ上の集計も持つのでロックして消す(M6
+                // H-10a)。ファイルは開きっぱなしにしない設計(quality.rs
+                // 参照)なので、Tauri 側は未接続時にファイルだけ直接消せば
+                // 済む(このエラーを見て呼び出し元がそちらへフォールバックする)。
+                let active = self.active.lock().await;
+                let active = active
+                    .get(&Self::key_for(&config))
+                    .with_context(|| "このネットワークは稼働していません".to_string())?;
+                active.quality.lock().unwrap().clear_all();
+                Ok(IpcResponse::Done)
+            }
         }
     }
 

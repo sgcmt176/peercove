@@ -958,6 +958,23 @@ export const ja = {
       "デバイス鍵を更新しますか？ 切り替え時に数秒間通信が途切れます。",
     rotateKeyRequested:
       "鍵の更新を要求しました。完了すると数秒間の再接続が発生します（結果はログに出ます）。",
+    // ストレージ管理(M6 H-10a。Android の設定タブ末尾の節をデスクトップへ移植)
+    storageTitle: "ストレージ管理",
+    storageInbox: "受信ボックス",
+    storageChat: "チャット履歴",
+    storageQuality: "品質履歴",
+    storageMemo: "共有メモ",
+    storageMemoHint: "— 共有メモの容量管理は「共有」画面の上限設定で行います",
+    storageClear: "クリア",
+    storageClearedInbox: (count: number) => `受信ボックスを空にしました（${count} 件）`,
+    storageCleared: "消去しました。",
+    storageChatDisabledHint: "— 接続中のみ削除できます",
+    storageConfirmInboxTitle: "受信ボックスを空にする",
+    storageConfirmInbox:
+      "受信ボックス内のファイルをすべて削除します。受信中のファイルはスキップされます。よろしいですか？",
+    storageConfirmChatTitle: "チャット履歴を削除する",
+    storageConfirmChat:
+      "この端末に保存されているチャット履歴をすべて削除します（相手側の履歴は消えません）。よろしいですか？",
   },
 
   // OS 通知(notify.ts)
@@ -1174,8 +1191,8 @@ export const ja = {
     limitsTitle: "共有メモの上限",
     limitsNote:
       "共有メモの容量・件数・履歴の保持上限を設定します。範囲外の値は保存時にエラーになります。",
-    limitsBodyLabel: "1メモの本文の上限(KiB)",
-    limitsTotalLabel: "全体容量の上限(MiB、本文+履歴)",
+    limitsBodyLabel: "1メモの本文の上限(KB)",
+    limitsTotalLabel: "全体容量の上限(MB、本文+履歴)",
     limitsCountLabel: "メモ件数の上限(ゴミ箱含む)",
     limitsVersionsLabel: "メモごとの変更履歴の保持件数",
     limitsHistoryDaysLabel: "変更履歴の保持日数",
@@ -1190,7 +1207,6 @@ export const ja = {
     commentDelete: "削除",
     commentDeleteConfirm: "このコメントを削除しますか?(元に戻せません)",
     commentLoadFailed: "コメントを読み込めません",
-    commentTooLong: (kib: number) => `コメントが長すぎます(上限 ${kib}KiB)`,
     commentBadge: (n: number) => `💬${n}`,
     // @All サジェスト候補(ADR-0055 決定 1b・1c)。通知動作(全員へ届く)は
     // H-2 で実装。この工程では候補として出すだけ。

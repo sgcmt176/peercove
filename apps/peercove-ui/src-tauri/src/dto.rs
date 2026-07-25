@@ -535,6 +535,23 @@ pub struct InboxItem {
     pub received_unix_ms: Option<u64>,
 }
 
+/// ストレージ管理(M6 H-10a)の使用量。存在しないものは 0(バイト)。
+/// Android の設定タブ末尾の節と同等の項目 + 共有メモの参考行。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageUsage {
+    /// `<config>.inbox/` ディレクトリの合計。
+    pub inbox_bytes: u64,
+    /// `<config>.chat.jsonl` + 送信キュー `<config>.chatq.json` の合計。
+    pub chat_bytes: u64,
+    /// `<config>.quality/` ディレクトリの合計。
+    pub quality_bytes: u64,
+    /// 共有メモ DB(ホスト: `<config>.memos.db` / メンバー:
+    /// `<config>.memocache.db`)。クリア操作はここでは持たない
+    /// (共有メモ画面の上限設定で管理する — サイズ表示のみ)。
+    pub memo_bytes: u64,
+}
+
 fn role_str(role: TunnelRole) -> &'static str {
     match role {
         TunnelRole::Host => "hosting",

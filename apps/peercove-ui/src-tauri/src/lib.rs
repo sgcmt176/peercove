@@ -27,7 +27,7 @@ use tauri::Manager;
 
 use crate::dto::{
     ChatMessage, ChatPage, DnsRecordDto, InboxItem, InitResult, InviteResult, JoinResult, LogEntry,
-    Logs, NetworkDto, SaveResult, Settings, SettingsUpdate, Status,
+    Logs, NetworkDto, SaveResult, Settings, SettingsUpdate, Status, StorageUsage,
 };
 
 /// デフォルトの設定ディレクトリ(Windows: %APPDATA%\… / Linux: ~/.config/…)。
@@ -856,6 +856,97 @@ fn delete_inbox_file(config_path: String, name: String) -> Result<(), String> {
         }
     }
     let _ = std::fs::remove_file(inbox_dir_for(&config_path).join(format!("{name}.pcvmeta")));
+    Ok(())
+}
+
+// ---- ストレージ管理(M6 H-10a。Android の設定タブ末尾の節をデスクトップへ移植) ----
+
+/// ディレクトリ内の全ファイルサイズ合計(再帰)。存在しなければ 0。
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(ft) if ft.is_dir() => dir_size(&entry.path()),
+            Ok(_) => std::fs::metadata(entry.path())
+                .map(|m| m.len())
+                .unwrap_or(0),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// ストレージ管理の各項目の使用量。すべて `<config>` からの派生パスなので
+/// configPath だけで完結する(デーモンへ問い合わせない)。
+#[tauri::command]
+fn storage_usage(config_path: String) -> Result<StorageUsage, String> {
+    let path = Path::new(&config_path);
+    let file_size = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    Ok(StorageUsage {
+        inbox_bytes: dir_size(&inbox_dir_for(&config_path)),
+        chat_bytes: file_size(path.with_extension("chat.jsonl"))
+            + file_size(path.with_extension("chatq.json")),
+        quality_bytes: dir_size(&path.with_extension("quality")),
+        // ホスト(memos.db)/ メンバー(memocache.db)のどちらか一方しか
+        // 通常は存在しない(両方あっても合算して問題ない)
+        memo_bytes: file_size(path.with_extension("memos.db"))
+            + file_size(path.with_extension("memocache.db")),
+    })
+}
+
+/// 受信ボックスの中身を一括削除する。ディレクトリ自体は残す。受信中で
+/// ロックされているファイルは削除に失敗してもよい(スキップして続行)。
+/// 戻り値は削除できた件数。
+#[tauri::command]
+fn clear_inbox(config_path: String) -> Result<u32, String> {
+    let dir = inbox_dir_for(&config_path);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(0); // まだ何も受信していない
+    };
+    let mut cleared = 0u32;
+    for entry in entries.flatten() {
+        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if is_file && std::fs::remove_file(entry.path()).is_ok() {
+            cleared += 1;
+        }
+    }
+    Ok(cleared)
+}
+
+/// チャット履歴の全消去(additive IPC)。履歴はデーモンのメモリが正本なので、
+/// このネットワークに接続中のときだけ成功する(未接続ならエラーを返す)。
+#[tauri::command]
+async fn chat_clear_all(config_path: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::ChatClearAll { config }).await
+}
+
+/// 通信品質履歴の全消去(additive IPC)。稼働中はデーモン経由でメモリごと
+/// 消し、未接続 or デーモンが応答しない場合はファイルだけ直接消す
+/// (品質ファイルは書きっぱなしで保持されない設計 — quality.rs 参照 — なので
+/// 未接続時にこの端末から直接消しても安全)。
+#[tauri::command]
+async fn quality_clear(config_path: String) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    if peercove_ipc::request_async(IpcRequest::QualityClear {
+        config: config.clone(),
+    })
+    .await
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let dir = config.with_extension("quality");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()) == Some("jsonl") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1702,6 +1793,10 @@ pub fn run() {
             list_inbox,
             save_inbox_file,
             delete_inbox_file,
+            storage_usage,
+            clear_inbox,
+            chat_clear_all,
+            quality_clear,
             read_text_preview,
             open_link,
             link_preview,

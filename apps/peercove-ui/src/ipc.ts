@@ -129,6 +129,15 @@ export interface InboxItem {
   receivedUnixMs: number | null;
 }
 
+/** ストレージ管理（M6 H-10a）の使用量。すべてバイト。 */
+export interface StorageUsage {
+  inboxBytes: number;
+  chatBytes: number;
+  qualityBytes: number;
+  /** 共有メモ DB のサイズ（参考表示のみ。クリアは共有メモ画面の上限設定で行う）。 */
+  memoBytes: number;
+}
+
 /** チャット履歴の 1 通（ADR-0016、M3-13b）。 */
 export interface ChatMessage {
   /** 履歴内の通し番号（差分フェッチ・未読管理に使う）。 */
@@ -1101,6 +1110,15 @@ export const api = {
     invoke<string | null>("save_inbox_file", { configPath, name }),
   deleteInboxFile: (configPath: string, name: string) =>
     invoke<void>("delete_inbox_file", { configPath, name }),
+  // ストレージ管理（M6 H-10a。Android の設定タブ末尾の節と同等）
+  storageUsage: (configPath: string) =>
+    invoke<StorageUsage>("storage_usage", { configPath }),
+  clearInbox: (configPath: string) =>
+    invoke<number>("clear_inbox", { configPath }),
+  chatClearAll: (configPath: string) =>
+    invoke<void>("chat_clear_all", { configPath }),
+  qualityClear: (configPath: string) =>
+    invoke<void>("quality_clear", { configPath }),
   // テキストファイルのチャット内プレビュー（M3-13e）
   readTextPreview: (path: string) =>
     invoke<TextPreview>("read_text_preview", { path }),
@@ -1186,7 +1204,8 @@ export function stateLabel(state: TunnelState): string {
 }
 
 export function formatBytes(bytes: number): string {
-  const units = ["B", "KiB", "MiB", "GiB"];
+  // 表記は KB/MB(依頼者指定で KiB/MiB から統一、M6 H-10)。計算は従来どおり 1024 進。
+  const units = ["B", "KB", "MB", "GB"];
   let value = bytes;
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) {

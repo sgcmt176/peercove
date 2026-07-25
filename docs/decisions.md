@@ -3521,6 +3521,12 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
   確実に固まるため、Android は `MAX_SHEET_ROWS` の上限だけ 1024 へ追随させ、
   表示既定(`MIN_DISPLAY_ROWS`=10 / `MIN_DISPLAY_COLS`=5)は据え置いた。
   Android の行仮想化(`LazyColumn` 化)は別タスク。
+  **Android の行仮想化と表示拡張は H-10b で追随**(`SheetScreen.kt` を
+  `Column` + `verticalScroll` から `LazyColumn` へ変更し、表示既定も
+  26 列 × 1024 行へ引き上げ済み。列ヘッダーは `LazyColumn` の外に固定表示。
+  行またぎ結合(rowSpan)は `LazyColumn` の制約上、内容を先頭行の左上セルに
+  表示し、2 行目以降の被結合セルは上辺の罫線を消した空セルとして表現する
+  簡易実装 = 既知の制限)。
 - **背景**: M6 H-7 後の依頼者検証で、シートに次の指摘が残った。
   (1) 日本語入力の 1 文字目だけが生のアルファベットになる(「あいうえお」→
   「aいうえお」)。H-6 と H-7a の 2 度の修正でも再発。(2) ウインドウ枠を

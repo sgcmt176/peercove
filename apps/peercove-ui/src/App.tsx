@@ -577,6 +577,7 @@ export default function App() {
             <NetworkSettingsView
               configPath={openConfig!}
               liveInterfaceName={openTunnel?.interfaceName ?? null}
+              isConnected={openTunnel !== null}
             />
           ) : view === "diagnostics" ? (
             <DiagnosticsView configPath={openConfig!} />

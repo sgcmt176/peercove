@@ -381,8 +381,7 @@ DB・配信・キャッシュ・バックアップ/診断・@種別:id カード
   公開時に filter-repo で履歴を書き換えたため(target-smoke 除去・作者メール
   noreply 化など)、**それ以前のクローン・バンドルとはハッシュが不一致**。
   古いクローン(Linux VM 等)は pull でなく再クローンすること
-- **Android の共有シートは行が仮想化されていない**(`SheetScreen.kt` は
-  `Column` + `verticalScroll` で全行を composition する)。デスクトップは
-  M6 H-8b で行を仮想化して 1024 行へ拡張したが、Android は表示既定を
-  10 行 × 5 列のままにしてある。大きなシートを Android で扱うようになったら
-  `LazyColumn` 化が必要
+- ~~Android の共有シートは行が仮想化されていない~~ → **解消(M6 H-10b)**。
+  `SheetScreen.kt` を `LazyColumn` 化し、表示既定も 26 列 × 1024 行へ
+  引き上げ済み。行またぎ結合(rowSpan)は先頭行に内容表示・継続行は空セル
+  という簡易表現(既知の制限、ADR-0056 参照)
