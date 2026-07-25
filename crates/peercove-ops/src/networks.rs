@@ -30,7 +30,9 @@ pub enum Role {
 pub struct NetworkEntry {
     /// ディレクトリ名でもある正規化済みの名前
     pub slug: String,
-    /// 設定に書かれたネットワーク名(通常 slug と一致)
+    /// 画面表示用の名前(ADR-0058)。`display_name` があればそれ、
+    /// 無ければ設定に書かれたネットワーク名(通常 slug と一致)。
+    /// DNS 名・スラッグは変わらないので、一致しなくなっても移動には使わない。
     pub name: String,
     pub role: Role,
     pub dir: PathBuf,
@@ -108,7 +110,7 @@ pub fn list(base: &Path) -> Vec<NetworkEntry> {
             continue;
         };
         entries.push(NetworkEntry {
-            name: config.network_name().to_string(),
+            name: config.display_title().to_string(),
             address: config.interface.address,
             slug,
             dir,
@@ -267,6 +269,31 @@ mod tests {
         let internal = networks_dir(&base).join(".replace-old-1-2");
         crate::init::init_host(&internal, "game-lan", 51821, false).unwrap();
         assert_eq!(list(&base).len(), 1);
+    }
+
+    /// ネットワーク表示名(ADR-0058)を設定していれば、一覧の name はそちらを
+    /// 使う(slug・DNS 名は変わらない)。
+    #[test]
+    fn list_uses_network_display_name_when_set() {
+        let base = base("list-display-name");
+        let (_, host_dir) = network_dir(&base, "Game LAN").unwrap();
+        crate::init::init_host(&host_dir, "Game LAN", 51820, false).unwrap();
+        let config_path = host_dir.join(HOST_FILE);
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            text.replacen(
+                "[interface]\n",
+                "[interface]\nnetwork_display_name = \"うちの LAN\"\n",
+                1,
+            ),
+        )
+        .unwrap();
+
+        let entries = list(&base);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slug, "game-lan", "DNS 名・スラッグは変わらない");
+        assert_eq!(entries[0].name, "うちの LAN");
     }
 
     #[test]

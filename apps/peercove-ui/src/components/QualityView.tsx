@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { QualityPoint, Tunnel, api, errorMessage, formatBytes } from "../ipc";
 import { t } from "../i18n";
+import { compareNatural } from "../naturalSort";
 
 type Period = 15 | 60 | 1440 | 10080;
 const PERIODS: Array<{ value: Period; label: string }> = [
@@ -47,15 +48,22 @@ export function QualityView({ tunnel }: { tunnel: Tunnel }) {
   }, [period, tunnel.config]);
 
   const peers = useMemo(() => {
+    // 品質履歴 DB は過去のサンプルをそのまま保持するため、削除済みメンバーの
+    // publicKey も残っている。現在のメンバー一覧(tunnel.members)に無い
+    // publicKey は候補から外す(依頼者指摘)。自分自身は tunnel.members に
+    // 常に含まれるので、特別扱いせずこの絞り込みだけで既存どおりになる。
+    const currentKeys = new Set(tunnel.members.map((member) => member.publicKey));
     const byKey = new Map<string, { key: string; label: string }>();
     for (const sample of samples) {
+      if (!currentKeys.has(sample.publicKey)) continue;
       byKey.set(sample.publicKey, {
         key: sample.publicKey,
         label: sample.name || sample.ip,
       });
     }
-    return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label));
-  }, [samples]);
+    // member-9 が member-11 より前に来るよう自然順ソート(依頼者指摘)。
+    return [...byKey.values()].sort((a, b) => compareNatural(a.label, b.label));
+  }, [samples, tunnel.members]);
 
   useEffect(() => {
     if (!peers.some((peer) => peer.key === peerKey)) {

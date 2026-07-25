@@ -718,6 +718,16 @@ export function SheetView({
     if (el === null && gridInputFocusedRef.current) {
       gridInputFocusedRef.current = false;
       tableWrapRef.current?.focus();
+      return;
+    }
+    // 仮想化でフォーカス行が描画ウィンドウへ戻ってきて input が再マウント
+    // されたとき、フォーカスが容器へ退避したままならここで input へ戻す
+    // (ADR-0056 決定 5 追補 H-9)。selection が変わっていないため
+    // [selection] の focus useEffect は走らず、これが無いと矢印キー以外の
+    // 入力が容器で死んだままになる。activeElement が容器のときだけ戻すので、
+    // 検索バー等からフォーカスを奪うことはない。
+    if (el !== null && document.activeElement === tableWrapRef.current) {
+      el.focus();
     }
   }, []);
 
@@ -1669,6 +1679,16 @@ export function SheetView({
     (event: ReactMouseEvent<HTMLTableCellElement>, row: number, col: number) => {
       if (event.button !== 0) return;
       if (editing) return;
+      // ブラウザの mousedown 既定動作(最も近いフォーカス可能祖先 =
+      // tabIndex=-1 のテーブル容器へフォーカス移動)を抑止する(ADR-0056
+      // 決定 1 追補 H-9)。React はこのハンドラ内の setSelection による
+      // 再レンダーと passive effect(常設 input への focus)を mousedown の
+      // 既定動作より**先に**流すため、抑止しないと「effect が input へ
+      // focus → 既定動作が容器へ focus」の順になり、フォーカスの最終着地が
+      // 容器になってタイピングが一切セルへ届かなくなる(実ブラウザでの
+      // 再現ハーネスにより確認済み。合成イベントでは既定動作が走らないため
+      // 再現しない点に注意)。
+      event.preventDefault();
       shouldFocusCellRef.current = true;
       const anchor = resolveMergeAnchor(row, col);
       if (event.shiftKey && selection) {
@@ -2037,8 +2057,18 @@ export function SheetView({
                   onChange={(event) => handleCellInputChange(event, r, c)}
                   onKeyDown={(event) => handleGridKeyDown(event, r, c)}
                   // blur は <td> ではなく <input> 自身に付ける(理由は
-                  // handleInputBlur 定義側のコメント参照)
-                  onBlur={() => handleInputBlur(r, c)}
+                  // handleInputBlur 定義側のコメント参照)。
+                  // gridInputFocusedRef はここで必ず落とす: 検索バー等へ
+                  // 通常の blur で移った後に仮想化スクロールで input が
+                  // アンマウントされたとき、setInputRef(null) が容器へ
+                  // focus してフォーカスを横取りしないようにするため
+                  // (H-9。フォーカスされたまま DOM から外れた場合は blur が
+                  // 発火しないので、その場合だけ ref が true のまま残り、
+                  // 容器への退避が正しく働く)。
+                  onBlur={() => {
+                    gridInputFocusedRef.current = false;
+                    handleInputBlur(r, c);
+                  }}
                   onCompositionStart={() => handleCompositionStart(r, c)}
                   onCompositionEnd={handleCompositionEnd}
                 />

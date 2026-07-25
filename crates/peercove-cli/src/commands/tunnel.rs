@@ -407,6 +407,9 @@ pub struct Snapshot {
     pub connection_error: Option<String>,
     /// (member のみ)相手の仮想 IP → 直接経路の状態(ADR-0013、M3-4)。
     pub direct: HashMap<std::net::Ipv4Addr, peercove_core::ipc::DirectStatus>,
+    /// ネットワーク表示名(ADR-0058)。host は自分の設定、member は受信したもの。
+    /// 未設定なら None(UI は network_name 表示にフォールバックする)。
+    pub network_display_name: Option<String>,
 }
 
 pub type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
@@ -750,6 +753,9 @@ pub async fn supervise(
                                     deny,
                                     force_relay,
                                     members,
+                                    // ネットワーク表示名(ADR-0058)。ホストは自分の
+                                    // host.toml が正本
+                                    network_display_name: config.interface.network_display_name.clone(),
                                 };
                                 ledger_tx.send_if_modified(|current| {
                                     if *current != dist {
@@ -766,6 +772,22 @@ pub async fn supervise(
                         }
                         Role::Member => {
                             let received = member_ledger.lock().unwrap().clone();
+                            // ネットワーク表示名(ADR-0058)を member.toml へ永続化する。
+                            // オフラインでも一覧に最新の表示名が出るようにするため。
+                            // 台帳を未受信の周期(起動直後・再接続中)は現状維持(触らない)。
+                            // トンネル再生成のトリガーには含めない(detect_reconfig_restart
+                            // は listen_port / mtu / 接続先だけを見る — 表示名の変更で
+                            // トンネルを作り直す必要はない)。
+                            if let Some(received) = &received {
+                                if let Err(e) = peercove_ops::settings::apply_network_display_name(
+                                    config_path,
+                                    received.distribution.network_display_name.as_deref(),
+                                ) {
+                                    tracing::warn!(
+                                        "ネットワーク表示名の反映に失敗しました: {e:#}"
+                                    );
+                                }
+                            }
                             // 直接ピアの追加・確認・除去(ADR-0013、M3-3)。
                             // 設定が読めない周期は現状維持(触らない)
                             let enabled =
@@ -912,8 +934,10 @@ pub async fn supervise(
                         tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
                     }
                     if let Some(snapshot) = &snapshot {
-                        let (dns_records, cname_records) = distribution
-                            .map(|dist| (dist.dns_records, dist.cname_records))
+                        let (dns_records, cname_records, network_display_name) = distribution
+                            .map(|dist| {
+                                (dist.dns_records, dist.cname_records, dist.network_display_name)
+                            })
                             .unwrap_or_default();
                         *snapshot.lock().unwrap() = Some(Snapshot {
                             peers: stats,
@@ -924,6 +948,7 @@ pub async fn supervise(
                             removed: removed.load(std::sync::atomic::Ordering::Relaxed),
                             connection_error: member_link.connection_error(),
                             direct: direct_routes,
+                            network_display_name,
                         });
                     }
                 }

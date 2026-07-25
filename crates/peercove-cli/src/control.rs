@@ -112,6 +112,9 @@ pub struct Distribution {
     pub dns_records: Vec<DnsRecord>,
     /// カスタム CNAME レコード(ADR-0025、M3-17)。
     pub cname_records: Vec<CnameRecord>,
+    /// ネットワーク表示名(ADR-0058)。host: 自分の設定
+    /// (`interface.network_display_name`)、member: 受信済みのもの。
+    pub network_display_name: Option<String>,
     /// ACL の遮断組(ADR-0018、M3-10。仮想 IP の正規化済みペア)。
     /// ワイヤには載せず、送信時にメンバーごとのフィルタ
     /// ([`ledger_message_for`])の材料にする。
@@ -169,6 +172,7 @@ fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMes
         members: dist.members,
         dns_records: dist.dns_records,
         cname_records: dist.cname_records,
+        network_display_name: dist.network_display_name,
     }
 }
 
@@ -200,12 +204,14 @@ type LedgerDigest = (
     )>,
     Vec<DnsRecord>,
     Vec<CnameRecord>,
+    Option<String>, // network_display_name(ADR-0058)
 );
 
 fn ledger_digest(
     members: &[LedgerEntry],
     dns_records: &[DnsRecord],
     cname_records: &[CnameRecord],
+    network_display_name: Option<&str>,
 ) -> LedgerDigest {
     (
         members
@@ -229,6 +235,7 @@ fn ledger_digest(
             .collect(),
         dns_records.to_vec(),
         cname_records.to_vec(),
+        network_display_name.map(str::to_string),
     )
 }
 
@@ -1469,10 +1476,16 @@ async fn member_reader(
                 members,
                 dns_records,
                 cname_records,
+                network_display_name,
             }) => {
                 // 意味のある変化があったときだけ INFO(エンドポイント鮮度の
                 // 定期更新による再配布は debug に落とす — ADR-0019)
-                let digest = ledger_digest(&members, &dns_records, &cname_records);
+                let digest = ledger_digest(
+                    &members,
+                    &dns_records,
+                    &cname_records,
+                    network_display_name.as_deref(),
+                );
                 if last_digest.as_ref() != Some(&digest) {
                     tracing::info!(
                         "台帳を受信しました({} 名、DNS レコード {} 件、CNAME {} 件)",
@@ -1491,6 +1504,7 @@ async fn member_reader(
                         cname_records,
                         deny: vec![], // deny はワイヤに載らない(blocked で受ける)
                         force_relay: vec![],
+                        network_display_name,
                     },
                     received_at: Instant::now(),
                 });
@@ -1645,29 +1659,29 @@ mod tests {
         fresher[0].endpoint = Some("203.0.113.9:51820".parse().unwrap());
         fresher[0].endpoint_age_secs = Some(60);
         assert_eq!(
-            ledger_digest(&base, &[], &[]),
-            ledger_digest(&fresher, &[], &[]),
+            ledger_digest(&base, &[], &[], None),
+            ledger_digest(&fresher, &[], &[], None),
             "エンドポイント鮮度だけの変化は意味のある変化ではない"
         );
 
         let mut offline = base.clone();
         offline[0].online = false;
         assert_ne!(
-            ledger_digest(&base, &[], &[]),
-            ledger_digest(&offline, &[], &[])
+            ledger_digest(&base, &[], &[], None),
+            ledger_digest(&offline, &[], &[], None)
         );
 
         let mut blocked = base.clone();
         blocked[0].blocked = true;
         assert_ne!(
-            ledger_digest(&base, &[], &[]),
-            ledger_digest(&blocked, &[], &[])
+            ledger_digest(&base, &[], &[], None),
+            ledger_digest(&blocked, &[], &[], None)
         );
 
         let more = vec![base[0].clone(), entry("bob", "100.100.42.3", true)];
         assert_ne!(
-            ledger_digest(&base, &[], &[]),
-            ledger_digest(&more, &[], &[])
+            ledger_digest(&base, &[], &[], None),
+            ledger_digest(&more, &[], &[], None)
         );
     }
 
@@ -1685,6 +1699,7 @@ mod tests {
             cname_records: vec![],
             deny: vec![],
             force_relay: vec![],
+            network_display_name: None,
         });
         let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
         let host_rtt: RttMap = Default::default();
@@ -1758,6 +1773,7 @@ mod tests {
                 }],
                 deny: vec![],
                 force_relay: vec![],
+                network_display_name: Some("うちの LAN".to_string()),
             })
             .unwrap();
         wait_for(&latest, |l| members_len(l) == Some(2)).await;
@@ -1777,6 +1793,11 @@ mod tests {
             assert_eq!(dist.dns_records[0].port, Some(8443));
             assert_eq!(dist.cname_records.len(), 1, "CNAME も一緒に届く");
             assert_eq!(dist.cname_records[0].target, "example.com");
+            assert_eq!(
+                dist.network_display_name.as_deref(),
+                Some("うちの LAN"),
+                "ネットワーク表示名も一緒に届く(ADR-0058)"
+            );
         }
 
         // 接続レジストリに登録されている(削除通知の配送口)
@@ -1810,6 +1831,7 @@ mod tests {
             cname_records: vec![],
             deny: vec![("100.100.42.2".parse().unwrap(), member_ip)],
             force_relay: vec![],
+            network_display_name: None,
         };
 
         let ControlMessage::Ledger { members, .. } = ledger_message_for(dist.clone(), member_ip)
@@ -1848,6 +1870,7 @@ mod tests {
             cname_records: vec![],
             deny: vec![],
             force_relay: vec![],
+            network_display_name: None,
         };
         let ControlMessage::Ledger {
             members,

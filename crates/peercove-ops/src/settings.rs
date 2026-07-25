@@ -36,6 +36,10 @@ pub struct Settings {
     /// ためここには出ない(変更はデーモン IPC の set_dns_name 経由)。
     /// 反映は次の supervisor 周期(約 5 秒)— 再起動不要。
     pub dns_name: Option<String>,
+    /// (host のみ)ネットワークの表示名(ADR-0058)。未設定なら一覧・詳細は
+    /// `network_name()` を表示に使う。DNS 名・slug には影響しない。
+    /// 反映: 保存後、稼働中なら次の台帳配布(数十秒以内)で全メンバーに届く。
+    pub network_display_name: Option<String>,
     /// 自分の仮想 IP とサブネット(表示のみ。変更は init/join のやり直し)。
     pub address: String,
     /// UDP 待受ポート。メンバーでは未指定(OS 任せ)が普通。
@@ -83,6 +87,9 @@ pub struct Update {
     /// (host のみ)自分の DNS 名(ADR-0021)。`None` または空文字で削除
     /// (従来導出に戻る)。メンバー設定では無視する。
     pub dns_name: Option<String>,
+    /// (host のみ)ネットワークの表示名(ADR-0058)。`None` または空文字で
+    /// 削除(従来どおり network_name 表示に戻る)。メンバー設定では無視する。
+    pub network_display_name: Option<String>,
     /// `None` で削除(ホストでは既定の 51820、メンバーでは OS 任せになる)。
     pub listen_port: Option<u16>,
     pub mtu: u16,
@@ -112,6 +119,7 @@ pub fn read(config_path: &Path) -> anyhow::Result<Settings> {
         interface_name: config.interface.name.clone(),
         display_name: config.interface.display_name.clone(),
         dns_name: config.interface.dns_name.clone(),
+        network_display_name: config.interface.network_display_name.clone(),
         address: config.interface.address.to_string(),
         listen_port: config.interface.listen_port,
         mtu: config.interface.mtu,
@@ -159,6 +167,23 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         .transpose()?;
 
     let current = read(config_path)?;
+    // (host のみ)ネットワーク表示名(ADR-0058)。メンバー設定では無視する。
+    let network_display_name = update
+        .network_display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|_| !current.is_member)
+        .map(|name| -> anyhow::Result<String> {
+            if name.chars().count() > 64 {
+                bail!("ネットワーク表示名は 64 文字以内にしてください");
+            }
+            if name.chars().any(char::is_control) {
+                bail!("ネットワーク表示名に制御文字は使えません");
+            }
+            Ok(name.to_string())
+        })
+        .transpose()?;
     // (host のみ)DNS 名(ADR-0021)。正規化 → 予約語・重複を検証してから書く
     let dns_name = update
         .dns_name
@@ -191,6 +216,10 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         match &dns_name {
             Some(label) => interface.insert("dns_name", toml_edit::value(label)),
             None => interface.remove("dns_name"),
+        };
+        match &network_display_name {
+            Some(name) => interface.insert("network_display_name", toml_edit::value(name)),
+            None => interface.remove("network_display_name"),
         };
     }
     match update.listen_port {
@@ -241,6 +270,34 @@ pub fn update(config_path: &Path, update: &Update) -> anyhow::Result<()> {
         peer["endpoint"] = toml_edit::value(endpoint.to_string());
     }
 
+    write_validated(lock, config_path, &doc.to_string())
+}
+
+/// 台帳で受信したネットワーク表示名を member.toml へ反映する(ADR-0058)。
+/// メンバーのデーモンが台帳受信のたびに呼ぶ想定。現在値と同じなら何もしない
+/// (毎周期の無駄な書き込みを避ける)。トンネル再生成のトリガー(supervisor の
+/// `detect_reconfig_restart`)には含めない — 表示名の変更でトンネルを
+/// 作り直す必要はないため。ホスト側の値が不正(64 文字超・制御文字)なら
+/// [`Config::validate`] が弾いて `Err` を返す。呼び出し側は警告ログに留め、
+/// 自分の設定ファイルを壊さないこと(締め出し防止。keyfiles::mark_key_self と同じ方針)。
+pub fn apply_network_display_name(
+    config_path: &Path,
+    received: Option<&str>,
+) -> anyhow::Result<()> {
+    let received = received.map(str::trim).filter(|s| !s.is_empty());
+    let current = Config::load(config_path)?;
+    if current.interface.network_display_name.as_deref() == received {
+        return Ok(());
+    }
+    let (lock, mut doc) = load_doc_locked(config_path)?;
+    let interface = doc
+        .get_mut("interface")
+        .and_then(|item| item.as_table_like_mut())
+        .context("[interface] が見つかりません")?;
+    match received {
+        Some(name) => interface.insert("network_display_name", toml_edit::value(name)),
+        None => interface.remove("network_display_name"),
+    };
     write_validated(lock, config_path, &doc.to_string())
 }
 
@@ -309,6 +366,7 @@ allowed_ips = ["10.119.96.2/32"]
             &Update {
                 display_name: Some("  alice2 ".to_string()),
                 dns_name: None,
+                network_display_name: None,
                 listen_port: Some(51900),
                 mtu: 1380,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
@@ -346,6 +404,7 @@ allowed_ips = ["10.119.96.2/32"]
             &Update {
                 display_name: Some("alice2".to_string()),
                 dns_name: None,
+                network_display_name: None,
                 listen_port: Some(51900),
                 mtu: 1380,
                 host_endpoint: None,
@@ -378,6 +437,7 @@ allowed_ips = ["10.119.96.2/32"]
         let base = Update {
             display_name: None,
             dns_name: None,
+            network_display_name: None,
             listen_port: None,
             mtu: 1420,
             host_endpoint: None,
@@ -433,6 +493,57 @@ allowed_ips = ["10.119.96.2/32"]
         assert_eq!(read(&member).unwrap().dns_name, None);
     }
 
+    /// ネットワーク表示名(ADR-0058): ホストのみ変更可。空で削除
+    /// (network_name 表示に戻る)。メンバー設定では無視される。DNS 名
+    /// (network_name)には一切影響しない。
+    #[test]
+    fn update_host_network_display_name() {
+        let path = write("host-network-display-name", HOST);
+        let base = Update {
+            display_name: None,
+            dns_name: None,
+            network_display_name: None,
+            listen_port: None,
+            mtu: 1420,
+            host_endpoint: None,
+            direct: true,
+            max_recv_file_mb: peercove_core::config::DEFAULT_MAX_RECV_FILE_MB,
+            require_invite_approval: false,
+            member_invites: true,
+            auto_connect: false,
+        };
+        update(
+            &path,
+            &Update {
+                network_display_name: Some("  うちの LAN  ".to_string()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        let after = read(&path).unwrap();
+        assert_eq!(
+            after.network_display_name.as_deref(),
+            Some("うちの LAN"),
+            "trim される"
+        );
+
+        // 空で削除
+        update(&path, &base).unwrap();
+        assert_eq!(read(&path).unwrap().network_display_name, None);
+
+        // メンバー設定では無視される(書き込まれない)
+        let member = write("member-network-display-name", MEMBER);
+        update(
+            &member,
+            &Update {
+                network_display_name: Some("スマホ".to_string()),
+                ..base
+            },
+        )
+        .unwrap();
+        assert_eq!(read(&member).unwrap().network_display_name, None);
+    }
+
     /// ホスト設定では endpoint を渡されても `[[peer]]`(= メンバー登録)を触らない。
     #[test]
     fn update_host_never_touches_peer_endpoint() {
@@ -442,6 +553,7 @@ allowed_ips = ["10.119.96.2/32"]
             &Update {
                 display_name: None,
                 dns_name: None,
+                network_display_name: None,
                 listen_port: None,
                 mtu: 1400,
                 host_endpoint: Some("198.51.100.7:51820".to_string()),
@@ -465,6 +577,7 @@ allowed_ips = ["10.119.96.2/32"]
         let base = Update {
             display_name: None,
             dns_name: None,
+            network_display_name: None,
             listen_port: None,
             mtu: 1420,
             host_endpoint: None,
@@ -512,6 +625,7 @@ allowed_ips = ["10.119.96.2/32"]
         let same = Update {
             display_name: current.display_name.clone(),
             dns_name: current.dns_name.clone(),
+            network_display_name: current.network_display_name.clone(),
             listen_port: current.listen_port,
             mtu: current.mtu,
             host_endpoint: current.host_endpoint.clone(),
@@ -555,5 +669,34 @@ allowed_ips = ["10.119.96.2/32"]
             host_endpoint: Some("198.51.100.7:51820".to_string()),
             ..same.clone()
         }));
+    }
+
+    /// 台帳受信の反映(ADR-0058): 変化があるときだけ書き込み、不正値は
+    /// 書かずにエラーを返す(自分の設定を壊さない)。
+    #[test]
+    fn apply_network_display_name_writes_only_on_change_and_rejects_invalid() {
+        let path = write("apply-network-display-name", MEMBER);
+        assert_eq!(read(&path).unwrap().network_display_name, None);
+
+        apply_network_display_name(&path, Some("うちの LAN")).unwrap();
+        assert_eq!(
+            read(&path).unwrap().network_display_name.as_deref(),
+            Some("うちの LAN")
+        );
+
+        // 同じ値の再適用は書き込みを行わない(mtime 変化なし)
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        apply_network_display_name(&path, Some("うちの LAN")).unwrap();
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "変化なしなら書き込まない");
+
+        // None で削除
+        apply_network_display_name(&path, None).unwrap();
+        assert_eq!(read(&path).unwrap().network_display_name, None);
+
+        // 不正値(65 文字)は書かずにエラー
+        assert!(apply_network_display_name(&path, Some(&"x".repeat(65))).is_err());
+        assert_eq!(read(&path).unwrap().network_display_name, None);
     }
 }

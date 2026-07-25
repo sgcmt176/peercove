@@ -1000,20 +1000,24 @@ function MemberRow({
                 🚫 {t.tunnel.member.blocked}
               </span>
             )}
-            {!member.isHost && member.inviteStatus && (
-              <span
-                className={`tag tag--invite-${member.inviteStatus}`}
-                title={
-                  member.inviteExpiresAt
-                    ? t.tunnel.member.inviteExpires(
-                        new Date(member.inviteExpiresAt * 1000).toLocaleString(),
-                      )
-                    : t.invite.never
-                }
-              >
-                {t.tunnel.member.inviteStatus[member.inviteStatus]}
-              </span>
-            )}
+            {/* 参加済みは基本状態なのでバッジを出さない(依頼者指摘)。
+                承認待ち・未参加系のステータスだけ引き続き表示する。 */}
+            {!member.isHost &&
+              member.inviteStatus &&
+              member.inviteStatus !== "joined" && (
+                <span
+                  className={`tag tag--invite-${member.inviteStatus}`}
+                  title={
+                    member.inviteExpiresAt
+                      ? t.tunnel.member.inviteExpires(
+                          new Date(member.inviteExpiresAt * 1000).toLocaleString(),
+                        )
+                      : t.invite.never
+                  }
+                >
+                  {t.tunnel.member.inviteStatus[member.inviteStatus]}
+                </span>
+              )}
             {member.subnets.map((subnet) => (
               <span key={subnet} className="tag mono" title={t.subnet.badgeTitle}>
                 {subnet}

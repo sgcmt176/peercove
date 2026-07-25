@@ -3334,6 +3334,15 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
 - 共有メモにもピン止めを追加。共有スキーマ v10 / キャッシュ v8、`SetPin`
   op(additive)、変更権限は編集者以上またはホスト、`updated_at` は動かさない。
 
+### 追補(2026-07-25 追補、M6 H-9b)
+
+- 依頼者フィードバックにより共有ピンを廃止し**端末ローカルのピン**に変更
+  (何が重要かは人によって異なるため)。wire の `SetPin` と `pinned`
+  フィールドは撤去、スキーマ v10/v8 の `pinned` 列は移行済み DB との互換の
+  ため残置。コメント欄は `<details>` が新しめの Chromium で
+  `::details-content` に中身をスロットし flex 高さ制約が効かなくなるため、
+  div + トグルへ変更。
+
 ## ADR-0053: 共有スケジュール表(M6 G-1)
 
 - **ステータス**: 採用(2026-07-24、設計)。**実装済み(同日)**: Rust 全層
@@ -3597,3 +3606,62 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
   壊れても最悪 1 回手で接続すれば再構築される。`deny_unknown_fields` の
   ため新フィールドを書いた TOML は旧版 peercove では読めないが、既定値なら
   書かない既存作法(`direct` / `member_invites`)に揃えて影響を抑える。
+
+## ADR-0058: ネットワーク表示名の変更(M6 H-9)
+
+- **ステータス**: 採用(2026-07-25、設計)。**実装済み(2026-07-25、H-9d)**。
+  設計との差分は「実装との整合」節を参照
+- **実装との整合(2026-07-25)**:
+  - TOML キー・Rust フィールド名は `display_name` ではなく
+    **`network_display_name`** にした。`[interface].display_name` は
+    ADR-0027 でこの端末自身(自分)の表示名として既に使われており、
+    そのまま `display_name` を追加すると同じ `[interface]` テーブル内で
+    キーが衝突する(Rust 側は同名フィールドを 2 つ持てず、TOML も同じ
+    キーを 2 度書けない)。用途が違う(ネットワーク全体の表示名 vs
+    自分 1 台の表示名)ため、`network_display_name` という別名にして
+    衝突を避けた。決定 1・3 の「display_name」はすべてこの名前と読み替える。
+  - 台帳(`ControlMessage::Ledger`)には `network_display_name: Option<String>`
+    を additive フィールドとして追加(`members` と同階層。ネットワーク単位の
+    値なので `LedgerEntry` ではなく `Ledger` メッセージ本体に載せた)。
+  - メンバーの永続化は `peercove_ops::settings::apply_network_display_name`
+    (デスクトップ・Android 共通)。台帳受信のたびに現在値と比較し、変化が
+    あるときだけ書き込む。ホストからの値が不正(64 文字超・制御文字)なら
+    `Config::validate` が弾いて書き込みを拒否し、警告ログに留める(自分の
+    設定ファイルを壊さない — `keyfiles::mark_key_self` と同じ方針)。
+  - トンネル再生成は起こさない: `detect_reconfig_restart` /
+    `Settings::restart_required` のどちらにも `network_display_name` を
+    含めていない(listen_port / mtu / 接続先だけが対象のまま)。
+  - デスクトップ一覧(`NetworksView.tsx`)のカード名は
+    `peercove_ops::networks::NetworkEntry.name` を `config.display_title()`
+    (表示名があればそれ、無ければ `network_name()`)に差し替えることで
+    対応した(専用の新フィールドは増やしていない)。この構造体は
+    Tauri の `NetworkDto` と Android の `NetworkInfo`(peercove-mobile)
+    双方の元データなので、1 箇所の変更で両方に反映される。稼働中は
+    IPC Status(`TunnelInfo.network_display_name` → `Tunnel.networkDisplayName`)
+    を優先し、より新しい値を出す。
+- **背景**: 依頼者要望「ネットワーク名変更ができるようにしたい(ホストのみ)」。
+  現状の `network_name` は表示名であると同時に **DNS ゾーンの基底・
+  `networks/<slug>/` のディレクトリ名・招待トークンの中身**を兼ねる技術
+  識別子(DNS ラベル制約)。これ自体を改名すると全端末の DNS 名が変わり、
+  ディレクトリ移動・トークン整合など影響が大きい。
+- **選択肢**:
+  - (a) `network_name` を直接改名し、全端末へ再配布・再設定 → DNS 名が
+    変わる副作用が大きく、稼働中の改名は危険。
+  - (b) メンバー名で前例のある**表示名の分離**(ADR-0022: 表示名は自由、
+    DNS 名は固定)をネットワークにも適用する。
+  - → **(b) を採用**。
+- **決定**:
+  1. `[interface]` に `display_name`(任意、UTF-8 自由文字列、64 文字
+     以内)を追加。既定(未設定)なら従来どおり `network_name` を表示に
+     使う。TOML へは設定時のみ書く(既定なら書かない — `deny_unknown_fields`
+     互換の既存作法)。
+  2. **変更できるのはホストのみ**。ネットワーク詳細ヘッダーの名前を
+     クリック(または編集アイコン)で変更する UI。
+  3. 台帳(ledger)に additive フィールドでネットワーク表示名を載せ、
+     メンバーのデーモンは受信時に member.toml の `display_name` へ永続化
+     する(member.toml 動的反映の既存基盤を流用)。オフラインでも一覧に
+     最新の表示名が出る。Android も台帳受信で追随。
+  4. DNS 名・slug・ディレクトリ・招待トークンは**変えない**。UI の説明に
+     「DNS 名は変わりません」と明記する。
+- **理由**: 表示と識別子の分離はメンバー名で実績があり、稼働中でも安全に
+  変更できる。旧クライアントは未知の台帳フィールドを無視する(additive)。

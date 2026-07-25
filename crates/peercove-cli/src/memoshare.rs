@@ -84,6 +84,15 @@ impl MemoHandle {
             MemoHandle::Member(cache) => cache.supported(),
         }
     }
+
+    /// 永続接続キャッシュ(M6 H-9a)を明示的に無効化する。バックアップ復元で
+    /// DB ファイルが差し替わった直後、およびトンネル停止時に呼ぶ。
+    pub fn invalidate_db_cache(&self) {
+        match self {
+            MemoHandle::Host(service) => service.invalidate_db_cache(),
+            MemoHandle::Member(cache) => cache.invalidate_db_cache(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -117,6 +126,22 @@ pub struct MemoService {
     /// シートのプレゼンス(選択セル、揮発。key = actor の member_id、
     /// ホストは空文字。ADR-0055 決定 6。DB には保存しない)。
     sheet_presence: Mutex<HashMap<String, SheetPresenceEntry>>,
+    /// 共有 DB への永続接続キャッシュ(M6 H-9a、locking protocol エラーの
+    /// 根治)。旧実装は 1 操作ごとに `SharedStore::open` してから drop
+    /// していたが、WAL モードは「最後の接続が閉じるときに WAL を
+    /// チェックポイントして -wal を削除し、次に開いた接続がそこから WAL
+    /// を回復する」という動きをするため、open/close が高頻度で重なると
+    /// 回復とチェックポイントが競合して SQLITE_PROTOCOL(code 15)が
+    /// 起きる。H-7a のリトライは頻度を下げただけで、シートの色変更、
+    /// 全員へのブロードキャスト読み取り、5 秒周期の watch_groups が
+    /// 重なる実負荷では再発した。接続をプロセス内で使い回して全操作を
+    /// ここへ直列化すれば、open/close の競合は原理的に発生しない。
+    /// `rusqlite::Connection` は Send だが Sync ではないため、
+    /// `Mutex<Option<SharedStore>>` で包むことで `MemoService` 自体の
+    /// Send + Sync を保つ(アクセスは常に `spawn_blocking` の中、つまり
+    /// 同期コンテキストなので、ここでの `std::sync::Mutex::lock` は
+    /// ランタイムをブロックしない)。
+    shared_store: Mutex<Option<SharedStore>>,
 }
 
 impl MemoService {
@@ -131,6 +156,7 @@ impl MemoService {
             seq: AtomicU64::new(1),
             last_maintenance: Mutex::new(None),
             sheet_presence: Mutex::new(HashMap::new()),
+            shared_store: Mutex::new(None),
         })
     }
 
@@ -349,21 +375,6 @@ impl MemoService {
                         let actor = actor.clone();
                         let id = id.clone();
                         move |store| store.update(&actor, &id, base_revision, &title, &body)
-                    })
-                    .await?;
-                memo.locked_by = self.lock_holder(&memo.id);
-                self.refresh_group_names(&mut memo);
-                self.broadcast_changed(id);
-                self.bump();
-                Ok(SharedMemoReply::Memo { memo })
-            }
-            SharedMemoOp::SetPin { id, pinned } => {
-                // 編集ロックは不要(本文を変更しないため)
-                let mut memo = self
-                    .blocking({
-                        let actor = actor.clone();
-                        let id = id.clone();
-                        move |store| store.set_pin(&actor, &id, pinned)
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
@@ -999,7 +1010,7 @@ impl MemoService {
             if released.is_empty() {
                 return;
             }
-            snapshot_closed(&service.db_path, &released);
+            snapshot_closed(&service, &released);
             for (id, _) in &released {
                 service.broadcast_lock(id, None);
                 service.bump();
@@ -1026,9 +1037,9 @@ impl MemoService {
         }
         {
             // DB IO なのでバックグラウンドで行う(ロック解放・配信は待たない)
-            let db_path = self.db_path.clone();
+            let service = Arc::clone(self);
             let released = expired.clone();
-            tokio::task::spawn_blocking(move || snapshot_closed(&db_path, &released));
+            tokio::task::spawn_blocking(move || snapshot_closed(&service, &released));
         }
         for (id, _) in expired {
             tracing::debug!("共有メモの編集ロックを無操作で解放しました(memo={id})");
@@ -1056,21 +1067,14 @@ impl MemoService {
             }
             *last = Some(Instant::now());
         }
-        let db_path = self.db_path.clone();
+        let service = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            let store = match SharedStore::open(&db_path) {
-                Ok(store) => store,
-                Err(e) => {
-                    tracing::warn!("共有メモの定期メンテナンスに失敗しました: {e:#}");
-                    return;
-                }
-            };
-            match store.purge_expired() {
+            match service.with_store(&|store| store.purge_expired()) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!("共有メモのゴミ箱から {n} 件を完全削除しました"),
                 Err(e) => tracing::warn!("共有メモのゴミ箱整理に失敗しました: {e:#}"),
             }
-            if let Err(e) = store.checkpoint() {
+            if let Err(e) = service.with_store(&|store| store.checkpoint()) {
                 tracing::warn!("共有メモの WAL チェックポイントに失敗しました: {e:#}");
             }
         });
@@ -1107,14 +1111,7 @@ impl MemoService {
         }
         let service = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            let store = match SharedStore::open(&service.db_path) {
-                Ok(store) => store,
-                Err(e) => {
-                    tracing::warn!("共有メモのグループ権限再配信に失敗しました: {e:#}");
-                    return;
-                }
-            };
-            match store.memo_ids_with_group_perms() {
+            match service.with_store(&|store| store.memo_ids_with_group_perms()) {
                 Ok(ids) => {
                     for id in ids {
                         service.broadcast_changed(id);
@@ -1140,20 +1137,45 @@ impl MemoService {
         }
     }
 
-    async fn blocking<T, F>(&self, f: F) -> anyhow::Result<T>
+    /// キャッシュした接続があれば再利用し、なければ開いて格納する
+    /// (M6 H-9a。`shared_store` フィールドのコメントに根本原因の説明)。
+    /// SQLite のロック競合エラーが起きたときは接続そのものを捨てる
+    /// (壊れているかもしれない接続を握り続けない。次回アクセスで開き直す)。
+    fn with_store<T>(
+        &self,
+        f: &dyn Fn(&mut SharedStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut guard = self.shared_store.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(SharedStore::open(&self.db_path)?);
+        }
+        let result = f(guard.as_mut().expect("直前に確保済み"));
+        if matches!(&result, Err(e) if is_retryable_sqlite_error(e)) {
+            *guard = None;
+        }
+        result
+    }
+
+    /// バックアップ復元で DB ファイルそのものが差し替わった直後、および
+    /// トンネル停止時に呼ぶ(M6 H-9a)。キャッシュした接続を明示的に閉じて
+    /// ファイルロックを残さない。次回アクセスで開き直す(クリーンアップを
+    /// 常に対で実装する、既存方針)。
+    pub fn invalidate_db_cache(&self) {
+        *self.shared_store.lock().unwrap() = None;
+    }
+
+    async fn blocking<T, F>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
         F: Fn(&mut SharedStore) -> anyhow::Result<T> + Send + 'static,
     {
-        let path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            retry_on_lock_error(|| {
-                let mut store = SharedStore::open(&path)?;
-                f(&mut store)
-            })
-        })
-        .await
-        .context("メモ処理タスクが失敗しました")?
+        let service = Arc::clone(self);
+        // リトライ対象は主に「別接続(バックアップのスナップショット読み取り・
+        // 診断の一回読み)との稀な競合」用。主経路(この blocking 経由の操作)
+        // は既に永続接続へ直列化済みなので、通常はここで初回成功する。
+        tokio::task::spawn_blocking(move || retry_on_lock_error(|| service.with_store(&f)))
+            .await
+            .context("メモ処理タスクが失敗しました")?
     }
 
     /// `shared_memo` capability を名乗った接続の (IP, 送信口) 一覧。
@@ -1180,9 +1202,6 @@ impl MemoService {
             let Ok(config) = Config::load(&service.config_path) else {
                 return;
             };
-            let Ok(store) = SharedStore::open(&service.db_path) else {
-                return;
-            };
             let holder = service.lock_holder(&id);
             for (ip, connection) in targets {
                 let Ok(actor) = Self::actor_for_ip(&config, ip) else {
@@ -1191,7 +1210,8 @@ impl MemoService {
                 // グループ権限のメモをリアルタイム配信するには、受信者ごとの
                 // Actor に所属グループを付けておく必要がある(ADR-0051)
                 let actor = actor.with_groups(service.group_ids_for(ip));
-                let event = match store.detail_if_visible(&actor, &id) {
+                let event = match service.with_store(&|store| store.detail_if_visible(&actor, &id))
+                {
                     Ok(Some(mut memo)) => {
                         memo.locked_by = holder.clone();
                         service.refresh_group_names(&mut memo);
@@ -1233,10 +1253,7 @@ impl MemoService {
             if targets.is_empty() {
                 return;
             }
-            let Ok(store) = SharedStore::open(&service.db_path) else {
-                return;
-            };
-            let Ok(folders) = store.folders() else {
+            let Ok(folders) = service.with_store(&|store| store.folders()) else {
                 return;
             };
             let event = SharedMemoEvent::Folders { folders };
@@ -1481,14 +1498,16 @@ fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
     locks.retain(|_, lock| lock.last_activity.elapsed() <= LOCK_TTL);
 }
 
-/// `SharedStore`/`CacheStore` を都度 open する構造(各 op ごとに新しい
-/// コネクションを開く)のため、書き込みが集中すると SQLite の
-/// locking protocol エラー(SQLITE_BUSY/SQLITE_LOCKED/SQLITE_PROTOCOL)が
-/// まれに起きる(ADR-0055 決定 6 追補 H-7a)。busy_timeout(5秒)は個々の
-/// SQL 文の待ちはカバーするが、コネクションの open/close 自体が重なった
-/// ときのロック取得プロトコルのエラーまでは吸収しないため、ここで
-/// アプリ層の安全弁として 50ms 間隔・最大 5 回まで再試行する。対象外の
-/// エラー(制約違反・データ不整合など)は最初の失敗でそのまま返す。
+/// 主経路(`MemoService::with_store` / `MemberMemoCache::with_store` 経由の
+/// 操作)は M6 H-9a で永続接続に直列化済みのため、この DB プロセス内での
+/// open/close 競合による locking protocol エラーは原理的に起きない。
+/// それでも残るのは「別接続(暗号化バックアップのスナップショット読み取り、
+/// 診断の一回読み — いずれも意図的に別接続のまま)」との瞬間的な競合で、
+/// busy_timeout(5秒)は個々の SQL 文の待ちはカバーするがコネクションの
+/// open/close 自体が重なったときのロック取得プロトコルのエラーまでは
+/// 吸収しないため、ここでアプリ層の安全弁として 50ms 間隔・最大 5 回まで
+/// 再試行する(ADR-0055 決定 6 追補 H-7a・H-9a)。対象外のエラー
+/// (制約違反・データ不整合など)は最初の失敗でそのまま返す。
 const RETRY_MAX_ATTEMPTS: u32 = 5;
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -1513,20 +1532,16 @@ fn retry_on_lock_error<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> any
 }
 
 /// (同期文脈から)複数メモの編集終了時スナップショットをまとめて行う。
-/// DB を開けない・書けない場合も呼び出し元のロック解放は既に完了している
-/// ため warn に留める(memo_id のみ。内容は出さない — ADR-0049)。
-fn snapshot_closed(db_path: &Path, released: &[(String, u64)]) {
-    match SharedStore::open(db_path) {
-        Ok(store) => {
-            for (id, revision) in released {
-                if let Err(e) = store.snapshot_if_revision_changed(id, *revision) {
-                    tracing::warn!(
-                        "共有メモの履歴スナップショットに失敗しました(memo={id}): {e:#}"
-                    );
-                }
-            }
+/// 永続接続(M6 H-9a)を経由するため、DB を開けない・書けない場合も
+/// 呼び出し元のロック解放は既に完了しているため warn に留める(memo_id
+/// のみ。内容は出さない — ADR-0049)。
+fn snapshot_closed(service: &Arc<MemoService>, released: &[(String, u64)]) {
+    for (id, revision) in released {
+        if let Err(e) =
+            service.with_store(&|store| store.snapshot_if_revision_changed(id, *revision))
+        {
+            tracing::warn!("共有メモの履歴スナップショットに失敗しました(memo={id}): {e:#}");
         }
-        Err(e) => tracing::warn!("共有メモの履歴スナップショットに失敗しました: {e:#}"),
     }
 }
 
@@ -1539,6 +1554,9 @@ pub struct MemberMemoCache {
     /// シートのプレゼンス(選択セル、揮発。key = sheet_id。ADR-0055 決定 6。
     /// **DB には保存しない**(SQLite キャッシュを経由させない)。
     sheet_presence: Mutex<HashMap<String, Vec<SheetPresencePeer>>>,
+    /// キャッシュ DB への永続接続(M6 H-9a)。理由は
+    /// `MemoService::shared_store` と同じ(locking protocol エラーの根治)。
+    cache_store: Mutex<Option<CacheStore>>,
 }
 
 impl MemberMemoCache {
@@ -1548,6 +1566,7 @@ impl MemberMemoCache {
             generation: AtomicU64::new(1),
             supported: AtomicBool::new(false),
             sheet_presence: Mutex::new(HashMap::new()),
+            cache_store: Mutex::new(None),
         })
     }
 
@@ -1567,20 +1586,34 @@ impl MemberMemoCache {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    async fn blocking<T, F>(&self, f: F) -> anyhow::Result<T>
+    /// `MemoService::with_store` と同じパターン(M6 H-9a)。
+    fn with_store<T>(&self, f: &dyn Fn(&mut CacheStore) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let mut guard = self.cache_store.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(CacheStore::open(&self.path)?);
+        }
+        let result = f(guard.as_mut().expect("直前に確保済み"));
+        if matches!(&result, Err(e) if is_retryable_sqlite_error(e)) {
+            *guard = None;
+        }
+        result
+    }
+
+    /// バックアップ復元でキャッシュ DB が差し替わった直後、およびトンネル
+    /// 停止時に呼ぶ(M6 H-9a)。次回アクセスで開き直す。
+    pub fn invalidate_db_cache(&self) {
+        *self.cache_store.lock().unwrap() = None;
+    }
+
+    async fn blocking<T, F>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
         F: Fn(&mut CacheStore) -> anyhow::Result<T> + Send + 'static,
     {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            retry_on_lock_error(|| {
-                let mut store = CacheStore::open(&path)?;
-                f(&mut store)
-            })
-        })
-        .await
-        .context("メモキャッシュタスクが失敗しました")?
+        let cache = Arc::clone(self);
+        tokio::task::spawn_blocking(move || retry_on_lock_error(|| cache.with_store(&f)))
+            .await
+            .context("メモキャッシュタスクが失敗しました")?
     }
 
     /// ホストからのイベントをキャッシュへ反映する。
@@ -1797,5 +1830,65 @@ impl MemberMemoCache {
         .await?;
         self.bump();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// テストごとに独立した `<dir>/host.toml` パスを作る(DB は
+    /// `host.memos.db` として同じフォルダーに作られる)。実際の設定ファイル
+    /// は不要(このテストで触る経路は Config::load を経由しない)。
+    fn temp_config_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-memoshare-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("host.toml")
+    }
+
+    /// M6 H-9a の煙テスト: 永続接続(1 本)に直列化しても、連続した
+    /// 大量アクセスで locking protocol エラーが起きないこと。旧実装
+    /// (1 操作 = 1 接続の open/close)ではここが再現条件だった。
+    #[tokio::test]
+    async fn persistent_connection_survives_many_sequential_ops() {
+        let config_path = temp_config_path("many-ops");
+        let service = MemoService::new(&config_path);
+        for _ in 0..100 {
+            service.blocking(|store| store.folders()).await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
+    }
+
+    /// invalidate_db_cache() 後は接続が閉じられ、次回アクセスで
+    /// 開き直されて引き続き使えること(復元・トンネル停止時のフック)。
+    #[tokio::test]
+    async fn invalidate_db_cache_reopens_store_on_next_access() {
+        let config_path = temp_config_path("invalidate");
+        let service = MemoService::new(&config_path);
+
+        service.blocking(|store| store.folders()).await.unwrap();
+        assert!(
+            service.shared_store.lock().unwrap().is_some(),
+            "初回アクセスでキャッシュされているはず"
+        );
+
+        service.invalidate_db_cache();
+        assert!(
+            service.shared_store.lock().unwrap().is_none(),
+            "invalidate 直後はキャッシュが空のはず"
+        );
+
+        // 無効化後も普通に使え、再び開き直されてキャッシュされる
+        service.blocking(|store| store.folders()).await.unwrap();
+        assert!(service.shared_store.lock().unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
     }
 }

@@ -271,6 +271,7 @@ fn update_settings_with(
     let mut update = peercove_ops::settings::Update {
         display_name: current.display_name.clone(),
         dns_name: current.dns_name.clone(),
+        network_display_name: current.network_display_name.clone(),
         listen_port: current.listen_port,
         mtu: current.mtu,
         host_endpoint: current.host_endpoint.clone(),

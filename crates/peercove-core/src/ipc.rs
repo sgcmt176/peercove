@@ -367,6 +367,11 @@ pub struct TunnelInfo {
     pub config: PathBuf,
     /// ネットワーク名(ADR-0012。設定の network_name、旧設定は既定名)。
     pub network: String,
+    /// ネットワークの表示名(ADR-0058)。host: 自分の設定 / member: 台帳で
+    /// 受信したもの。未設定なら None(UI は `network` を表示に使う)。
+    /// 旧デーモンの応答には無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_display_name: Option<String>,
     pub role: TunnelRole,
     /// 自分の仮想 IP。
     pub address: Ipv4Addr,

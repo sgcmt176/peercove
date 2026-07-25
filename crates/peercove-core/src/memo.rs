@@ -400,10 +400,6 @@ pub struct SharedMemoSummary {
     /// コメント件数(ADR-0052 決定 4)。一覧の 💬 バッジ用。
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub comment_count: u32,
-    /// ピン止め(全員に見える共有フラグ。個人ごとではない、M6 H-8c、
-    /// ADR-0052 追補)。一覧の並びは pinned DESC が最優先。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pinned: bool,
 }
 
 /// 共有メモ 1 件の全体。`everyone` / `members` は can_manage のときだけ載る。
@@ -443,10 +439,6 @@ pub struct SharedMemoDetail {
     /// コメント件数(ADR-0052 決定 4)。
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub comment_count: u32,
-    /// ピン止め(全員に見える共有フラグ。個人ごとではない、M6 H-8c、
-    /// ADR-0052 追補)。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub pinned: bool,
 }
 
 /// 共有メモのコメント 1 件(ADR-0052 決定 4)。単層(返信ツリーなし)。
@@ -504,13 +496,6 @@ pub enum SharedMemoOp {
         base_revision: u64,
         title: String,
         body: String,
-    },
-    /// ピン止めの切り替え(全員に見える共有フラグ。個人ごとではない)。
-    /// 変更できるのは編集権限(editor)以上またはホスト(閲覧のみは拒否)。
-    /// `updated_at` と本文リビジョンは動かさない(M6 H-8c、ADR-0052 追補)。
-    SetPin {
-        id: String,
-        pinned: bool,
     },
     /// 編集ロックの取得。応答は最新の [`SharedMemoReply::Memo`]
     /// (これを土台に編集を始める)。

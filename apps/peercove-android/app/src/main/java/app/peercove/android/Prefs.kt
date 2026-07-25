@@ -98,6 +98,28 @@ object Prefs {
             if (convId != key && value == true) convId else null
         }.toSet()
 
+    /** 共有メモのピン留め(端末ローカル、M6 H-9b)。全員に見える共有ピン
+     *  (SetPin op)は依頼者フィードバックにより撤去し、このマシンだけに
+     *  効く表示設定へ変更した(「何が大事なのかは操作する人によって
+     *  異なる」ため)。並び順は保持しない(一覧側でピン留め→先頭、ピン
+     *  同士は元の並び順のまま並べ替える)ので、会話ミュートと同じ単純な
+     *  boolean フラグの集合として保存する。 */
+    fun isMemoPinned(context: Context, slug: String, memoId: String): Boolean =
+        prefs(context).getBoolean("memopin/$slug/$memoId", false)
+
+    fun setMemoPinned(context: Context, slug: String, memoId: String, pinned: Boolean) {
+        val key = "memopin/$slug/$memoId"
+        prefs(context).edit().apply {
+            if (pinned) putBoolean(key, true) else remove(key)
+        }.apply()
+    }
+
+    fun allMemoPins(context: Context, slug: String): Set<String> =
+        prefs(context).all.mapNotNull { (key, value) ->
+            val id = key.removePrefix("memopin/$slug/")
+            if (id != key && value == true) id else null
+        }.toSet()
+
     /** チャット通知の本文をロック画面で隠す(全体設定)。 */
     fun hideNotifContent(context: Context): Boolean =
         prefs(context).getBoolean("notif_hide_content", false)

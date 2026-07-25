@@ -2100,6 +2100,35 @@ button.msg__ref:hover {
   margin: 0;
   font-size: 20px;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ネットワーク表示名の変更(ADR-0058、ホストのみ)。 */
+.detail__rename-btn {
+  font-size: 14px;
+  opacity: 0.7;
+}
+
+.detail__rename-btn:hover {
+  opacity: 1;
+}
+
+.detail__rename {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.detail__rename-input {
+  font-size: 20px;
+  min-width: 12ch;
+}
+
+.detail__rename-hint {
+  flex-basis: 100%;
+  margin: 0;
 }
 
 .detail__identity {
@@ -3025,7 +3054,18 @@ button.msg__ref:hover {
    flex 配分 + min-height: 0 + overflow: hidden の組み合わせで担う
    (祖先の高さが確定しない問題を踏まないよう、% ではなく flex 比のまま)。
    閉じているとき(details が open でない)は引き続き flex: none で
-   本文だけが残り高さを占める。 */
+   本文だけが残り高さを占める。
+   M6 H-9b 追補(根治): 上記の flex 配分は前提として details 要素の
+   *直接の子* に効くことに依存していたが、新しめの Chromium(WebView2
+   含む、131+)では details の中身(summary 以外)が ::details-content
+   という中間ボックスへスロットされるため、details に付けた
+   display:flex が直接の子(.memo__comments-list 側の
+   flex:1;min-height:0;overflow-y:auto)へ伝播せず構造的に無効化される
+   (実測: 高さ制約 100px の details 内でリストが 1216px のまま
+   非スクロール = 「2 件しか見えずスクロールもできない」という症状の
+   真因)。details/summary をやめて div + トグルボタン(React state)に
+   置き換え、`[open]` 属性セレクタを `.memo__comments--open` クラスへ
+   変更した。フレックス配分の値そのものは上記の経緯を維持する。 */
 .memo__comments {
   border-top: 1px solid var(--border);
   padding-top: 8px;
@@ -3037,16 +3077,29 @@ button.msg__ref:hover {
   overflow: hidden;
 }
 
-.memo__comments[open] {
+.memo__comments--open {
   flex: 1 1 0;
   min-height: 160px;
 }
 
-.memo__comments summary {
+.memo__comments-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  margin: 0;
+  padding: 0;
+  font: inherit;
   cursor: pointer;
   color: var(--muted);
   font-weight: 600;
   flex: none;
+}
+
+.memo__comments-toggle:hover {
+  filter: none;
+  color: var(--text);
 }
 
 .memo__comments-list {

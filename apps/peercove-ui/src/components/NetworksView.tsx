@@ -178,6 +178,9 @@ function NetworkCard({
   const running = tunnel !== null;
   const connected = running && !tunnel.connectionError && !tunnel.removed;
   const isHost = network.role === "hosting";
+  // 表示名(ADR-0058): 稼働中は台帳/自分の設定由来の最新値、
+  // 停止中は一覧の name(既に display_title 済み)を使う
+  const displayName = tunnel?.networkDisplayName || tunnel?.network || network.name;
   const onlineCount =
     tunnel?.members.filter((member) => member.online).length ?? 0;
 
@@ -225,7 +228,7 @@ function NetworkCard({
                   : t.networks.stopped
             }
           />
-          {network.name}
+          {displayName}
           <span className="tag">
             {isHost ? t.networks.roleHost : t.networks.roleMember}
           </span>

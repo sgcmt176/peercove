@@ -95,7 +95,6 @@ import uniffi.peercove_mobile.sharedMemoRelease
 import uniffi.peercove_mobile.sharedMemoResolveTitles
 import uniffi.peercove_mobile.sharedMemoSave
 import uniffi.peercove_mobile.sharedMemoSaveVersion
-import uniffi.peercove_mobile.sharedMemoSetPin
 import uniffi.peercove_mobile.sharedMemoTrash
 
 private val sharedDateFmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
@@ -305,7 +304,11 @@ fun SharedMemoTab(
                 label = { Text(stringResource(R.string.memo_search)) },
             )
             Spacer(modifier = Modifier.height(8.dp))
-            val memos = result?.memos ?: emptyList()
+            // ピン止め(端末ローカル、M6 H-9b): ピン留め→先頭、ピン同士は
+            // 元の並び順のまま(sortedByDescending は安定ソート)。
+            val pinnedIds = remember(slug, refreshTick) { Prefs.allMemoPins(context, slug) }
+            val memos = (result?.memos ?: emptyList())
+                .sortedByDescending { pinnedIds.contains(it.id) }
             if (memos.isEmpty()) {
                 Text(
                     stringResource(R.string.shared_memo_empty),
@@ -322,7 +325,7 @@ fun SharedMemoTab(
                     Card(onClick = { openId = memo.id }, modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (memo.pinned) {
+                                if (pinnedIds.contains(memo.id)) {
                                     Icon(
                                         Icons.Filled.PushPin,
                                         contentDescription = stringResource(R.string.memo_pin),
@@ -416,7 +419,12 @@ private fun SharedMemoEditor(
     onNotice: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var detail by remember { mutableStateOf<SharedMemoDetailInfo?>(null) }
+    // ピン止め(端末ローカル、M6 H-9b)。全員に見える共有ピン(SetPin op)は
+    // 依頼者フィードバックにより撤去し、このマシンだけに効く表示設定へ
+    // 変更した(何が重要かは人によって異なるため)。
+    var pinned by remember(id) { mutableStateOf(Prefs.isMemoPinned(context, slug, id)) }
     var editing by remember { mutableStateOf(false) }
     var title by remember { mutableStateOf("") }
     var body by remember { mutableStateOf("") }
@@ -694,7 +702,10 @@ private fun SharedMemoEditor(
                     label = { Text(stringResource(R.string.shared_memo_finish)) },
                 )
             }
-            if (detail?.canEdit == true || detail?.canManage == true) {
+            run {
+                // ピン止め(端末ローカル、M6 H-9b)は権限に関わらず全員が使える
+                // ため、オーバーフローメニュー自体は常に表示する(ゴミ箱だけ
+                // canManage で内側から出し分ける)。
                 IconButton(onClick = { menuOpen = true }) {
                     Icon(
                         Icons.Filled.MoreVert,
@@ -702,32 +713,23 @@ private fun SharedMemoEditor(
                     )
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    // ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
-                    // 変更できるのは編集権限(editor)以上またはホスト。
-                    if (detail?.canEdit == true) {
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    stringResource(
-                                        if (detail?.pinned == true) R.string.memo_unpin
-                                        else R.string.memo_pin,
-                                    ),
-                                )
-                            },
-                            onClick = {
-                                menuOpen = false
-                                scope.launch {
-                                    try {
-                                        detail = withContext(Dispatchers.IO) {
-                                            sharedMemoSetPin(slug, id, detail?.pinned != true)
-                                        }
-                                    } catch (e: MobileException) {
-                                        onNotice(e.message ?: "")
-                                    }
-                                }
-                            },
-                        )
-                    }
+                    // ピン止め(端末ローカル、M6 H-9b。依頼者フィードバックにより
+                    // 全員共有から端末ローカルへ変更): 権限チェック不要。
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                stringResource(
+                                    if (pinned) R.string.shared_memo_unpin_local
+                                    else R.string.shared_memo_pin_local,
+                                ),
+                            )
+                        },
+                        onClick = {
+                            menuOpen = false
+                            pinned = !pinned
+                            Prefs.setMemoPinned(context, slug, id, pinned)
+                        },
+                    )
                     if (detail?.canManage == true) {
                         DropdownMenuItem(
                             text = {

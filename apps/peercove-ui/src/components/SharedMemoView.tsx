@@ -55,6 +55,36 @@ import { splitMentions } from "../mentions";
 
 const AUTOSAVE_DELAY_MS = 600;
 
+// ---- ピン止め(端末ローカル、M6 H-9b) ----
+//
+// 昨日実装した共有ピン(全員に見える、SetPin op)は依頼者フィードバック
+// (「何が大事なのかは操作する人によって異なる」)により撤去し、
+// このマシンだけに効く localStorage 保存へ変更した。chat.ts の
+// ピン留め(peercove-chat-pins:<config>)と同じ形式・同じキー命名規則に
+// 合わせている。configPath(ネットワークの設定ファイルパス)をキーの一部
+// にして、ネットワークをまたいで混ざらないようにする。
+function memoPinKey(configPath: string): string {
+  return `peercove-memo-pins:${configPath}`;
+}
+
+function loadMemoPins(configPath: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(memoPinKey(configPath));
+    const list = raw ? (JSON.parse(raw) as string[]) : [];
+    return new Set(Array.isArray(list) ? list : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveMemoPins(configPath: string, pins: Set<string>): void {
+  try {
+    localStorage.setItem(memoPinKey(configPath), JSON.stringify([...pins]));
+  } catch {
+    // 保存できなくてもピン留めが効かなくなるだけ
+  }
+}
+
 export function SharedMemoView({
   configPath,
   isHost,
@@ -102,6 +132,31 @@ export function SharedMemoView({
   /** 変更履歴パネルを開いているか(本文領域を置き換える)。 */
   const [historyOpen, setHistoryOpen] = useState(false);
   const [limitsOpen, setLimitsOpen] = useState(false);
+  // ピン止め(端末ローカル、M6 H-9b)。configPath ごとに localStorage で保持。
+  const [pins, setPins] = useState<Set<string>>(() => loadMemoPins(configPath));
+  useEffect(() => {
+    setPins(loadMemoPins(configPath));
+  }, [configPath]);
+  const togglePin = useCallback(
+    (id: string) => {
+      setPins((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) {
+          next.delete(id);
+        } else {
+          next.add(id);
+        }
+        saveMemoPins(configPath, next);
+        return next;
+      });
+    },
+    [configPath],
+  );
+  // ピン留め → 先頭(ピン同士は元の並び順のまま)。
+  const sortedMemos = useMemo(
+    () => [...memos].sort((a, b) => Number(pins.has(b.id)) - Number(pins.has(a.id))),
+    [memos, pins],
+  );
 
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
   // 自動保存の土台(CAS 用リビジョンと保存済み内容)
@@ -548,7 +603,7 @@ export function SharedMemoView({
               {trashView ? t.memo.emptyTrash : t.sharedMemo.empty}
             </li>
           )}
-          {memos.map((memo) => (
+          {sortedMemos.map((memo) => (
             <li key={memo.id}>
               <button
                 type="button"
@@ -560,7 +615,7 @@ export function SharedMemoView({
                 onClick={() => void open(memo.id)}
               >
                 <span className="memo__item-title">
-                  {memo.pinned && <span aria-hidden>📌 </span>}
+                  {pins.has(memo.id) && <span aria-hidden>📌 </span>}
                   {memo.title || t.memo.untitled}
                 </span>
                 {memo.locked_by && (
@@ -669,22 +724,20 @@ export function SharedMemoView({
                 </button>
               )}
               <span className="memo__actions-sep" />
-              {/* ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
-                  編集権限が無い(閲覧のみ)人には出さない。 */}
-              {!trashView && selected.can_edit && (
+              {/* ピン止め(端末ローカル、M6 H-9b)。何が重要かは人によって
+                  異なるため権限に関わらず全員が使える。 */}
+              {!trashView && (
                 <button
                   type="button"
                   className="button--icon"
-                  title={selected.pinned ? t.memo.unpin : t.memo.pin}
-                  onClick={() =>
-                    void run({
-                      op: "set_pin",
-                      id: selected.id,
-                      pinned: !selected.pinned,
-                    })
+                  title={
+                    pins.has(selected.id)
+                      ? t.sharedMemo.unpinLocal
+                      : t.sharedMemo.pinLocal
                   }
+                  onClick={() => togglePin(selected.id)}
                 >
-                  {selected.pinned ? "📌" : "📍"}
+                  {pins.has(selected.id) ? "📌" : "📍"}
                 </button>
               )}
               {editing && (
@@ -983,6 +1036,8 @@ function CommentsPanel({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  // 開閉状態(既定で開)。details を使わない理由は下の JSX 側コメント参照。
+  const [open, setOpen] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const load = useCallback(async () => {
@@ -1057,65 +1112,86 @@ function CommentsPanel({
     }
   };
 
+  // details/summary をやめて div + トグルボタンにしている理由(M6 H-9b):
+  // 新しめの Chromium(WebView2 含む、131+)では details の中身(summary
+  // 以外)が ::details-content という中間ボックスへスロットされ、details
+  // 直下に指定した display:flex が効かなくなる。.memo__comments-list の
+  // flex:1; min-height:0; overflow-y:auto が構造的に無効化され、コメント
+  // 一覧が高さ制約の中で非スクロールのままあふれる不具合が実機で再現した
+  // (H-7b・H-8c の CSS 調整で直らなかったのはこれが真因)。
   return (
-    <details className="memo__comments" open>
-      <summary>{t.sharedMemo.commentsTitle(comments.length)}</summary>
-      {loadError && <p className="memo__notice small">{loadError}</p>}
-      {!loading && comments.length === 0 && !loadError && (
-        <p className="muted small">{t.sharedMemo.commentsEmpty}</p>
+    <div className={open ? "memo__comments memo__comments--open" : "memo__comments"}>
+      <button
+        type="button"
+        className="memo__comments-toggle"
+        onClick={() => setOpen(!open)}
+      >
+        {open ? "▼ " : "▶ "}
+        {t.sharedMemo.commentsTitle(comments.length)}
+      </button>
+      {open && (
+        <>
+          {loadError && <p className="memo__notice small">{loadError}</p>}
+          {!loading && comments.length === 0 && !loadError && (
+            <p className="muted small">{t.sharedMemo.commentsEmpty}</p>
+          )}
+          <ul className="memo__comments-list">
+            {comments.map((comment) => (
+              <li key={comment.comment_id} className="memo__comment">
+                <div className="memo__comment-meta">
+                  <span className="memo__comment-author">
+                    {comment.author_name || t.sharedMemo.hostName}
+                  </span>
+                  <span className="muted small">
+                    {formatDate(comment.created_at_unix_ms)}
+                  </span>
+                  {(canManage || comment.author_id === myMemberId) && (
+                    <button
+                      type="button"
+                      className="memo__comment-delete"
+                      title={t.sharedMemo.commentDelete}
+                      onClick={() => void remove(comment.comment_id)}
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+                <p className="memo__comment-body">
+                  {renderCommentBody(comment.body, myName, memberNames)}
+                </p>
+              </li>
+            ))}
+          </ul>
+          <div className="memo__comment-input">
+            <textarea
+              ref={textareaRef}
+              value={draft}
+              placeholder={t.sharedMemo.commentPlaceholder}
+              rows={2}
+              onChange={(event) => handleDraftChange(event.target)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <MentionSuggestList
+              candidates={mentionCandidates}
+              onPick={insertMention}
+            />
+            <button
+              type="button"
+              className="memo__comment-send"
+              disabled={draft.trim() === "" || sending}
+              onClick={() => void send()}
+            >
+              {t.sharedMemo.commentSend}
+            </button>
+          </div>
+        </>
       )}
-      <ul className="memo__comments-list">
-        {comments.map((comment) => (
-          <li key={comment.comment_id} className="memo__comment">
-            <div className="memo__comment-meta">
-              <span className="memo__comment-author">
-                {comment.author_name || t.sharedMemo.hostName}
-              </span>
-              <span className="muted small">
-                {formatDate(comment.created_at_unix_ms)}
-              </span>
-              {(canManage || comment.author_id === myMemberId) && (
-                <button
-                  type="button"
-                  className="memo__comment-delete"
-                  title={t.sharedMemo.commentDelete}
-                  onClick={() => void remove(comment.comment_id)}
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-            <p className="memo__comment-body">
-              {renderCommentBody(comment.body, myName, memberNames)}
-            </p>
-          </li>
-        ))}
-      </ul>
-      <div className="memo__comment-input">
-        <textarea
-          ref={textareaRef}
-          value={draft}
-          placeholder={t.sharedMemo.commentPlaceholder}
-          rows={2}
-          onChange={(event) => handleDraftChange(event.target)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-              event.preventDefault();
-              void send();
-            }
-          }}
-        />
-        <MentionSuggestList candidates={mentionCandidates} onPick={insertMention} />
-        <button
-          type="button"
-          className="memo__comment-send"
-          disabled={draft.trim() === "" || sending}
-          onClick={() => void send()}
-        >
-          {t.sharedMemo.commentSend}
-        </button>
-      </div>
-    </details>
+    </div>
   );
 }
 
@@ -1324,6 +1400,7 @@ function PermsDialog({
 
   return (
     <Modal title={t.sharedMemo.permsTitle} onClose={onClose}>
+      <div className="modal__body">
       <p className="muted small">{t.sharedMemo.permsNote}</p>
       <div className="field">
         <label>{t.sharedMemo.everyoneLabel}</label>
@@ -1421,6 +1498,7 @@ function PermsDialog({
           })}
         </div>
       )}
+      </div>
       <div className="modal__actions">
         <button type="button" className="button--ghost" onClick={onClose}>
           {t.common.cancel}
@@ -1710,6 +1788,7 @@ function LimitsDialog({
 
   return (
     <Modal title={t.sharedMemo.limitsTitle} onClose={onClose}>
+      <div className="modal__body">
       <p className="muted small">{t.sharedMemo.limitsNote}</p>
       {loadError && <p className="memo__notice small">{loadError}</p>}
       {!limits && !loadError && (
@@ -1754,15 +1833,18 @@ function LimitsDialog({
             (value) => value,
           )}
           {saveError && <p className="memo__notice small">{saveError}</p>}
-          <div className="modal__actions">
-            <button type="button" className="button--ghost" onClick={onClose}>
-              {t.common.cancel}
-            </button>
-            <button type="button" disabled={saving} onClick={() => void save()}>
-              {saving ? t.common.running : t.common.save}
-            </button>
-          </div>
         </>
+      )}
+      </div>
+      {limits && (
+        <div className="modal__actions">
+          <button type="button" className="button--ghost" onClick={onClose}>
+            {t.common.cancel}
+          </button>
+          <button type="button" disabled={saving} onClick={() => void save()}>
+            {saving ? t.common.running : t.common.save}
+          </button>
+        </div>
       )}
     </Modal>
   );

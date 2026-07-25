@@ -394,6 +394,7 @@ mod tests {
                 cname_records: vec![],
                 deny: vec![],
                 force_relay: vec![],
+                network_display_name: None,
             },
             received_at: at,
         }

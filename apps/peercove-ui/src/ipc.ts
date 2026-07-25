@@ -201,6 +201,8 @@ export interface Tunnel {
   config: string;
   /** ネットワーク名（ADR-0012）。 */
   network: string;
+  /** ネットワークの表示名（ADR-0058）。未設定なら null（`network` にフォールバック）。 */
+  networkDisplayName?: string | null;
   /** このトンネルでの役割。 */
   role: "hosting" | "joined";
   address: string;
@@ -327,6 +329,8 @@ export interface Settings {
   displayName: string | null;
   /** (host のみ)自分の DNS 名（ADR-0021、M3-14a）。未設定なら実質 host。 */
   dnsName: string | null;
+  /** (host のみ)ネットワークの表示名（ADR-0058）。未設定なら network 表示に戻る。 */
+  networkDisplayName: string | null;
   address: string;
   listenPort: number | null;
   mtu: number;
@@ -351,6 +355,8 @@ export interface SettingsUpdate {
   displayName: string | null;
   /** (host のみ)自分の DNS 名（ADR-0021）。null / 空で既定（host）に戻す。 */
   dnsName: string | null;
+  /** (host のみ)ネットワークの表示名（ADR-0058）。null / 空で削除(network 表示に戻る)。 */
+  networkDisplayName: string | null;
   listenPort: number | null;
   mtu: number;
   hostEndpoint: string | null;
@@ -628,8 +634,6 @@ export interface SharedMemoSummary {
   checklist_total?: number;
   /** コメント件数(ADR-0052 決定 4)。一覧の 💬 バッジ用。 */
   comment_count?: number;
-  /** ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。 */
-  pinned?: boolean;
 }
 
 export interface SharedMemoDetail {
@@ -652,8 +656,6 @@ export interface SharedMemoDetail {
   groups?: SharedGroupPerm[];
   /** コメント件数(ADR-0052 決定 4)。 */
   comment_count?: number;
-  /** ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。 */
-  pinned?: boolean;
 }
 
 /** 共有メモのコメント 1 件(ADR-0052 決定 4)。単層(返信ツリーなし)。 */
@@ -905,9 +907,6 @@ export type SharedMemoOp =
       title: string;
       body: string;
     }
-  // ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
-  // 変更できるのは編集権限(editor)以上またはホスト。
-  | { op: "set_pin"; id: string; pinned: boolean }
   | { op: "acquire_lock"; id: string }
   | { op: "release_lock"; id: string }
   | { op: "force_unlock"; id: string }
@@ -1171,12 +1170,6 @@ export const api = {
     invoke<SharedMemoReply>("shared_memo_op", { configPath, op }),
   sharedMemoExport: (configPath: string, id: string) =>
     invoke<string | null>("shared_memo_export", { configPath, id }),
-  // ピン止め(全員に見える共有フラグ、M6 H-8c、ADR-0052 追補)。
-  sharedMemoSetPin: (configPath: string, id: string, pinned: boolean) =>
-    invoke<SharedMemoReply>("shared_memo_op", {
-      configPath,
-      op: { op: "set_pin", id, pinned },
-    }),
 };
 
 // ---- 表示ヘルパ ----

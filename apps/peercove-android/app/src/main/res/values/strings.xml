@@ -349,6 +349,10 @@
     <string name="shared_memo_host">ホスト</string>
     <string name="shared_memo_trash_confirm">このメモをゴミ箱へ移動しますか?(復元はホストの画面から行えます)</string>
 
+    <!-- ピン止め(端末ローカル、M6 H-9b。全員共有から変更) -->
+    <string name="shared_memo_pin_local">この端末でピン留め</string>
+    <string name="shared_memo_unpin_local">この端末のピン留めを解除</string>
+
     <!-- 変更履歴(M5 F-3、ADR-0049) -->
     <string name="shared_memo_history">履歴</string>
     <string name="shared_memo_history_empty">変更履歴がありません</string>

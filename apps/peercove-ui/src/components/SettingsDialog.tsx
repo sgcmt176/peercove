@@ -124,9 +124,11 @@ function SettingsForm({
       }
       const result = await api.saveSettings(configPath, {
         // 表示名・DNS 名はメンバー一覧から変更する(ADR-0027、M3-19)。
-        // ここでは現在値をそのまま書き戻して消さない
+        // ネットワーク表示名(ADR-0058)はネットワーク詳細ヘッダーの ✏️ から
+        // 変更する(ホストのみ)。ここでは現在値をそのまま書き戻して消さない
         displayName: settings.displayName,
         dnsName: settings.dnsName,
+        networkDisplayName: settings.networkDisplayName,
         listenPort: portValue,
         mtu: mtuValue,
         hostEndpoint:

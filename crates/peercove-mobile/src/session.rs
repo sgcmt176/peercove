@@ -155,6 +155,8 @@ pub struct LedgerSnapshot {
     pub members: Vec<LedgerEntry>,
     pub dns_records: Vec<DnsRecord>,
     pub cname_records: Vec<CnameRecord>,
+    /// ネットワーク表示名(ADR-0058)。ホストの設定をそのまま載せる。
+    pub network_display_name: Option<String>,
 }
 
 /// ファイル転送の進捗(UI がポーリングする)。
@@ -552,14 +554,26 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
                         members,
                         dns_records,
                         cname_records,
+                        network_display_name,
                     }) => {
                         tracing::debug!("台帳を受信しました({} 名)", members.len());
                         // メンバー再追加(別の鍵)を検知して 1:1 履歴をクリア(検証 FB)
                         shared.reconcile_identities(&members);
+                        // ネットワーク表示名(ADR-0058)を member.toml へ永続化する
+                        // (オフラインでも一覧に最新の表示名が出るため)。トンネル
+                        // 再生成は起こさない(supervisor が listen_port/mtu/接続先
+                        // だけを見て再生成を判断する既存経路とは独立)。
+                        if let Err(e) = peercove_ops::settings::apply_network_display_name(
+                            &shared.cfg.config_path,
+                            network_display_name.as_deref(),
+                        ) {
+                            tracing::warn!("ネットワーク表示名の反映に失敗しました: {e:#}");
+                        }
                         *shared.ledger.lock().unwrap() = Some(LedgerSnapshot {
                             members,
                             dns_records,
                             cname_records,
+                            network_display_name,
                         });
                     }
                     Ok(ControlMessage::Ping { nonce }) => {
@@ -2594,6 +2608,7 @@ mod tests {
             members,
             dns_records: vec![],
             cname_records: vec![],
+            network_display_name: None,
         });
     }
 
@@ -2638,6 +2653,7 @@ mod tests {
             ],
             dns_records: vec![],
             cname_records: vec![],
+            network_display_name: Some("うちの LAN".to_string()),
         };
         writer
             .write_all((serde_json::to_string(&ledger).unwrap() + "\n").as_bytes())
@@ -2652,6 +2668,15 @@ mod tests {
                 .is_some_and(|l| l.members.len() == 2)
         }));
         assert!(session.shared.control_connected.load(Ordering::Relaxed));
+        // ネットワーク表示名(ADR-0058)が member.toml へ永続化される
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                peercove_core::config::Config::load(&session.shared.cfg.config_path)
+                    .map(|c| c.interface.network_display_name.as_deref() == Some("うちの LAN"))
+                    .unwrap_or(false)
+            }),
+            "ネットワーク表示名が member.toml へ書かれる"
+        );
 
         // ping に pong が返る
         writer
@@ -3143,6 +3168,7 @@ mod tests {
             &peercove_ops::settings::Update {
                 display_name: current.display_name.clone(),
                 dns_name: current.dns_name.clone(),
+                network_display_name: current.network_display_name.clone(),
                 listen_port: current.listen_port,
                 mtu: current.mtu,
                 host_endpoint: current.host_endpoint.clone(),

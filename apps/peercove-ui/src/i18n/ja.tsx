@@ -378,6 +378,9 @@ export const ja = {
     disconnect: "切断",
     back: "一覧へ戻る",
     connected: "接続中",
+    // ネットワーク表示名の変更(ADR-0058、ホストのみ)。DNS 名は変わらない
+    renameNetwork: "ネットワーク表示名を変更",
+    renameHint: "表示名だけが変わります。DNS 名は変わりません。",
     configFileLabel: "設定ファイル",
     membersHead: (n: number) => `メンバー（${n}）`,
     // 詳細ヘッダー直下の統計カード(M3-15)
@@ -1137,6 +1140,11 @@ export const ja = {
     // メモ間リンク・バックリンク(M5 F-5 Stage 2、ADR-0052 決定 2)
     wikilinkMissing: "リンク先のメモが見つかりません",
     backlinksTitle: (n: number) => `バックリンク (${n})`,
+
+    // ピン止め(端末ローカル、M6 H-9b。依頼者フィードバックにより全員共有
+    // から端末ローカルへ変更: 何が重要かは人によって異なるため)
+    pinLocal: "この端末でピン留め(自分だけに表示される並び順)",
+    unpinLocal: "この端末のピン留めを解除",
 
     // チャットへのリンクをコピー `@memo:id`(M5 F-5 Stage 4、ADR-0052 決定 1)
     copyLink: "リンクをコピー",

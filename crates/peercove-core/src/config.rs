@@ -201,6 +201,16 @@ pub struct InterfaceConfig {
     /// ADR-0021 以降は表示専用(DNS 名は `dns_name` / `[[peer]].dns_name` が別に持つ)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// ネットワークの表示名(ADR-0058)。未設定なら `network_name()` を表示に
+    /// 使う。DNS 名・slug・ディレクトリ・招待トークンには一切影響しない。
+    /// 変更できるのはホストのみ。メンバーは台帳配布(additive)で受信し、
+    /// member.toml のこのフィールドへ永続化する(オフラインでも一覧に出るため)。
+    /// 上のフィールド `display_name`(この端末自身の表示名、ADR-0027)とは
+    /// 別物 — 名前が近いので注意。
+    /// 注意: `deny_unknown_fields` のため、これを書いた設定は旧バージョンでは
+    /// 読めない(明示エラーになる)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_display_name: Option<String>,
     /// 招待 v3 の join 時に端末上で生成する識別子。同じトークンの二重利用防止用。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
@@ -423,6 +433,15 @@ impl Config {
             .unwrap_or(crate::names::DEFAULT_NETWORK_NAME)
     }
 
+    /// 画面表示用のネットワーク名(ADR-0058)。`network_display_name` が
+    /// あればそれ、無ければ [`Config::network_name`](DNS 名基底)を使う。
+    pub fn display_title(&self) -> &str {
+        self.interface
+            .network_display_name
+            .as_deref()
+            .unwrap_or_else(|| self.network_name())
+    }
+
     /// 設定ファイルを読み込み、検証し、相対パスを設定ファイル基準で解決する。
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
@@ -567,6 +586,19 @@ impl Config {
                 return invalid(format!(
                     "network_name \"{name}\" が不正です(小文字英数とハイフンのみ、63 文字以内)"
                 ));
+            }
+        }
+        // ネットワーク表示名(ADR-0058)。DNS 名とは無関係の自由文字列。
+        if let Some(name) = &self.interface.network_display_name {
+            if name.trim().is_empty() || name.chars().count() > 64 {
+                return invalid(
+                    "interface.network_display_name は 1〜64 文字にしてください".to_string(),
+                );
+            }
+            if name.chars().any(char::is_control) {
+                return invalid(
+                    "interface.network_display_name に制御文字は使えません".to_string(),
+                );
             }
         }
         // ACL(ADR-0018): ホスト⇔メンバーの遮断はコントロールチャネルが
@@ -1100,6 +1132,34 @@ deny = [["10.100.42.3", "10.100.42.2"], ["10.100.42.2", "10.100.42.3"]]
         // 正規化されていない名前は弾く
         config.interface.network_name = Some("My LAN".into());
         assert!(config.validate().is_err());
+    }
+
+    /// ネットワーク表示名(ADR-0058): 未設定なら network_name、設定すれば
+    /// それを表示に使う。DNS 名(network_name)には影響しない。
+    #[test]
+    fn network_display_name_defaults_and_validates() {
+        let mut config = parse(MEMBER_TOML);
+        assert_eq!(config.interface.network_display_name, None);
+        assert_eq!(config.display_title(), config.network_name());
+
+        config.interface.network_display_name = Some("うちの LAN".into());
+        config.validate().unwrap();
+        assert_eq!(config.display_title(), "うちの LAN");
+        assert_eq!(
+            config.network_name(),
+            crate::names::DEFAULT_NETWORK_NAME,
+            "DNS 名は変わらない"
+        );
+
+        // 空文字・64 文字超は拒否
+        config.interface.network_display_name = Some("".into());
+        assert!(config.validate().is_err());
+        config.interface.network_display_name = Some("x".repeat(65));
+        assert!(config.validate().is_err());
+        config.interface.network_display_name = Some("x".repeat(64));
+        assert!(config.validate().is_ok());
+        config.interface.network_display_name = Some("a\nb".into());
+        assert!(config.validate().is_err(), "制御文字は拒否");
     }
 
     #[test]

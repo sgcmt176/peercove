@@ -78,6 +78,12 @@ pub enum ControlMessage {
         /// (旧バージョンとは互いに無視し合う)。[`PROTO_VERSION`] は上げない。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cname_records: Vec<crate::dns::CnameRecord>,
+        /// ネットワーク表示名(ADR-0058)。ホストの `[interface].network_display_name`
+        /// をそのまま載せる(未設定なら None)。メンバーは受信時に member.toml へ
+        /// 永続化する(オフラインでも一覧に出るため)。追加フィールドなので
+        /// [`PROTO_VERSION`] は上げない。旧メンバーは未知フィールドとして無視する。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_display_name: Option<String>,
     },
     /// host → member: あなたは削除された(以後トンネルは通らない)。
     Removed { message: String },
@@ -327,6 +333,7 @@ mod tests {
                     port: None,
                     health: None,
                 }],
+                network_display_name: Some("うちの LAN".to_string()),
             },
             ControlMessage::Removed {
                 message: "ホストにより削除されました".to_string(),
@@ -394,11 +401,13 @@ mod tests {
             }
         );
 
-        // dns_records / cname_records が空なら旧バージョンとワイヤ表現が一致する(互換維持)
+        // dns_records / cname_records / network_display_name が空・未設定なら
+        // 旧バージョンとワイヤ表現が一致する(互換維持)
         let json = serde_json::to_string(&ControlMessage::Ledger {
             members: vec![],
             dns_records: vec![],
             cname_records: vec![],
+            network_display_name: None,
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"ledger","members":[]}"#);
@@ -423,6 +432,7 @@ mod tests {
                 members: vec![],
                 dns_records: vec![],
                 cname_records: vec![],
+                network_display_name: None,
             }
         );
 

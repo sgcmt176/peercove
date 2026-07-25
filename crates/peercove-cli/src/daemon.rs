@@ -1648,6 +1648,9 @@ impl DaemonShared {
         let network = active.network.clone();
         active.dns_task.abort();
         active.health.lock().unwrap().stop();
+        // 共有メモ DB の永続接続キャッシュ(M6 H-9a)をここで明示的に閉じる。
+        // ファイルロックを残さない(クリーンアップを常に対で実装する、既存方針)。
+        active.memo.invalidate_db_cache();
         let _ = active.stop_tx.send(true);
         // 破棄待ちに上限を設ける(stop_all と同じ理由: OS 側の TUN/WG 破棄が
         // 固まっても、UI の切断操作を永久に待たせない)
@@ -1676,6 +1679,8 @@ impl DaemonShared {
             let network = active.network.clone();
             active.dns_task.abort();
             active.health.lock().unwrap().stop();
+            // stop() と同じ理由(M6 H-9a)。
+            active.memo.invalidate_db_cache();
             let _ = active.stop_tx.send(true);
             match tokio::time::timeout(TEARDOWN_TIMEOUT, active.task).await {
                 Ok(Ok(Ok(()))) => tracing::info!("トンネルを停止しました(network={network})"),
@@ -2103,7 +2108,17 @@ fn unix_ms() -> u64 {
 
 /// 1 トンネル分の status 応答を組み立てる。
 fn tunnel_info(active: &Active) -> TunnelInfo {
-    let (peers, ledger, dns_records, cname_records, rtt_ms, removed, connection_error, direct) = {
+    let (
+        peers,
+        ledger,
+        dns_records,
+        cname_records,
+        rtt_ms,
+        removed,
+        connection_error,
+        direct,
+        network_display_name,
+    ) = {
         let snapshot = active.snapshot.lock().unwrap();
         match snapshot.as_ref() {
             Some(snapshot) => (
@@ -2115,6 +2130,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
                 snapshot.removed,
                 snapshot.connection_error.clone(),
                 snapshot.direct.clone(),
+                snapshot.network_display_name.clone(),
             ),
             None => (
                 Vec::new(),
@@ -2125,6 +2141,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
                 false,
                 None,
                 HashMap::new(),
+                None,
             ),
         }
     };
@@ -2162,6 +2179,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
     TunnelInfo {
         config: active.config.clone(),
         network: active.network.clone(),
+        network_display_name,
         role: match active.role {
             Role::Host => TunnelRole::Host,
             Role::Member => TunnelRole::Member,

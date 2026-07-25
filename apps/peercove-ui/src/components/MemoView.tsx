@@ -366,22 +366,24 @@ export function MemoView({
           title={t.memo.copyToSharedChoose}
           onClose={() => setChooseSharedTarget(false)}
         >
-          <ul className="memo__list">
-            {sharedTargets.map((target) => (
-              <li key={target.configPath}>
-                <button
-                  type="button"
-                  className="memo__item"
-                  onClick={() => {
-                    setChooseSharedTarget(false);
-                    void copyToShared(target);
-                  }}
-                >
-                  <span className="memo__item-title">{target.label}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          <div className="modal__body">
+            <ul className="memo__list">
+              {sharedTargets.map((target) => (
+                <li key={target.configPath}>
+                  <button
+                    type="button"
+                    className="memo__item"
+                    onClick={() => {
+                      setChooseSharedTarget(false);
+                      void copyToShared(target);
+                    }}
+                  >
+                    <span className="memo__item-title">{target.label}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
         </Modal>
       )}
       <aside className="memo__side card">

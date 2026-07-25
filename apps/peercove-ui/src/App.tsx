@@ -272,7 +272,10 @@ export default function App() {
 
   // ネットワークを開いていて、かつデーモンに接続できている(詳細/設定を出す)
   const detail = connection.kind === "ok" && openConfig !== null;
-  const detailName = openTunnel?.network ?? openInfo?.name ?? "";
+  // ネットワーク表示名(ADR-0058)。稼働中は台帳/自分の設定由来
+  // (openTunnel.networkDisplayName)、停止中は一覧の name(display_title 済み)
+  const detailName =
+    openTunnel?.networkDisplayName || openTunnel?.network || openInfo?.name || "";
   const detailHost = (openTunnel?.role ?? openInfo?.role) === "hosting";
   const myDisplayName =
     openTunnel?.members.find((member) => member.isSelf)?.name?.trim() || null;
@@ -498,6 +501,7 @@ export default function App() {
         {detail && (
           <DetailHeader
             name={detailName}
+            configPath={openConfig!}
             myDisplayName={myDisplayName}
             isHost={detailHost}
             running={openTunnel !== null}
@@ -505,6 +509,7 @@ export default function App() {
             disconnecting={disconnecting}
             onBack={backToList}
             onDisconnect={() => void disconnect()}
+            onRenamed={changed}
           />
         )}
         {detail && openTunnel?.removed && (
@@ -634,6 +639,7 @@ export default function App() {
 /** ネットワーク詳細・設定ページのヘッダー(戻る・名前・状態・切断)。 */
 function DetailHeader({
   name,
+  configPath,
   myDisplayName,
   isHost,
   running,
@@ -641,8 +647,10 @@ function DetailHeader({
   disconnecting,
   onBack,
   onDisconnect,
+  onRenamed,
 }: {
   name: string;
+  configPath: string;
   myDisplayName: string | null;
   isHost: boolean;
   running: boolean;
@@ -650,7 +658,50 @@ function DetailHeader({
   disconnecting: boolean;
   onBack: () => void;
   onDisconnect: () => void;
+  /** ネットワーク表示名を変更した(ADR-0058)。呼び出し側が再取得する。 */
+  onRenamed: () => void;
 }) {
+  // ネットワーク表示名の変更(ADR-0058、ホストのみ)。DNS 名・スラッグは
+  // 変わらない。保存は設定 API 経由(他項目は現在値のまま書き戻す)
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(name);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const startEdit = () => {
+    setValue(name);
+    setError(null);
+    setEditing(true);
+  };
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const current = await api.readSettings(configPath);
+      const trimmed = value.trim();
+      await api.saveSettings(configPath, {
+        displayName: current.displayName,
+        dnsName: current.dnsName,
+        networkDisplayName: trimmed === "" ? null : trimmed,
+        listenPort: current.listenPort,
+        mtu: current.mtu,
+        hostEndpoint: current.hostEndpoint,
+        direct: current.direct,
+        maxRecvFileMb: current.maxRecvFileMb,
+        requireInviteApproval: current.requireInviteApproval,
+        memberInvites: current.memberInvites,
+        autoConnect: current.autoConnect,
+      });
+      setEditing(false);
+      onRenamed();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="detail__head">
       <button
@@ -661,7 +712,56 @@ function DetailHeader({
       >
         ←
       </button>
-      <h2 className="detail__title">{name}</h2>
+      {editing ? (
+        <span className="detail__rename">
+          <input
+            className="detail__rename-input"
+            value={value}
+            autoFocus
+            maxLength={64}
+            disabled={busy}
+            onChange={(event) => setValue(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void save();
+              if (event.key === "Escape") setEditing(false);
+            }}
+          />
+          <button
+            type="button"
+            className="button--icon"
+            title={t.common.save}
+            disabled={busy}
+            onClick={() => void save()}
+          >
+            ✓
+          </button>
+          <button
+            type="button"
+            className="button--icon"
+            title={t.common.cancel}
+            disabled={busy}
+            onClick={() => setEditing(false)}
+          >
+            ✕
+          </button>
+        </span>
+      ) : (
+        <h2 className="detail__title">
+          {name}
+          {isHost && (
+            <button
+              type="button"
+              className="button--icon detail__rename-btn"
+              title={t.tunnel.renameNetwork}
+              onClick={startEdit}
+            >
+              ✏️
+            </button>
+          )}
+        </h2>
+      )}
+      {editing && <p className="muted small detail__rename-hint">{t.tunnel.renameHint}</p>}
+      {editing && error && <p className="error-text">{error}</p>}
       {myDisplayName && (
         <span
           className="detail__identity"

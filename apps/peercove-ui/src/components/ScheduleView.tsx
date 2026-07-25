@@ -526,6 +526,13 @@ export function ScheduleView({
                   .filter(Boolean)
                   .join(" ")}
                 onClick={() => setSelectedDay(day)}
+                onDoubleClick={() => {
+                  // シングルクリックの「その日の予定一覧を表示」は変えず、
+                  // ダブルクリックだけその日を選択した上で追加ダイアログを開く
+                  // (依頼者指摘)。読み取り専用時は追加ボタン同様に開かない。
+                  setSelectedDay(day);
+                  if (readOnlyReason === null) openCreateDialog(day);
+                }}
               >
                 <span className="schedule__cell-date-row">
                   <span
@@ -637,6 +644,7 @@ export function ScheduleView({
           }
           onClose={() => setDialog(null)}
         >
+          <div className="modal__body">
           <div className="field">
             <label>{t.schedule.titleLabel}</label>
             <input
@@ -714,6 +722,7 @@ export function ScheduleView({
               })}
             </div>
           </div>
+          </div>
           <div className="modal__actions">
             <button
               type="button"
@@ -738,6 +747,7 @@ export function ScheduleView({
           title={t.schedule.detailTitle}
           onClose={() => setSelectedEvent(null)}
         >
+          <div className="modal__body">
           <h3 className="schedule__detail-title">{selectedEvent.title}</h3>
           <p className="muted small">
             {selectedEvent.all_day
@@ -785,6 +795,7 @@ export function ScheduleView({
             startUnixMs={selectedEvent.start_unix_ms}
             onNotice={setNotice}
           />
+          </div>
           <div className="modal__actions">
             <button
               type="button"

@@ -366,6 +366,9 @@ pub struct Tunnel {
     pub config: String,
     /// ネットワーク名(ADR-0012)。
     pub network: String,
+    /// ネットワークの表示名(ADR-0058)。未設定なら None(フロントは
+    /// `network` にフォールバックする)。
+    pub network_display_name: Option<String>,
     /// "hosting" | "joined"
     pub role: &'static str,
     pub address: String,
@@ -420,6 +423,7 @@ impl From<&TunnelInfo> for Tunnel {
         Self {
             config: display_path(&info.config),
             network: info.network.clone(),
+            network_display_name: info.network_display_name.clone(),
             role: role_str(info.role),
             address: info.address.to_string(),
             interface_name: info.interface_name.clone(),
@@ -771,6 +775,8 @@ pub struct Settings {
     pub display_name: Option<String>,
     /// (host のみ)自分の DNS 名(ADR-0021、M3-14a)。
     pub dns_name: Option<String>,
+    /// (host のみ)ネットワークの表示名(ADR-0058)。未設定なら network 表示に戻る。
+    pub network_display_name: Option<String>,
     pub address: String,
     pub listen_port: Option<u16>,
     pub mtu: u16,
@@ -797,6 +803,7 @@ impl From<peercove_ops::settings::Settings> for Settings {
             interface_name: settings.interface_name,
             display_name: settings.display_name,
             dns_name: settings.dns_name,
+            network_display_name: settings.network_display_name,
             address: settings.address,
             listen_port: settings.listen_port,
             mtu: settings.mtu,
@@ -821,6 +828,9 @@ pub struct SettingsUpdate {
     /// (host のみ)自分の DNS 名(ADR-0021)。None / 空文字で従来導出に戻す。
     #[serde(default)]
     pub dns_name: Option<String>,
+    /// (host のみ)ネットワークの表示名(ADR-0058)。None / 空文字で削除。
+    #[serde(default)]
+    pub network_display_name: Option<String>,
     pub listen_port: Option<u16>,
     pub mtu: u16,
     pub host_endpoint: Option<String>,
@@ -845,6 +855,7 @@ impl From<SettingsUpdate> for peercove_ops::settings::Update {
         Self {
             display_name: update.display_name,
             dns_name: update.dns_name,
+            network_display_name: update.network_display_name,
             listen_port: update.listen_port,
             mtu: update.mtu,
             host_endpoint: update.host_endpoint,
@@ -906,6 +917,7 @@ mod tests {
         let info = TunnelInfo {
             config: std::path::PathBuf::from("host.toml"),
             network: "home".to_string(),
+            network_display_name: Some("うちの LAN".to_string()),
             role: TunnelRole::Host,
             address: "10.100.42.1".parse().unwrap(),
             interface_name: "peercove0".to_string(),
@@ -974,6 +986,10 @@ mod tests {
             "実行時のインターフェース名が status に載る(M3-20)"
         );
         assert_eq!(json["tunnel"]["network"], "home");
+        assert_eq!(
+            json["tunnel"]["networkDisplayName"], "うちの LAN",
+            "ネットワーク表示名が status に載る(ADR-0058)"
+        );
         assert_eq!(json["tunnel"]["role"], "hosting");
         assert_eq!(json["tunnel"]["members"][0]["name"], "alice");
         assert_eq!(json["tunnel"]["members"][0]["isHost"], false);
@@ -1058,6 +1074,7 @@ mod tests {
         let info = TunnelInfo {
             config: std::path::PathBuf::from("member.toml"),
             network: "home".to_string(),
+            network_display_name: None,
             role: TunnelRole::Member,
             address: "10.100.42.2".parse().unwrap(), // 自分
             interface_name: "peercove0".to_string(),
@@ -1151,6 +1168,7 @@ mod tests {
             interface_name: "peercove0".to_string(),
             display_name: Some("alice".to_string()),
             dns_name: None,
+            network_display_name: None,
             address: "10.119.96.2/24".to_string(),
             listen_port: None,
             mtu: 1420,
