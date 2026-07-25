@@ -1293,7 +1293,6 @@ export const ja = {
     toolbarUnderline: "下線",
     toolbarStrike: "取り消し線",
     toolbarFontSize: "フォントサイズ",
-    toolbarFontSizeDefault: "既定",
     toolbarTextColor: "文字色",
     toolbarBgColor: "背景色",
     toolbarColorNone: "なし",

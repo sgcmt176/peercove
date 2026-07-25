@@ -60,6 +60,12 @@ const NUMERIC_RE = /^-?\d+(\.\d+)?$/;
 
 const FONT_SIZE_CHOICES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36];
 
+/** 書式未指定セルの実フォントサイズ(px)。styles.css の `.sheet__table` の
+ * font-size と必ず一致させること(M6 H-9 追補: ツールバーの表示を「既定」
+ * ではなく実サイズの数字にするため、既定値を選択肢に揃えた)。この値を
+ * 選んだときは書式に保存せず「未指定」に戻す(データを汚さない)。 */
+const DEFAULT_FONT_SIZE = 12;
+
 // 固定枠(freeze panes、ADR-0055 決定 6/ADR-0055 決定 6 追補 H-7a)の
 // ピクセルオフセット計算のフォールバック初期値(DOM 実測が終わるまでの
 // 一瞬だけ使う。useLayoutEffect が paint 前に実測値へ差し替えるため、
@@ -523,7 +529,12 @@ export function SheetView({
         const size =
           kind === "col" ? colWidthsRef.current.get(index) : rowHeightsRef.current.get(index);
         if (size !== undefined) {
-          void commitLayout(kind, index, size);
+          // ref 経由で最新の commitLayout を呼ぶ(M6 H-9 追補)。この effect は
+          // deps が空でマウント時に 1 度だけ張られるため、commitLayout を直接
+          // 参照するとマウント時点のクロージャ(activeSheetId === null)を
+          // 掴んだままになり、内部の null ガードで保存が一度も送信されない
+          //  = リサイズが次の再取得で必ず元に戻るバグの原因だった。
+          void commitLayoutRef.current(kind, index, size);
         }
       }
     };
@@ -758,7 +769,6 @@ export function SheetView({
   // ツールバー・右クリックメニュー・Undo など複数箇所から参照するため、
   // JSX 直前ではなくここで(hooks より前に)計算しておく。
   const selectionRect = selection ? rangeOf(selection) : null;
-  const hasRangeSelection = selectionRect !== null && !isSingleCell(selectionRect);
   const toolbarDisabled = readOnlyReason !== null || !selection;
 
   // 現在の選択範囲がちょうど 1 件の既存結合と一致するか(単一セル選択かつ
@@ -881,6 +891,14 @@ export function SheetView({
     },
     [activeSheetId, sheetOp],
   );
+
+  // マウント時に 1 度だけ張る window の mouseup ハンドラから、常に最新の
+  // commitLayout(= 最新の activeSheetId)を呼ぶための ref(M6 H-9 追補。
+  // 上の onWindowMouseUp 内のコメント参照)。
+  const commitLayoutRef = useRef(commitLayout);
+  useEffect(() => {
+    commitLayoutRef.current = commitLayout;
+  }, [commitLayout]);
 
   const resetLayout = useCallback(
     async (kind: "col" | "row", index: number) => {
@@ -1907,25 +1925,11 @@ export function SheetView({
   const topSpacerHeight = rowOffsets[renderStart] - rowOffsets[freezeRows];
   const bottomSpacerHeight = rowOffsets[displayRows] - rowOffsets[renderEnd];
 
-  // ステータスバーの選択範囲表示(ADR-0055 決定 6 追補 H-8a)。列全体選択
-  // なら "A:A"(複数列は "A:C")、行全体選択なら "1:1" と Excel 風に出す。
-  // それ以外(通常のセル範囲、全セル選択)は従来どおり "F3:F6" 形式。
-  let statusRangeText = "";
-  if (selectionRect) {
-    const spansAllRows = selectionRect.r0 === 0 && selectionRect.r1 === displayRows - 1;
-    const spansAllCols = selectionRect.c0 === 0 && selectionRect.c1 === displayCols - 1;
-    if (spansAllRows && !spansAllCols) {
-      statusRangeText = `${colLabel(selectionRect.c0)}:${colLabel(selectionRect.c1)}`;
-    } else if (spansAllCols && !spansAllRows) {
-      statusRangeText = `${selectionRect.r0 + 1}:${selectionRect.r1 + 1}`;
-    } else if (hasRangeSelection) {
-      statusRangeText = `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}:${colLabel(
-        selectionRect.c1,
-      )}${selectionRect.r1 + 1}`;
-    } else {
-      statusRangeText = `${colLabel(selectionRect.c0)}${selectionRect.r0 + 1}`;
-    }
-  }
+  // 選択範囲のステータスバー表示は撤去(M6 H-9 追補、依頼者指摘)。
+  // H-7a で「表示のオンオフでグリッドがずれる」対策として常設化したが、
+  // 依頼者の再検証で「そもそも不要。グリッドを下いっぱいに広げてほしい」
+  // となったため、行番号・列ラベルのハイライト(--active)だけを選択範囲の
+  // 表示手段として残す。
 
   /** 行 1 本分の <tr> を描画する(行の仮想化、ADR-0056 決定 5)。固定行の
    * 常時描画・可視ウィンドウの両方から呼ばれる。 */
@@ -2259,12 +2263,12 @@ export function SheetView({
               className="sheet__toolbar-select"
               aria-label={t.sheet.toolbarFontSize}
               disabled={toolbarDisabled}
-              value={primaryFormat.font_size ?? ""}
-              onChange={(event) =>
-                setFontSize(event.target.value ? Number(event.target.value) : undefined)
-              }
+              value={primaryFormat.font_size ?? DEFAULT_FONT_SIZE}
+              onChange={(event) => {
+                const size = Number(event.target.value);
+                setFontSize(size === DEFAULT_FONT_SIZE ? undefined : size);
+              }}
             >
-              <option value="">{t.sheet.toolbarFontSizeDefault}</option>
               {FONT_SIZE_CHOICES.map((size) => (
                 <option key={size} value={size}>
                   {size}
@@ -2590,16 +2594,6 @@ export function SheetView({
           </table>
         </div>
       ) : null}
-
-      {activeSheet && (
-        // 選択範囲の常設ステータスバー(ADR-0055 決定 6 追補 H-7a)。
-        // グリッド枠外の左下に置き、単一セルでも常に表示することで、
-        // 複数選択との切り替えでツールバーが出たり消えたりして
-        // グリッドが上下にずれる問題を無くす。
-        <div className="sheet__status-bar">
-          <span className="sheet__status-bar-range">{statusRangeText}</span>
-        </div>
-      )}
 
       {cellMenu && activeSheetId && (
         <ContextMenu
