@@ -3976,38 +3976,10 @@ button.msg__ref:hover {
   opacity: 1;
 }
 
-.sheet__tab-menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  z-index: 5;
-  display: flex;
-  flex-direction: column;
-  min-width: 10em;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--shadow);
-  padding: 4px;
-  gap: 2px;
-}
-
-.sheet__tab-menu button {
-  border: none;
-  background: transparent;
-  color: var(--text);
-  text-align: left;
-  padding: 5px 8px;
-  border-radius: 6px;
-}
-
-.sheet__tab-menu button:hover {
-  background: var(--accent-soft);
-}
-
-.sheet__tab-menu-danger {
-  color: var(--danger) !important;
-}
+/* シートタブの ⋮ ドロップダウン(.sheet__tab-menu)は M6 H-9 追補で撤去し、
+   汎用 ContextMenu(.context-menu、position:fixed / z-index 1000)へ統一。
+   タブ内の絶対配置ではグリッドの sticky ヘッダーや祖先のレイアウトに
+   下部が欠ける問題があった。 */
 
 .sheet__notice {
   color: var(--accent);

@@ -291,7 +291,11 @@ export function SheetView({
   const [presence, setPresence] = useState<SheetPresencePeer[]>([]);
   const [offline, setOffline] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [menuFor, setMenuFor] = useState<string | null>(null);
+  // シートタブの ⋮ メニュー(M6 H-9 追補: タブ内の絶対配置ドロップダウンを
+  // やめ、汎用 ContextMenu(position:fixed、z-index 1000)で出す。タブ内の
+  // 配置だとグリッドのヘッダー(sticky + z-index)や祖先の overflow に
+  // 埋もれて下部が欠ける)。
+  const [tabMenu, setTabMenu] = useState<{ x: number; y: number; sheet: SheetMeta } | null>(null);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [editing, setEditing] = useState<EditingState | null>(null);
   const [conflictHighlight, setConflictHighlight] = useState<Set<string>>(
@@ -1820,7 +1824,6 @@ export function SheetView({
 
   const renameSheet = useCallback(
     (sheet: SheetMeta) => {
-      setMenuFor(null);
       const name = window.prompt(t.sheet.renamePrompt, sheet.name);
       if (name === null) return;
       const trimmed = name.trim();
@@ -1843,7 +1846,6 @@ export function SheetView({
 
   const deleteSheet = useCallback(
     (sheet: SheetMeta) => {
-      setMenuFor(null);
       if (!window.confirm(t.sheet.deleteConfirm(sheet.name))) return;
       void (async () => {
         try {
@@ -1863,19 +1865,10 @@ export function SheetView({
   );
 
   const copySheetLink = useCallback((sheet: SheetMeta) => {
-    setMenuFor(null);
     void writeText(sharedRefToken("sheet", sheet.id)).then(() =>
       setNotice(t.sheet.copyLinkDone),
     );
   }, []);
-
-  // メニュー表示中に他所をクリックしたら閉じる
-  useEffect(() => {
-    if (!menuFor) return;
-    const onDocClick = () => setMenuFor(null);
-    document.addEventListener("click", onDocClick);
-    return () => document.removeEventListener("click", onDocClick);
-  }, [menuFor]);
 
   if (loadError !== null) {
     return (
@@ -2178,32 +2171,17 @@ export function SheetView({
               title={t.sheet.moreOptions}
               onClick={(event) => {
                 event.stopPropagation();
-                setMenuFor(menuFor === sheet.id ? null : sheet.id);
+                if (tabMenu?.sheet.id === sheet.id) {
+                  setTabMenu(null);
+                  return;
+                }
+                // ボタンの直下に ContextMenu(position:fixed)を開く
+                const rect = event.currentTarget.getBoundingClientRect();
+                setTabMenu({ x: rect.left, y: rect.bottom + 4, sheet });
               }}
             >
               ⋮
             </button>
-            {menuFor === sheet.id && (
-              <div className="sheet__tab-menu" onClick={(event) => event.stopPropagation()}>
-                <button type="button" onClick={() => copySheetLink(sheet)}>
-                  🔗 {t.sheet.copyLink}
-                </button>
-                {sheet.can_manage && (
-                  <>
-                    <button type="button" onClick={() => renameSheet(sheet)}>
-                      ✏ {t.sheet.renameSheet}
-                    </button>
-                    <button
-                      type="button"
-                      className="sheet__tab-menu-danger"
-                      onClick={() => deleteSheet(sheet)}
-                    >
-                      🗑 {t.sheet.deleteSheet}
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
           </div>
         ))}
         <button
@@ -2594,6 +2572,27 @@ export function SheetView({
           </table>
         </div>
       ) : null}
+
+      {tabMenu && (
+        <ContextMenu
+          x={tabMenu.x}
+          y={tabMenu.y}
+          onClose={() => setTabMenu(null)}
+          items={[
+            { label: `🔗 ${t.sheet.copyLink}`, onClick: () => copySheetLink(tabMenu.sheet) },
+            ...(tabMenu.sheet.can_manage
+              ? [
+                  { label: `✏ ${t.sheet.renameSheet}`, onClick: () => renameSheet(tabMenu.sheet) },
+                  {
+                    label: `🗑 ${t.sheet.deleteSheet}`,
+                    danger: true,
+                    onClick: () => deleteSheet(tabMenu.sheet),
+                  },
+                ]
+              : []),
+          ]}
+        />
+      )}
 
       {cellMenu && activeSheetId && (
         <ContextMenu
