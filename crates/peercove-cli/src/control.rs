@@ -1890,7 +1890,24 @@ async fn member_session(
     let result = tokio::select! {
         biased;
         joined = &mut read_task => { writer.abort(); joined }
-        joined = &mut writer => { read_task.abort(); joined }
+        joined = &mut writer => {
+            // 書き側が先に終わるのは、**ホストが Removed を送った直後に接続を
+            // 閉じ**、こちらの書き込み(ping や共有メモの同期要求)が
+            // 接続リセットで失敗したケースが多い。ここで読み側を即 abort すると、
+            // 受信済みの Removed 行を解釈する前に捨ててしまい、
+            // 「削除された」フラグが立たず UI に理由が出ない(CI の
+            // removed_notification_ends_session が不安定だったのはこの競合。
+            // biased は「両方 ready のとき」の優先順位しか決められない)。
+            // 受信バッファに結論が残っている可能性があるので、短時間だけ
+            // 読み側の完了を待ち、その結論を優先する。
+            match tokio::time::timeout(Duration::from_millis(500), &mut read_task).await {
+                Ok(joined_read) => joined_read,
+                Err(_) => {
+                    read_task.abort();
+                    joined
+                }
+            }
+        }
     };
     sync_task.abort();
     result.unwrap_or_else(|e| Err(anyhow::anyhow!("制御タスクが異常終了しました: {e}")))
