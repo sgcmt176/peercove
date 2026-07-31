@@ -1601,7 +1601,16 @@ async fn handle_member(
             read_task.abort();
             Ok(Ok(()))
         }
-        joined = &mut writer => { read_task.abort(); joined }
+        joined = &mut writer => {
+            // 書き側が終わった直後にソケットを閉じない。読み側を少しだけ
+            // 回し続けて受信キューを空にし、相手が閉じる(EOF)のを待つ。
+            // 受信データを残したまま閉じると RST になり、相手が受け取った
+            // ばかりの Removed を捨ててしまうため(host_writer のコメント参照)。
+            // 相手が閉じなければタイムアウトで打ち切る。
+            let _ = tokio::time::timeout(Duration::from_millis(500), &mut read_task).await;
+            read_task.abort();
+            joined
+        }
         joined = &mut read_task => { writer.abort(); joined }
     };
     let result =
@@ -1666,6 +1675,15 @@ async fn host_writer(
                         write_half.write_all(encode_line(&message).as_bytes()).await?;
                         if is_removed {
                             write_half.flush().await?;
+                            // FIN を送って「もう書かない」ことだけ伝える(ここで
+                            // ソケットごと閉じない)。閉じるのは handle_member が
+                            // 読み側を少し流してから。**受信キューにデータを
+                            // 残したまま閉じると Windows は FIN ではなく RST を
+                            // 送り、RST を受けた相手は未読の受信バッファを捨てる**
+                            // = 直前に送った Removed が読まれずに消える
+                            // (メンバーに切断理由が出ない。CI の
+                            // removed_notification_ends_session が落ち続けた真因)。
+                            let _ = write_half.shutdown().await;
                             return Ok(()); // 削除通知後は切断
                         }
                     }
