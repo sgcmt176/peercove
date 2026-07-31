@@ -418,6 +418,20 @@ button:disabled {
   gap: 8px;
 }
 
+/* メンバー詳細の権限チェックボックス(M7 J-1 追補)。縦に 1 つずつ並べ、
+   説明文は label の title(ツールチップ)に寄せる。 */
+.member-detail__perms {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.member-detail__perms .field--check {
+  cursor: help;
+  align-items: center;
+}
+
 .field--check > span {
   color: var(--text);
 }

@@ -1276,33 +1276,30 @@ function MemberDetailDialog({
           )}
         </dl>
 
+        {/* 権限チェックボックスは縦に並べ、説明はツールチップ(title)に
+            寄せる(M7 J-1 追補、依頼者指摘: 長文の説明でレイアウトが
+            崩れていた)。 */}
         {isHost && !member.isHost && !member.isSelf && (
-          <label className="field--check">
-            <input
-              type="checkbox"
-              checked={canInvite}
-              disabled={busy}
-              onChange={(event) => void toggleCanInvite(event.target.checked)}
-            />
-            <span>
-              {t.tunnel.member.canInviteLabel}
-              <small className="muted"> {t.tunnel.member.canInviteHint}</small>
-            </span>
-          </label>
-        )}
-        {isHost && !member.isHost && !member.isSelf && (
-          <label className="field--check">
-            <input
-              type="checkbox"
-              checked={admin}
-              disabled={busy}
-              onChange={(event) => void toggleAdmin(event.target.checked)}
-            />
-            <span>
-              {t.tunnel.member.adminLabel}
-              <small className="muted"> {t.tunnel.member.adminHint}</small>
-            </span>
-          </label>
+          <div className="member-detail__perms">
+            <label className="field--check" title={t.tunnel.member.canInviteHint}>
+              <input
+                type="checkbox"
+                checked={canInvite}
+                disabled={busy}
+                onChange={(event) => void toggleCanInvite(event.target.checked)}
+              />
+              <span>{t.tunnel.member.canInviteLabel}</span>
+            </label>
+            <label className="field--check" title={t.tunnel.member.adminHint}>
+              <input
+                type="checkbox"
+                checked={admin}
+                disabled={busy}
+                onChange={(event) => void toggleAdmin(event.target.checked)}
+              />
+              <span>{t.tunnel.member.adminLabel}</span>
+            </label>
+          </div>
         )}
       </div>
       <div className="modal__actions">
