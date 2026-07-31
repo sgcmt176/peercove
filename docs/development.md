@@ -226,14 +226,22 @@ Android は署名が無いと**そもそも端末にインストールできな�
 (期限切れ = アップデートを配れなくなる)。
 
 ```powershell
+# keytool は親フォルダを作らないので先に用意する
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.peercove" | Out-Null
+
 & "$env:JAVA_HOME\bin\keytool.exe" -genkeypair -v `
   -keystore "$env:USERPROFILE\.peercove\peercove-release.jks" `
   -storetype PKCS12 -keyalg RSA -keysize 4096 -validity 10000 `
-  -alias peercove
+  -alias peercove `
+  -dname "CN=PeerCove, OU=Unknown, O=PeerCove, L=Unknown, ST=Unknown, C=JP"
 ```
 
-対話でパスワードと識別名(CN など)を聞かれます。**パスワードはパスワード
-マネージャ等に保管**してください。
+対話でパスワードを聞かれます。**パスワードマネージャ等に保管**してください。
+
+識別名(`-dname`)は**実名を入れないこと**。証明書は APK に埋め込まれて配布され、
+`apksigner verify --print-certs` で誰でも読めます。自己署名なので実名を入れても
+信頼性は上がりません。**後から変更もできません**(別の証明書 = 別の署名者と
+みなされ、上書き更新が拒否される)。
 
 #### 2. `keystore.properties` を置く
 
