@@ -1126,8 +1126,14 @@ select {
   overflow: hidden;
   border-radius: 6px;
   border: 1px solid var(--border);
+  /* 期間を広げてもカードを押し広げないよう、必ず縮められるようにする
+     (M7 J-3 追補、依頼者指摘: 7 日を選ぶと横スクロールバーが出ていた)。 */
+  min-width: 0;
 }
-.quality__route-segment { flex: 1 1 4px; min-width: 2px; }
+/* セグメントは「必ず縮む」設定にする。以前は min-width:2px + flex-basis:4px
+   だったため、サンプル数 × 2px が容器の最小幅になり、7 日(最大 480 個)で
+   960px 以上になって画面全体が横に伸びていた。 */
+.quality__route-segment { flex: 1 1 0; min-width: 0; }
 .quality__route-segment--direct,
 .quality__route-legend i.direct { background: #059669; }
 .quality__route-segment--relay,
@@ -1933,6 +1939,8 @@ button.msg__ref:hover {
   align-items: center;
   gap: 10px;
   padding: 6px 8px 14px;
+  /* 一覧をスクロールさせても上部に残す(M7 J-3 追補) */
+  flex: none;
 }
 
 .sidebar__brand-name {
@@ -1941,6 +1949,10 @@ button.msg__ref:hover {
   letter-spacing: 0.02em;
 }
 
+/* 項目が増えて画面に収まらないときは、この一覧だけを縦スクロールさせる
+   (M7 J-3 追補、依頼者指摘)。ブランド行(上)とフッター(下: 接続状態・
+   バージョン)は常に見える位置に固定したいので、スクロールはここに閉じる。
+   min-height:0 はフレックス子がはみ出さずに縮むために必須。 */
 .sidebar__nav {
   list-style: none;
   margin: 0;
@@ -1948,6 +1960,11 @@ button.msg__ref:hover {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* スクロールバーの分だけ項目が詰まって見えないよう、右に少し余白 */
+  padding-right: 2px;
 }
 
 .sidebar__item {
@@ -1988,7 +2005,11 @@ button.msg__ref:hover {
 }
 
 .sidebar__foot {
+  /* 一覧(.sidebar__nav)が flex:1 で伸びるので margin-top:auto は不要だが、
+     一覧が短いときの下寄せのために残す。flex:none で縮まないようにする
+     (M7 J-3 追補: 一覧をスクロールさせてもフッターは常に見える)。 */
   margin-top: auto;
+  flex: none;
   display: flex;
   flex-direction: column;
   gap: 8px;

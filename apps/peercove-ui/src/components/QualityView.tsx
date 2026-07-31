@@ -151,7 +151,10 @@ export function QualityView({ tunnel }: { tunnel: Tunnel }) {
           <section className="card quality__route">
             <h3>{t.quality.route}</h3>
             <div className="quality__route-strip" aria-label={t.quality.route}>
-              {thinSamples(selected, 480).map((sample) => (
+              {/* 240 まで間引く(M7 J-3 追補)。以前は 480 で、1 本あたりが
+                  1px 未満になって潰れる期間があった。240 なら横幅 600px の
+                  カードでも 2.5px 確保できる。 */}
+              {thinSamples(selected, 240).map((sample) => (
                 <span
                   key={sample.windowStartUnixMs}
                   className={`quality__route-segment quality__route-segment--${sample.route}`}
