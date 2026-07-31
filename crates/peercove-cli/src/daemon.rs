@@ -2231,6 +2231,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         connection_error,
         direct,
         network_display_name,
+        perm_groups_snapshot,
     ) = {
         let snapshot = active.snapshot.lock().unwrap();
         match snapshot.as_ref() {
@@ -2244,6 +2245,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
                 snapshot.connection_error.clone(),
                 snapshot.direct.clone(),
                 snapshot.network_display_name.clone(),
+                snapshot.perm_groups.clone(),
             ),
             None => (
                 Vec::new(),
@@ -2255,6 +2257,7 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
                 None,
                 HashMap::new(),
                 None,
+                Vec::new(),
             ),
         }
     };
@@ -2271,24 +2274,18 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         let chat = active.chat.lock().unwrap();
         (chat.latest_seq(), chat.generation())
     };
-    // グループも同じ理由で 1 回で取り切る(groups と perm_groups の 2
-    // フィールドが同じ Mutex を別々に lock() すると自己デッドロックする)
-    let (joined_groups, perm_groups) = {
-        let groups = active.groups.lock().unwrap();
-        let joined = groups.joined(active.address);
-        let list = match active.role {
-            Role::Host => groups.all(),
-            Role::Member => groups.joined(active.address),
-        };
-        let perm_groups = list
-            .into_iter()
-            .map(|g| peercove_core::ipc::PermGroup {
-                id: g.id,
-                name: g.name,
-            })
-            .collect::<Vec<_>>();
-        (joined, perm_groups)
-    };
+    let joined_groups = active.groups.lock().unwrap().joined(active.address);
+    // 権限ダイアログ向け(ADR-0060 決定1): host は ACL ポリシーから、member は
+    // 受信済みの台帳から(どちらも supervise がスナップショットへ詰めている
+    // — チャットグループ由来の旧経路は廃止)。
+    let perm_groups: Vec<peercove_core::ipc::PermGroup> = perm_groups_snapshot
+        .into_iter()
+        .map(|g| peercove_core::ipc::PermGroup {
+            id: g.id,
+            name: g.name,
+            members: g.members,
+        })
+        .collect();
     TunnelInfo {
         config: active.config.clone(),
         network: active.network.clone(),
@@ -2342,8 +2339,9 @@ fn tunnel_info(active: &Active) -> TunnelInfo {
         groups: joined_groups,
         shared_memo_seq: active.memo.seq(),
         shared_memo: active.memo.supported(),
-        // 権限ダイアログ向け(ADR-0051): host は既知の全グループ、member は
-        // 自分が属するグループだけ(自分が指定できるのはそこだけのため)
+        // 権限ダイアログ向け(ADR-0060 決定1): host は ACL ポリシーの
+        // 権限グループ全件、member は台帳配布分(自分が指定できるのは
+        // そこに載っているものだけ)
         perm_groups,
     }
 }

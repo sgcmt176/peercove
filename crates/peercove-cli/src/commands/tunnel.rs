@@ -410,6 +410,10 @@ pub struct Snapshot {
     /// ネットワーク表示名(ADR-0058)。host は自分の設定、member は受信したもの。
     /// 未設定なら None(UI は network_name 表示にフォールバックする)。
     pub network_display_name: Option<String>,
+    /// 権限グループ(ADR-0060 決定1)。host は ACL ポリシーから構築、member は
+    /// 受信済みの台帳から。daemon 側はこれをそのまま IPC の `perm_groups`
+    /// (`peercove_core::ipc::PermGroup`)へ変換する。
+    pub perm_groups: Vec<peercove_core::proto::PermGroupInfo>,
 }
 
 pub type SharedSnapshot = Arc<Mutex<Option<Snapshot>>>;
@@ -541,7 +545,10 @@ pub async fn supervise(
                     }
                 };
                 memo_service.attach_connections(Arc::clone(&connections));
-                memo_service.attach_groups(Arc::clone(&groups));
+                // 権限グループの参照先は ACL ポリシー(host.toml)に切り替えた
+                // (ADR-0060 決定3)。MemoService はチャットグループの
+                // GroupStore を持たなくなったため、ここでの attach は不要
+                // (`watch_groups` に毎周期の `config` をそのまま渡す)。
                 tasks.push(tokio::spawn(control::run_host_server(
                     spec.address.addr(),
                     ledger_rx,
@@ -633,10 +640,14 @@ pub async fn supervise(
                     if let crate::memoshare::MemoHandle::Host(service) = &memo {
                         service.sweep_expired_locks();
                         service.maintain();
-                        // グループ改名・メンバー増減・削除への追従(ADR-0051)。
-                        // リビジョン変化を検知したときだけ DB を開くので、
-                        // 毎周期呼んでも軽い
-                        service.watch_groups();
+                        // 権限グループの改名・メンバー増減・削除への追従
+                        // (ADR-0051、ADR-0060 決定3)。内容ハッシュが変化した
+                        // ときだけ DB を開くので、毎周期呼んでも軽い。config は
+                        // この周期の読み込み結果をそのまま渡す(無ければ今回は
+                        // 何もしない — 次周期に読めれば追いつく)
+                        if let Some(config) = &config {
+                            service.watch_groups(config);
+                        }
                         // シートのプレゼンス失効掃除(TTL 10 秒、ADR-0055 決定 6)
                         service.sweep_sheet_presence();
                     }
@@ -707,6 +718,19 @@ pub async fn supervise(
                                         entry.platform = info.platform.clone();
                                     }
                                 }
+                                // 権限グループ(ADR-0060 決定1)。台帳と同じ周期で
+                                // ACL ポリシーから構築し、members(公開鍵)を
+                                // 仮想 IP へ解決する(ホストも解決対象 — 決定2)
+                                let perm_groups = build_perm_groups(config, &members);
+                                // 初回起動時、ACL の権限グループが空ならチャット
+                                // グループから取り込む(決定4)。取り込み後は
+                                // acl.groups が非空になるので自然に再実行されない
+                                migrate_chat_groups_to_perm_groups(
+                                    config_path,
+                                    config,
+                                    &members,
+                                    &groups,
+                                );
                                 crate::health::schedule(&health, config, &members);
                                 let mut dns_records = peercove_core::dns::resolve_records(
                                     &config.dns_records,
@@ -761,6 +785,7 @@ pub async fn supervise(
                                     // ネットワーク表示名(ADR-0058)。ホストは自分の
                                     // host.toml が正本
                                     network_display_name: config.interface.network_display_name.clone(),
+                                    perm_groups,
                                 };
                                 ledger_tx.send_if_modified(|current| {
                                     if *current != dist {
@@ -939,11 +964,17 @@ pub async fn supervise(
                         tracing::debug!("ステータスファイルの書き出しに失敗: {e:#}");
                     }
                     if let Some(snapshot) = &snapshot {
-                        let (dns_records, cname_records, network_display_name) = distribution
-                            .map(|dist| {
-                                (dist.dns_records, dist.cname_records, dist.network_display_name)
-                            })
-                            .unwrap_or_default();
+                        let (dns_records, cname_records, network_display_name, perm_groups) =
+                            distribution
+                                .map(|dist| {
+                                    (
+                                        dist.dns_records,
+                                        dist.cname_records,
+                                        dist.network_display_name,
+                                        dist.perm_groups,
+                                    )
+                                })
+                                .unwrap_or_default();
                         *snapshot.lock().unwrap() = Some(Snapshot {
                             peers: stats,
                             ledger,
@@ -954,6 +985,7 @@ pub async fn supervise(
                             connection_error: member_link.connection_error(),
                             direct: direct_routes,
                             network_display_name,
+                            perm_groups,
                         });
                     }
                 }
@@ -1073,6 +1105,89 @@ fn build_ledger(
         });
     }
     ledger
+}
+
+/// 権限グループ(ADR-0060 決定1)を ACL ポリシーから台帳配布用に組み立てる。
+/// `AclGroup.members` は公開鍵だが、配布は既存の台帳と同じ作法(仮想 IP)に
+/// 合わせて解決する。ホストや削除済みメンバーの公開鍵など、渡された台帳
+/// (`ledger`。host 自身のエントリを含む)に無いものは静かに飛ばす
+/// (決定2: ACL の評価はホストを含むルールを無視するが、権限グループ自体は
+/// ホストを持てる。ここで台帳に host のエントリがあれば解決できる)。
+fn build_perm_groups(
+    config: &Config,
+    ledger: &[LedgerEntry],
+) -> Vec<peercove_core::proto::PermGroupInfo> {
+    let ip_by_key: HashMap<&[u8; 32], Ipv4Addr> = ledger
+        .iter()
+        .map(|e| (e.public_key.as_bytes(), e.ip))
+        .collect();
+    config
+        .acl
+        .groups
+        .iter()
+        .map(|group| peercove_core::proto::PermGroupInfo {
+            id: group.id.clone(),
+            name: group.name.clone(),
+            members: group
+                .members
+                .iter()
+                .filter_map(|key| ip_by_key.get(key.as_bytes()).copied())
+                .collect(),
+        })
+        .collect()
+}
+
+/// チャットグループ(ADR-0016)の 1 件を権限グループへ変換する純関数
+/// (id・name をそのまま引き継ぎ、members は渡された台帳で仮想 IP →
+/// 公開鍵へ解決する。解決できない IP はスキップ)。id が DNS ラベルとして
+/// 不正なもの(想定外の旧データ)は取り込まない。
+fn perm_groups_from_chat_groups(
+    chat_groups: &[peercove_core::msg::GroupInfo],
+    ledger: &[LedgerEntry],
+) -> Vec<peercove_core::acl::AclGroup> {
+    let key_by_ip: HashMap<Ipv4Addr, peercove_core::keys::PublicKey> =
+        ledger.iter().map(|e| (e.ip, e.public_key)).collect();
+    chat_groups
+        .iter()
+        .filter(|g| peercove_core::names::is_dns_label(&g.id))
+        .map(|g| peercove_core::acl::AclGroup {
+            id: g.id.clone(),
+            name: g.name.clone(),
+            members: g
+                .members
+                .iter()
+                .filter_map(|ip| key_by_ip.get(ip).copied())
+                .collect(),
+        })
+        .collect()
+}
+
+/// 初回起動時、ACL の権限グループが空ならチャットグループから取り込む
+/// (ADR-0060 決定4)。呼び出し側では毎周期(5 秒)呼んで構わない —
+/// `config.acl.groups` が空の間だけ意味を持ち、一度書き込まれれば以後の
+/// 呼び出しは何もしない(冪等)。
+fn migrate_chat_groups_to_perm_groups(
+    config_path: &Path,
+    config: &Config,
+    ledger: &[LedgerEntry],
+    groups: &crate::groups::SharedGroups,
+) {
+    if !config.acl.groups.is_empty() {
+        return;
+    }
+    let chat_groups = groups.lock().unwrap().all();
+    if chat_groups.is_empty() {
+        return;
+    }
+    let imported = perm_groups_from_chat_groups(&chat_groups, ledger);
+    match peercove_ops::acl::import_perm_groups(config_path, imported.clone()) {
+        Ok(true) => tracing::info!(
+            "チャットグループから権限グループを{}件取り込みました",
+            imported.len()
+        ),
+        Ok(false) => {} // 空だった、または他経路で既に取り込み済み(冪等)
+        Err(e) => tracing::warn!("権限グループの取り込みに失敗しました: {e:#}"),
+    }
 }
 
 fn invite_isolation(config: &Config) -> Vec<IsolatedPeer> {
@@ -1680,6 +1795,76 @@ mod tests {
             !ledger[1].can_invite,
             "グローバルトグル OFF では admin でも false"
         );
+    }
+
+    /// 権限グループ(ADR-0060 決定1): ACL ポリシーの group.members(公開鍵)を
+    /// 台帳から仮想 IP へ解決して載せる。ホストの公開鍵も解決できる(決定2)。
+    /// 未登録(削除済み)の公開鍵は静かに飛ばす。
+    #[test]
+    fn build_perm_groups_resolves_public_keys_to_ips() {
+        let alice_key = PrivateKey::generate().public_key();
+        let stale_key = PrivateKey::generate().public_key();
+        let host_key = PrivateKey::generate().public_key();
+        let config = host_config(&format!(
+            "[[peer]]\nname = \"alice\"\npublic_key = \"{alice_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\n\n\
+             [acl]\ndefault = \"allow\"\n\n\
+             [[acl.group]]\nid = \"servers\"\nname = \"サーバー\"\nmembers = [\"{alice_key}\", \"{host_key}\", \"{stale_key}\"]\n"
+        ));
+        let ledger = build_ledger(&config, &host_key, &[]);
+        let groups = build_perm_groups(&config, &ledger);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "servers");
+        assert_eq!(groups[0].name, "サーバー");
+        // alice(10.100.42.2)・ホスト(10.100.42.1)は解決される。stale は飛ばす
+        // (members 指定順 = alice, host, stale)
+        assert_eq!(
+            groups[0].members,
+            vec![
+                "10.100.42.2".parse::<Ipv4Addr>().unwrap(),
+                "10.100.42.1".parse::<Ipv4Addr>().unwrap(),
+            ]
+        );
+    }
+
+    /// チャットグループからの初回取り込み(ADR-0060 決定4): id/name を
+    /// 引き継ぎ、members(仮想 IP)を台帳から公開鍵へ解決する。
+    #[test]
+    fn perm_groups_from_chat_groups_resolves_ips_and_keeps_id_name() {
+        let alice_key = PrivateKey::generate().public_key();
+        let bob_key = PrivateKey::generate().public_key();
+        let host_key = PrivateKey::generate().public_key();
+        let config = host_config(&format!(
+            "[[peer]]\nname = \"alice\"\npublic_key = \"{alice_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\n\n\
+             [[peer]]\nname = \"bob\"\npublic_key = \"{bob_key}\"\nallowed_ips = [\"10.100.42.3/32\"]\n"
+        ));
+        let ledger = build_ledger(&config, &host_key, &[]);
+        let chat_groups = vec![
+            peercove_core::msg::GroupInfo {
+                id: "chat-1".to_string(),
+                name: "みんな".to_string(),
+                members: vec![
+                    "10.100.42.2".parse().unwrap(),
+                    "10.100.42.3".parse().unwrap(),
+                ],
+                revision: 1,
+                updated_by: "10.100.42.2".parse().unwrap(),
+            },
+            peercove_core::msg::GroupInfo {
+                id: "chat-2".to_string(),
+                name: "開発".to_string(),
+                members: vec!["10.100.42.2".parse().unwrap()],
+                revision: 1,
+                updated_by: "10.100.42.2".parse().unwrap(),
+            },
+        ];
+        let imported = perm_groups_from_chat_groups(&chat_groups, &ledger);
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].id, "chat-1");
+        assert_eq!(imported[0].name, "みんな");
+        assert_eq!(imported[0].members.len(), 2);
+        assert_eq!(imported[1].id, "chat-2");
+        assert_eq!(imported[1].name, "開発");
+        assert_eq!(imported[1].members, vec![alice_key]);
     }
 
     /// 鍵ローテーション(ADR-0020): 同じ IP を設定内の別の鍵が引き継いだら、

@@ -396,6 +396,7 @@ mod tests {
                 deny: vec![],
                 force_relay: vec![],
                 network_display_name: None,
+                perm_groups: vec![],
             },
             received_at: at,
         }

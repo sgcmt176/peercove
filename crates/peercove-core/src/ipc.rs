@@ -485,11 +485,15 @@ pub struct TunnelInfo {
     pub perm_groups: Vec<PermGroup>,
 }
 
-/// 共有メモの権限指定 UI 向けのグループ 1 件(id + 現在名だけ。ADR-0051)。
+/// 共有メモの権限指定 UI 向けのグループ 1 件(ADR-0051、ADR-0060 決定1で
+/// members を追加)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermGroup {
     pub id: String,
     pub name: String,
+    /// メンバーの仮想 IP(ADR-0060)。旧デーモンの応答には無い(空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<Ipv4Addr>,
 }
 
 fn u64_is_zero(value: &u64) -> bool {

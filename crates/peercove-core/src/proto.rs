@@ -84,6 +84,12 @@ pub enum ControlMessage {
         /// [`PROTO_VERSION`] は上げない。旧メンバーは未知フィールドとして無視する。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network_display_name: Option<String>,
+        /// 権限グループ(ADR-0060 決定1)。host は ACL ポリシー(host.toml)を
+        /// 正本に、members(公開鍵)をこの台帳と同じタイミングで仮想 IP へ
+        /// 解決して載せる。追加フィールドなので旧バージョンとは互いに
+        /// 無視し合う([`PROTO_VERSION`] は上げない)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        perm_groups: Vec<PermGroupInfo>,
     },
     /// host → member: あなたは削除された(以後トンネルは通らない)。
     Removed { message: String },
@@ -286,6 +292,30 @@ pub enum AdminRequest {
     /// 編集が既定値から始まる / id 未付番レコードを操作できない)を解消する
     /// (`peercove_ops::dns::list_records` が id の遅延付番も行うため)。
     DnsListFull,
+    /// 権限グループの作成(ADR-0060 決定1)。members は仮想 IP 指定(ホスト
+    /// 自身の IP も指定できる — 決定2)。応答に `data` は載らない(作成後の
+    /// 一覧は次回の台帳配布 `perm_groups` で拾える)。
+    PermGroupCreate {
+        name: String,
+        members: Vec<Ipv4Addr>,
+    },
+    /// 権限グループの改名。
+    PermGroupRename { id: String, name: String },
+    /// 権限グループのメンバー入れ替え(丸ごと差し替え)。
+    PermGroupSetMembers { id: String, members: Vec<Ipv4Addr> },
+    /// 権限グループの削除。参照している ACL ルールも一緒に消える。
+    PermGroupDelete { id: String },
+}
+
+/// 権限グループ(ADR-0060 決定1)1 件の台帳配布向けワイヤ表現。
+/// `peercove_core::acl::AclGroup` は公開鍵で members を持つが、配布時は
+/// 既存の台帳と同じ作法(仮想 IP)へホストが解決してから載せる。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermGroupInfo {
+    pub id: String,
+    /// 空なら UI 側が id を表示名として扱う(旧 ACL グループの移行分)。
+    pub name: String,
+    pub members: Vec<Ipv4Addr>,
 }
 
 /// [`AdminRequest::AclWrite`] / [`AdminOpData::AclPolicy`] が共用する ACL v2
@@ -559,6 +589,11 @@ mod tests {
                     health: None,
                 }],
                 network_display_name: Some("うちの LAN".to_string()),
+                perm_groups: vec![PermGroupInfo {
+                    id: "servers".to_string(),
+                    name: "サーバー".to_string(),
+                    members: vec!["100.100.42.2".parse().unwrap()],
+                }],
             },
             ControlMessage::Removed {
                 message: "ホストにより削除されました".to_string(),
@@ -689,6 +724,7 @@ mod tests {
                         default: crate::acl::AclAction::Deny,
                         groups: vec![crate::acl::AclGroup {
                             id: "servers".to_string(),
+                            name: "サーバー".to_string(),
                             members: vec![PrivateKey::generate().public_key()],
                         }],
                         rules: vec![crate::acl::AclRule {
@@ -719,6 +755,33 @@ mod tests {
             ControlMessage::AdminOp {
                 seq: 15,
                 op: AdminRequest::DnsListFull,
+            },
+            ControlMessage::AdminOp {
+                seq: 16,
+                op: AdminRequest::PermGroupCreate {
+                    name: "サーバー".to_string(),
+                    members: vec!["100.100.42.2".parse().unwrap()],
+                },
+            },
+            ControlMessage::AdminOp {
+                seq: 17,
+                op: AdminRequest::PermGroupRename {
+                    id: "servers".to_string(),
+                    name: "本番サーバー".to_string(),
+                },
+            },
+            ControlMessage::AdminOp {
+                seq: 18,
+                op: AdminRequest::PermGroupSetMembers {
+                    id: "servers".to_string(),
+                    members: vec!["100.100.42.3".parse().unwrap()],
+                },
+            },
+            ControlMessage::AdminOp {
+                seq: 19,
+                op: AdminRequest::PermGroupDelete {
+                    id: "servers".to_string(),
+                },
             },
             ControlMessage::AdminOpResult {
                 seq: 1,
@@ -811,13 +874,14 @@ mod tests {
             }
         );
 
-        // dns_records / cname_records / network_display_name が空・未設定なら
-        // 旧バージョンとワイヤ表現が一致する(互換維持)
+        // dns_records / cname_records / network_display_name / perm_groups が
+        // 空・未設定なら旧バージョンとワイヤ表現が一致する(互換維持)
         let json = serde_json::to_string(&ControlMessage::Ledger {
             members: vec![],
             dns_records: vec![],
             cname_records: vec![],
             network_display_name: None,
+            perm_groups: vec![],
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"ledger","members":[]}"#);
@@ -847,6 +911,7 @@ mod tests {
                 dns_records: vec![],
                 cname_records: vec![],
                 network_display_name: None,
+                perm_groups: vec![],
             }
         );
 

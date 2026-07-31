@@ -8,6 +8,7 @@ use std::path::Path;
 
 use peercove_core::acl::{AclAction, AclGroup, AclRule, AclTarget};
 use peercove_core::config::Config;
+use peercove_core::keys::PublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::peers::{load_doc_locked, write_validated};
@@ -75,6 +76,9 @@ pub fn write_policy(config_path: &Path, policy: &PolicySettings) -> anyhow::Resu
         for group in &policy.groups {
             let mut table = toml_edit::Table::new();
             table["id"] = toml_edit::value(&group.id);
+            if !group.name.is_empty() {
+                table["name"] = toml_edit::value(&group.name);
+            }
             let mut members = toml_edit::Array::new();
             for member in &group.members {
                 members.push(member.to_base64());
@@ -117,6 +121,128 @@ pub fn write_policy(config_path: &Path, policy: &PolicySettings) -> anyhow::Resu
     }
     doc["acl"] = toml_edit::Item::Table(acl);
     write_validated(lock, config_path, &doc.to_string())
+}
+
+// ---- 権限グループ(PermGroup)の CRUD(ADR-0060 決定1) ----
+//
+// 権限グループは ACL v2 ポリシーの `groups`(= `AclGroup`)そのものを指す
+// (「グループ」の 2 系統をここで一本化する)。読み書きは既存の
+// read_policy/write_policy を経由するので、旧 deny pair の v2 移行にも
+// 自然に相乗りする。
+
+/// 権限グループを作成し、生成した id を返す。id は名前から生成する
+/// (旧 `AclDialog.tsx` の slug 生成を踏襲)。ホストの公開鍵も members に
+/// 含められる(決定2: ACL 評価はホストを含むルールを無視するので安全)。
+pub fn perm_group_create(
+    config_path: &Path,
+    name: &str,
+    members: &[PublicKey],
+) -> anyhow::Result<String> {
+    let mut policy = read_policy(config_path)?;
+    let id = unique_group_id(&policy.groups, name);
+    policy.groups.push(AclGroup {
+        id: id.clone(),
+        name: name.trim().to_string(),
+        members: members.to_vec(),
+    });
+    write_policy(config_path, &policy)?;
+    Ok(id)
+}
+
+/// 権限グループの表示名を変える(id は不変)。
+pub fn perm_group_rename(config_path: &Path, id: &str, name: &str) -> anyhow::Result<()> {
+    let mut policy = read_policy(config_path)?;
+    let group = policy
+        .groups
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| anyhow::anyhow!("権限グループ {id} がありません"))?;
+    group.name = name.trim().to_string();
+    write_policy(config_path, &policy)
+}
+
+/// 権限グループのメンバーを丸ごと差し替える。
+pub fn perm_group_set_members(
+    config_path: &Path,
+    id: &str,
+    members: &[PublicKey],
+) -> anyhow::Result<()> {
+    let mut policy = read_policy(config_path)?;
+    let group = policy
+        .groups
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| anyhow::anyhow!("権限グループ {id} がありません"))?;
+    group.members = members.to_vec();
+    write_policy(config_path, &policy)
+}
+
+/// 権限グループを削除する。参照している ACL ルール(source/destination の
+/// どちらか)も一緒に消す(旧 `AclDialog.tsx` の削除処理をここへ寄せた —
+/// ADR-0060)。
+pub fn perm_group_delete(config_path: &Path, id: &str) -> anyhow::Result<()> {
+    let mut policy = read_policy(config_path)?;
+    let before = policy.groups.len();
+    policy.groups.retain(|g| g.id != id);
+    if policy.groups.len() == before {
+        anyhow::bail!("権限グループ {id} がありません");
+    }
+    policy.rules.retain(|rule| {
+        !target_references_group(&rule.source, id)
+            && !target_references_group(&rule.destination, id)
+    });
+    write_policy(config_path, &policy)
+}
+
+fn target_references_group(target: &AclTarget, id: &str) -> bool {
+    matches!(target, AclTarget::Group { group } if group == id)
+}
+
+/// チャットグループからの初回取り込み(ADR-0060 決定4)。呼び出し側
+/// (`peercove-cli`。チャットグループの `GroupInfo` を読めるのはそちら)が
+/// id/name を引き継ぎ members を公開鍵へ解決した [`AclGroup`] を渡す。
+/// ACL の groups が空のときだけ書き込む(既に何かあれば何もしない = 冪等)。
+/// 戻り値は実際に書き込んだか。
+pub fn import_perm_groups(config_path: &Path, groups: Vec<AclGroup>) -> anyhow::Result<bool> {
+    if groups.is_empty() {
+        return Ok(false);
+    }
+    let mut policy = read_policy(config_path)?;
+    if !policy.groups.is_empty() {
+        return Ok(false);
+    }
+    policy.groups = groups;
+    write_policy(config_path, &policy)?;
+    Ok(true)
+}
+
+/// 名前から DNS ラベル準拠の id を生成する(衝突があれば連番、それでも
+/// 埋まっていれば最終手段としてランダムな英数)。
+fn unique_group_id(existing: &[AclGroup], name: &str) -> String {
+    let base = peercove_core::names::dns_label(name).unwrap_or_else(|| "group".to_string());
+    // 連番サフィックス("-999" まで4文字)の余地を残す
+    let base = if base.len() > 55 {
+        base[..55].trim_end_matches('-').to_string()
+    } else {
+        base
+    };
+    if !existing.iter().any(|g| g.id == base) {
+        return base;
+    }
+    for n in 2u32..1000 {
+        let candidate = format!("{base}-{n}");
+        if !existing.iter().any(|g| g.id == candidate) {
+            return candidate;
+        }
+    }
+    random_group_id()
+}
+
+fn random_group_id() -> String {
+    use rand_core::{OsRng, RngCore};
+    let mut buf = [0u8; 4];
+    OsRng.fill_bytes(&mut buf);
+    format!("group-{:x}", u32::from_le_bytes(buf))
 }
 
 fn target_item(target: &AclTarget) -> toml_edit::Item {
@@ -331,6 +457,7 @@ mod tests {
                 default: AclAction::Allow,
                 groups: vec![AclGroup {
                     id: "servers".into(),
+                    name: "サーバー".into(),
                     members: vec![bob],
                 }],
                 rules: vec![AclRule {
@@ -351,5 +478,105 @@ mod tests {
         let after = Config::load(&config).unwrap();
         assert!(after.acl.groups.is_empty());
         assert!(after.acl.rules.is_empty());
+    }
+
+    /// 権限グループ(ADR-0060 決定1)の CRUD ラウンドトリップ:
+    /// 作成 → 改名 → メンバー変更 → 削除(参照ルールも一緒に消える)。
+    #[test]
+    fn perm_group_crud_roundtrip() {
+        let config = setup("perm-group-crud");
+        add(&config, "alice", "10.100.42.2");
+        add(&config, "bob", "10.100.42.3");
+        let loaded = Config::load(&config).unwrap();
+        let alice = loaded.peers[0].public_key;
+        let bob = loaded.peers[1].public_key;
+
+        let id = perm_group_create(&config, "サーバー", &[alice]).unwrap();
+        assert_eq!(id, "group"); // 日本語名は dns_label で空になるので既定名
+        let policy = read_policy(&config).unwrap();
+        assert_eq!(policy.groups.len(), 1);
+        assert_eq!(policy.groups[0].name, "サーバー");
+        assert_eq!(policy.groups[0].members, vec![alice]);
+
+        perm_group_rename(&config, &id, "本番サーバー").unwrap();
+        assert_eq!(read_policy(&config).unwrap().groups[0].name, "本番サーバー");
+
+        perm_group_set_members(&config, &id, &[alice, bob]).unwrap();
+        assert_eq!(
+            read_policy(&config).unwrap().groups[0].members,
+            vec![alice, bob]
+        );
+
+        // 削除時に、このグループを参照する ACL ルールも一緒に消える
+        write_policy(
+            &config,
+            &PolicySettings {
+                default: AclAction::Allow,
+                groups: read_policy(&config).unwrap().groups,
+                rules: vec![AclRule {
+                    id: "deny-group".into(),
+                    action: AclAction::Deny,
+                    source: AclTarget::Any("any".into()),
+                    destination: AclTarget::Group { group: id.clone() },
+                    protocol: peercove_core::acl::AclProtocol::Any,
+                    ports: vec![],
+                    enabled: true,
+                }],
+            },
+        )
+        .unwrap();
+        perm_group_delete(&config, &id).unwrap();
+        let after = read_policy(&config).unwrap();
+        assert!(after.groups.is_empty());
+        assert!(after.rules.is_empty(), "参照していたルールも消える");
+
+        // 存在しない id はエラー
+        assert!(perm_group_delete(&config, &id).is_err());
+    }
+
+    /// id は英字名から生成し、衝突すれば連番で一意化する。
+    #[test]
+    fn perm_group_create_generates_unique_ids() {
+        let config = setup("perm-group-ids");
+        let id1 = perm_group_create(&config, "Servers", &[]).unwrap();
+        assert_eq!(id1, "servers");
+        let id2 = perm_group_create(&config, "Servers", &[]).unwrap();
+        assert_eq!(id2, "servers-2");
+    }
+
+    /// チャットグループからの初回取り込み(ADR-0060 決定4)。ACL が空なら
+    /// 書き込み、id/name が保たれる。2 回目は何もしない(冪等)。
+    #[test]
+    fn import_perm_groups_only_when_empty() {
+        let config = setup("perm-group-import");
+        add(&config, "alice", "10.100.42.2");
+        let alice = Config::load(&config).unwrap().peers[0].public_key;
+        let imported = vec![
+            AclGroup {
+                id: "chat-1".into(),
+                name: "みんな".into(),
+                members: vec![alice],
+            },
+            AclGroup {
+                id: "chat-2".into(),
+                name: "開発".into(),
+                members: vec![],
+            },
+        ];
+        assert!(import_perm_groups(&config, imported.clone()).unwrap());
+        let policy = read_policy(&config).unwrap();
+        assert_eq!(policy.groups.len(), 2);
+        assert_eq!(policy.groups[0].id, "chat-1");
+        assert_eq!(policy.groups[0].name, "みんな");
+        assert_eq!(policy.groups[1].id, "chat-2");
+
+        // 既に何かあれば取り込まない(冪等)
+        let more = vec![AclGroup {
+            id: "chat-3".into(),
+            name: "無視される".into(),
+            members: vec![],
+        }];
+        assert!(!import_perm_groups(&config, more).unwrap());
+        assert_eq!(read_policy(&config).unwrap().groups.len(), 2);
     }
 }

@@ -146,7 +146,12 @@ export type AdminRequest =
   | { op: "acl_write"; policy: AclPolicySettings }
   | { op: "set_subnets"; ip: string; subnets: string[] }
   | { op: "dns_check_now" }
-  | { op: "dns_list_full" };
+  | { op: "dns_list_full" }
+  // 権限グループ(ADR-0060 決定1)。members は仮想 IP 指定(ホスト自身の IP も可)。
+  | { op: "perm_group_create"; name: string; members: string[] }
+  | { op: "perm_group_rename"; id: string; name: string }
+  | { op: "perm_group_set_members"; id: string; members: string[] }
+  | { op: "perm_group_delete"; id: string };
 
 /** [`AdminRequest`]「read_network_settings」への応答。 */
 export interface AdminNetworkSettings {
@@ -357,7 +362,9 @@ export interface Tunnel {
   sharedMemoSeq: number;
   /** 共有メモが使えるか（member で false = ホスト未対応 or 未同期）。 */
   sharedMemo: boolean;
-  /** 共有メモの権限ダイアログで選べるグループ（ADR-0051）。host は既知の全グループ、member は自分の所属グループだけ。 */
+  /** 権限グループ（ADR-0051、ADR-0060 決定1で参照先が一本化）。共有メモの権限
+   *  ダイアログとサイドバー「グループ」画面の両方がここを見る。host は ACL
+   *  ポリシー由来、member は台帳配布分。 */
   permGroups?: PermGroup[];
   /** 解決済みカスタム DNS レコード（ADR-0022）。member はここから一覧表示する。 */
   dnsRecords: DnsRecord[];
@@ -411,7 +418,7 @@ export interface BackupPreview {
 export type AclAction = "allow" | "deny";
 export type AclProtocol = "any" | "tcp" | "udp" | "icmp";
 export type AclTarget = "any" | { member: string } | { group: string } | { subnet: string } | { service: string };
-export interface AclGroup { id: string; members: string[]; }
+export interface AclGroup { id: string; name: string; members: string[]; }
 export interface AclRule { id: string; action: AclAction; source: AclTarget; destination: AclTarget; protocol: AclProtocol; ports: string[]; enabled: boolean; }
 export interface AclPolicySettings { default: AclAction; groups: AclGroup[]; rules: AclRule[]; }
 
@@ -732,10 +739,11 @@ export interface SharedGroupPerm {
   level: SharedPermLevel;
 }
 
-/** 共有メモの権限ダイアログで選べるグループ(ADR-0051)。id + 現在名だけ。 */
+/** 共有メモの権限ダイアログで選べるグループ(ADR-0051、ADR-0060 決定1で members を追加)。 */
 export interface PermGroup {
   id: string;
   name: string;
+  members?: string[];
 }
 
 export interface SharedMemoQuery {
@@ -1188,6 +1196,16 @@ export const api = {
     invoke<void>("set_acl", { configPath, deny }),
   readAclPolicy: (configPath: string) => invoke<AclPolicySettings>("read_acl_policy", { configPath }),
   writeAclPolicy: (configPath: string, policy: AclPolicySettings) => invoke<void>("write_acl_policy", { configPath, policy }),
+  // 権限グループ（ADR-0060 決定1）。ホストはこれを直接、admin メンバーは
+  // adminOp({ op: "perm_group_*" }) 経由（ホストは IPC を経由しない従来の作法）。
+  permGroupCreate: (configPath: string, name: string, members: string[]) =>
+    invoke<string>("perm_group_create", { configPath, name, members }),
+  permGroupRename: (configPath: string, id: string, name: string) =>
+    invoke<void>("perm_group_rename", { configPath, id, name }),
+  permGroupSetMembers: (configPath: string, id: string, members: string[]) =>
+    invoke<void>("perm_group_set_members", { configPath, id, members }),
+  permGroupDelete: (configPath: string, id: string) =>
+    invoke<void>("perm_group_delete", { configPath, id }),
   // チャット（ADR-0016、M3-13b/c）。peer 指定で 1:1、group 指定でグループ宛、
   // どちらも null でネットワーク全体宛
   chatSend: (

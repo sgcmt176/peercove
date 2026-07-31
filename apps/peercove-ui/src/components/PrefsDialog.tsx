@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Prefs, loadPrefs, savePrefs } from "../prefs";
 import { UpdateInfo, api, errorMessage } from "../ipc";
 import { checkForUpdate, clearUpdateCache } from "../update";
-import { t } from "../i18n";
+import { LocaleId, currentLocale, setLocale, t } from "../i18n";
 import { NetworkInfo } from "../ipc";
 import { BackupView } from "./BackupView";
 
@@ -31,6 +31,14 @@ export function AppSettingsView({
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
   const [checking, setChecking] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [locale, setLocaleState] = useState<LocaleId>(currentLocale);
+
+  const changeLocale = (id: LocaleId) => {
+    if (id === locale) return;
+    if (!window.confirm(t.prefs.languageReloadConfirm)) return;
+    setLocaleState(id);
+    setLocale(id);
+  };
 
   const toggle = (key: "notifications" | "linkPreview" | "updateChecks" | "qualityAlerts") => {
     const next = { ...prefs, [key]: !prefs[key] };
@@ -61,6 +69,17 @@ export function AppSettingsView({
     <section className="card">
       <h2 className="card-title">{t.prefs.title}</h2>
       <div className="page-body">
+        <label className="prefs__threshold">
+          <span>{t.prefs.language}</span>
+          <select
+            value={locale}
+            onChange={(event) => changeLocale(event.target.value as LocaleId)}
+          >
+            <option value="ja">{t.prefs.languageJa}</option>
+            <option value="en">{t.prefs.languageEn}</option>
+          </select>
+        </label>
+        <p className="muted small prefs__hint">{t.prefs.languageHint}</p>
         <label className="chat__pick-row">
           <input
             type="checkbox"

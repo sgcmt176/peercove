@@ -113,11 +113,10 @@ pub struct MemoService {
     db_path: PathBuf,
     /// 接続中メンバー(supervisor が周期ごとに差し込む)。
     connections: Mutex<Option<Connections>>,
-    /// 既知グループ全量(ADR-0051)。IP → 所属グループの解決と、グループ
-    /// 権限を持つメモの再配信(`watch_groups`)に使う。
-    groups: Mutex<Option<crate::groups::SharedGroups>>,
-    /// 直近に見た「全グループの (id, revision)」の署名(`watch_groups`)。
-    /// 変化を検知したときだけ再配信を行う。
+    /// 直近に見た「全権限グループの (id, 内容ハッシュ)」の署名(`watch_groups`)。
+    /// 変化を検知したときだけ再配信を行う(ADR-0060 決定3。権限グループ
+    /// [`peercove_core::acl::AclGroup`] は revision を持たないため、
+    /// id・名前・members から作った内容ハッシュを revision の代わりに使う)。
     last_group_sig: Mutex<Option<Vec<(String, u64)>>>,
     locks: Mutex<HashMap<String, LockInfo>>,
     seq: AtomicU64,
@@ -150,7 +149,6 @@ impl MemoService {
             config_path: config_path.to_path_buf(),
             db_path: config_path.with_extension("memos.db"),
             connections: Mutex::new(None),
-            groups: Mutex::new(None),
             last_group_sig: Mutex::new(None),
             locks: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
@@ -165,42 +163,72 @@ impl MemoService {
         *self.connections.lock().unwrap() = Some(connections);
     }
 
-    /// supervisor 起動時にグループ表を差し込む(ADR-0051。attach_connections
-    /// と同じパターン。入れ直しをまたいで使い回す)。
-    pub fn attach_groups(&self, groups: crate::groups::SharedGroups) {
-        *self.groups.lock().unwrap() = Some(groups);
-    }
-
-    /// `ip` が現在属しているグループの id 一覧(ADR-0051)。GroupStore は
-    /// 全グループ(自分が非メンバーのものも)を持つため、ここで
-    /// 「members に ip を含むか」で絞り込む。未 attach なら空。
-    fn group_ids_for(&self, ip: Ipv4Addr) -> Vec<String> {
-        let Some(groups) = self.groups.lock().unwrap().clone() else {
+    /// `ip` が現在属している権限グループの id 一覧(ADR-0060 決定3。従来は
+    /// チャットグループの GroupStore を見ていたが、共有メモの権限判定は
+    /// ホストの ACL ポリシー(host.toml `[acl]`)の権限グループを正本にする。
+    /// 権限グループの members は公開鍵で持つため、まず ip → 公開鍵を
+    /// `config.peers` の allowed_ips で突き合わせてから絞り込む
+    /// (`Self::actor_for_ip` と同じ突き合わせ方)。一致するピアが無ければ空
+    /// (呼び出し元は常にピアの IP を渡す — ホスト自身の IP を渡すことはない)。
+    fn group_ids_for(config: &Config, ip: Ipv4Addr) -> Vec<String> {
+        let Some(key) = config
+            .peers
+            .iter()
+            .find(|peer| peer.allowed_ips.first().map(|net| net.addr()) == Some(ip))
+            .map(|peer| peer.public_key)
+        else {
             return Vec::new();
         };
-        let store = groups.lock().unwrap();
-        store
-            .all()
-            .into_iter()
-            .filter(|g| g.members.contains(&ip))
-            .map(|g| g.id)
+        config
+            .acl
+            .groups
+            .iter()
+            .filter(|g| g.members.contains(&key))
+            .map(|g| g.id.clone())
             .collect()
     }
 
-    /// detail に載るグループ権限の表示名を、GroupStore に現存するグループ
-    /// なら現在名で上書きする(改名追従)。ストアの保存値はスナップショット
-    /// のままなので、返す直前にサービス層で行う。
-    fn refresh_group_names(&self, memo: &mut SharedMemoDetail) {
+    /// detail に載るグループ権限の表示名を、ACL ポリシーに現存する権限
+    /// グループなら現在名で上書きする(改名追従。ADR-0060 決定3)。ストアの
+    /// 保存値はスナップショットのままなので、返す直前にサービス層で行う。
+    /// ACL ポリシーの読み込みは小さな TOML の同期読み取りだが、呼び出し元は
+    /// すべて非同期コンテキストなので spawn_blocking に包む。
+    async fn refresh_group_names(&self, memo: &mut SharedMemoDetail) {
         if memo.groups.is_empty() {
             return;
         }
-        let Some(groups) = self.groups.lock().unwrap().clone() else {
-            return;
-        };
-        let store = groups.lock().unwrap();
+        let path = self.config_path.clone();
+        let names: HashMap<String, String> = tokio::task::spawn_blocking(move || {
+            Config::load(&path)
+                .map(|config| {
+                    config
+                        .acl
+                        .groups
+                        .into_iter()
+                        .map(|g| (g.id, g.name))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
         for perm in &mut memo.groups {
-            if let Some(group) = store.get(&perm.group_id) {
-                perm.name = group.name;
+            if let Some(name) = names.get(&perm.group_id) {
+                perm.name = name.clone();
+            }
+        }
+    }
+
+    /// [`Self::refresh_group_names`] の同期版。呼び出し側がすでに
+    /// spawn_blocking の中で `config` を読み込み済みの場所(`broadcast_changed`
+    /// など)で使う(ADR-0060 決定3)。
+    fn apply_group_names(config: &Config, memo: &mut SharedMemoDetail) {
+        if memo.groups.is_empty() {
+            return;
+        }
+        for perm in &mut memo.groups {
+            if let Some(group) = config.acl.groups.iter().find(|g| g.id == perm.group_id) {
+                perm.name = group.name.clone();
             }
         }
     }
@@ -250,12 +278,13 @@ impl MemoService {
         let path = self.config_path.clone();
         let actor = tokio::task::spawn_blocking(move || {
             let config = Config::load(&path)?;
-            Self::actor_for_ip(&config, member_ip)
+            let groups = Self::group_ids_for(&config, member_ip);
+            Ok::<_, anyhow::Error>(Self::actor_for_ip(&config, member_ip)?.with_groups(groups))
         })
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("内部エラー: {e}")));
         let actor = match actor {
-            Ok(actor) => actor.with_groups(self.group_ids_for(member_ip)),
+            Ok(actor) => actor,
             Err(e) => {
                 return SharedMemoReply::Err {
                     message: format!("{e:#}"),
@@ -314,7 +343,7 @@ impl MemoService {
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
-                self.refresh_group_names(&mut memo);
+                self.refresh_group_names(&mut memo).await;
                 Ok(SharedMemoReply::Memo { memo })
             }
             SharedMemoOp::ResolveTitles { titles } => {
@@ -378,7 +407,7 @@ impl MemoService {
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
-                self.refresh_group_names(&mut memo);
+                self.refresh_group_names(&mut memo).await;
                 self.broadcast_changed(id);
                 self.bump();
                 Ok(SharedMemoReply::Memo { memo })
@@ -414,7 +443,7 @@ impl MemoService {
                     );
                 }
                 memo.locked_by = Some(actor.name.clone());
-                self.refresh_group_names(&mut memo);
+                self.refresh_group_names(&mut memo).await;
                 self.broadcast_lock(&id, Some(actor.name.clone()));
                 self.bump();
                 Ok(SharedMemoReply::Memo { memo })
@@ -506,7 +535,7 @@ impl MemoService {
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
-                self.refresh_group_names(&mut memo);
+                self.refresh_group_names(&mut memo).await;
                 // 権限を失ったメンバーには Removed が届く(broadcast_changed が
                 // 受信者ごとに可視判定して振り分ける)
                 self.broadcast_changed(id);
@@ -602,7 +631,7 @@ impl MemoService {
                     })
                     .await?;
                 memo.locked_by = self.lock_holder(&memo.id);
-                self.refresh_group_names(&mut memo);
+                self.refresh_group_names(&mut memo).await;
                 self.broadcast_changed(id);
                 self.bump();
                 Ok(SharedMemoReply::Memo { memo })
@@ -663,26 +692,50 @@ impl MemoService {
                 Ok(SharedMemoReply::Sheet { reply })
             }
             SharedMemoOp::PermGroupList => {
-                // 権限ダイアログ向けの全グループ一覧(M7 J-1b、ADR-0059)。
-                // host か admin を委任されたメンバーだけに返す(それ以外は
-                // 拒否 — 個人の所属を超えてグループ全量を見せる操作のため)
+                // 権限ダイアログ向けの全グループ一覧(M7 J-1b、ADR-0059。
+                // ADR-0060 決定3で参照先をチャットグループから権限グループへ
+                // 切り替え)。host か admin を委任されたメンバーだけに返す
+                // (それ以外は拒否 — 個人の所属を超えてグループ全量を見せる
+                // 操作のため)
                 if !(actor.member_id.is_none() || actor.admin) {
                     bail!("グループ一覧を取得できるのはホストと管理者(admin)だけです");
                 }
-                let groups = {
-                    let Some(groups) = self.groups.lock().unwrap().clone() else {
-                        return Ok(SharedMemoReply::PermGroups { groups: Vec::new() });
+                let path = self.config_path.clone();
+                let groups = tokio::task::spawn_blocking(move || {
+                    let Ok(config) = Config::load(&path) else {
+                        return Vec::new();
                     };
-                    let store = groups.lock().unwrap();
-                    store
-                        .all()
+                    // members(公開鍵)→ 仮想 IP。ここは config.peers だけで解決する
+                    // (ホスト自身が members に含まれていても、この一覧生成では
+                    // 解決しない — host_public_key を持たないため。台帳配布経由の
+                    // `TunnelInfo.perm_groups` 側では解決済みなので、ホストを含む
+                    // 表示はそちらが正)
+                    let ip_by_key: HashMap<[u8; 32], Ipv4Addr> = config
+                        .peers
+                        .iter()
+                        .filter_map(|peer| {
+                            peer.allowed_ips
+                                .first()
+                                .map(|net| (*peer.public_key.as_bytes(), net.addr()))
+                        })
+                        .collect();
+                    config
+                        .acl
+                        .groups
                         .into_iter()
                         .map(|g| peercove_core::ipc::PermGroup {
                             id: g.id,
                             name: g.name,
+                            members: g
+                                .members
+                                .iter()
+                                .filter_map(|key| ip_by_key.get(key.as_bytes()).copied())
+                                .collect(),
                         })
                         .collect()
-                };
+                })
+                .await
+                .unwrap_or_default();
                 Ok(SharedMemoReply::PermGroups { groups })
             }
         }
@@ -1103,22 +1156,23 @@ impl MemoService {
         });
     }
 
-    /// グループの改名・メンバー増減・削除への追従(ADR-0051)。全グループの
-    /// (id, revision) から作った署名を前回と比較し、**変化した時だけ**
+    /// グループの改名・メンバー増減・削除への追従(ADR-0051、ADR-0060 決定3で
+    /// 権限グループ = ACL ポリシーの `groups` へ参照先を切り替え)。全グループの
+    /// (id, 内容ハッシュ)から作った署名を前回と比較し、**変化した時だけ**
     /// グループ権限を持つメモを受信者ごとに可視判定し直して再配信する
     /// (見える人には Changed、見えなくなった人には Removed —
     /// `broadcast_changed` がそのまま面倒を見る)。supervisor の tick から
     /// (sweep_expired_locks / maintain と同じ場所で)毎周期呼んでよい。
-    pub fn watch_groups(self: &Arc<Self>) {
-        let Some(groups) = self.groups.lock().unwrap().clone() else {
-            return;
-        };
+    /// `config` は呼び出し元(tick ループ)がその周期で読み込んだものをそのまま
+    /// 渡す(ここで読み直さない — 権限グループは revision を持たないため、
+    /// 内容ハッシュを revision の代わりに使う)。
+    pub fn watch_groups(self: &Arc<Self>, config: &Config) {
         let sig: Vec<(String, u64)> = {
-            let store = groups.lock().unwrap();
-            let mut sig: Vec<(String, u64)> = store
-                .all()
-                .into_iter()
-                .map(|g| (g.id, g.revision))
+            let mut sig: Vec<(String, u64)> = config
+                .acl
+                .groups
+                .iter()
+                .map(|g| (g.id.clone(), group_content_hash(g)))
                 .collect();
             sig.sort();
             sig
@@ -1232,12 +1286,15 @@ impl MemoService {
                 };
                 // グループ権限のメモをリアルタイム配信するには、受信者ごとの
                 // Actor に所属グループを付けておく必要がある(ADR-0051)
-                let actor = actor.with_groups(service.group_ids_for(ip));
+                let actor = actor.with_groups(Self::group_ids_for(&config, ip));
                 let event = match service.with_store(&|store| store.detail_if_visible(&actor, &id))
                 {
                     Ok(Some(mut memo)) => {
                         memo.locked_by = holder.clone();
-                        service.refresh_group_names(&mut memo);
+                        // すでにこの spawn_blocking(同期コンテキスト)で config を
+                        // 読み込み済みなので、非同期版 refresh_group_names ではなく
+                        // config を直接使う同期版で表示名を上書きする(ADR-0060 決定3)
+                        Self::apply_group_names(&config, &mut memo);
                         SharedMemoEvent::Changed { memo }
                     }
                     Ok(None) => SharedMemoEvent::Removed { id: id.clone() },
@@ -1521,6 +1578,20 @@ impl MemoService {
 
 fn prune_expired(locks: &mut HashMap<String, LockInfo>) {
     locks.retain(|_, lock| lock.last_activity.elapsed() <= LOCK_TTL);
+}
+
+/// 権限グループ 1 件の内容ハッシュ(`MemoService::watch_groups` 用、ADR-0060
+/// 決定3)。[`peercove_core::acl::AclGroup`] は revision を持たないため、
+/// 名前・メンバー(公開鍵、順不同)から作ったハッシュを変化検知の代わりに使う。
+/// 暗号学的な強度は不要(衝突しても最悪 1 周期分の再配信が遅れるだけ)。
+fn group_content_hash(group: &peercove_core::acl::AclGroup) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    group.name.hash(&mut hasher);
+    let mut members: Vec<String> = group.members.iter().map(|key| key.to_base64()).collect();
+    members.sort();
+    members.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 主経路(`MemoService::with_store` / `MemberMemoCache::with_store` 経由の
@@ -1915,5 +1986,34 @@ mod tests {
         assert!(service.shared_store.lock().unwrap().is_some());
 
         let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
+    }
+
+    /// 権限グループの参照先切り替え(ADR-0060 決定3): `group_ids_for` が
+    /// チャットグループの GroupStore ではなく、ホストの ACL ポリシー
+    /// (`config.acl.groups`)を見て、ip → 公開鍵 → 権限グループ id を解決
+    /// できること。既存の `memo_group_perms`(DB 側、group id を保持する
+    /// だけで内容は知らない)は、ここで返す id さえ J-3a の移行前後で
+    /// 変わらなければ引き続き有効に働く(id 継続は
+    /// `tunnel::perm_groups_from_chat_groups` 側のテストで確認済み)。
+    #[test]
+    fn group_ids_for_resolves_via_acl_policy() {
+        let alice_key = peercove_core::keys::PrivateKey::generate().public_key();
+        let text = format!(
+            "[interface]\nprivate_key_file = \"host.key\"\naddress = \"10.100.42.1/24\"\nlisten_port = 51820\n\n\
+             [[peer]]\nname = \"alice\"\npublic_key = \"{alice_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\n\n\
+             [acl]\ndefault = \"allow\"\n\n\
+             [[acl.group]]\nid = \"servers\"\nname = \"サーバー\"\nmembers = [\"{alice_key}\"]\n"
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+
+        let alice_ip: Ipv4Addr = "10.100.42.2".parse().unwrap();
+        assert_eq!(
+            MemoService::group_ids_for(&config, alice_ip),
+            vec!["servers".to_string()]
+        );
+
+        // 権限グループに属さない(登録も無い)IP は空
+        let stranger: Ipv4Addr = "10.100.42.9".parse().unwrap();
+        assert!(MemoService::group_ids_for(&config, stranger).is_empty());
     }
 }

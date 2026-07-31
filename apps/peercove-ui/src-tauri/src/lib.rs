@@ -1545,6 +1545,40 @@ fn write_acl_policy(
     peercove_ops::acl::write_policy(Path::new(&config_path), &policy).map_err(to_message)
 }
 
+// ---- 権限グループ(ADR-0060 決定1)。ホスト自身は IPC を経由せず直接
+// host.toml を編集する(admin メンバーからは admin_op 経由 — ADR-0059 の
+// 既存パターンと同じ) ----
+
+#[tauri::command]
+fn perm_group_create(
+    config_path: String,
+    name: String,
+    members: Vec<peercove_core::keys::PublicKey>,
+) -> Result<String, String> {
+    peercove_ops::acl::perm_group_create(Path::new(&config_path), &name, &members)
+        .map_err(to_message)
+}
+
+#[tauri::command]
+fn perm_group_rename(config_path: String, id: String, name: String) -> Result<(), String> {
+    peercove_ops::acl::perm_group_rename(Path::new(&config_path), &id, &name).map_err(to_message)
+}
+
+#[tauri::command]
+fn perm_group_set_members(
+    config_path: String,
+    id: String,
+    members: Vec<peercove_core::keys::PublicKey>,
+) -> Result<(), String> {
+    peercove_ops::acl::perm_group_set_members(Path::new(&config_path), &id, &members)
+        .map_err(to_message)
+}
+
+#[tauri::command]
+fn perm_group_delete(config_path: String, id: String) -> Result<(), String> {
+    peercove_ops::acl::perm_group_delete(Path::new(&config_path), &id).map_err(to_message)
+}
+
 // ---- カスタム DNS レコード(M3-1c、ADR-0011 §1b、ADR-0022) ----
 
 /// メンバー参照("host" または公開鍵 base64)を解析する。
@@ -1824,6 +1858,10 @@ pub fn run() {
             set_acl,
             read_acl_policy,
             write_acl_policy,
+            perm_group_create,
+            perm_group_rename,
+            perm_group_set_members,
+            perm_group_delete,
             pick_file,
             save_pasted_file,
             send_file,

@@ -122,6 +122,9 @@ pub struct Distribution {
     pub deny: Vec<(Ipv4Addr, Ipv4Addr)>,
     /// 細粒度ACLにより直接通信を禁止する組と、その理由となる先頭ルールID。
     pub force_relay: Vec<(Ipv4Addr, Ipv4Addr, String)>,
+    /// 権限グループ(ADR-0060 決定1)。host: ACL ポリシーから構築したもの
+    /// (members は台帳と同じ周期で仮想 IP へ解決済み)、member: 受信済みのもの。
+    pub perm_groups: Vec<peercove_core::proto::PermGroupInfo>,
 }
 
 /// 台帳スナップショットをメンバー向けにフィルタして Ledger メッセージにする
@@ -140,8 +143,22 @@ fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMes
         .filter(|entry| isolated_ips.contains(&entry.ip))
         .filter_map(|entry| entry.dns_name.clone())
         .collect();
-    dist.members
-        .retain(|entry| !isolated_ips.contains(&entry.ip));
+    // 承認待ち端末は原則どのメンバーにも見せない(ADR-0048 の隔離)。ただし
+    // **admin(管理を委任されたメンバー)にだけは一覧へ載せる**(ADR-0059
+    // J-2 拡大、M7 J-3 追補: 依頼者検証で「admin が招待した端末が admin の
+    // 一覧から消えて承認できない」不具合として顕在化した)。admin は承認の
+    // 実行者なので、承認待ちの存在が見えないと仕事にならない。
+    // 名前解決(dns_records / cname_records)と到達性は admin 相手でも
+    // 従来どおり隔離したままにする(承認前に通信できてしまわないように。
+    // 実際の遮断はホスト側の isolation が行う)。
+    let recipient_is_admin = dist
+        .members
+        .iter()
+        .any(|entry| entry.ip == member_ip && entry.is_admin);
+    if !recipient_is_admin {
+        dist.members
+            .retain(|entry| !isolated_ips.contains(&entry.ip));
+    }
     dist.dns_records
         .retain(|record| !isolated_ips.contains(&record.ip));
     dist.cname_records.retain(|record| {
@@ -174,6 +191,7 @@ fn ledger_message_for(mut dist: Distribution, member_ip: Ipv4Addr) -> ControlMes
         dns_records: dist.dns_records,
         cname_records: dist.cname_records,
         network_display_name: dist.network_display_name,
+        perm_groups: dist.perm_groups,
     }
 }
 
@@ -205,7 +223,8 @@ type LedgerDigest = (
     )>,
     Vec<DnsRecord>,
     Vec<CnameRecord>,
-    Option<String>, // network_display_name(ADR-0058)
+    Option<String>,                           // network_display_name(ADR-0058)
+    Vec<peercove_core::proto::PermGroupInfo>, // perm_groups(ADR-0060)
 );
 
 fn ledger_digest(
@@ -213,6 +232,7 @@ fn ledger_digest(
     dns_records: &[DnsRecord],
     cname_records: &[CnameRecord],
     network_display_name: Option<&str>,
+    perm_groups: &[peercove_core::proto::PermGroupInfo],
 ) -> LedgerDigest {
     (
         members
@@ -237,6 +257,7 @@ fn ledger_digest(
         dns_records.to_vec(),
         cname_records.to_vec(),
         network_display_name.map(str::to_string),
+        perm_groups.to_vec(),
     )
 }
 
@@ -980,6 +1001,9 @@ impl HostRequests {
         // DnsCheckNow はネットワーク全体への副作用(file IO なし)なので、
         // spawn_blocking の外で Arc を複製して移す(SharedHealth は Arc<Mutex<_>>)
         let health = self.health.clone();
+        // 権限グループの members(IP)→公開鍵解決にホスト自身の鍵が要る
+        // (ADR-0060 決定1: ホストも members に指定できる)
+        let host_public_key = self.host_public_key;
         let outcome = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(String, Option<AdminOpData>)> {
                 let config = peercove_core::config::Config::load(&path)?;
@@ -1186,6 +1210,38 @@ impl HostRequests {
                             Some(AdminOpData::DnsRecords { records }),
                         ))
                     }
+                    // 権限グループ(ADR-0060 決定1)。members は仮想 IP 指定
+                    // なので、ここで公開鍵へ解決してから ops を呼ぶ。
+                    // 注意: 既存の guard_target(自分自身・ホストを対象外に
+                    // するガード)はここでは使わない — グループにホストを
+                    // 含められるのは決定2で認めた正当な操作のため。
+                    AdminRequest::PermGroupCreate { name, members } => {
+                        let keys = members
+                            .iter()
+                            .map(|&ip| resolve_member_pubkey(&config, &host_public_key, ip))
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        let id = peercove_ops::acl::perm_group_create(&path, &name, &keys)?;
+                        Ok((
+                            format!("権限グループ \"{name}\" を作成しました(id={id})"),
+                            None,
+                        ))
+                    }
+                    AdminRequest::PermGroupRename { id, name } => {
+                        peercove_ops::acl::perm_group_rename(&path, &id, &name)?;
+                        Ok(("権限グループの名前を変更しました".to_string(), None))
+                    }
+                    AdminRequest::PermGroupSetMembers { id, members } => {
+                        let keys = members
+                            .iter()
+                            .map(|&ip| resolve_member_pubkey(&config, &host_public_key, ip))
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        peercove_ops::acl::perm_group_set_members(&path, &id, &keys)?;
+                        Ok(("権限グループのメンバーを変更しました".to_string(), None))
+                    }
+                    AdminRequest::PermGroupDelete { id } => {
+                        peercove_ops::acl::perm_group_delete(&path, &id)?;
+                        Ok(("権限グループを削除しました".to_string(), None))
+                    }
                 }
             },
         )
@@ -1255,6 +1311,25 @@ fn encode_line(message: &ControlMessage) -> String {
     let mut line = serde_json::to_string(message).expect("ControlMessage は常に直列化可能");
     line.push('\n');
     line
+}
+
+/// 権限グループの members(仮想 IP 指定)を公開鍵へ解決する(ADR-0060
+/// 決定1)。ホスト自身の IP も解決できる(決定2で言うホスト除外は ACL の
+/// *評価*だけの話で、権限グループの members 指定自体は制限しない)。
+fn resolve_member_pubkey(
+    config: &peercove_core::config::Config,
+    host_public_key: &peercove_core::keys::PublicKey,
+    ip: Ipv4Addr,
+) -> anyhow::Result<peercove_core::keys::PublicKey> {
+    if ip == config.interface.address.addr() {
+        return Ok(*host_public_key);
+    }
+    config
+        .peers
+        .iter()
+        .find(|peer| peer.allowed_ips.iter().any(|net| net.addr() == ip))
+        .map(|peer| peer.public_key)
+        .ok_or_else(|| anyhow::anyhow!("{ip} はこのネットワークのメンバーにいません"))
 }
 
 /// ネットワーク設定(admin 中継、ADR-0059 J-2 拡大)の 1 項目だけを変えて
@@ -1999,6 +2074,7 @@ async fn member_reader(
                 dns_records,
                 cname_records,
                 network_display_name,
+                perm_groups,
             }) => {
                 // 意味のある変化があったときだけ INFO(エンドポイント鮮度の
                 // 定期更新による再配布は debug に落とす — ADR-0019)
@@ -2007,6 +2083,7 @@ async fn member_reader(
                     &dns_records,
                     &cname_records,
                     network_display_name.as_deref(),
+                    &perm_groups,
                 );
                 if last_digest.as_ref() != Some(&digest) {
                     tracing::info!(
@@ -2027,6 +2104,7 @@ async fn member_reader(
                         deny: vec![], // deny はワイヤに載らない(blocked で受ける)
                         force_relay: vec![],
                         network_display_name,
+                        perm_groups,
                     },
                     received_at: Instant::now(),
                 });
@@ -2210,29 +2288,29 @@ mod tests {
         fresher[0].endpoint = Some("203.0.113.9:51820".parse().unwrap());
         fresher[0].endpoint_age_secs = Some(60);
         assert_eq!(
-            ledger_digest(&base, &[], &[], None),
-            ledger_digest(&fresher, &[], &[], None),
+            ledger_digest(&base, &[], &[], None, &[]),
+            ledger_digest(&fresher, &[], &[], None, &[]),
             "エンドポイント鮮度だけの変化は意味のある変化ではない"
         );
 
         let mut offline = base.clone();
         offline[0].online = false;
         assert_ne!(
-            ledger_digest(&base, &[], &[], None),
-            ledger_digest(&offline, &[], &[], None)
+            ledger_digest(&base, &[], &[], None, &[]),
+            ledger_digest(&offline, &[], &[], None, &[])
         );
 
         let mut blocked = base.clone();
         blocked[0].blocked = true;
         assert_ne!(
-            ledger_digest(&base, &[], &[], None),
-            ledger_digest(&blocked, &[], &[], None)
+            ledger_digest(&base, &[], &[], None, &[]),
+            ledger_digest(&blocked, &[], &[], None, &[])
         );
 
         let more = vec![base[0].clone(), entry("bob", "100.100.42.3", true)];
         assert_ne!(
-            ledger_digest(&base, &[], &[], None),
-            ledger_digest(&more, &[], &[], None)
+            ledger_digest(&base, &[], &[], None, &[]),
+            ledger_digest(&more, &[], &[], None, &[])
         );
     }
 
@@ -2251,6 +2329,7 @@ mod tests {
             deny: vec![],
             force_relay: vec![],
             network_display_name: None,
+            perm_groups: vec![],
         });
         let connections: Connections = Arc::new(Mutex::new(HashMap::new()));
         let host_rtt: RttMap = Default::default();
@@ -2327,6 +2406,7 @@ mod tests {
                 deny: vec![],
                 force_relay: vec![],
                 network_display_name: Some("うちの LAN".to_string()),
+                perm_groups: vec![],
             })
             .unwrap();
         wait_for(&latest, |l| members_len(l) == Some(2)).await;
@@ -2390,6 +2470,7 @@ mod tests {
             deny: vec![("100.100.42.2".parse().unwrap(), member_ip)],
             force_relay: vec![],
             network_display_name: None,
+            perm_groups: vec![],
         };
 
         let ControlMessage::Ledger { members, .. } = ledger_message_for(dist.clone(), member_ip)
@@ -2430,6 +2511,7 @@ mod tests {
             deny: vec![],
             force_relay: vec![],
             network_display_name: None,
+            perm_groups: vec![],
         };
         let ControlMessage::Ledger {
             members,
@@ -2442,6 +2524,50 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].ip, "100.100.42.3".parse::<Ipv4Addr>().unwrap());
         assert!(dns_records.is_empty());
+    }
+
+    /// admin(管理を委任されたメンバー)には承認待ち端末も見せる(M7 J-3 追補)。
+    /// 見えないと承認できないため。名前解決は admin 相手でも隔離したまま。
+    #[test]
+    fn ledger_message_shows_approval_pending_to_admin() {
+        let admin_ip: Ipv4Addr = "100.100.42.3".parse().unwrap();
+        let mut pending = entry("pending", "100.100.42.2", true);
+        pending.invite_status = Some("awaiting_approval".to_string());
+        pending.dns_name = Some("pending".to_string());
+        let mut admin = entry("admin", "100.100.42.3", true);
+        admin.is_admin = true;
+        let dist = Distribution {
+            members: vec![pending, admin],
+            dns_records: vec![DnsRecord {
+                id: None,
+                name: "pending-service".to_string(),
+                ip: "100.100.42.2".parse().unwrap(),
+                scheme: None,
+                port: None,
+                health: None,
+            }],
+            cname_records: vec![],
+            deny: vec![],
+            force_relay: vec![],
+            network_display_name: None,
+            perm_groups: vec![],
+        };
+        let ControlMessage::Ledger {
+            members,
+            dns_records,
+            ..
+        } = ledger_message_for(dist, admin_ip)
+        else {
+            panic!("Ledger メッセージになる");
+        };
+        assert_eq!(members.len(), 2, "admin には承認待ちも見える");
+        assert!(members
+            .iter()
+            .any(|m| m.invite_status.as_deref() == Some("awaiting_approval")));
+        assert!(
+            dns_records.is_empty(),
+            "承認前の名前解決は admin 相手でも配らない"
+        );
     }
 
     /// Removed を送るとメンバー側セッションが終了し、台帳がクリアされる。
@@ -2826,6 +2952,118 @@ mod tests {
         }
     }
 
+    /// 権限グループ(ADR-0060 決定1): admin が作成・改名・メンバー変更・削除
+    /// できること。members にホスト自身の IP を指定でき、公開鍵へ解決される
+    /// (決定2)。guard_target(自分自身・ホスト対象外)は適用されない。
+    #[tokio::test]
+    async fn apply_admin_op_perm_group_crud_by_admin_updates_host_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-permgroup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let host_key = PrivateKey::generate().public_key();
+        let admin_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            host_key,
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+        let host_ip: Ipv4Addr = "127.0.0.10".parse().unwrap();
+
+        // 作成: ホスト自身の IP も members に指定できる(決定2)
+        let create_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                1,
+                peercove_core::proto::AdminRequest::PermGroupCreate {
+                    name: "サーバー".to_string(),
+                    members: vec![admin_ip, host_ip],
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                create_reply,
+                ControlMessage::AdminOpResult { accepted: true, .. }
+            ),
+            "admin は作成できること: {create_reply:?}"
+        );
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert_eq!(config.acl.groups.len(), 1);
+        let group = &config.acl.groups[0];
+        assert_eq!(group.name, "サーバー");
+        assert_eq!(group.members.len(), 2, "admin + host が解決される");
+        assert!(
+            group.members.contains(&host_key),
+            "ホストの公開鍵に解決される"
+        );
+        assert!(group.members.contains(&admin_key));
+        let id = group.id.clone();
+
+        // 改名
+        let rename_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                2,
+                peercove_core::proto::AdminRequest::PermGroupRename {
+                    id: id.clone(),
+                    name: "本番サーバー".to_string(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            rename_reply,
+            ControlMessage::AdminOpResult { accepted: true, .. }
+        ));
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert_eq!(config.acl.groups[0].name, "本番サーバー");
+
+        // メンバー変更(admin のみに絞る)
+        let set_members_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                3,
+                peercove_core::proto::AdminRequest::PermGroupSetMembers {
+                    id: id.clone(),
+                    members: vec![admin_ip],
+                },
+            )
+            .await;
+        assert!(matches!(
+            set_members_reply,
+            ControlMessage::AdminOpResult { accepted: true, .. }
+        ));
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert_eq!(config.acl.groups[0].members, vec![admin_key]);
+
+        // 削除
+        let delete_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                4,
+                peercove_core::proto::AdminRequest::PermGroupDelete { id },
+            )
+            .await;
+        assert!(matches!(
+            delete_reply,
+            ControlMessage::AdminOpResult { accepted: true, .. }
+        ));
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert!(config.acl.groups.is_empty());
+    }
+
     /// 汎用 Admin 中継: SetSubnets が対象ピアの subnets へ反映されること。
     #[tokio::test]
     async fn apply_admin_op_set_subnets_by_admin_updates_host_toml() {
@@ -3078,6 +3316,21 @@ mod tests {
             },
             peercove_core::proto::AdminRequest::DnsListFull,
             peercove_core::proto::AdminRequest::DnsCheckNow,
+            peercove_core::proto::AdminRequest::PermGroupCreate {
+                name: "サーバー".to_string(),
+                members: vec!["127.0.0.3".parse().unwrap()],
+            },
+            peercove_core::proto::AdminRequest::PermGroupRename {
+                id: "servers".to_string(),
+                name: "本番".to_string(),
+            },
+            peercove_core::proto::AdminRequest::PermGroupSetMembers {
+                id: "servers".to_string(),
+                members: vec!["127.0.0.3".parse().unwrap()],
+            },
+            peercove_core::proto::AdminRequest::PermGroupDelete {
+                id: "servers".to_string(),
+            },
         ] {
             let reply = requests.apply_admin_op(actor_ip, 1, op.clone()).await;
             assert!(

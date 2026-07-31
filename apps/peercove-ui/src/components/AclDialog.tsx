@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { AclPolicySettings, AclProtocol, AclRule, AclTarget, DnsRecord, Member, api, errorMessage } from "../ipc";
+import { useEffect, useState } from "react";
+import { AclPolicySettings, AclProtocol, AclRule, AclTarget, DnsRecord, Member, PermGroup, api, errorMessage } from "../ipc";
 import { t } from "../i18n";
 
 type TargetKind = "any" | "member" | "group" | "subnet" | "service";
@@ -12,8 +12,13 @@ type TargetKind = "any" | "member" | "group" | "subnet" | "service";
  * 使う DNS レコード一覧も同様に分岐する(admin は `adminDnsListFull` — J-1c の
  * 配布データには id が乗らない旧レコードがありうるため)。admin が自分自身への
  * 制限を外せてしまう点は ADR-0059 で許容済み。
+ *
+ * グループ(members の集まり)の作成・改名・削除は ADR-0060 でサイドバーの
+ * 「グループ」画面(`PermGroupView`)へ一本化した。ここではルールの送信元/
+ * 宛先として選ぶだけ(選択肢は `permGroups` — 台帳配布 or ACL ポリシー由来、
+ * 親コンポーネントから渡される)。
  */
-export function AclView({ configPath, members, isHost }: { configPath: string; members: Member[]; isHost: boolean; }) {
+export function AclView({ configPath, members, isHost, permGroups }: { configPath: string; members: Member[]; isHost: boolean; permGroups: PermGroup[]; }) {
   const [policy, setPolicy] = useState<AclPolicySettings | null>(null);
   const [services, setServices] = useState<DnsRecord[]>([]);
   const [busy, setBusy] = useState(false);
@@ -25,8 +30,6 @@ export function AclView({ configPath, members, isHost }: { configPath: string; m
   const [destinationValue, setDestinationValue] = useState("");
   const [protocol, setProtocol] = useState<AclProtocol>("any");
   const [ports, setPorts] = useState("");
-  const [groupName, setGroupName] = useState("");
-  const [groupMembers, setGroupMembers] = useState<Set<string>>(new Set());
 
   const peers = members.filter((member) => !member.isHost);
   const usableServices = services.filter((record) => record.id && !record.cname && record.port);
@@ -86,7 +89,7 @@ export function AclView({ configPath, members, isHost }: { configPath: string; m
   const labelTarget = (value: AclTarget) => {
     if (value === "any") return t.acl.any;
     if ("member" in value) return peers.find((m) => m.publicKey === value.member)?.name ?? value.member.slice(0, 8);
-    if ("group" in value) return `${t.acl.group}: ${value.group}`;
+    if ("group" in value) return `${t.acl.group}: ${permGroups.find((g) => g.id === value.group)?.name || value.group}`;
     if ("subnet" in value) return value.subnet;
     return usableServices.find((s) => s.id === value.service)?.fqdn ?? value.service;
   };
@@ -111,13 +114,6 @@ export function AclView({ configPath, members, isHost }: { configPath: string; m
     [rules[index], rules[index + offset]] = [rules[index + offset], rules[index]];
     void save({ ...policy, rules });
   };
-  const groupId = useMemo(() => groupName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 63), [groupName]);
-  const addGroup = () => {
-    if (!policy || !groupId || groupMembers.size === 0) return;
-    void save({ ...policy, groups: [...policy.groups, { id: groupId, members: [...groupMembers] }] });
-    setGroupName(""); setGroupMembers(new Set());
-  };
-
   return <div className="acl-page">
     <section className="card acl-page__head">
       <h2 className="card-title">{t.acl.title}</h2>
@@ -131,19 +127,19 @@ export function AclView({ configPath, members, isHost }: { configPath: string; m
         </section>
         <section className="acl-v2__builder"><h3>{t.acl.addRule}</h3><div className="acl-v2__form">
           <label>{t.acl.action}<select value={action} onChange={(e) => setAction(e.target.value as "allow" | "deny")}><option value="deny">{t.acl.deny}</option><option value="allow">{t.acl.allow}</option></select></label>
-          <TargetInput label={t.acl.source} kind={sourceKind} value={sourceValue} setKind={setSourceKind} setValue={setSourceValue} members={peers} groups={policy.groups.map((g) => g.id)} services={usableServices} allowService={false}/>
-          <TargetInput label={t.acl.destination} kind={destinationKind} value={destinationValue} setKind={setDestinationKind} setValue={setDestinationValue} members={peers} groups={policy.groups.map((g) => g.id)} services={usableServices} allowService/>
+          <TargetInput label={t.acl.source} kind={sourceKind} value={sourceValue} setKind={setSourceKind} setValue={setSourceValue} members={peers} groups={permGroups} services={usableServices} allowService={false}/>
+          <TargetInput label={t.acl.destination} kind={destinationKind} value={destinationValue} setKind={setDestinationKind} setValue={setDestinationValue} members={peers} groups={permGroups} services={usableServices} allowService/>
           <label>{t.acl.protocol}<select value={protocol} onChange={(e) => { setProtocol(e.target.value as AclProtocol); if (!['tcp','udp'].includes(e.target.value)) setPorts(""); }}><option value="any">ANY</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></label>
           {(protocol === "tcp" || protocol === "udp") && <label>{t.acl.ports}<input value={ports} placeholder="443, 8000-8100" onChange={(e) => setPorts(e.target.value)}/></label>}
         </div><p className="acl-v2__preview">{preview}</p><p className="notice small">{t.acl.relayWarning}</p><button type="button" disabled={busy} onClick={addRule}>{t.acl.addRule}</button></section>
-        <section className="acl-v2__groups"><h3>{t.acl.groups}</h3>{policy.groups.map((group) => <div className="row" key={group.id}><strong>{group.id}</strong><span className="muted small">{group.members.length}{t.acl.people}</span><button type="button" className="button--ghost" onClick={() => void save({ ...policy, groups: policy.groups.filter((g) => g.id !== group.id), rules: policy.rules.filter((r) => !(typeof r.source !== 'string' && 'group' in r.source && r.source.group === group.id) && !(typeof r.destination !== 'string' && 'group' in r.destination && r.destination.group === group.id)) })}>{t.common.delete}</button></div>)}<label>{t.acl.groupName}<input value={groupName} onChange={(e) => setGroupName(e.target.value)}/></label><div className="acl-v2__member-checks">{peers.map((member) => <label className="chat__pick-row" key={member.publicKey}><input type="checkbox" checked={groupMembers.has(member.publicKey)} onChange={(e) => { const next = new Set(groupMembers); e.target.checked ? next.add(member.publicKey) : next.delete(member.publicKey); setGroupMembers(next); }}/><span>{member.name ?? member.ip}</span></label>)}</div><button type="button" className="button--ghost" disabled={!groupId || groupMembers.size === 0 || busy} onClick={addGroup}>{t.acl.addGroup}</button></section>
+        <section className="acl-v2__groups"><h3>{t.acl.groups}</h3><p className="muted small">{t.acl.groupsMovedNotice}</p></section>
       </>}
       {error && <p role="alert" className="error-text small">{error}</p>}
     </section>
   </div>;
 }
 
-function TargetInput({ label, kind, value, setKind, setValue, members, groups, services, allowService }: { label: string; kind: TargetKind; value: string; setKind: (kind: TargetKind) => void; setValue: (value: string) => void; members: Member[]; groups: string[]; services: DnsRecord[]; allowService: boolean; }) {
-  const selectKind = (next: TargetKind) => { setKind(next); setValue(next === "member" ? members[0]?.publicKey ?? "" : next === "group" ? groups[0] ?? "" : next === "service" ? services[0]?.id ?? "" : ""); };
-  return <fieldset className="acl-v2__target"><legend>{label}</legend><select value={kind} onChange={(e) => selectKind(e.target.value as TargetKind)}><option value="any">{t.acl.any}</option><option value="member">{t.acl.member}</option><option value="group">{t.acl.group}</option><option value="subnet">{t.acl.subnet}</option>{allowService && <option value="service">{t.acl.service}</option>}</select>{kind === "member" && <select value={value} onChange={(e) => setValue(e.target.value)}>{members.map((m) => <option key={m.publicKey} value={m.publicKey}>{m.name ?? m.ip}</option>)}</select>}{kind === "group" && <select value={value} onChange={(e) => setValue(e.target.value)}>{groups.map((g) => <option key={g}>{g}</option>)}</select>}{kind === "subnet" && <input value={value} placeholder="10.99.0.0/24" onChange={(e) => setValue(e.target.value)}/>} {kind === "service" && <select value={value} onChange={(e) => setValue(e.target.value)}>{services.map((s) => <option key={s.id!} value={s.id!}>{s.fqdn}:{s.port}</option>)}</select>}</fieldset>;
+function TargetInput({ label, kind, value, setKind, setValue, members, groups, services, allowService }: { label: string; kind: TargetKind; value: string; setKind: (kind: TargetKind) => void; setValue: (value: string) => void; members: Member[]; groups: PermGroup[]; services: DnsRecord[]; allowService: boolean; }) {
+  const selectKind = (next: TargetKind) => { setKind(next); setValue(next === "member" ? members[0]?.publicKey ?? "" : next === "group" ? groups[0]?.id ?? "" : next === "service" ? services[0]?.id ?? "" : ""); };
+  return <fieldset className="acl-v2__target"><legend>{label}</legend><select value={kind} onChange={(e) => selectKind(e.target.value as TargetKind)}><option value="any">{t.acl.any}</option><option value="member">{t.acl.member}</option><option value="group">{t.acl.group}</option><option value="subnet">{t.acl.subnet}</option>{allowService && <option value="service">{t.acl.service}</option>}</select>{kind === "member" && <select value={value} onChange={(e) => setValue(e.target.value)}>{members.map((m) => <option key={m.publicKey} value={m.publicKey}>{m.name ?? m.ip}</option>)}</select>}{kind === "group" && <select value={value} onChange={(e) => setValue(e.target.value)}>{groups.map((g) => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}</select>}{kind === "subnet" && <input value={value} placeholder="10.99.0.0/24" onChange={(e) => setValue(e.target.value)}/>} {kind === "service" && <select value={value} onChange={(e) => setValue(e.target.value)}>{services.map((s) => <option key={s.id!} value={s.id!}>{s.fqdn}:{s.port}</option>)}</select>}</fieldset>;
 }

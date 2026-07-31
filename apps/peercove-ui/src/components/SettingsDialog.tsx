@@ -371,7 +371,6 @@ function AdminNetworkSection({ configPath }: { configPath: string }) {
   const [settings, setSettings] = useState<AdminNetworkSettings | null>(null);
   const [requireApproval, setRequireApproval] = useState(false);
   const [memberInvites, setMemberInvites] = useState(true);
-  const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -384,7 +383,6 @@ function AdminNetworkSection({ configPath }: { configPath: string }) {
         setSettings(data);
         setRequireApproval(data.requireInviteApproval);
         setMemberInvites(data.memberInvites);
-        setDisplayName(data.networkDisplayName ?? "");
       })
       .catch((e) => setError(errorMessage(e)));
   }, [configPath]);
@@ -422,22 +420,9 @@ function AdminNetworkSection({ configPath }: { configPath: string }) {
     }
   };
 
-  const applyDisplayName = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const trimmed = displayName.trim();
-      await api.adminOp(configPath, {
-        op: "set_network_display_name",
-        name: trimmed === "" ? null : trimmed,
-      });
-      notifyApplied();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  // ネットワーク表示名の変更はこの画面から撤去した(M7 J-3 追補)。
+  // 上部ヘッダーの ✏️(App.tsx の DetailHeader)へ一本化しており、admin も
+  // そこから adminOp 経由で変更できる。
 
   return (
     <div className="field">
@@ -475,29 +460,9 @@ function AdminNetworkSection({ configPath }: { configPath: string }) {
               <small className="muted"> {t.settings.memberInvitesHint}</small>
             </span>
           </label>
-          <label className="field">
-            <span>
-              {t.settings.networkDisplayNameLabel}
-              <small className="muted">{t.settings.networkDisplayNameHint}</small>
-            </span>
-            <div className="row">
-              <input
-                type="text"
-                value={displayName}
-                maxLength={64}
-                disabled={busy}
-                onChange={(event) => setDisplayName(event.target.value)}
-              />
-              <button
-                type="button"
-                className="button--ghost"
-                disabled={busy}
-                onClick={() => void applyDisplayName()}
-              >
-                {t.common.save}
-              </button>
-            </div>
-          </label>
+          {/* ネットワーク表示名の変更はここには置かない(M7 J-3 追補、
+              依頼者指示)。画面上部のネットワーク名の横にある ✏️ から
+              直接編集する経路に一本化する(admin もその経路を使える)。 */}
           {error && <p className="error-text small">{error}</p>}
           {notice && <p className="notice">{notice}</p>}
         </>

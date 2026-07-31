@@ -187,11 +187,16 @@ impl Row {
     }
 
     fn visible_to(&self, actor: &Actor, ctx: &PermContext) -> bool {
-        if actor.is_host() || self.owner_id == actor.owner_id() {
+        // admin(ADR-0059 の委任メンバー)はホストと同じ扱いで常に参照できる
+        // (ADR-0060 決定6、依頼者指示: 「常に参照や権限編集を出来る状態で
+        // OK」)。ゴミ箱の可視性もここに含めて開く。`can_edit` は変えない
+        // (閲覧・権限編集ができれば足りる。本文編集まで自動的に許すと
+        // 委任の意図が広がりすぎる)。
+        if actor.is_host() || actor.admin || self.owner_id == actor.owner_id() {
             return true;
         }
         if self.deleted_at.is_some() {
-            return false; // ゴミ箱は所有者・ホストのみ
+            return false; // ゴミ箱は所有者・ホスト・admin のみ
         }
         self.effective_level(actor, ctx) != SharedPermLevel::None
     }
@@ -3638,9 +3643,12 @@ mod tests {
     }
 
     /// admin 委任(ADR-0059、M7 J-1b): admin は所有者でなくても SetPerms が
-    /// でき、しかも「自分に見えていないメモ」の権限も変更できる(委任の
-    /// 趣旨がアクセス整理のため、ホストと同じ扱い)。非 admin メンバーは
-    /// 引き続き拒否される。
+    /// でき、しかも(ADR-0060 決定6以降は)本文も常に見える(ホストと同じ
+    /// 扱いに変更)。非 admin メンバーは引き続き拒否される。
+    ///
+    /// (旧: J-1b の時点では visible_to は admin を含まず、この点をこの
+    /// テストが確認していた。ADR-0060 決定6で「admin は常に参照・権限編集
+    /// できる」へ方針変更したため、期待値を反転させた。)
     #[test]
     fn admin_can_set_perms_even_on_invisible_memo() {
         let (_dir, mut store) = open_temp();
@@ -3649,16 +3657,17 @@ mod tests {
         let carol_admin = Actor::member("id-carol", "キャロル").with_admin(true);
 
         let memo = store.create(&alice, "共有", "本文", None).unwrap();
-        // 全体 none + 個別なしにして、キャロル(admin)からも見えなくする
+        // 全体 none + 個別なしにして、ボブからは見えなくする
         store
             .set_perms(&alice, &memo.id, SharedPermLevel::None, &[], None)
             .unwrap();
         assert!(
-            store.get(&carol_admin, &memo.id).is_err(),
-            "admin でも閲覧権限が無ければ本文は見えない(visible_to は不変)"
+            store.get(&carol_admin, &memo.id).is_ok(),
+            "admin は個別の閲覧権限が無くても常に見える(ADR-0060 決定6)"
         );
+        assert!(store.get(&bob, &memo.id).is_err(), "非 admin には見えない");
 
-        // それでも admin は権限変更ができる(can_manage は admin を含む)
+        // admin は権限変更もできる(can_manage は admin を含む、ADR-0059)
         store
             .set_perms(&carol_admin, &memo.id, SharedPermLevel::Viewer, &[], None)
             .unwrap();
@@ -3671,6 +3680,44 @@ mod tests {
         assert!(store
             .set_perms(&bob, &memo.id, SharedPermLevel::Editor, &[], None)
             .is_err());
+    }
+
+    /// admin は個別の閲覧権限指定が無いメモでも常に一覧・詳細に出る
+    /// (ADR-0060 決定6)。非 admin メンバーには従来どおり出ない。ゴミ箱
+    /// (trash クエリ)についても同様に admin だけ見える。
+    #[test]
+    fn admin_sees_memo_and_trash_without_explicit_permission() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+        let admin = Actor::member("id-carol", "キャロル").with_admin(true);
+
+        let memo = store.create(&alice, "共有", "本文", None).unwrap();
+        // 全体 none + 個別なし = 所有者以外には見えないはずの状態
+        store
+            .set_perms(&alice, &memo.id, SharedPermLevel::None, &[], None)
+            .unwrap();
+
+        // 一覧: admin には出るが、非 admin(ボブ)には出ない
+        let (admin_list, _) = store.list(&admin, &SharedMemoQuery::default()).unwrap();
+        assert_eq!(
+            admin_list.len(),
+            1,
+            "admin の一覧には閲覧権限の無いメモも出る"
+        );
+        let (bob_list, _) = store.list(&bob, &SharedMemoQuery::default()).unwrap();
+        assert!(bob_list.is_empty(), "非 admin の一覧には出ない");
+
+        // ゴミ箱: 所有者が捨てたあとも同様(所有者・ホスト・admin のみ)
+        store.trash(&alice, &memo.id).unwrap();
+        let trash_query = SharedMemoQuery {
+            trash: true,
+            ..Default::default()
+        };
+        let (admin_trash, _) = store.list(&admin, &trash_query).unwrap();
+        assert_eq!(admin_trash.len(), 1, "admin にはゴミ箱も見える");
+        let (bob_trash, _) = store.list(&bob, &trash_query).unwrap();
+        assert!(bob_trash.is_empty(), "非 admin にはゴミ箱は見えない");
     }
 
     /// グループ権限(ADR-0051): 優先順位「メンバー個別 > グループ(該当する

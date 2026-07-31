@@ -57,7 +57,7 @@ export const ja = {
     prefs: "アプリ設定",
     logs: "デーモンのログ",
     // 外観テーマの切替ボタン(M3-6)。ライト ⇄ ダークの 2 状態
-    theme: (theme: "light" | "dark") =>
+    theme: (theme: "light" | "dark"): string =>
       theme === "light"
         ? "外観: ライト（クリックでダーク）"
         : "外観: ダーク（クリックでライト）",
@@ -70,16 +70,17 @@ export const ja = {
     sharedMemos: "共有",
     members: "メンバー",
     chat: "チャット",
-    stats: "品質",
+    stats: "通信品質",
     inbox: "受信",
     dns: "DNS",
     subnets: "サブネット",
     acl: "通信制御",
+    groups: "グループ",
     diagnostics: "診断",
     settings: "設定",
     connected: "接続中",
     disconnected: "未接続",
-    theme: (theme: "light" | "dark") =>
+    theme: (theme: "light" | "dark"): string =>
       theme === "light"
         ? "外観: ライト（クリックでダーク）"
         : "外観: ダーク（クリックでライト）",
@@ -225,6 +226,11 @@ export const ja = {
   // アプリ全体の設定(M3-13e)。このマシンだけに効く(localStorage)
   prefs: {
     title: "アプリ設定",
+    language: "言語 / Language",
+    languageJa: "日本語",
+    languageEn: "English",
+    languageHint: "この端末での表示言語です。既定は OS の言語設定に従います。",
+    languageReloadConfirm: "言語を切り替えます。画面を再読み込みします。よろしいですか？",
     notifications: "OS 通知を出す",
     notificationsHint:
       "メンバーの参加・切断、チャットの新着、ファイルの受信完了の通知です。オフにしても未読バッジや受信タブの表示は変わりません。",
@@ -417,7 +423,7 @@ export const ja = {
     // ネットワーク詳細のタブ(M3-6)
     tabs: {
       chat: "チャット",
-      stats: "品質",
+      stats: "通信品質",
       inbox: "受信",
     },
     invite: "メンバーを招待",
@@ -637,7 +643,7 @@ export const ja = {
   transfer: {
     head: "転送",
     // 一覧の行頭に出す向き
-    direction: (d: "send" | "recv") => (d === "send" ? "送信" : "受信"),
+    direction: (d: "send" | "recv"): string => (d === "send" ? "送信" : "受信"),
     done: "完了",
     failed: (reason: string) => `失敗: ${reason}`,
     progress: (transferred: string, size: string) => `${transferred} / ${size}`,
@@ -724,7 +730,37 @@ export const ja = {
     groups: "メンバーグループ",
     groupName: "新しいグループ名",
     addGroup: "グループを追加",
-    people: "人",
+    // 件数つきで受ける(英語の単複を正しく出すため。M7 J-4 追補)
+    people: (n: number): string => `${n}人`,
+    groupsMovedNotice:
+      "グループの作成・改名・メンバー編集は左メニューの「グループ」画面で行います。ここではルールの送信元・宛先として選べます。",
+  },
+
+  // 権限グループ(ADR-0060)。通信制御・共有メモなど複数箇所で共通に使う
+  // 「誰を含むか」の単位。サイドバーの独立画面(PermGroupView)。
+  permGroups: {
+    title: "グループ",
+    intro:
+      "通信制御や共有メモの権限指定で使うメンバーのまとまりです。作成・改名・メンバー編集・削除は、ホストと、管理を委任されたメンバー（admin）が行えます。変更は台帳配布を経て全員に反映されます（数秒かかることがあります）。",
+    viewOnlyNote: "ここでは閲覧のみです（編集はホストまたは admin が行えます）。",
+    empty: "グループはまだありません。",
+    membersLabel: "メンバー",
+    unresolved: "（未解決）",
+    create: "グループを作成",
+    createTitle: "グループを作成",
+    nameLabel: "グループ名",
+    namePlaceholder: "例: サーバー",
+    membersPick: "メンバーを選択",
+    hostIncludeNote:
+      "ホストを含めても、通信制御では無視されます（ホスト経由の通信は通信制御の対象外のため）。",
+    rename: "名前を変更",
+    renameTitle: "グループ名を変更",
+    editMembers: "メンバーを編集",
+    editMembersTitle: "メンバーを編集",
+    deleteTitle: "グループを削除",
+    deleteConfirm: (name: string) =>
+      `「${name}」を削除します。このグループを使っている通信制御のルールも一緒に削除されます。よろしいですか？`,
+    createDisabledHint: "グループ名と、メンバーを 1 人以上選んでください。",
   },
 
   // DNS 管理画面(M3-1c、ADR-0022/0023 でカスタムレコード拡張)

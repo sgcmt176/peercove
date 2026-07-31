@@ -47,6 +47,10 @@ impl Default for AclTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclGroup {
     pub id: String,
+    /// 表示名(ADR-0060 決定1で追加、additive)。旧データは空文字のままで、
+    /// UI 側は空なら id を表示名として扱う。
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub members: Vec<PublicKey>,
 }
@@ -386,9 +390,14 @@ fn resolve_target(
                 .ok_or_else(|| format!("ACL group {group} がありません"))?;
             let mut result = Vec::new();
             for member in &group.members {
-                result.extend(peer_networks(config, member).ok_or_else(|| {
-                    format!("ACL group {} が未登録メンバーを参照しています", group.id)
-                })?);
+                // 権限グループ(ADR-0060 決定1/2)はホストも members に持てるが、
+                // ホストは config.peers に含まれないため peer_networks は None を
+                // 返す。ACL 評価はホストを含むルールを無視する仕様なので、ここは
+                // エラーにせず単に対象外として無視する(削除済みメンバーの残留
+                // 参照も同様に許容する)。
+                if let Some(nets) = peer_networks(config, member) {
+                    result.extend(nets);
+                }
             }
             Ok(result)
         }
@@ -709,6 +718,37 @@ mod tests {
         let json = serde_json::to_value(rule).unwrap();
         assert_eq!(json["ports"], serde_json::json!([]));
         assert_eq!(json["enabled"], serde_json::json!(true));
+    }
+
+    /// 権限グループ(ADR-0060 決定1/2): グループにホスト(config.peers に
+    /// 居ない公開鍵)が混ざっていても `AclPolicy::compile` はエラーにせず、
+    /// そのメンバーを評価対象から静かに無視する(解決できるメンバーの
+    /// マッチングは維持する)。
+    #[test]
+    fn compile_ignores_unresolvable_group_members_including_host() {
+        let member_key = crate::keys::PrivateKey::generate().public_key();
+        let host_like_key = crate::keys::PrivateKey::generate().public_key();
+        let text = format!(
+            "[interface]\nprivate_key_file = \"host.key\"\naddress = \"10.100.42.1/24\"\nlisten_port = 51820\n\n\
+             [[peer]]\nname = \"alice\"\npublic_key = \"{member_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\n\n\
+             [acl]\ndefault = \"allow\"\n\n\
+             [[acl.group]]\nid = \"servers\"\nname = \"サーバー\"\nmembers = [\"{member_key}\", \"{host_like_key}\"]\n\n\
+             [[acl.rule]]\nid = \"deny-servers\"\naction = \"deny\"\nsource = \"any\"\ndestination = {{ group = \"servers\" }}\n"
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        let policy = AclPolicy::compile(&config).expect("host混在のグループでもコンパイルできる");
+        assert_eq!(
+            policy
+                .evaluate(
+                    "192.0.2.1".parse().unwrap(),
+                    "10.100.42.2".parse().unwrap(),
+                    6,
+                    Some(80)
+                )
+                .action,
+            AclAction::Deny,
+            "解決できるメンバー(alice)へのマッチは維持される"
+        );
     }
 
     fn transport_packet(

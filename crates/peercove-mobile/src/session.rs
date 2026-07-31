@@ -555,6 +555,8 @@ fn control_session(shared: &Arc<SessionShared>, stream: TcpStream) -> anyhow::Re
                         dns_records,
                         cname_records,
                         network_display_name,
+                        // 権限グループ(ADR-0060)は Android に UI が無いので無視する
+                        perm_groups: _,
                     }) => {
                         tracing::debug!("台帳を受信しました({} 名)", members.len());
                         // メンバー再追加(別の鍵)を検知して 1:1 履歴をクリア(検証 FB)
@@ -2655,6 +2657,7 @@ mod tests {
             dns_records: vec![],
             cname_records: vec![],
             network_display_name: Some("うちの LAN".to_string()),
+            perm_groups: vec![],
         };
         writer
             .write_all((serde_json::to_string(&ledger).unwrap() + "\n").as_bytes())

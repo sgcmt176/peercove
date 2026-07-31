@@ -34,6 +34,7 @@ import { NetworkSettingsView } from "./components/SettingsDialog";
 import { AppSettingsView } from "./components/PrefsDialog";
 import { DiagnosticsView } from "./components/DiagnosticsView";
 import { AclView } from "./components/AclDialog";
+import { PermGroupView } from "./components/PermGroupView";
 import { loadPrefs } from "./prefs";
 import { checkForUpdate } from "./update";
 import logoUrl from "./assets/logo.png";
@@ -52,6 +53,7 @@ type View =
   | "dns"
   | "subnets"
   | "acl"
+  | "perm-groups"
   | "diagnostics"
   | "net-settings";
 
@@ -403,6 +405,13 @@ export default function App() {
                 </>
               )}
               <SidebarItem
+                icon="🏷"
+                label={t.sidebar.groups}
+                active={view === "perm-groups"}
+                disabled={openTunnel === null}
+                onClick={() => setView("perm-groups")}
+              />
+              <SidebarItem
                 icon="✓"
                 label={t.sidebar.diagnostics}
                 active={view === "diagnostics"}
@@ -595,6 +604,16 @@ export default function App() {
               configPath={openTunnel.config}
               members={openTunnel.members}
               isHost={detailHost}
+              permGroups={openTunnel.permGroups ?? []}
+            />
+          ) : view === "perm-groups" && openTunnel !== null ? (
+            <PermGroupView
+              configPath={openTunnel.config}
+              members={openTunnel.members}
+              permGroups={openTunnel.permGroups ?? []}
+              isHost={detailHost}
+              isAdmin={detailSelfAdmin}
+              onChanged={changed}
             />
           ) : view === "net-memos" && openTunnel !== null ? (
             <SharedHubView
