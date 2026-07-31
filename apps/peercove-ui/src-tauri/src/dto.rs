@@ -343,6 +343,10 @@ impl From<&peercove_core::msg::GroupInfo> for Group {
 pub struct PermGroup {
     pub id: String,
     pub name: String,
+    /// 所属メンバーの仮想 IP(ADR-0060)。**ここを落とすとグループ画面の
+    /// メンバー表示・編集初期値が常に空になり、「メンバーを追加できない」
+    /// ように見える**(M7 J-3 追補で実際に起きた)。
+    pub members: Vec<std::net::Ipv4Addr>,
 }
 
 impl From<&peercove_core::ipc::PermGroup> for PermGroup {
@@ -350,6 +354,7 @@ impl From<&peercove_core::ipc::PermGroup> for PermGroup {
         Self {
             id: info.id.clone(),
             name: info.name.clone(),
+            members: info.members.clone(),
         }
     }
 }
