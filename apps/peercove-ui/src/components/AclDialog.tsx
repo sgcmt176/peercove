@@ -42,6 +42,11 @@ export function AclView({ configPath, members, isHost }: { configPath: string; m
     Promise.all([loadPolicy, loadServices])
       .then(([loaded, dns]) => {
         if (!alive) return;
+        // 読み込み成功時は古いエラー表示を消す(M7 J-2 追補。以前は admin 依頼の
+        // 受け口が単一スロットだったため、ポリシーと DNS 一覧を同時取得すると
+        // 必ずどちらかが「ホストとの接続が切れました」で失敗していた。連番対応で
+        // 直ったが、念のため成功時にも明示的にクリアしておく)
+        setError(null);
         // 初期のACL v2実装は既定値のports/enabledをJSONから省略した。
         // 旧UIバックエンドからの応答でもページ全体を落とさないよう補完する。
         setPolicy({

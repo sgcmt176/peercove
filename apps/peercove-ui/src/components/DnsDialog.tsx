@@ -108,7 +108,12 @@ export function DnsView({
     if (!isAdmin) return;
     api
       .adminDnsListFull(configPath)
-      .then(setAdminRecords)
+      .then((records) => {
+        // 成功時は古いエラー表示を消す(M7 J-2 追補。admin 依頼の連番対応前は
+        // 単一スロットの上書きで「ホストとの接続が切れました」が残ることがあった)
+        setError(null);
+        setAdminRecords(records);
+      })
       .catch((e) => setError(errorMessage(e)));
   }, [configPath, isAdmin]);
 

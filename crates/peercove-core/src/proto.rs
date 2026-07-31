@@ -187,10 +187,24 @@ pub enum ControlMessage {
     ///
     /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
     /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
-    AdminDnsOp { op: AdminDnsRequest },
+    ///
+    /// `seq` はメンバー側が応答([`ControlMessage::AdminDnsResult`])と突き合わせる
+    /// 連番(M7 J-2 追補)。`#[serde(default)]` で旧ホスト・旧メンバー間の
+    /// メッセージ(seq を持たない)も 0 として受けられるようにしてある。
+    AdminDnsOp {
+        #[serde(default)]
+        seq: u64,
+        op: AdminDnsRequest,
+    },
     /// host → member: [`ControlMessage::AdminDnsOp`] への応答(依頼が来た
-    /// 接続にだけ返す)。
-    AdminDnsResult { accepted: bool, message: String },
+    /// 接続にだけ返す)。`seq` は対応する `AdminDnsOp` の値をそのまま返す
+    /// (M7 J-2 追補)。
+    AdminDnsResult {
+        #[serde(default)]
+        seq: u64,
+        accepted: bool,
+        message: String,
+    },
     /// member → host: 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)。
     /// メンバー管理・ネットワーク設定など、admin の付与・剥奪以外の操作を
     /// ホストへ中継する。発行者が admin かどうかは常にホストが host.toml 正本
@@ -199,11 +213,22 @@ pub enum ControlMessage {
     ///
     /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
     /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
-    AdminOp { op: AdminRequest },
+    ///
+    /// `seq` はメンバー側が応答([`ControlMessage::AdminOpResult`])と突き合わせる
+    /// 連番(M7 J-2 追補、共有メモの `MemoReq`/`MemoResp` と同じ方式)。
+    /// `#[serde(default)]` で旧ホスト・旧メンバー間のメッセージ(seq を持たない)
+    /// も 0 として受けられるようにしてある。
+    AdminOp {
+        #[serde(default)]
+        seq: u64,
+        op: AdminRequest,
+    },
     /// host → member: [`ControlMessage::AdminOp`] への応答(依頼が来た接続に
     /// だけ返す)。`data` は読み取り系の依頼(例: [`AdminRequest::ReadNetworkSettings`])
-    /// にだけ載る。
+    /// にだけ載る。`seq` は対応する `AdminOp` の値をそのまま返す(M7 J-2 追補)。
     AdminOpResult {
+        #[serde(default)]
+        seq: u64,
         accepted: bool,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -565,6 +590,7 @@ mod tests {
                 message: "更新しました".to_string(),
             },
             ControlMessage::AdminDnsOp {
+                seq: 1,
                 op: AdminDnsRequest::Add {
                     name: "web".to_string(),
                     ip: Some("10.1.0.50".parse().unwrap()),
@@ -576,11 +602,13 @@ mod tests {
                 },
             },
             ControlMessage::AdminDnsOp {
+                seq: 2,
                 op: AdminDnsRequest::Remove {
                     id: "svc-1".to_string(),
                 },
             },
             ControlMessage::AdminDnsOp {
+                seq: 3,
                 op: AdminDnsRequest::SetHealth {
                     id: "svc-1".to_string(),
                     enabled: true,
@@ -591,58 +619,71 @@ mod tests {
                 },
             },
             ControlMessage::AdminDnsResult {
+                seq: 3,
                 accepted: false,
                 message: "管理が委任されていません".to_string(),
             },
             ControlMessage::AdminOp {
+                seq: 1,
                 op: AdminRequest::RemoveMember {
                     ip: "100.100.42.2".parse().unwrap(),
                 },
             },
             ControlMessage::AdminOp {
+                seq: 2,
                 op: AdminRequest::RenameMember {
                     ip: "100.100.42.2".parse().unwrap(),
                     name: "アリス".to_string(),
                 },
             },
             ControlMessage::AdminOp {
+                seq: 3,
                 op: AdminRequest::ApproveMember {
                     ip: "100.100.42.2".parse().unwrap(),
                 },
             },
             ControlMessage::AdminOp {
+                seq: 4,
                 op: AdminRequest::SetCanInvite {
                     ip: "100.100.42.2".parse().unwrap(),
                     allowed: true,
                 },
             },
             ControlMessage::AdminOp {
+                seq: 5,
                 op: AdminRequest::SetMemberDnsName {
                     ip: "100.100.42.2".parse().unwrap(),
                     dns_name: "alice".to_string(),
                 },
             },
             ControlMessage::AdminOp {
+                seq: 6,
                 op: AdminRequest::ReadNetworkSettings,
             },
             ControlMessage::AdminOp {
+                seq: 7,
                 op: AdminRequest::SetRequireApproval { enabled: true },
             },
             ControlMessage::AdminOp {
+                seq: 8,
                 op: AdminRequest::SetMemberInvites { enabled: false },
             },
             ControlMessage::AdminOp {
+                seq: 9,
                 op: AdminRequest::SetNetworkDisplayName {
                     name: Some("うちの LAN".to_string()),
                 },
             },
             ControlMessage::AdminOp {
+                seq: 10,
                 op: AdminRequest::SetNetworkDisplayName { name: None },
             },
             ControlMessage::AdminOp {
+                seq: 11,
                 op: AdminRequest::AclRead,
             },
             ControlMessage::AdminOp {
+                seq: 12,
                 op: AdminRequest::AclWrite {
                     policy: AclPolicyWire {
                         default: crate::acl::AclAction::Deny,
@@ -665,23 +706,28 @@ mod tests {
                 },
             },
             ControlMessage::AdminOp {
+                seq: 13,
                 op: AdminRequest::SetSubnets {
                     ip: "100.100.42.2".parse().unwrap(),
                     subnets: vec!["192.168.10.0/24".to_string()],
                 },
             },
             ControlMessage::AdminOp {
+                seq: 14,
                 op: AdminRequest::DnsCheckNow,
             },
             ControlMessage::AdminOp {
+                seq: 15,
                 op: AdminRequest::DnsListFull,
             },
             ControlMessage::AdminOpResult {
+                seq: 1,
                 accepted: true,
                 message: "削除しました".to_string(),
                 data: None,
             },
             ControlMessage::AdminOpResult {
+                seq: 6,
                 accepted: true,
                 message: "現在の設定を取得しました".to_string(),
                 data: Some(AdminOpData::NetworkSettings {
@@ -691,6 +737,7 @@ mod tests {
                 }),
             },
             ControlMessage::AdminOpResult {
+                seq: 11,
                 accepted: true,
                 message: "現在の ACL ポリシーを取得しました".to_string(),
                 data: Some(AdminOpData::AclPolicy {
@@ -702,6 +749,7 @@ mod tests {
                 }),
             },
             ControlMessage::AdminOpResult {
+                seq: 15,
                 accepted: true,
                 message: "DNS レコード一覧を取得しました".to_string(),
                 data: Some(AdminOpData::DnsRecords {

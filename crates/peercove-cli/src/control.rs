@@ -349,12 +349,19 @@ struct MemberLinkState {
     display_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
     /// メンバー招待の発行依頼(ADR-0048)の応答待ち。dns_reply と同じ仕組み。
     invite_reply: Option<tokio::sync::oneshot::Sender<InviteReply>>,
-    /// DNS 管理依頼(admin 委任、ADR-0059 決定 3、J-1c)の応答待ち。
-    /// dns_reply と同じ仕組み。
-    dns_admin_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
-    /// 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)の応答待ち。
-    /// dns_reply と同じ仕組み。
-    admin_op_reply: Option<tokio::sync::oneshot::Sender<AdminOpReply>>,
+    /// DNS 管理依頼(admin 委任、ADR-0059 決定 3、J-1c)の応答待ち(seq → 受け口)。
+    /// M7 J-2 追補: 以前は単一スロットだったため、ACL 画面がポリシーと
+    /// DNS 一覧を `Promise.all` で同時取得すると後発が先発の受け口を
+    /// 上書きし、先発側が Err(切断扱い)になっていた。共有メモ(memo_pending)
+    /// と同じ連番付きマップに揃えて、同時に複数の依頼を安全に待てるようにする。
+    dns_admin_pending: HashMap<u64, tokio::sync::oneshot::Sender<(bool, String)>>,
+    /// AdminDnsOp の連番。dns_admin_pending と対。
+    dns_admin_seq: u64,
+    /// 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)の応答待ち(seq → 受け口)。
+    /// dns_admin_pending と同じ理由・同じ仕組み(M7 J-2 追補)。
+    admin_pending: HashMap<u64, tokio::sync::oneshot::Sender<AdminOpReply>>,
+    /// AdminOp の連番。admin_pending と対。
+    admin_seq: u64,
     /// 共有メモ(M5 F-2)の応答待ち(seq → 受け口)。他の依頼と違い
     /// 同時に複数飛ばせる(一覧 + 本文の取り直しなど)。
     memo_pending: HashMap<u64, tokio::sync::oneshot::Sender<peercove_core::memo::SharedMemoReply>>,
@@ -453,17 +460,29 @@ impl MemberLink {
     /// (admin 委任、ADR-0059 決定 3、J-1c)。切断中なら `None`。
     /// 仕組みは [`Self::request_dns_name`] と同じ。最終判定は常にホスト側
     /// (peer.admin)なので、ここでは権限チェックしない。
+    ///
+    /// M7 J-2 追補: 連番(seq)を採番してから送る。ホストからの応答は
+    /// `AdminDnsResult { seq, .. }` として返るので、同じ MemberLink へ複数の
+    /// 依頼(例: ACL 画面がポリシーと DNS 一覧を同時取得)を投げても
+    /// 互いの受け口を上書きしない(dns_admin_pending は seq → 受け口 のマップ)。
+    /// 連番は AdminOp とは別のカウンタ(dns_admin_seq)を使う。1 つに共用しても
+    /// 動作上は問題ないが、AdminDnsOp と AdminOp は別メッセージ型で応答も
+    /// 別ハンドラ(put_dns_admin_result / put_admin_op_result)なので、
+    /// カウンタも分けたほうが「このカウンタはこのマップの分だけ」と対応が
+    /// 素直で読みやすい。
     pub fn request_dns_admin(
         &self,
         op: peercove_core::proto::AdminDnsRequest,
     ) -> Option<tokio::sync::oneshot::Receiver<(bool, String)>> {
         let mut state = self.inner.lock().unwrap();
+        state.dns_admin_seq += 1;
+        let seq = state.dns_admin_seq;
         let outbox = state.outbox.as_ref()?;
-        if outbox.send(ControlMessage::AdminDnsOp { op }).is_err() {
+        if outbox.send(ControlMessage::AdminDnsOp { seq, op }).is_err() {
             return None;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        state.dns_admin_reply = Some(tx);
+        state.dns_admin_pending.insert(seq, tx);
         Some(rx)
     }
 
@@ -471,17 +490,22 @@ impl MemberLink {
     /// ADR-0059 J-2 拡大)。切断中なら `None`。仕組みは [`Self::request_dns_name`]
     /// と同じ。最終判定は常にホスト側(peer.admin)なので、ここでは権限
     /// チェックしない。
+    ///
+    /// M7 J-2 追補: [`Self::request_dns_admin`] と同じ理由で連番付きマップ
+    /// (admin_pending)を使う。カウンタ(admin_seq)は dns_admin_seq とは別。
     pub fn request_admin_op(
         &self,
         op: peercove_core::proto::AdminRequest,
     ) -> Option<tokio::sync::oneshot::Receiver<AdminOpReply>> {
         let mut state = self.inner.lock().unwrap();
+        state.admin_seq += 1;
+        let seq = state.admin_seq;
         let outbox = state.outbox.as_ref()?;
-        if outbox.send(ControlMessage::AdminOp { op }).is_err() {
+        if outbox.send(ControlMessage::AdminOp { seq, op }).is_err() {
             return None;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        state.admin_op_reply = Some(tx);
+        state.admin_pending.insert(seq, tx);
         Some(rx)
     }
 
@@ -517,8 +541,8 @@ impl MemberLink {
         state.dns_reply = None; // 応答待ちの受け口は Err(切断)になる
         state.display_reply = None;
         state.invite_reply = None;
-        state.dns_admin_reply = None;
-        state.admin_op_reply = None;
+        state.dns_admin_pending.clear();
+        state.admin_pending.clear();
         state.memo_pending.clear();
         state.connection_error = None;
     }
@@ -529,8 +553,8 @@ impl MemberLink {
         state.dns_reply = None;
         state.display_reply = None;
         state.invite_reply = None;
-        state.dns_admin_reply = None;
-        state.admin_op_reply = None;
+        state.dns_admin_pending.clear();
+        state.admin_pending.clear();
         state.memo_pending.clear();
     }
 
@@ -556,14 +580,17 @@ impl MemberLink {
         }
     }
 
-    fn put_dns_admin_result(&self, accepted: bool, message: String) {
-        if let Some(reply) = self.inner.lock().unwrap().dns_admin_reply.take() {
+    /// seq が map に無い場合は握りつぶす(旧ホストからの seq なし = 0 の応答、
+    /// または既にタイムアウトなどで諦めた依頼への遅延応答 — M7 J-2 追補)。
+    fn put_dns_admin_result(&self, seq: u64, accepted: bool, message: String) {
+        if let Some(reply) = self.inner.lock().unwrap().dns_admin_pending.remove(&seq) {
             let _ = reply.send((accepted, message));
         }
     }
 
-    fn put_admin_op_result(&self, reply: AdminOpReply) {
-        if let Some(sender) = self.inner.lock().unwrap().admin_op_reply.take() {
+    /// put_dns_admin_result と同じ理由で seq が map に無ければ握りつぶす。
+    fn put_admin_op_result(&self, seq: u64, reply: AdminOpReply) {
+        if let Some(sender) = self.inner.lock().unwrap().admin_pending.remove(&seq) {
             let _ = sender.send(reply);
         }
     }
@@ -828,6 +855,7 @@ impl HostRequests {
     async fn apply_admin_dns(
         &self,
         member_ip: Ipv4Addr,
+        seq: u64,
         op: peercove_core::proto::AdminDnsRequest,
     ) -> ControlMessage {
         use peercove_core::proto::AdminDnsRequest;
@@ -910,6 +938,7 @@ impl HostRequests {
                 // 可視化(ADR-0059)。レコード内容の詳細(名前・IP)は debug 程度に留める
                 tracing::info!("メンバー {member_ip} が DNS 設定を変更しました");
                 ControlMessage::AdminDnsResult {
+                    seq,
                     accepted: true,
                     message,
                 }
@@ -917,6 +946,7 @@ impl HostRequests {
             Ok(Err(e)) => {
                 tracing::info!("メンバー {member_ip} の DNS 設定変更を受け付けませんでした: {e:#}");
                 ControlMessage::AdminDnsResult {
+                    seq,
                     accepted: false,
                     message: format!("{e:#}"),
                 }
@@ -924,6 +954,7 @@ impl HostRequests {
             Err(e) => {
                 tracing::warn!("DNS 設定変更の適用タスクが失敗しました: {e}");
                 ControlMessage::AdminDnsResult {
+                    seq,
                     accepted: false,
                     message: "ホスト側の内部エラーです".to_string(),
                 }
@@ -939,6 +970,7 @@ impl HostRequests {
     async fn apply_admin_op(
         &self,
         member_ip: Ipv4Addr,
+        seq: u64,
         op: peercove_core::proto::AdminRequest,
     ) -> ControlMessage {
         use peercove_core::proto::{AdminOpData, AdminRequest};
@@ -1163,6 +1195,7 @@ impl HostRequests {
                 // 可視化(ADR-0059)。対象の詳細(名前・IP)はログに出さず件数程度に留める
                 tracing::info!("メンバー {member_ip} が Admin 操作を行いました");
                 ControlMessage::AdminOpResult {
+                    seq,
                     accepted: true,
                     message,
                     data,
@@ -1171,6 +1204,7 @@ impl HostRequests {
             Ok(Err(e)) => {
                 tracing::info!("メンバー {member_ip} の Admin 操作を受け付けませんでした: {e:#}");
                 ControlMessage::AdminOpResult {
+                    seq,
                     accepted: false,
                     message: format!("{e:#}"),
                     data: None,
@@ -1179,6 +1213,7 @@ impl HostRequests {
             Err(e) => {
                 tracing::warn!("Admin 操作の適用タスクが失敗しました: {e}");
                 ControlMessage::AdminOpResult {
+                    seq,
                     accepted: false,
                     message: "ホスト側の内部エラーです".to_string(),
                     data: None,
@@ -1640,16 +1675,19 @@ async fn host_reader(
                 let reply = requests.memo.handle_for_member(member_ip, op).await;
                 let _ = out.send(ControlMessage::MemoResp { seq, reply });
             }
-            Ok(ControlMessage::AdminDnsOp { op }) => {
+            Ok(ControlMessage::AdminDnsOp { seq, op }) => {
                 // DNS 管理のリモート依頼(admin 委任、ADR-0059 決定 3、J-1c)。
-                // 権限(peer.admin)は apply_admin_dns の中で毎回検証する
-                let reply = requests.apply_admin_dns(member_ip, op).await;
+                // 権限(peer.admin)は apply_admin_dns の中で毎回検証する。
+                // seq は依頼された値をそのまま応答へ載せる(M7 J-2 追補、
+                // メンバー側の連番対応マップと突き合わせるため)。
+                let reply = requests.apply_admin_dns(member_ip, seq, op).await;
                 let _ = out.send(reply);
             }
-            Ok(ControlMessage::AdminOp { op }) => {
+            Ok(ControlMessage::AdminOp { seq, op }) => {
                 // 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)。
-                // 権限(peer.admin)は apply_admin_op の中で毎回検証する
-                let reply = requests.apply_admin_op(member_ip, op).await;
+                // 権限(peer.admin)は apply_admin_op の中で毎回検証する。
+                // seq は依頼された値をそのまま応答へ載せる(M7 J-2 追補)。
+                let reply = requests.apply_admin_op(member_ip, seq, op).await;
                 let _ = out.send(reply);
             }
             Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
@@ -2040,23 +2078,33 @@ async fn member_reader(
                 // 共有メモの応答(M5 F-2)。IPC ハンドラ・同期タスクの受け口へ渡す
                 link.put_memo_result(seq, reply);
             }
-            Ok(ControlMessage::AdminDnsResult { accepted, message }) => {
+            Ok(ControlMessage::AdminDnsResult {
+                seq,
+                accepted,
+                message,
+            }) => {
                 // DNS 管理の応答(admin 委任、ADR-0059 決定 3、J-1c)。
-                // IPC ハンドラが待つ受け口へ渡す
-                link.put_dns_admin_result(accepted, message);
+                // IPC ハンドラが待つ受け口へ渡す(seq で対応する依頼と突き合わせる。
+                // M7 J-2 追補)
+                link.put_dns_admin_result(seq, accepted, message);
             }
             Ok(ControlMessage::AdminOpResult {
+                seq,
                 accepted,
                 message,
                 data,
             }) => {
                 // 汎用 Admin 中継の応答(admin 委任、ADR-0059 J-2 拡大)。
-                // IPC ハンドラが待つ受け口へ渡す
-                link.put_admin_op_result(AdminOpReply {
-                    accepted,
-                    message,
-                    data,
-                });
+                // IPC ハンドラが待つ受け口へ渡す(seq で対応する依頼と突き合わせる。
+                // M7 J-2 追補)
+                link.put_admin_op_result(
+                    seq,
+                    AdminOpReply {
+                        accepted,
+                        message,
+                        data,
+                    },
+                );
             }
             Ok(ControlMessage::MemoEvent { event }) => {
                 // リアルタイム配信(M5 F-2)。キャッシュへ反映し、世代を進める
@@ -2474,6 +2522,71 @@ mod tests {
         assert!(server.await.unwrap().is_ok());
     }
 
+    /// M7 J-2 追補: 同じ MemberLink へ 2 本の admin 依頼(AdminOp)を同時に
+    /// 出しても、互いの受け口を上書きせず両方が正しい応答を受け取ること。
+    /// 単一スロット(admin_op_reply: Option<Sender<_>>)だった頃は後発の
+    /// 依頼が先発の受け口を上書きし、先発側の Receiver が Err(切断扱い)に
+    /// なっていた(ACL 画面が AclRead と DnsListFull を Promise.all で同時に
+    /// 投げると必ずどちらかが「ホストとの接続が切れました」になっていた
+    /// 不具合の再現)。
+    #[test]
+    fn concurrent_admin_op_requests_both_resolve_correctly() {
+        let link = Arc::new(MemberLink::default());
+        let mut out = link.attach_for_test();
+
+        // 1 本目(ACL ポリシーの取得)
+        let mut rx1 = link
+            .request_admin_op(peercove_core::proto::AdminRequest::AclRead)
+            .expect("接続済みなので送れる");
+        // 2 本目(DNS 一覧の取得)。単一スロットのままなら 1 本目の受け口を上書きしていた。
+        let mut rx2 = link
+            .request_admin_op(peercove_core::proto::AdminRequest::DnsListFull)
+            .expect("接続済みなので送れる");
+
+        let seq1 = match out.try_recv().unwrap() {
+            ControlMessage::AdminOp {
+                seq,
+                op: peercove_core::proto::AdminRequest::AclRead,
+            } => seq,
+            other => panic!("AdminOp(AclRead) を期待: {other:?}"),
+        };
+        let seq2 = match out.try_recv().unwrap() {
+            ControlMessage::AdminOp {
+                seq,
+                op: peercove_core::proto::AdminRequest::DnsListFull,
+            } => seq,
+            other => panic!("AdminOp(DnsListFull) を期待: {other:?}"),
+        };
+        assert_ne!(seq1, seq2, "連番は依頼ごとに異なること");
+
+        // ホストからの応答は届いた順とは限らない(ここでは 2 本目を先に返す)。
+        link.put_admin_op_result(
+            seq2,
+            AdminOpReply {
+                accepted: true,
+                message: "DNS レコード一覧を取得しました".to_string(),
+                data: None,
+            },
+        );
+        link.put_admin_op_result(
+            seq1,
+            AdminOpReply {
+                accepted: true,
+                message: "現在の ACL ポリシーを取得しました".to_string(),
+                data: None,
+            },
+        );
+
+        let reply1 = rx1
+            .try_recv()
+            .expect("1 本目の受け口が上書きされず解決すること");
+        assert!(reply1.accepted);
+        assert_eq!(reply1.message, "現在の ACL ポリシーを取得しました");
+        let reply2 = rx2.try_recv().expect("2 本目の受け口も解決すること");
+        assert!(reply2.accepted);
+        assert_eq!(reply2.message, "DNS レコード一覧を取得しました");
+    }
+
     /// 汎用 Admin 中継(ADR-0059 J-2 拡大): admin を委任されたメンバーからの
     /// RemoveMember が host.toml へ反映されること。
     #[tokio::test]
@@ -2506,6 +2619,7 @@ mod tests {
         let reply = requests
             .apply_admin_op(
                 admin_ip,
+                1,
                 peercove_core::proto::AdminRequest::RemoveMember { ip: target_ip },
             )
             .await;
@@ -2554,6 +2668,7 @@ mod tests {
         let reply = requests
             .apply_admin_op(
                 actor_ip,
+                1,
                 peercove_core::proto::AdminRequest::RemoveMember { ip: target_ip },
             )
             .await;
@@ -2601,6 +2716,7 @@ mod tests {
         let self_reply = requests
             .apply_admin_op(
                 admin_ip,
+                1,
                 peercove_core::proto::AdminRequest::RemoveMember { ip: admin_ip },
             )
             .await;
@@ -2618,6 +2734,7 @@ mod tests {
         let host_reply = requests
             .apply_admin_op(
                 admin_ip,
+                2,
                 peercove_core::proto::AdminRequest::RemoveMember { ip: host_ip },
             )
             .await;
@@ -2676,6 +2793,7 @@ mod tests {
         let write_reply = requests
             .apply_admin_op(
                 admin_ip,
+                1,
                 peercove_core::proto::AdminRequest::AclWrite {
                     policy: policy.clone(),
                 },
@@ -2693,7 +2811,7 @@ mod tests {
         assert_eq!(config.acl.rules.len(), 1);
 
         let read_reply = requests
-            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::AclRead)
+            .apply_admin_op(admin_ip, 2, peercove_core::proto::AdminRequest::AclRead)
             .await;
         match read_reply {
             ControlMessage::AdminOpResult {
@@ -2739,6 +2857,7 @@ mod tests {
         let reply = requests
             .apply_admin_op(
                 admin_ip,
+                1,
                 peercove_core::proto::AdminRequest::SetSubnets {
                     ip: target_ip,
                     subnets: vec!["192.168.10.0/24".to_string()],
@@ -2764,6 +2883,7 @@ mod tests {
         let bad_reply = requests
             .apply_admin_op(
                 admin_ip,
+                2,
                 peercove_core::proto::AdminRequest::SetSubnets {
                     ip: target_ip,
                     subnets: vec!["not-a-cidr".to_string()],
@@ -2812,7 +2932,7 @@ mod tests {
         let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
 
         let reply = requests
-            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::DnsCheckNow)
+            .apply_admin_op(admin_ip, 1, peercove_core::proto::AdminRequest::DnsCheckNow)
             .await;
         assert!(
             matches!(reply, ControlMessage::AdminOpResult { accepted: true, .. }),
@@ -2852,7 +2972,7 @@ mod tests {
         let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
 
         let reply = requests
-            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::DnsCheckNow)
+            .apply_admin_op(admin_ip, 1, peercove_core::proto::AdminRequest::DnsCheckNow)
             .await;
         assert!(
             matches!(
@@ -2894,7 +3014,7 @@ mod tests {
         let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
 
         let reply = requests
-            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::DnsListFull)
+            .apply_admin_op(admin_ip, 1, peercove_core::proto::AdminRequest::DnsListFull)
             .await;
         match reply {
             ControlMessage::AdminOpResult {
@@ -2959,7 +3079,7 @@ mod tests {
             peercove_core::proto::AdminRequest::DnsListFull,
             peercove_core::proto::AdminRequest::DnsCheckNow,
         ] {
-            let reply = requests.apply_admin_op(actor_ip, op.clone()).await;
+            let reply = requests.apply_admin_op(actor_ip, 1, op.clone()).await;
             assert!(
                 matches!(
                     reply,

@@ -3790,3 +3790,28 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
     経路では `api.adminDnsCheckNow` を呼ぶ。
 - **互換**: プロトコル・IPC とも additive のみ。`PeerConfig.admin` を書いた
   host.toml は旧バイナリで読めない(既存の `can_invite` と同じ注意)。
+- **(2026-07-31 追補、M7 J-2 追補)**: admin 依頼の応答受け口を単一スロットから
+  連番対応のマップへ変更(共有メモの MemoReq/MemoResp と同じ方式)。ACL 画面が
+  ポリシーと DNS 一覧を同時取得するため、単一スロットでは先発の依頼が
+  上書きされて『接続が切れました』になっていた。
+  - `ControlMessage::AdminOp` / `AdminOpResult` / `AdminDnsOp` / `AdminDnsResult`
+    に `seq: u64`(`#[serde(default)]`)を additive で追加。PROTO_VERSION は
+    据え置き。
+  - メンバー側(`control.rs` `MemberLinkState`)は `admin_op_reply` /
+    `dns_admin_reply`(単一スロット)を廃止し、`admin_pending: HashMap<u64, _>` /
+    `dns_admin_pending: HashMap<u64, _>` に変更。連番のカウンタ(`admin_seq` /
+    `dns_admin_seq`)は AdminOp と AdminDnsOp で別々に持つ(メッセージ型・
+    応答ハンドラが別なので、対応関係が素直になるほうを選んだ。1 つに共用
+    しても動作上の問題はない)。`attach`/`detach` は map を `clear()`。
+  - 応答を受けた側(`put_admin_op_result` / `put_dns_admin_result`)は seq が
+    map に無ければ握りつぶす(旧ホストからの seq なし = 0 の応答、または
+    既にタイムアウトなどで諦めた依頼への遅延応答)。
+  - ホスト側は依頼された seq をそのまま応答へ載せて返すだけ(`apply_admin_op`
+    / `apply_admin_dns` に `seq` 引数を追加)。
+  - 新メンバー→旧ホストの組み合わせでは、旧ホストは seq を無視して従来の
+    (seq なし = 0 の)応答を返すが、新メンバー側は 1 から連番採番するため
+    対応づかず、15 秒のタイムアウト後に既存の「ホストから応答がありません
+    (ホストのバージョンが古い可能性があります)」という分かりやすいエラーに
+    なる。誤った成功として扱うより安全なので、この挙動でよいと判断した。
+  - UI 側(`AclDialog.tsx` / `DnsDialog.tsx`)は読み込み成功時に
+    `setError(null)` するよう小さく堅牢化(古いエラー表示が残らないように)。
