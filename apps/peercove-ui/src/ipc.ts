@@ -125,6 +125,97 @@ export type AdminDnsOp =
       external?: boolean;
     };
 
+/**
+ * 汎用 Admin 中継の依頼（admin 委任、ADR-0059 J-2 拡大）。Rust 側
+ * `peercove_core::proto::AdminRequest` とワイヤ互換の形（タグ `op` は
+ * snake_case）でそのまま渡す。admin の付与・剥奪はここに含まれない
+ * （常にホストのみ）。最終判定は常にホスト側。
+ */
+export type AdminRequest =
+  | { op: "remove_member"; ip: string }
+  | { op: "rename_member"; ip: string; name: string }
+  | { op: "approve_member"; ip: string }
+  | { op: "set_can_invite"; ip: string; allowed: boolean }
+  | { op: "set_member_dns_name"; ip: string; dns_name: string }
+  | { op: "read_network_settings" }
+  | { op: "set_require_approval"; enabled: boolean }
+  | { op: "set_member_invites"; enabled: boolean }
+  | { op: "set_network_display_name"; name?: string | null }
+  // ACL・広告サブネット・DNS 残りの委任(ADR-0059 J-2 拡大の残り)。
+  | { op: "acl_read" }
+  | { op: "acl_write"; policy: AclPolicySettings }
+  | { op: "set_subnets"; ip: string; subnets: string[] }
+  | { op: "dns_check_now" }
+  | { op: "dns_list_full" };
+
+/** [`AdminRequest`]「read_network_settings」への応答。 */
+export interface AdminNetworkSettings {
+  requireInviteApproval: boolean;
+  memberInvites: boolean;
+  networkDisplayName: string | null;
+}
+
+/**
+ * `admin_op` の生の応答（Rust `AdminOpData` とワイヤ互換）。UI 側は
+ * `api.adminOp` / `api.adminAclRead` などでこの形を読みやすい形へ変換してから使う。
+ */
+type AdminOpDataWire =
+  | {
+      kind: "network_settings";
+      require_invite_approval: boolean;
+      member_invites: boolean;
+      network_display_name?: string | null;
+    }
+  | { kind: "acl_policy"; policy: AclPolicySettings }
+  | { kind: "dns_records"; records: AdminDnsRecordWire[] };
+
+/** [`AdminOpData::DnsRecords`] 内の 1 レコード（Rust `AdminDnsRecord` とワイヤ互換）。 */
+interface AdminDnsRecordWire {
+  id: string | null;
+  name: string;
+  ip?: string | null;
+  member?: string | null;
+  cname?: string | null;
+  under?: string | null;
+  relative: string;
+  fqdn: string;
+  resolved_ip?: string | null;
+  scheme?: string | null;
+  port?: number | null;
+  url?: string | null;
+  health_enabled: boolean;
+  health_kind: "tcp" | "http_head";
+  health_path: string;
+  health_expected_status?: number | null;
+  health_external?: boolean;
+}
+
+/** [`AdminDnsRecordWire`] を画面が扱う [`DnsRecord`] 形へ変換する。
+ * health（測定結果）は admin_op では取得しないため null（配布データの
+ * ものを使うのは呼び出し側の役目）。 */
+function adminDnsRecordToDnsRecord(record: AdminDnsRecordWire): DnsRecord {
+  return {
+    id: record.id,
+    name: record.name,
+    ip: record.resolved_ip ?? null,
+    fqdn: record.fqdn,
+    member: record.member ?? null,
+    cname: record.cname ?? null,
+    under: record.under ?? null,
+    scheme: record.scheme ?? null,
+    port: record.port ?? null,
+    url: record.url ?? null,
+    health: null,
+    healthSettings: {
+      enabled: record.health_enabled,
+      kind: record.health_kind,
+      path: record.health_path,
+      expectedStatus: record.health_expected_status ?? null,
+      external: record.health_external ?? false,
+    },
+  };
+}
+
 export interface Peer {
   publicKey: string;
   endpoint: string | null;
@@ -1210,6 +1301,68 @@ export const api = {
   // J-1c）。ホストへ中継され、権限確認（peer.admin）を経て適用される。
   adminDnsOp: (configPath: string, op: AdminDnsOp) =>
     invoke<void>("admin_dns_op", { configPath, op }),
+  // (member、admin 委任) 汎用 Admin 中継（ADR-0059 J-2 拡大）。メンバー管理・
+  // ネットワーク設定などをホストへ中継し、権限確認（peer.admin）を経て
+  // 適用される。read_network_settings の応答だけ AdminNetworkSettings へ
+  // 変換して返す（他の依頼は常に null）。admin の付与・剥奪は含まれない
+  // （常にホストの setMemberAdmin を使う）。
+  adminOp: async (
+    configPath: string,
+    op: AdminRequest,
+  ): Promise<AdminNetworkSettings | null> => {
+    const data = await invoke<AdminOpDataWire | null>("admin_op", {
+      configPath,
+      op,
+    });
+    if (!data) return null;
+    switch (data.kind) {
+      case "network_settings":
+        return {
+          requireInviteApproval: data.require_invite_approval,
+          memberInvites: data.member_invites,
+          networkDisplayName: data.network_display_name ?? null,
+        };
+      default:
+        return null;
+    }
+  },
+  // (member、admin 委任) ACL v2 ポリシー全体の委任（ADR-0059 J-2 拡大の残り）。
+  // ホストは readAclPolicy/writeAclPolicy を直接、admin は adminOp 中継。
+  adminAclRead: async (configPath: string): Promise<AclPolicySettings> => {
+    const data = await invoke<AdminOpDataWire | null>("admin_op", {
+      configPath,
+      op: { op: "acl_read" },
+    });
+    if (!data || data.kind !== "acl_policy") {
+      throw new Error("想定外の応答です");
+    }
+    return data.policy;
+  },
+  adminAclWrite: (configPath: string, policy: AclPolicySettings) =>
+    invoke<void>("admin_op", {
+      configPath,
+      op: { op: "acl_write", policy },
+    }),
+  // (member、admin 委任) 広告サブネットの委任（ADR-0059 J-2 拡大の残り）。
+  adminSetSubnets: (configPath: string, ip: string, subnets: string[]) =>
+    invoke<void>("admin_op", {
+      configPath,
+      op: { op: "set_subnets", ip, subnets },
+    }),
+  // (member、admin 委任) DNS「今すぐ確認」の委任（ADR-0059 J-2 拡大の残り）。
+  adminDnsCheckNow: (configPath: string) =>
+    invoke<void>("admin_op", { configPath, op: { op: "dns_check_now" } }),
+  // (member、admin 委任) ホスト正本の DNS レコード一覧(id・ヘルス設定の現在値
+  // つき)の委任（ADR-0059 J-2 拡大の残り）。J-1c の既知の制限（admin のヘルス
+  // 編集が既定値から始まる / id 未付番レコードを操作できない）を解消する。
+  adminDnsListFull: async (configPath: string): Promise<DnsRecord[]> => {
+    const data = await invoke<AdminOpDataWire | null>("admin_op", {
+      configPath,
+      op: { op: "dns_list_full" },
+    });
+    if (!data || data.kind !== "dns_records") return [];
+    return data.records.map(adminDnsRecordToDnsRecord);
+  },
   readSettings: (configPath: string) =>
     invoke<Settings>("read_settings", { configPath }),
   saveSettings: (configPath: string, update: SettingsUpdate) =>

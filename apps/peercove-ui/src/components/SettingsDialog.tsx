@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react";
-import { Settings, StorageUsage, api, errorMessage, formatBytes } from "../ipc";
+import {
+  AdminNetworkSettings,
+  Settings,
+  StorageUsage,
+  api,
+  errorMessage,
+  formatBytes,
+} from "../ipc";
 import { ConfirmModal } from "./Modal";
 import { t } from "../i18n";
 
@@ -21,6 +28,7 @@ export function NetworkSettingsView({
   configPath,
   liveInterfaceName,
   isConnected,
+  isSelfAdmin,
 }: {
   configPath: string;
   /** 接続中の実アダプタ名(自動採番後）。未接続なら null で設定値を出す。 */
@@ -28,6 +36,10 @@ export function NetworkSettingsView({
   /** このネットワークに接続中か(ストレージ管理: チャット履歴のクリアは
    *  接続中のみ実行できる — M6 H-10a)。省略時は未接続扱い。 */
   isConnected?: boolean;
+  /** 自分が管理を委任されている(ADR-0059 J-2 拡大)。メンバーの設定ページに
+   *  「ネットワーク管理(委任)」節を追加で出す。省略時は false(ホスト自身の
+   *  設定ページには不要)。 */
+  isSelfAdmin?: boolean;
 }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -48,6 +60,7 @@ export function NetworkSettingsView({
           settings={settings}
           liveInterfaceName={liveInterfaceName}
           isConnected={isConnected ?? false}
+          isSelfAdmin={isSelfAdmin ?? false}
         />
       ) : (
         <div className="page-body">
@@ -67,11 +80,13 @@ function SettingsForm({
   settings,
   liveInterfaceName,
   isConnected,
+  isSelfAdmin,
 }: {
   configPath: string;
   settings: Settings;
   liveInterfaceName: string | null;
   isConnected: boolean;
+  isSelfAdmin: boolean;
 }) {
   // 接続中は実際に使われているアダプタ名を出す(既定名が衝突すると自動採番で
   // peercove1 等になるため、設定ファイルの値と食い違いうる — ADR-0028、M3-20)
@@ -320,6 +335,10 @@ function SettingsForm({
         {error && <p className="error-text">{error}</p>}
         {notice && <p className="notice">{notice}</p>}
 
+        {settings.isMember && isSelfAdmin && (
+          <AdminNetworkSection configPath={configPath} />
+        )}
+
         <StorageManagement configPath={configPath} isConnected={isConnected} />
       </div>
       <div className="page-actions">
@@ -338,6 +357,152 @@ function SettingsForm({
         />
       )}
     </>
+  );
+}
+
+/**
+ * ネットワーク管理(委任、ADR-0059 J-2 拡大)。管理を委任されたメンバーが、
+ * ホストのネットワーク設定(承認制・メンバー招待許可・表示名)を
+ * `api.adminOp` 経由(中継)で読み書きする。開いたときに `ReadNetworkSettings`
+ * で現在値を取得し、変更は各 Set 系を個別に送る(保存ボタンでまとめない —
+ * チェックボックスは即時反映、表示名だけ入力欄 + ボタン)。
+ */
+function AdminNetworkSection({ configPath }: { configPath: string }) {
+  const [settings, setSettings] = useState<AdminNetworkSettings | null>(null);
+  const [requireApproval, setRequireApproval] = useState(false);
+  const [memberInvites, setMemberInvites] = useState(true);
+  const [displayName, setDisplayName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .adminOp(configPath, { op: "read_network_settings" })
+      .then((data) => {
+        if (!data) return;
+        setSettings(data);
+        setRequireApproval(data.requireInviteApproval);
+        setMemberInvites(data.memberInvites);
+        setDisplayName(data.networkDisplayName ?? "");
+      })
+      .catch((e) => setError(errorMessage(e)));
+  }, [configPath]);
+
+  const notifyApplied = () => {
+    setNotice(t.dns.adminApplyNotice);
+    setTimeout(() => setNotice(null), 8000);
+  };
+
+  const applyRequireApproval = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.adminOp(configPath, { op: "set_require_approval", enabled });
+      setRequireApproval(enabled);
+      notifyApplied();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyMemberInvites = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.adminOp(configPath, { op: "set_member_invites", enabled });
+      setMemberInvites(enabled);
+      notifyApplied();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyDisplayName = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const trimmed = displayName.trim();
+      await api.adminOp(configPath, {
+        op: "set_network_display_name",
+        name: trimmed === "" ? null : trimmed,
+      });
+      notifyApplied();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="field">
+      <h3 className="section-head">{t.settings.adminNetworkTitle}</h3>
+      <p className="muted small">{t.settings.adminNetworkHint}</p>
+      {!settings ? (
+        error ? (
+          <p className="error-text">{error}</p>
+        ) : (
+          <p className="muted small">{t.common.loading}</p>
+        )
+      ) : (
+        <>
+          <label className="field field--check">
+            <input
+              type="checkbox"
+              checked={requireApproval}
+              disabled={busy}
+              onChange={(event) => void applyRequireApproval(event.target.checked)}
+            />
+            <span>
+              {t.settings.inviteApprovalLabel}
+              <small className="muted"> {t.settings.inviteApprovalHint}</small>
+            </span>
+          </label>
+          <label className="field field--check">
+            <input
+              type="checkbox"
+              checked={memberInvites}
+              disabled={busy}
+              onChange={(event) => void applyMemberInvites(event.target.checked)}
+            />
+            <span>
+              {t.settings.memberInvitesLabel}
+              <small className="muted"> {t.settings.memberInvitesHint}</small>
+            </span>
+          </label>
+          <label className="field">
+            <span>
+              {t.settings.networkDisplayNameLabel}
+              <small className="muted">{t.settings.networkDisplayNameHint}</small>
+            </span>
+            <div className="row">
+              <input
+                type="text"
+                value={displayName}
+                maxLength={64}
+                disabled={busy}
+                onChange={(event) => setDisplayName(event.target.value)}
+              />
+              <button
+                type="button"
+                className="button--ghost"
+                disabled={busy}
+                onClick={() => void applyDisplayName()}
+              >
+                {t.common.save}
+              </button>
+            </div>
+          </label>
+          {error && <p className="error-text small">{error}</p>}
+          {notice && <p className="notice">{notice}</p>}
+        </>
+      )}
+    </div>
   );
 }
 

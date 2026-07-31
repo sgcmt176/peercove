@@ -232,13 +232,15 @@ pub enum SheetOp {
         #[serde(default)]
         name: String,
     },
-    /// 改名(作成者・ホストのみ)。応答は [`SheetReply::Sheet`]。
+    /// 改名(作成者・管理者(ホスト/admin)のみ、ADR-0059 J-2 拡大)。
+    /// 応答は [`SheetReply::Sheet`]。
     Rename {
         sheet_id: String,
         #[serde(default)]
         name: String,
     },
-    /// 削除(作成者・ホストのみ。セルもまとめて削除)。
+    /// 削除(作成者・管理者(ホスト/admin)のみ。セルもまとめて削除。
+    /// ADR-0059 J-2 拡大)。
     Delete { sheet_id: String },
     /// セルのバッチ書き込み(全員可。貼り付け(TSV)も 1 バッチ)。
     /// 応答は [`SheetReply::WriteResult`](部分失敗をサポートする)。

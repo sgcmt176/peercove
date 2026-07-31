@@ -3676,7 +3676,9 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
 
 - **ステータス**: 採用(2026-07-26、設計)。実装は J-1a(バックアップ CLI)/
   J-1b(admin 基盤 + 共有メモ権限、**実装済み 2026-07-31**)/
-  J-1c(DNS のリモート管理、**実装済み 2026-07-31**)
+  J-1c(DNS のリモート管理、**実装済み 2026-07-31**)/
+  J-2 拡大(共有データ系 = J-2a、メンバー管理・ネットワーク設定 = J-2b、
+  ACL・広告サブネット・DNS 残り = J-2c、**すべて実装済み 2026-07-31**)
 - **背景**: 依頼者がホストを VPS で常時稼働させる計画。ヘッドレス運用の
   ため (1) 暗号化バックアップの CLI 化、(2) ホストが信用するメンバーへ
   admin 権限を委任し、グループ権限操作と DNS 設定をメンバー端末から
@@ -3732,5 +3734,59 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
      環境変数 `PEERCOVE_BACKUP_PASSPHRASE` またはファイル指定
      (`--passphrase-file`)。restore は該当ネットワークが稼働中なら拒否
      (UI と同じガード)。cron からの定期実行を想定。
+- **J-2 拡大(2026-07-31 依頼者指示)**: admin を「ホストと同等」へ拡大。
+  **admin 権限の付与・剥奪だけはホスト専用のまま**(権限の連鎖を防ぐ)。
+  それ以外はすべて委任する:
+  - 共有データ系(既存の中継に乗る): 共有メモの上限設定・フォルダー
+    作成/改名/削除・編集ロックの強制解除、他人の予定の編集/削除、
+    他人のシートの改名/削除
+  - 中継の新設(AdminDnsOp と同型の汎用 AdminOp): メンバーの削除/
+    一括削除/改名/承認待ちの承認/can_invite 付与/他メンバーの DNS 名
+    変更、承認制トグル・メンバー招待許可トグル・ネットワーク表示名、
+    ACL ポリシーの読み書き、広告サブネットの設定、DNS の「今すぐ確認」と
+    ホスト正本のレコード/ヘルス設定の参照
+  - **admin は招待発行が常に可能**: 実効 can_invite = can_invite || admin
+    (個別 OFF 不可。UI では admin のときチェック ON + 無効表示)
+- **J-2 実装済み(2026-07-31)**: J-2a(共有データ系)・J-2b(メンバー管理・
+  ネットワーク設定)に続き、J-2c(ACL・広告サブネット・DNS 残り)で
+  `AdminRequest` に `AclRead` / `AclWrite` / `SetSubnets` / `DnsCheckNow` /
+  `DnsListFull` を追加し、J-2 拡大の対象をすべて実装した。実装時の判断:
+  - **ACL ポリシー型のワイヤへの載せ方**: `peercove_ops::acl::PolicySettings`
+    (default/groups/rules)は peercove-ops の型だが、フィールドの実体
+    (`AclAction`/`AclGroup`/`AclRule`)はもともと peercove-core
+    (`peercove_core::acl`)にある。peercove-core は peercove-ops に依存
+    できないため、`proto::AclPolicyWire`(同じ 3 フィールドを core の型で
+    持つだけの最小ミラー struct)を core 側へ新設し、`AdminRequest::AclWrite`
+    / `AdminOpData::AclPolicy` の双方で共用した。`PolicySettings` との
+    相互変換(フィールドをそのままコピーするだけ)は control.rs が行う。
+  - **DnsCheckNow の処理層**: IPC `CheckDnsHealth` は daemon の
+    `Active::health`(稼働中トンネルごとの `SharedHealth`)を直接叩くが、
+    `apply_admin_op`(control.rs `HostRequests`)はもともと host.toml の
+    パスしか持たず、稼働中トンネルの状態には触れない。`HostRequests` に
+    `health: Option<SharedHealth>` を追加し、`supervise` の Role::Host
+    分岐で `HostRequests::with_health(health.clone())` として稼働中の実体を
+    差し込むビルダーメソッドを新設した(既存の `HostRequests::new` 呼び出し
+    — テストを含む — は変更不要)。`apply_admin_op` 内では file IO を伴わない
+    ため、`self.health.clone()`(Arc なので安価)を `spawn_blocking` の外で
+    複製して閉じ込め、`DnsCheckNow` アームで `health.lock().unwrap().request_now()`
+    を呼ぶ。`with_health` 未設定(単体テスト等)では「このネットワークは
+    稼働していません」を返す。
+  - **DnsListFull**: `peercove_ops::dns::list_records` をそのまま呼び、
+    `RecordDetail` を `AdminDnsRecord`(core 新設、health_* を平坦化した
+    ワイヤ型)へ変換して返す。`list_records` が id の遅延付番も行うため、
+    admin が DNS 画面を開くだけで旧レコード(id 未付与)にも id が付き、
+    J-1c にあった 2 つの制限(id 未付番レコードを操作できない / ヘルス
+    編集が既定値から始まる)が解消される。
+  - **SetSubnets の自己ガード**: 他の per-member admin op(RemoveMember 等)
+    と同様に `guard_target`(対象にホスト自身・依頼者自身を指定できない)を
+    適用した。サブネット編集専用の「自分の分」を admin が中継で変更する
+    経路は今回作らない(必要になれば別途 ADR で検討)。
+  - **UI**: `AclDialog.tsx`(AclView)・`SubnetDialog.tsx`(SubnetView)を
+    `isHost` prop で 2 経路分岐(host = 直接 Tauri コマンド / admin =
+    `api.adminAclRead`/`adminAclWrite`/`adminSetSubnets` 経由)。
+    `DnsDialog.tsx` は admin が画面を開いた時点で `api.adminDnsListFull`
+    を取得し、配布データ(`distributed`)へフォールバックする形にした。
+    「今すぐ確認」ボタンは `canManage`(isHost || isAdmin)で開放し、admin
+    経路では `api.adminDnsCheckNow` を呼ぶ。
 - **互換**: プロトコル・IPC とも additive のみ。`PeerConfig.admin` を書いた
   host.toml は旧バイナリで読めない(既存の `can_invite` と同じ注意)。

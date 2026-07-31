@@ -53,6 +53,11 @@ export function TunnelView({
   onChanged: () => void;
 }) {
   const isHost = tunnel.role === "hosting";
+  // 管理の委任(ADR-0059 J-2 拡大)。自分の行が admin なら、メンバー管理・
+  // ネットワーク設定を api.adminOp 経由(中継)で操作できる。ホストは
+  // 従来どおり host.toml を直接操作する(2 経路の分岐は各ハンドラ内で行う)。
+  const isSelfAdmin = tunnel.members.some((m) => m.isSelf && m.isAdmin);
+  const canManageMembers = isHost || isSelfAdmin;
   // RTT はコントロールチャネルで測っているので、台帳と公開鍵で突き合わせる
   const peerByKey = new Map(tunnel.peers.map((peer) => [peer.publicKey, peer]));
   /** 受信ボックスの中身(M3-9b)。status のポーリングに合わせて読み直す。 */
@@ -92,13 +97,21 @@ export function TunnelView({
     0,
   );
 
+  // メンバーの削除。ホストは host.toml を直接、admin(委任先メンバー)は
+  // api.adminOp 経由でホストへ中継する(ADR-0059 J-2 拡大)。中継の反映は
+  // 台帳配布を待つため数秒かかる旨を出す。
   const remove = async (member: Member) => {
     setBusy(true);
     setError(null);
     try {
-      const name = await api.removeMember(tunnel.config, member.publicKey);
+      if (isHost) {
+        const name = await api.removeMember(tunnel.config, member.publicKey);
+        setNotice(t.tunnel.removeNotice(name));
+      } else {
+        await api.adminOp(tunnel.config, { op: "remove_member", ip: member.ip });
+        setNotice(t.dns.adminApplyNotice);
+      }
       setRemoving(null);
-      setNotice(t.tunnel.removeNotice(name));
       setTimeout(() => setNotice(null), 8000);
       onChanged();
     } catch (e) {
@@ -112,8 +125,13 @@ export function TunnelView({
     setBusy(true);
     setError(null);
     try {
-      await api.approveMember(tunnel.config, member.publicKey);
-      setNotice(t.tunnel.member.approved);
+      if (isHost) {
+        await api.approveMember(tunnel.config, member.publicKey);
+        setNotice(t.tunnel.member.approved);
+      } else {
+        await api.adminOp(tunnel.config, { op: "approve_member", ip: member.ip });
+        setNotice(t.dns.adminApplyNotice);
+      }
       setTimeout(() => setNotice(null), 8000);
       onChanged();
     } catch (e) {
@@ -123,9 +141,10 @@ export function TunnelView({
     }
   };
 
-  // 表示名の変更(ADR-0021 / ADR-0027、M3-14a / M3-19)。DNS 名と同じく、
+  // 表示名の変更(ADR-0021 / ADR-0027、M3-14a / M3-19、ADR-0059 J-2 拡大)。
   // 自分の行はホスト = 直接 host.toml、メンバー = デーモン経由(ホストが検証)。
-  // ホストから見た他メンバーの行は renameMember(host.toml を直接)。
+  // ホストから見た他メンバーの行は renameMember(host.toml を直接)、
+  // admin から見た他メンバーの行は api.adminOp(中継)。
   const rename = async (member: Member, newName: string) => {
     setError(null);
     try {
@@ -134,8 +153,16 @@ export function TunnelView({
         else await api.setMyDisplayName(tunnel.config, newName);
         setNotice(t.tunnel.member.displayRenamed);
         setTimeout(() => setNotice(null), 8000);
-      } else {
+      } else if (isHost) {
         await api.renameMember(tunnel.config, member.publicKey, newName);
+      } else {
+        await api.adminOp(tunnel.config, {
+          op: "rename_member",
+          ip: member.ip,
+          name: newName,
+        });
+        setNotice(t.dns.adminApplyNotice);
+        setTimeout(() => setNotice(null), 8000);
       }
       onChanged();
     } catch (e) {
@@ -143,16 +170,23 @@ export function TunnelView({
     }
   };
 
-  // DNS 名の変更(ADR-0021、M3-14a)。ホストは全員分を直接、
-  // メンバーは自分の分だけデーモン経由(ホストが検証)で変更する
+  // DNS 名の変更(ADR-0021、M3-14a、ADR-0059 J-2 拡大)。ホストは全員分を
+  // 直接、メンバー本人は自分の分だけデーモン経由(ホストが検証)で変更し、
+  // admin は他メンバーの分を api.adminOp(中継)で変更する。
   const renameDns = async (member: Member, label: string) => {
     setError(null);
     try {
       if (isHost) {
         if (member.isHost) await api.setHostDnsName(tunnel.config, label);
         else await api.setMemberDnsName(tunnel.config, member.publicKey, label);
-      } else {
+      } else if (member.isSelf) {
         await api.setMyDnsName(tunnel.config, label);
+      } else {
+        await api.adminOp(tunnel.config, {
+          op: "set_member_dns_name",
+          ip: member.ip,
+          dns_name: label,
+        });
       }
       setNotice(t.tunnel.member.dnsRenamed);
       setTimeout(() => setNotice(null), 8000);
@@ -217,15 +251,16 @@ export function TunnelView({
                     {t.transfer.sendButton}
                   </button>
                 )}
-                {isHost && tunnel.members.some((m) => !m.isSelf && !m.isHost) && (
-                  <button
-                    type="button"
-                    className="button--ghost small"
-                    onClick={() => setBulkRemoving(true)}
-                  >
-                    {t.tunnel.bulkRemove.open}
-                  </button>
-                )}
+                {canManageMembers &&
+                  tunnel.members.some((m) => !m.isSelf && !m.isHost) && (
+                    <button
+                      type="button"
+                      className="button--ghost small"
+                      onClick={() => setBulkRemoving(true)}
+                    >
+                      {t.tunnel.bulkRemove.open}
+                    </button>
+                  )}
                 {isHost && (
                   <button type="button" onClick={() => setInviting(true)}>
                     {t.tunnel.invite}
@@ -265,8 +300,14 @@ export function TunnelView({
                           config={tunnel.config}
                           member={member}
                           peer={peerByKey.get(member.publicKey) ?? null}
-                          canManage={isHost && !member.isHost}
-                          canEditDns={isHost || member.isSelf}
+                          canManage={
+                            canManageMembers && !member.isHost && !member.isSelf
+                          }
+                          canEditDns={
+                            isHost ||
+                            member.isSelf ||
+                            (isSelfAdmin && !member.isHost && !member.isSelf)
+                          }
                           onChat={() => onOpenChat(member.ip)}
                           onDetail={() => setDetail(member)}
                           onRemove={() => setRemoving(member)}
@@ -315,7 +356,11 @@ export function TunnelView({
           isHost={isHost}
         />
       ) : (
-        <SubnetView configPath={tunnel.config} members={tunnel.members} />
+        <SubnetView
+          configPath={tunnel.config}
+          members={tunnel.members}
+          isHost={isHost}
+        />
       )}
 
       {inviting && (
@@ -347,6 +392,7 @@ export function TunnelView({
             detail
           }
           isHost={isHost}
+          isSelfAdmin={isSelfAdmin}
           onClose={() => setDetail(null)}
           onNotice={(text) => {
             setNotice(text);
@@ -370,6 +416,7 @@ export function TunnelView({
       {bulkRemoving && (
         <BulkRemoveDialog
           tunnel={tunnel}
+          isHost={isHost}
           onClose={() => setBulkRemoving(false)}
           onDone={(ok, failed) => {
             setBulkRemoving(false);
@@ -544,10 +591,14 @@ function SendFileDialog({
  */
 function BulkRemoveDialog({
   tunnel,
+  isHost,
   onClose,
   onDone,
 }: {
   tunnel: Tunnel;
+  /** ホストは host.toml を直接、admin(委任先メンバー)は api.adminOp
+   *  経由でホストへ中継する(ADR-0059 J-2 拡大)。 */
+  isHost: boolean;
   onClose: () => void;
   /** 実行後(ok = 成功件数、failed = 失敗件数)。0 件実行(ガードで弾いた場合)は呼ばない。 */
   onDone: (ok: number, failed: number) => void;
@@ -612,7 +663,14 @@ function BulkRemoveDialog({
     let failed = 0;
     for (const member of selected) {
       try {
-        await api.removeMember(tunnel.config, member.publicKey);
+        if (isHost) {
+          await api.removeMember(tunnel.config, member.publicKey);
+        } else {
+          await api.adminOp(tunnel.config, {
+            op: "remove_member",
+            ip: member.ip,
+          });
+        }
         ok++;
       } catch {
         failed++;
@@ -1157,6 +1215,7 @@ function MemberDetailDialog({
   config,
   member,
   isHost,
+  isSelfAdmin,
   onClose,
   onNotice,
   onError,
@@ -1164,6 +1223,9 @@ function MemberDetailDialog({
   config: string;
   member: Member;
   isHost: boolean;
+  /** 自分が管理を委任されている(ADR-0059 J-2 拡大)。can_invite の切り替えは
+   *  ホスト・admin どちらもできる(中継経由)。admin の付与・剥奪はホストのみ。 */
+  isSelfAdmin: boolean;
   onClose: () => void;
   onNotice: (text: string) => void;
   onError: (text: string) => void;
@@ -1173,13 +1235,25 @@ function MemberDetailDialog({
   const [admin, setAdmin] = useState(member.isAdmin);
   const [busy, setBusy] = useState(false);
 
+  // 招待発行の許可(ADR-0048、ADR-0059 J-2 拡大)。ホストは直接、admin は
+  // api.adminOp 経由でホストへ中継する。admin なメンバーは実効 can_invite が
+  // 常に true(個別 OFF 不可)なので、ここへは来ない(呼び出し元でチェック
+  // 済み+無効表示にする)。
   const toggleCanInvite = async (allowed: boolean) => {
     setBusy(true);
     onError("");
     try {
-      await api.setMemberCanInvite(config, member.publicKey, allowed);
+      if (isHost) {
+        await api.setMemberCanInvite(config, member.publicKey, allowed);
+      } else {
+        await api.adminOp(config, {
+          op: "set_can_invite",
+          ip: member.ip,
+          allowed,
+        });
+      }
       setCanInvite(allowed);
-      onNotice(t.tunnel.member.canInviteUpdated);
+      onNotice(isHost ? t.tunnel.member.canInviteUpdated : t.dns.adminApplyNotice);
     } catch (e) {
       onError(errorMessage(e));
     } finally {
@@ -1279,26 +1353,37 @@ function MemberDetailDialog({
         {/* 権限チェックボックスは縦に並べ、説明はツールチップ(title)に
             寄せる(M7 J-1 追補、依頼者指摘: 長文の説明でレイアウトが
             崩れていた)。 */}
-        {isHost && !member.isHost && !member.isSelf && (
+        {(isHost || isSelfAdmin) && !member.isHost && !member.isSelf && (
           <div className="member-detail__perms">
-            <label className="field--check" title={t.tunnel.member.canInviteHint}>
+            <label
+              className="field--check"
+              title={
+                member.isAdmin
+                  ? t.tunnel.member.canInviteAdminHint
+                  : t.tunnel.member.canInviteHint
+              }
+            >
               <input
                 type="checkbox"
-                checked={canInvite}
-                disabled={busy}
+                // admin は招待発行が常に可能(ADR-0059 J-2 拡大、個別 OFF 不可)。
+                // 台帳の実効値(member.canInvite)をそのまま出す
+                checked={member.isAdmin || canInvite}
+                disabled={busy || member.isAdmin}
                 onChange={(event) => void toggleCanInvite(event.target.checked)}
               />
               <span>{t.tunnel.member.canInviteLabel}</span>
             </label>
-            <label className="field--check" title={t.tunnel.member.adminHint}>
-              <input
-                type="checkbox"
-                checked={admin}
-                disabled={busy}
-                onChange={(event) => void toggleAdmin(event.target.checked)}
-              />
-              <span>{t.tunnel.member.adminLabel}</span>
-            </label>
+            {isHost && (
+              <label className="field--check" title={t.tunnel.member.adminHint}>
+                <input
+                  type="checkbox"
+                  checked={admin}
+                  disabled={busy}
+                  onChange={(event) => void toggleAdmin(event.target.checked)}
+                />
+                <span>{t.tunnel.member.adminLabel}</span>
+              </label>
+            )}
           </div>
         )}
       </div>

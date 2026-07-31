@@ -216,6 +216,18 @@ pub enum IpcRequest {
         config: PathBuf,
         op: crate::proto::AdminDnsRequest,
     },
+    /// (member のみ)汎用 Admin 中継を要求する(admin 委任、ADR-0059 J-2 拡大)。
+    /// メンバー管理・ネットワーク設定などをホストへ届け、権限確認(peer.admin)
+    /// と適用の結果を待って返す(成功 = [`IpcResponse::AdminOp`] / 拒否・
+    /// タイムアウトは Err に理由)。admin の付与・剥奪はここに含めない(常に
+    /// ホスト UI 専用)。ホスト自身の操作は従来どおり設定ファイル操作
+    /// (peercove-ops)で、IPC には乗せない。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。デスクトップ専用
+    /// (Android は対象外 = ADR-0059 決定 4)。
+    AdminOp {
+        config: PathBuf,
+        op: crate::proto::AdminRequest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -275,6 +287,12 @@ pub enum IpcResponse {
     Memo { reply: crate::memo::MemoReply },
     /// SharedMemo への応答(M5 F-2)。
     SharedMemo { reply: crate::memo::SharedMemoReply },
+    /// AdminOp への応答(admin 委任、ADR-0059 J-2 拡大)。`data` は読み取り系
+    /// の依頼(例: `ReadNetworkSettings`)にだけ載る。
+    AdminOp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<crate::proto::AdminOpData>,
+    },
 }
 
 /// 1 応答で返すチャットの上限(IPC の 1 行上限 256 KiB に収めるため、
@@ -553,6 +571,10 @@ mod tests {
                 config: PathBuf::from("member.toml"),
                 role: TunnelRole::Member,
             },
+            IpcRequest::AdminOp {
+                config: PathBuf::from("member.toml"),
+                op: crate::proto::AdminRequest::ReadNetworkSettings,
+            },
         ];
         for (i, req) in requests.into_iter().enumerate() {
             let envelope = IpcEnvelope { id: i as u64, req };
@@ -578,6 +600,16 @@ mod tests {
             IpcReply {
                 id: 3,
                 result: IpcResult::Err("トンネルは動いていません".to_string()),
+            },
+            IpcReply {
+                id: 4,
+                result: IpcResult::Ok(IpcResponse::AdminOp {
+                    data: Some(crate::proto::AdminOpData::NetworkSettings {
+                        require_invite_approval: true,
+                        member_invites: false,
+                        network_display_name: None,
+                    }),
+                }),
             },
         ];
         for reply in replies {

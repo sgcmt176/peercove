@@ -91,7 +91,8 @@ pub enum ScheduleOp {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         participants: Vec<ScheduleParticipant>,
     },
-    /// 更新(CAS)。作成者・ホストのみ。`base_revision` が現在と一致しない
+    /// 更新(CAS)。作成者・管理者(ホスト/admin)のみ(ADR-0059 J-2 拡大)。
+    /// `base_revision` が現在と一致しない
     /// 場合は競合として拒否される。応答は更新後の [`ScheduleReply::Event`]。
     Update {
         id: String,
@@ -109,7 +110,8 @@ pub enum ScheduleOp {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         participants: Vec<ScheduleParticipant>,
     },
-    /// 削除(物理削除、ゴミ箱なし = V1)。作成者・ホストのみ。
+    /// 削除(物理削除、ゴミ箱なし = V1)。作成者・管理者(ホスト/admin)のみ
+    /// (ADR-0059 J-2 拡大)。
     Delete { id: String },
 }
 

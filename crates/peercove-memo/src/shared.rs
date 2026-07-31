@@ -1230,10 +1230,11 @@ impl SharedStore {
         Ok(limits)
     }
 
-    /// 共有メモの容量・履歴上限を設定する(ホスト管理者のみ)。
+    /// 共有メモの容量・履歴上限を設定する(管理者(ホスト/admin)のみ、
+    /// ADR-0059 J-2 拡大)。
     pub fn set_limits(&self, actor: &Actor, limits: &SharedMemoLimits) -> anyhow::Result<()> {
-        if !actor.is_host() {
-            bail!("共有メモの上限設定を変更できるのはホスト管理者だけです");
+        if !(actor.is_host() || actor.admin) {
+            bail!("共有メモの上限設定を変更できるのは管理者(ホスト/admin)だけです");
         }
         limits
             .validate()
@@ -1542,7 +1543,7 @@ impl SharedStore {
     }
 
     pub fn folder_create(&mut self, actor: &Actor, name: &str) -> anyhow::Result<MemoFolder> {
-        self.require_host(actor)?;
+        self.require_admin(actor)?;
         let name = validate_folder_name(name)?;
         let exists: bool = self
             .conn
@@ -1571,7 +1572,7 @@ impl SharedStore {
     }
 
     pub fn folder_rename(&mut self, actor: &Actor, id: &str, name: &str) -> anyhow::Result<()> {
-        self.require_host(actor)?;
+        self.require_admin(actor)?;
         let name = validate_folder_name(name)?;
         let changed = self.conn.execute(
             "UPDATE folders SET name = ?1 WHERE id = ?2",
@@ -1584,7 +1585,7 @@ impl SharedStore {
     }
 
     pub fn folder_delete(&mut self, actor: &Actor, id: &str) -> anyhow::Result<()> {
-        self.require_host(actor)?;
+        self.require_admin(actor)?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE memos SET folder_id = NULL WHERE folder_id = ?1",
@@ -1598,9 +1599,11 @@ impl SharedStore {
         Ok(())
     }
 
-    fn require_host(&self, actor: &Actor) -> anyhow::Result<()> {
-        if !actor.is_host() {
-            bail!("共有フォルダーを管理できるのはホスト管理者だけです");
+    /// フォルダー管理(作成・改名・削除)ができるか(管理者(ホスト/admin)
+    /// のみ、ADR-0059 J-2 拡大)。
+    fn require_admin(&self, actor: &Actor) -> anyhow::Result<()> {
+        if !(actor.is_host() || actor.admin) {
+            bail!("共有フォルダーを管理できるのは管理者(ホスト/admin)だけです");
         }
         Ok(())
     }
@@ -1627,8 +1630,9 @@ impl SharedStore {
     // ---- 共有スケジュール表(M6 G-1、ADR-0053) ----
     //
     // 権限はメモよりずっと単純: ネットワーク全員が閲覧・追加でき、編集・
-    // 削除は作成者 + ホストだけ(決定 3)。ゴミ箱は持たず物理削除、編集
-    // ロックも持たず revision CAS のみで競合を検知する(決定 4)。
+    // 削除は作成者 + 管理者(ホスト/admin、ADR-0059 J-2 拡大)だけ
+    // (決定 3)。ゴミ箱は持たず物理削除、編集ロックも持たず revision CAS
+    // のみで競合を検知する(決定 4)。
 
     fn schedule_row(&self, id: &str) -> anyhow::Result<ScheduleRow> {
         self.conn
@@ -1709,7 +1713,8 @@ impl SharedStore {
         self.schedule_get(actor, &id)
     }
 
-    /// 更新(CAS)。作成者 + ホストのみ(ADR-0053 決定 3・4)。
+    /// 更新(CAS)。作成者 + 管理者(ホスト/admin)のみ(ADR-0053 決定 3・4、
+    /// ADR-0059 J-2 拡大)。
     #[allow(clippy::too_many_arguments)]
     pub fn schedule_update(
         &mut self,
@@ -1728,8 +1733,8 @@ impl SharedStore {
         validate_schedule_range(start_unix_ms, end_unix_ms)?;
         validate_schedule_participants(participants)?;
         let row = self.schedule_row(id)?;
-        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
-            bail!("この予定を編集できるのは作成者とホスト管理者だけです");
+        if !(actor.is_host() || actor.admin || row.owner_id == actor.owner_id()) {
+            bail!("この予定を編集できるのは作成者と管理者(ホスト/admin)だけです");
         }
         if row.revision as u64 != base_revision {
             bail!("competing_edit: 他の端末の変更が先に保存されています(最新を読み込み直してください)");
@@ -1756,11 +1761,12 @@ impl SharedStore {
         self.schedule_get(actor, id)
     }
 
-    /// 削除(物理削除、ゴミ箱なし = V1)。作成者 + ホストのみ。
+    /// 削除(物理削除、ゴミ箱なし = V1)。作成者 + 管理者(ホスト/admin)のみ
+    /// (ADR-0059 J-2 拡大)。
     pub fn schedule_delete(&mut self, actor: &Actor, id: &str) -> anyhow::Result<()> {
         let row = self.schedule_row(id)?;
-        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
-            bail!("この予定を削除できるのは作成者とホスト管理者だけです");
+        if !(actor.is_host() || actor.admin || row.owner_id == actor.owner_id()) {
+            bail!("この予定を削除できるのは作成者と管理者(ホスト/admin)だけです");
         }
         self.conn
             .execute("DELETE FROM schedule_events WHERE id = ?1", params![id])?;
@@ -1769,7 +1775,8 @@ impl SharedStore {
 
     // ---- 共有シート(M6 G-2、ADR-0054) ----
     //
-    // シート(メタ)の作成は全員可。改名・削除は作成者 + ホストのみ。
+    // シート(メタ)の作成は全員可。改名・削除は作成者 + 管理者(ホスト/admin、
+    // ADR-0059 J-2 拡大)のみ。
     // セルの読み取り・書き込みは全員可(決定 5)。アドレスは固定(行・列の
     // 挿入/削除による繰り上げは持たない、決定 3)。競合はセル単位の
     // revision CAS のみ(決定 4)。
@@ -1838,7 +1845,7 @@ impl SharedStore {
         self.sheet_get(actor, &id)
     }
 
-    /// 改名(作成者 + ホストのみ、決定 5)。
+    /// 改名(作成者 + 管理者(ホスト/admin)のみ、決定 5。ADR-0059 J-2 拡大)。
     pub fn sheet_rename(
         &mut self,
         actor: &Actor,
@@ -1847,8 +1854,8 @@ impl SharedStore {
     ) -> anyhow::Result<SheetMeta> {
         validate_sheet_name(name)?;
         let row = self.sheet_row(id)?;
-        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
-            bail!("このシートを改名できるのは作成者とホスト管理者だけです");
+        if !(actor.is_host() || actor.admin || row.owner_id == actor.owner_id()) {
+            bail!("このシートを改名できるのは作成者と管理者(ホスト/admin)だけです");
         }
         self.conn.execute(
             "UPDATE sheets SET name = ?1, updated_at = ?2 WHERE id = ?3",
@@ -1857,11 +1864,12 @@ impl SharedStore {
         self.sheet_get(actor, id)
     }
 
-    /// 削除(作成者 + ホストのみ、決定 5)。セルもまとめて削除する。
+    /// 削除(作成者 + 管理者(ホスト/admin)のみ、決定 5。ADR-0059 J-2 拡大)。
+    /// セルもまとめて削除する。
     pub fn sheet_delete(&mut self, actor: &Actor, id: &str) -> anyhow::Result<()> {
         let row = self.sheet_row(id)?;
-        if !(actor.is_host() || row.owner_id == actor.owner_id()) {
-            bail!("このシートを削除できるのは作成者とホスト管理者だけです");
+        if !(actor.is_host() || actor.admin || row.owner_id == actor.owner_id()) {
+            bail!("このシートを削除できるのは作成者と管理者(ホスト/admin)だけです");
         }
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM sheet_cells WHERE sheet_id = ?1", params![id])?;
@@ -2253,9 +2261,10 @@ struct ScheduleRow {
 }
 
 impl ScheduleRow {
-    /// can_edit は作成者本人かホストなら真(ADR-0053 決定 3)。
+    /// can_edit は作成者本人か管理者(ホスト/admin)なら真(ADR-0053 決定 3、
+    /// ADR-0059 J-2 拡大)。
     fn into_event(self, actor: &Actor) -> ScheduleEvent {
-        let can_edit = actor.is_host() || self.owner_id == actor.owner_id();
+        let can_edit = actor.is_host() || actor.admin || self.owner_id == actor.owner_id();
         let participants: Vec<ScheduleParticipant> =
             serde_json::from_str(&self.participants).unwrap_or_default();
         ScheduleEvent {
@@ -2355,9 +2364,10 @@ struct SheetRow {
 }
 
 impl SheetRow {
-    /// can_manage は作成者本人かホストなら真(ADR-0054 決定 5)。
+    /// can_manage は作成者本人か管理者(ホスト/admin)なら真(ADR-0054 決定 5、
+    /// ADR-0059 J-2 拡大)。
     fn into_meta(self, actor: &Actor) -> SheetMeta {
-        let can_manage = actor.is_host() || self.owner_id == actor.owner_id();
+        let can_manage = actor.is_host() || actor.admin || self.owner_id == actor.owner_id();
         SheetMeta {
             id: self.id,
             name: self.name,
@@ -3876,6 +3886,20 @@ mod tests {
         assert_eq!(store.get(&alice, &memo.id).unwrap().folder_id, None);
     }
 
+    /// admin 委任メンバーもフォルダーの作成・改名・削除ができる
+    /// (ADR-0059 J-2 拡大)。非 admin メンバーは引き続き拒否される。
+    #[test]
+    fn folders_admin_managed() {
+        let (_dir, mut store) = open_temp();
+        let admin = Actor::member("id-admin", "アドミン").with_admin(true);
+        let alice = Actor::member("id-alice", "アリス");
+        assert!(store.folder_create(&alice, "共有").is_err());
+        let folder = store.folder_create(&admin, "共有").unwrap();
+        store.folder_rename(&admin, &folder.id, "改名済み").unwrap();
+        store.folder_delete(&admin, &folder.id).unwrap();
+        assert!(store.folders().unwrap().is_empty());
+    }
+
     #[test]
     fn limits_validate_and_permission() {
         let (_dir, store) = open_temp();
@@ -3898,6 +3922,19 @@ mod tests {
         };
         store.set_limits(&host, &ok).unwrap();
         assert_eq!(store.limits().unwrap().trash_days, 7);
+    }
+
+    /// admin 委任メンバーも上限設定を変更できる(ADR-0059 J-2 拡大)。
+    #[test]
+    fn limits_admin_permission() {
+        let (_dir, store) = open_temp();
+        let admin = Actor::member("id-admin", "アドミン").with_admin(true);
+        let ok = SharedMemoLimits {
+            trash_days: 3,
+            ..Default::default()
+        };
+        store.set_limits(&admin, &ok).unwrap();
+        assert_eq!(store.limits().unwrap().trash_days, 3);
     }
 
     #[test]
@@ -4716,6 +4753,39 @@ mod tests {
         assert!(store.schedule_delete(&host, &event.id).is_ok());
     }
 
+    /// admin 委任メンバーも他人の予定を編集・削除できる(ADR-0059 J-2
+    /// 拡大)。can_edit(into_event の計算)も admin には真を返す。
+    #[test]
+    fn schedule_edit_delete_by_admin() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let admin = Actor::member("id-admin", "アドミン").with_admin(true);
+
+        let event = store
+            .schedule_create(&alice, "アリスの予定", "", 1_000, None, false, &[])
+            .unwrap();
+        assert!(
+            store.schedule_get(&admin, &event.id).unwrap().can_edit,
+            "admin には can_edit = true が返る"
+        );
+
+        let by_admin = store
+            .schedule_update(
+                &admin,
+                &event.id,
+                event.revision,
+                "adminが編集",
+                "",
+                1_000,
+                None,
+                false,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(by_admin.title, "adminが編集");
+        assert!(store.schedule_delete(&admin, &event.id).is_ok());
+    }
+
     /// revision CAS(決定 4): 古い revision での更新は拒否される。
     #[test]
     fn schedule_update_rejects_stale_revision() {
@@ -4988,6 +5058,27 @@ mod tests {
             .unwrap();
         assert_eq!(by_host.name, "ホストが改名");
         assert!(store.sheet_delete(&host, &sheet.id).is_ok());
+    }
+
+    /// admin 委任メンバーも他人のシートを改名・削除できる(ADR-0059 J-2
+    /// 拡大)。can_manage(into_meta の計算)も admin には真を返す。
+    #[test]
+    fn sheet_manage_by_admin() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let admin = Actor::member("id-admin", "アドミン").with_admin(true);
+
+        let sheet = store.sheet_create(&alice, "アリスの表").unwrap();
+        assert!(
+            store.sheet_get(&admin, &sheet.id).unwrap().can_manage,
+            "admin には can_manage = true が返る"
+        );
+
+        let by_admin = store
+            .sheet_rename(&admin, &sheet.id, "adminが改名")
+            .unwrap();
+        assert_eq!(by_admin.name, "adminが改名");
+        assert!(store.sheet_delete(&admin, &sheet.id).is_ok());
     }
 
     /// セル書き込みは全員可(決定 5)。新規セルは revision 1、

@@ -547,12 +547,17 @@ pub async fn supervise(
                     ledger_rx,
                     Arc::clone(&connections),
                     Arc::clone(&rtt),
-                    Arc::new(control::HostRequests::new(
-                        config_path.to_path_buf(),
-                        host_public_key,
-                        external_endpoint,
-                        memo_service,
-                    )),
+                    Arc::new(
+                        control::HostRequests::new(
+                            config_path.to_path_buf(),
+                            host_public_key,
+                            external_endpoint,
+                            memo_service,
+                        )
+                        // admin 中継の DnsCheckNow(ADR-0059 J-2 拡大)がこのトンネルの
+                        // ヘルス監視を即時実行できるようにする
+                        .with_health(health.clone()),
+                    ),
                 )));
             }
             Role::Member => {
@@ -1034,8 +1039,11 @@ fn build_ledger(
             capabilities: vec![],
             // 同一性 ID(再追加検知用)。鍵ローテーションでは変わらない
             member_id: peer.invite_id.clone(),
-            // 招待発行の可否(ADR-0048)。グローバルトグルと端末指名の AND
-            can_invite: config.interface.member_invites && peer.can_invite,
+            // 招待発行の可否(ADR-0048)。グローバルトグルと「端末指名 or admin」の AND。
+            // admin は招待発行が常に可能(ADR-0059 J-2 拡大、依頼者指定)。個別 OFF
+            // はできない(実効値だけを台帳に載せ、host.toml の can_invite は変えない —
+            // admin を外せば従来の個別値に戻る)
+            can_invite: config.interface.member_invites && (peer.can_invite || peer.admin),
             // 管理の委任(ADR-0059)。グローバルトグルは無い
             is_admin: peer.admin,
             // 招待者(ADR-0048)。現在名に解決し、発行者が消えていれば
@@ -1644,6 +1652,34 @@ mod tests {
         assert!(!ledger[0].is_admin, "ホスト自身のエントリは false のまま");
         assert!(ledger[1].is_admin, "admin = true のピアは is_admin が立つ");
         assert!(!ledger[2].is_admin, "既定は非管理者");
+    }
+
+    /// 招待発行の実効値(ADR-0059 J-2 拡大、依頼者指定): admin は
+    /// can_invite = false のままでも実効的に true(常に招待発行できる)。
+    /// host.toml の can_invite は書き換えないので、admin を外せば個別値
+    /// (false)に戻る。グローバルトグル(member_invites)が OFF なら admin でも false。
+    #[test]
+    fn build_ledger_admin_grants_effective_can_invite() {
+        let admin_key = PrivateKey::generate().public_key();
+        let config = host_config(&format!(
+            "[[peer]]\nname = \"alice\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\nadmin = true\n"
+        ));
+        let host_key = PrivateKey::generate().public_key();
+        let ledger = build_ledger(&config, &host_key, &[]);
+        assert!(
+            ledger[1].can_invite,
+            "can_invite が false でも admin なら実効 true"
+        );
+
+        // グローバルトグル(member_invites)が OFF なら admin でも招待発行できない
+        let config = host_config(&format!(
+            "member_invites = false\n[[peer]]\nname = \"alice\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\nadmin = true\n"
+        ));
+        let ledger = build_ledger(&config, &host_key, &[]);
+        assert!(
+            !ledger[1].can_invite,
+            "グローバルトグル OFF では admin でも false"
+        );
     }
 
     /// 鍵ローテーション(ADR-0020): 同じ IP を設定内の別の鍵が引き継いだら、

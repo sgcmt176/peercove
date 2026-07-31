@@ -277,6 +277,11 @@ export default function App() {
   const detailName =
     openTunnel?.networkDisplayName || openTunnel?.network || openInfo?.name || "";
   const detailHost = (openTunnel?.role ?? openInfo?.role) === "hosting";
+  // 管理の委任(ADR-0059 J-2 拡大)。自分が admin なら、ネットワーク表示名の
+  // 変更などホスト専用だった一部操作を中継経由で開放する
+  const detailSelfAdmin =
+    openTunnel?.members.some((member) => member.isSelf && member.isAdmin) ??
+    false;
   const myDisplayName =
     openTunnel?.members.find((member) => member.isSelf)?.name?.trim() || null;
   const chatUnread = openTunnel ? totalUnread(openTunnel) : 0;
@@ -379,7 +384,7 @@ export default function App() {
                 disabled={openTunnel === null}
                 onClick={() => setView("dns")}
               />
-              {detailHost && (
+              {(detailHost || detailSelfAdmin) && (
                 <>
                   <SidebarItem
                     icon="🖧"
@@ -504,6 +509,7 @@ export default function App() {
             configPath={openConfig!}
             myDisplayName={myDisplayName}
             isHost={detailHost}
+            isSelfAdmin={detailSelfAdmin}
             running={openTunnel !== null}
             rejected={Boolean(openTunnel?.connectionError)}
             disconnecting={disconnecting}
@@ -578,11 +584,18 @@ export default function App() {
               configPath={openConfig!}
               liveInterfaceName={openTunnel?.interfaceName ?? null}
               isConnected={openTunnel !== null}
+              isSelfAdmin={detailSelfAdmin}
             />
           ) : view === "diagnostics" ? (
             <DiagnosticsView configPath={openConfig!} />
-          ) : view === "acl" && detailHost && openTunnel !== null ? (
-            <AclView configPath={openTunnel.config} members={openTunnel.members} />
+          ) : view === "acl" &&
+            (detailHost || detailSelfAdmin) &&
+            openTunnel !== null ? (
+            <AclView
+              configPath={openTunnel.config}
+              members={openTunnel.members}
+              isHost={detailHost}
+            />
           ) : view === "net-memos" && openTunnel !== null ? (
             <SharedHubView
               configPath={openTunnel.config}
@@ -643,6 +656,7 @@ function DetailHeader({
   configPath,
   myDisplayName,
   isHost,
+  isSelfAdmin,
   running,
   rejected,
   disconnecting,
@@ -654,6 +668,9 @@ function DetailHeader({
   configPath: string;
   myDisplayName: string | null;
   isHost: boolean;
+  /** 自分が管理を委任されている(ADR-0059 J-2 拡大)。ホストでなくても
+   *  ネットワーク表示名を変更できる(中継経由)。 */
+  isSelfAdmin: boolean;
   running: boolean;
   rejected: boolean;
   disconnecting: boolean;
@@ -662,8 +679,9 @@ function DetailHeader({
   /** ネットワーク表示名を変更した(ADR-0058)。呼び出し側が再取得する。 */
   onRenamed: () => void;
 }) {
-  // ネットワーク表示名の変更(ADR-0058、ホストのみ)。DNS 名・スラッグは
-  // 変わらない。保存は設定 API 経由(他項目は現在値のまま書き戻す)
+  // ネットワーク表示名の変更(ADR-0058、ホストのみ。ADR-0059 J-2 拡大で
+  // admin にも開放)。DNS 名・スラッグは変わらない。ホストは設定 API 経由
+  // (他項目は現在値のまま書き戻す)、admin は adminOp 経由(中継)
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState(name);
   const [busy, setBusy] = useState(false);
@@ -679,21 +697,28 @@ function DetailHeader({
     setBusy(true);
     setError(null);
     try {
-      const current = await api.readSettings(configPath);
       const trimmed = value.trim();
-      await api.saveSettings(configPath, {
-        displayName: current.displayName,
-        dnsName: current.dnsName,
-        networkDisplayName: trimmed === "" ? null : trimmed,
-        listenPort: current.listenPort,
-        mtu: current.mtu,
-        hostEndpoint: current.hostEndpoint,
-        direct: current.direct,
-        maxRecvFileMb: current.maxRecvFileMb,
-        requireInviteApproval: current.requireInviteApproval,
-        memberInvites: current.memberInvites,
-        autoConnect: current.autoConnect,
-      });
+      if (isHost) {
+        const current = await api.readSettings(configPath);
+        await api.saveSettings(configPath, {
+          displayName: current.displayName,
+          dnsName: current.dnsName,
+          networkDisplayName: trimmed === "" ? null : trimmed,
+          listenPort: current.listenPort,
+          mtu: current.mtu,
+          hostEndpoint: current.hostEndpoint,
+          direct: current.direct,
+          maxRecvFileMb: current.maxRecvFileMb,
+          requireInviteApproval: current.requireInviteApproval,
+          memberInvites: current.memberInvites,
+          autoConnect: current.autoConnect,
+        });
+      } else {
+        await api.adminOp(configPath, {
+          op: "set_network_display_name",
+          name: trimmed === "" ? null : trimmed,
+        });
+      }
       setEditing(false);
       onRenamed();
     } catch (e) {
@@ -749,7 +774,7 @@ function DetailHeader({
       ) : (
         <h2 className="detail__title">
           {name}
-          {isHost && (
+          {(isHost || isSelfAdmin) && (
             <button
               type="button"
               className="button--icon detail__rename-btn"

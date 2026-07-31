@@ -191,6 +191,144 @@ pub enum ControlMessage {
     /// host → member: [`ControlMessage::AdminDnsOp`] への応答(依頼が来た
     /// 接続にだけ返す)。
     AdminDnsResult { accepted: bool, message: String },
+    /// member → host: 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)。
+    /// メンバー管理・ネットワーク設定など、admin の付与・剥奪以外の操作を
+    /// ホストへ中継する。発行者が admin かどうかは常にホストが host.toml 正本
+    /// (`PeerConfig.admin`)で依頼ごとに検証する(メンバー UI の出し分けは
+    /// 入り口の親切にすぎない)。変更系は既存の周期的な台帳再配布に自動で乗る。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
+    /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
+    AdminOp { op: AdminRequest },
+    /// host → member: [`ControlMessage::AdminOp`] への応答(依頼が来た接続に
+    /// だけ返す)。`data` は読み取り系の依頼(例: [`AdminRequest::ReadNetworkSettings`])
+    /// にだけ載る。
+    AdminOpResult {
+        accepted: bool,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<AdminOpData>,
+    },
+}
+
+/// [`ControlMessage::AdminOp`] の中身(ADR-0059 J-2 拡大)。admin の
+/// 付与・剥奪(`set_peer_admin`)はここに**含めない**(権限の連鎖を防ぐため
+/// 常にホスト UI 専用 — ADR-0059)。
+///
+/// additive なタグ付き enum なので、将来 variant を足しても旧バージョンとは
+/// 互いに無視し合う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AdminRequest {
+    /// メンバーの削除。対象にホスト自身・依頼者自身は指定できない
+    /// (ホスト正本で拒否する — 事故防止)。
+    RemoveMember { ip: Ipv4Addr },
+    /// メンバーの表示名変更。
+    RenameMember { ip: Ipv4Addr, name: String },
+    /// 承認待ち端末の承認。
+    ApproveMember { ip: Ipv4Addr },
+    /// メンバー招待の発行許可(端末指名)の切り替え。
+    SetCanInvite { ip: Ipv4Addr, allowed: bool },
+    /// 他メンバーの DNS 名の変更。
+    SetMemberDnsName { ip: Ipv4Addr, dns_name: String },
+    /// ネットワーク設定(承認制・メンバー招待許可・表示名)の現在値を読む。
+    /// 応答は [`AdminOpData::NetworkSettings`]。
+    ReadNetworkSettings,
+    /// 新規参加端末を承認まで隔離するか。
+    SetRequireApproval { enabled: bool },
+    /// メンバーによる招待発行を許可するか(グローバルトグル)。
+    SetMemberInvites { enabled: bool },
+    /// ネットワーク表示名(ADR-0058)。`None` で削除(既定表示に戻る)。
+    SetNetworkDisplayName {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// ACL v2 ポリシー全体の現在値を読む(ADR-0059 J-2 拡大)。
+    /// 応答は [`AdminOpData::AclPolicy`]。
+    AclRead,
+    /// ACL v2 ポリシー全体を差し替える(`peercove_ops::acl::write_policy` と同じ、
+    /// 旧 deny pair は保存時に v2 へ移行される)。admin が自分自身への制限を
+    /// 外せてしまう点は ADR-0059 で許容済み(最終判定は常にホスト側)。
+    AclWrite { policy: AclPolicyWire },
+    /// メンバーの広告サブネット(ADR-0014)を丸ごと差し替える。空で解除。
+    /// CIDR のパースはホスト側で行い、不正な文字列はエラー応答になる。
+    SetSubnets { ip: Ipv4Addr, subnets: Vec<String> },
+    /// ホストの DNS サービス監視を間隔前でも再実行する(M3-14e と同じ処理を
+    /// admin 中継で呼べるようにしたもの)。応答に `data` は載らない。
+    DnsCheckNow,
+    /// カスタム DNS レコードの完全な一覧を読む(id・ヘルス設定の現在値つき)。
+    /// 応答は [`AdminOpData::DnsRecords`]。J-1c の既知の制限(admin のヘルス
+    /// 編集が既定値から始まる / id 未付番レコードを操作できない)を解消する
+    /// (`peercove_ops::dns::list_records` が id の遅延付番も行うため)。
+    DnsListFull,
+}
+
+/// [`AdminRequest::AclWrite`] / [`AdminOpData::AclPolicy`] が共用する ACL v2
+/// ポリシー全体のワイヤ表現。`peercove_ops::acl::PolicySettings` と同じ形
+/// (default/groups/rules)だが、peercove-core は peercove-ops に依存できない
+/// ためここへ最小のミラー型を置く(フィールドの型自体は peercove_core::acl の
+/// 型をそのまま流用)。ops::acl::PolicySettings との変換は control.rs が行う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AclPolicyWire {
+    pub default: crate::acl::AclAction,
+    #[serde(default)]
+    pub groups: Vec<crate::acl::AclGroup>,
+    #[serde(default)]
+    pub rules: Vec<crate::acl::AclRule>,
+}
+
+/// [`AdminRequest::DnsListFull`] への応答内の 1 レコード。
+/// `peercove_ops::dns::RecordDetail` を平坦化したもの(ターゲットは
+/// ip / member / cname のいずれか — [`AdminDnsRequest::Add`] と同じ表現)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDnsRecord {
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<Ipv4Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<crate::config::MemberRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cname: Option<String>,
+    /// 親メンバー(端末配下サブドメインのとき)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub under: Option<crate::config::MemberRef>,
+    /// under を親ラベルへ解決したドット付き相対名(`web.alice` 等)。
+    pub relative: String,
+    pub fqdn: String,
+    /// member ターゲットを現在の仮想 IP へ解決した値(参照切れは None)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ip: Option<Ipv4Addr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub health_enabled: bool,
+    pub health_kind: crate::dns::HealthCheckKind,
+    pub health_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_expected_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub health_external: bool,
+}
+
+/// [`ControlMessage::AdminOpResult`] の `data`(読み取り系の応答のみ)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AdminOpData {
+    /// [`AdminRequest::ReadNetworkSettings`] への応答。
+    NetworkSettings {
+        require_invite_approval: bool,
+        member_invites: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_display_name: Option<String>,
+    },
+    /// [`AdminRequest::AclRead`] への応答。
+    AclPolicy { policy: AclPolicyWire },
+    /// [`AdminRequest::DnsListFull`] への応答。
+    DnsRecords { records: Vec<AdminDnsRecord> },
 }
 
 /// [`ControlMessage::AdminDnsOp`] の中身(ADR-0059 決定 3、J-1c)。
@@ -455,6 +593,138 @@ mod tests {
             ControlMessage::AdminDnsResult {
                 accepted: false,
                 message: "管理が委任されていません".to_string(),
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::RemoveMember {
+                    ip: "100.100.42.2".parse().unwrap(),
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::RenameMember {
+                    ip: "100.100.42.2".parse().unwrap(),
+                    name: "アリス".to_string(),
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::ApproveMember {
+                    ip: "100.100.42.2".parse().unwrap(),
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::SetCanInvite {
+                    ip: "100.100.42.2".parse().unwrap(),
+                    allowed: true,
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::SetMemberDnsName {
+                    ip: "100.100.42.2".parse().unwrap(),
+                    dns_name: "alice".to_string(),
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::ReadNetworkSettings,
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::SetRequireApproval { enabled: true },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::SetMemberInvites { enabled: false },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::SetNetworkDisplayName {
+                    name: Some("うちの LAN".to_string()),
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::SetNetworkDisplayName { name: None },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::AclRead,
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::AclWrite {
+                    policy: AclPolicyWire {
+                        default: crate::acl::AclAction::Deny,
+                        groups: vec![crate::acl::AclGroup {
+                            id: "servers".to_string(),
+                            members: vec![PrivateKey::generate().public_key()],
+                        }],
+                        rules: vec![crate::acl::AclRule {
+                            id: "deny-servers".to_string(),
+                            action: crate::acl::AclAction::Deny,
+                            source: crate::acl::AclTarget::Any("any".to_string()),
+                            destination: crate::acl::AclTarget::Group {
+                                group: "servers".to_string(),
+                            },
+                            protocol: crate::acl::AclProtocol::Tcp,
+                            ports: vec!["8080".to_string()],
+                            enabled: true,
+                        }],
+                    },
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::SetSubnets {
+                    ip: "100.100.42.2".parse().unwrap(),
+                    subnets: vec!["192.168.10.0/24".to_string()],
+                },
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::DnsCheckNow,
+            },
+            ControlMessage::AdminOp {
+                op: AdminRequest::DnsListFull,
+            },
+            ControlMessage::AdminOpResult {
+                accepted: true,
+                message: "削除しました".to_string(),
+                data: None,
+            },
+            ControlMessage::AdminOpResult {
+                accepted: true,
+                message: "現在の設定を取得しました".to_string(),
+                data: Some(AdminOpData::NetworkSettings {
+                    require_invite_approval: true,
+                    member_invites: false,
+                    network_display_name: Some("うちの LAN".to_string()),
+                }),
+            },
+            ControlMessage::AdminOpResult {
+                accepted: true,
+                message: "現在の ACL ポリシーを取得しました".to_string(),
+                data: Some(AdminOpData::AclPolicy {
+                    policy: AclPolicyWire {
+                        default: crate::acl::AclAction::Allow,
+                        groups: vec![],
+                        rules: vec![],
+                    },
+                }),
+            },
+            ControlMessage::AdminOpResult {
+                accepted: true,
+                message: "DNS レコード一覧を取得しました".to_string(),
+                data: Some(AdminOpData::DnsRecords {
+                    records: vec![AdminDnsRecord {
+                        id: Some("svc-1".to_string()),
+                        name: "web".to_string(),
+                        ip: Some("10.100.42.50".parse().unwrap()),
+                        member: None,
+                        cname: None,
+                        under: Some(crate::config::MemberRef::Host),
+                        relative: "web.host".to_string(),
+                        fqdn: "web.host.home.peercove.internal".to_string(),
+                        resolved_ip: Some("10.100.42.50".parse().unwrap()),
+                        scheme: Some("http".to_string()),
+                        port: Some(8080),
+                        url: Some("http://web.host.home.peercove.internal:8080/".to_string()),
+                        health_enabled: true,
+                        health_kind: crate::dns::HealthCheckKind::HttpHead,
+                        health_path: "/ready".to_string(),
+                        health_expected_status: Some(204),
+                        health_external: false,
+                    }],
+                }),
             },
         ];
         for message in messages {

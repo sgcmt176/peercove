@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -325,6 +326,15 @@ pub struct InviteReply {
     pub expires_at: Option<u64>,
 }
 
+/// [`ControlMessage::AdminOpResult`] の中身(メンバー側の受け口用、ADR-0059
+/// J-2 拡大)。
+#[derive(Debug)]
+pub struct AdminOpReply {
+    pub accepted: bool,
+    pub message: String,
+    pub data: Option<peercove_core::proto::AdminOpData>,
+}
+
 #[derive(Default)]
 struct MemberLinkState {
     /// セッション世代。接続のたびに増える(「このセッションで依頼済みか」の判定用)。
@@ -342,6 +352,9 @@ struct MemberLinkState {
     /// DNS 管理依頼(admin 委任、ADR-0059 決定 3、J-1c)の応答待ち。
     /// dns_reply と同じ仕組み。
     dns_admin_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
+    /// 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)の応答待ち。
+    /// dns_reply と同じ仕組み。
+    admin_op_reply: Option<tokio::sync::oneshot::Sender<AdminOpReply>>,
     /// 共有メモ(M5 F-2)の応答待ち(seq → 受け口)。他の依頼と違い
     /// 同時に複数飛ばせる(一覧 + 本文の取り直しなど)。
     memo_pending: HashMap<u64, tokio::sync::oneshot::Sender<peercove_core::memo::SharedMemoReply>>,
@@ -454,6 +467,24 @@ impl MemberLink {
         Some(rx)
     }
 
+    /// 汎用 Admin 操作をホストへ依頼し、応答の受け口を返す(admin 委任、
+    /// ADR-0059 J-2 拡大)。切断中なら `None`。仕組みは [`Self::request_dns_name`]
+    /// と同じ。最終判定は常にホスト側(peer.admin)なので、ここでは権限
+    /// チェックしない。
+    pub fn request_admin_op(
+        &self,
+        op: peercove_core::proto::AdminRequest,
+    ) -> Option<tokio::sync::oneshot::Receiver<AdminOpReply>> {
+        let mut state = self.inner.lock().unwrap();
+        let outbox = state.outbox.as_ref()?;
+        if outbox.send(ControlMessage::AdminOp { op }).is_err() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.admin_op_reply = Some(tx);
+        Some(rx)
+    }
+
     /// 共有メモの操作をホストへ送り、応答の受け口を返す(M5 F-2)。
     /// 切断中なら `None`。他の依頼と違い同時に複数を待てる。
     pub fn request_memo(
@@ -487,6 +518,7 @@ impl MemberLink {
         state.display_reply = None;
         state.invite_reply = None;
         state.dns_admin_reply = None;
+        state.admin_op_reply = None;
         state.memo_pending.clear();
         state.connection_error = None;
     }
@@ -498,6 +530,7 @@ impl MemberLink {
         state.display_reply = None;
         state.invite_reply = None;
         state.dns_admin_reply = None;
+        state.admin_op_reply = None;
         state.memo_pending.clear();
     }
 
@@ -526,6 +559,12 @@ impl MemberLink {
     fn put_dns_admin_result(&self, accepted: bool, message: String) {
         if let Some(reply) = self.inner.lock().unwrap().dns_admin_reply.take() {
             let _ = reply.send((accepted, message));
+        }
+    }
+
+    fn put_admin_op_result(&self, reply: AdminOpReply) {
+        if let Some(sender) = self.inner.lock().unwrap().admin_op_reply.take() {
+            let _ = sender.send(reply);
         }
     }
 
@@ -563,6 +602,11 @@ pub struct HostRequests {
     memo: Arc<crate::memoshare::MemoService>,
     /// host.toml の読み書きを直列化する(複数メンバーの同時依頼)。
     lock: tokio::sync::Mutex<()>,
+    /// DNS ヘルスチェックの即時実行(admin 中継、ADR-0059 J-2 拡大)。稼働中
+    /// トンネルの `daemon::Active::health` と同じ実体を共有する。`with_health`
+    /// で差し込まれるまでは `None`(単体テストなど)で、その間は
+    /// `AdminRequest::DnsCheckNow` を「このネットワークは稼働していません」で拒否する。
+    health: Option<crate::health::SharedHealth>,
 }
 
 impl HostRequests {
@@ -578,7 +622,15 @@ impl HostRequests {
             external_endpoint,
             memo,
             lock: tokio::sync::Mutex::new(()),
+            health: None,
         }
+    }
+
+    /// 稼働中トンネルのヘルス監視を差し込む(admin 中継の DnsCheckNow 用、
+    /// ADR-0059 J-2 拡大)。`supervise` の Role::Host 分岐でだけ呼ばれる。
+    pub fn with_health(mut self, health: crate::health::SharedHealth) -> Self {
+        self.health = Some(health);
+        self
     }
 
     /// 鍵ローテーション依頼を適用し、(accepted, メッセージ) を返す。
@@ -700,7 +752,9 @@ impl HostRequests {
                 &config,
                 &peercove_ops::peers::Selector::Ip(member_ip),
             )?;
-            if !issuer.can_invite {
+            // admin は招待発行が常に可能(ADR-0059 J-2 拡大、依頼者指定)。
+            // 個別 OFF はできない
+            if !(issuer.can_invite || issuer.admin) {
                 anyhow::bail!(
                     "この端末には招待発行の権限がありません(ホスト管理者が許可すると使えます)"
                 );
@@ -877,6 +931,262 @@ impl HostRequests {
         }
     }
 
+    /// 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)を適用し、応答メッセージを
+    /// 返す。権限(peer.admin)は依頼ごとに host.toml 正本で確認する。admin の
+    /// 付与・剥奪はここに含めない(常にホスト UI 専用 — ADR-0059)。配布(台帳の
+    /// 再配布・設定の反映)は既存の周期処理に自動で乗るため、ここでは追加の
+    /// 配布処理を書かない。
+    async fn apply_admin_op(
+        &self,
+        member_ip: Ipv4Addr,
+        op: peercove_core::proto::AdminRequest,
+    ) -> ControlMessage {
+        use peercove_core::proto::{AdminOpData, AdminRequest};
+        let _guard = self.lock.lock().await;
+        let path = self.config_path.clone();
+        let approved_at = unix_secs();
+        // DnsCheckNow はネットワーク全体への副作用(file IO なし)なので、
+        // spawn_blocking の外で Arc を複製して移す(SharedHealth は Arc<Mutex<_>>)
+        let health = self.health.clone();
+        let outcome = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(String, Option<AdminOpData>)> {
+                let config = peercove_core::config::Config::load(&path)?;
+                let actor = peercove_ops::peers::find_peer(
+                    &config,
+                    &peercove_ops::peers::Selector::Ip(member_ip),
+                )?;
+                if !actor.admin {
+                    anyhow::bail!("管理が委任されていません");
+                }
+                // 対象がホスト自身・依頼者自身でないことを確認する(admin が
+                // 自分やホストを操作してしまう事故防止)。
+                let guard_target = |ip: Ipv4Addr| -> anyhow::Result<()> {
+                    if ip == member_ip {
+                        anyhow::bail!("自分自身は対象にできません");
+                    }
+                    if ip == config.interface.address.addr() {
+                        anyhow::bail!("ホストは対象にできません");
+                    }
+                    Ok(())
+                };
+                match op {
+                    AdminRequest::RemoveMember { ip } => {
+                        guard_target(ip)?;
+                        let removed = peercove_ops::peers::remove_peer(
+                            &path,
+                            &peercove_ops::peers::Selector::Ip(ip),
+                        )?;
+                        Ok((
+                            format!(
+                                "{} を削除しました(数秒〜数十秒でトンネルから除外されます)",
+                                removed.display
+                            ),
+                            None,
+                        ))
+                    }
+                    AdminRequest::RenameMember { ip, name } => {
+                        guard_target(ip)?;
+                        peercove_ops::peers::rename_peer(
+                            &path,
+                            &peercove_ops::peers::Selector::Ip(ip),
+                            name.trim(),
+                        )?;
+                        Ok(("表示名を変更しました(数秒で反映されます)".to_string(), None))
+                    }
+                    AdminRequest::ApproveMember { ip } => {
+                        guard_target(ip)?;
+                        peercove_ops::peers::approve_invite(
+                            &path,
+                            &peercove_ops::peers::Selector::Ip(ip),
+                            approved_at,
+                        )?;
+                        Ok(("承認しました".to_string(), None))
+                    }
+                    AdminRequest::SetCanInvite { ip, allowed } => {
+                        guard_target(ip)?;
+                        peercove_ops::peers::set_peer_can_invite(
+                            &path,
+                            &peercove_ops::peers::Selector::Ip(ip),
+                            allowed,
+                        )?;
+                        Ok((
+                            "招待発行の許可を変更しました(数秒で反映されます)".to_string(),
+                            None,
+                        ))
+                    }
+                    AdminRequest::SetMemberDnsName { ip, dns_name } => {
+                        guard_target(ip)?;
+                        peercove_ops::peers::set_peer_dns_name(
+                            &path,
+                            &peercove_ops::peers::Selector::Ip(ip),
+                            dns_name.trim(),
+                        )?;
+                        Ok(("DNS 名を変更しました(数秒で反映されます)".to_string(), None))
+                    }
+                    AdminRequest::ReadNetworkSettings => {
+                        let settings = peercove_ops::settings::read(&path)?;
+                        Ok((
+                            "現在の設定を取得しました".to_string(),
+                            Some(AdminOpData::NetworkSettings {
+                                require_invite_approval: settings.require_invite_approval,
+                                member_invites: settings.member_invites,
+                                network_display_name: settings.network_display_name,
+                            }),
+                        ))
+                    }
+                    AdminRequest::SetRequireApproval { enabled } => {
+                        let mut update = network_settings_update(&path)?;
+                        update.require_invite_approval = enabled;
+                        peercove_ops::settings::update(&path, &update)?;
+                        Ok(("承認制の設定を変更しました".to_string(), None))
+                    }
+                    AdminRequest::SetMemberInvites { enabled } => {
+                        let mut update = network_settings_update(&path)?;
+                        update.member_invites = enabled;
+                        peercove_ops::settings::update(&path, &update)?;
+                        Ok(("メンバー招待の許可を変更しました".to_string(), None))
+                    }
+                    AdminRequest::SetNetworkDisplayName { name } => {
+                        let mut update = network_settings_update(&path)?;
+                        update.network_display_name = name;
+                        peercove_ops::settings::update(&path, &update)?;
+                        Ok((
+                            "ネットワーク表示名を変更しました(数秒で反映されます)".to_string(),
+                            None,
+                        ))
+                    }
+                    AdminRequest::AclRead => {
+                        let policy = peercove_ops::acl::read_policy(&path)?;
+                        Ok((
+                            "現在の ACL ポリシーを取得しました".to_string(),
+                            Some(AdminOpData::AclPolicy {
+                                policy: peercove_core::proto::AclPolicyWire {
+                                    default: policy.default,
+                                    groups: policy.groups,
+                                    rules: policy.rules,
+                                },
+                            }),
+                        ))
+                    }
+                    AdminRequest::AclWrite { policy } => {
+                        peercove_ops::acl::write_policy(
+                            &path,
+                            &peercove_ops::acl::PolicySettings {
+                                default: policy.default,
+                                groups: policy.groups,
+                                rules: policy.rules,
+                            },
+                        )?;
+                        Ok((
+                            "ACL ポリシーを変更しました(数秒で反映されます)".to_string(),
+                            None,
+                        ))
+                    }
+                    AdminRequest::SetSubnets { ip, subnets } => {
+                        guard_target(ip)?;
+                        let parsed: Vec<ipnet::Ipv4Net> = subnets
+                            .iter()
+                            .map(|s| {
+                                s.trim().parse().map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "\"{s}\" は CIDR(例 192.168.10.0/24)として解釈できません"
+                                    )
+                                })
+                            })
+                            .collect::<anyhow::Result<_>>()?;
+                        peercove_ops::peers::set_subnets(
+                            &path,
+                            &peercove_ops::peers::Selector::Ip(ip),
+                            &parsed,
+                        )?;
+                        Ok((
+                            "広告サブネットを変更しました(数秒で反映されます)".to_string(),
+                            None,
+                        ))
+                    }
+                    AdminRequest::DnsCheckNow => {
+                        // 稼働中トンネルの状態(daemon::Active::health)が要る操作なので、
+                        // supervise の Role::Host 分岐で HostRequests::with_health が
+                        // 差し込んだ実体を使う(未接続の HostRequests では拒否する)。
+                        let health = health
+                            .ok_or_else(|| anyhow::anyhow!("このネットワークは稼働していません"))?;
+                        health.lock().unwrap().request_now();
+                        Ok(("DNS の確認をリクエストしました".to_string(), None))
+                    }
+                    AdminRequest::DnsListFull => {
+                        let records = peercove_ops::dns::list_records(&path)?
+                            .into_iter()
+                            .map(|record| {
+                                let (ip, member, cname) = match record.target {
+                                    peercove_ops::dns::RecordTarget::Ip(ip) => {
+                                        (Some(ip), None, None)
+                                    }
+                                    peercove_ops::dns::RecordTarget::Member(member) => {
+                                        (None, Some(member), None)
+                                    }
+                                    peercove_ops::dns::RecordTarget::Cname(domain) => {
+                                        (None, None, Some(domain))
+                                    }
+                                };
+                                peercove_core::proto::AdminDnsRecord {
+                                    id: record.id,
+                                    name: record.name,
+                                    ip,
+                                    member,
+                                    cname,
+                                    under: record.under,
+                                    relative: record.relative,
+                                    fqdn: record.fqdn,
+                                    resolved_ip: record.resolved_ip,
+                                    scheme: record.scheme,
+                                    port: record.port,
+                                    url: record.url,
+                                    health_enabled: record.health.enabled,
+                                    health_kind: record.health.kind,
+                                    health_path: record.health.path,
+                                    health_expected_status: record.health.expected_status,
+                                    health_external: record.health.external,
+                                }
+                            })
+                            .collect();
+                        Ok((
+                            "DNS レコード一覧を取得しました".to_string(),
+                            Some(AdminOpData::DnsRecords { records }),
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+        match outcome {
+            Ok(Ok((message, data))) => {
+                // 可視化(ADR-0059)。対象の詳細(名前・IP)はログに出さず件数程度に留める
+                tracing::info!("メンバー {member_ip} が Admin 操作を行いました");
+                ControlMessage::AdminOpResult {
+                    accepted: true,
+                    message,
+                    data,
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::info!("メンバー {member_ip} の Admin 操作を受け付けませんでした: {e:#}");
+                ControlMessage::AdminOpResult {
+                    accepted: false,
+                    message: format!("{e:#}"),
+                    data: None,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Admin 操作の適用タスクが失敗しました: {e}");
+                ControlMessage::AdminOpResult {
+                    accepted: false,
+                    message: "ホスト側の内部エラーです".to_string(),
+                    data: None,
+                }
+            }
+        }
+    }
+
     /// 招待 v3 の期限をホスト正本で確認し、初回 Hello を永続化する。
     async fn accept_invite(
         &self,
@@ -910,6 +1220,26 @@ fn encode_line(message: &ControlMessage) -> String {
     let mut line = serde_json::to_string(message).expect("ControlMessage は常に直列化可能");
     line.push('\n');
     line
+}
+
+/// ネットワーク設定(admin 中継、ADR-0059 J-2 拡大)の 1 項目だけを変えて
+/// 書き戻すため、現在値から `Update` を組み立てる。`peercove_ops::settings::update`
+/// は全項目を要求するため(UI が現在値を読んでから渡す作法と同じ)。
+fn network_settings_update(path: &Path) -> anyhow::Result<peercove_ops::settings::Update> {
+    let current = peercove_ops::settings::read(path)?;
+    Ok(peercove_ops::settings::Update {
+        display_name: current.display_name,
+        dns_name: current.dns_name,
+        network_display_name: current.network_display_name,
+        listen_port: current.listen_port,
+        mtu: current.mtu,
+        host_endpoint: current.host_endpoint,
+        direct: current.direct,
+        max_recv_file_mb: current.max_recv_file_mb,
+        require_invite_approval: current.require_invite_approval,
+        member_invites: current.member_invites,
+        auto_connect: current.auto_connect,
+    })
 }
 
 /// 送信済み ping の記録。ping を打つのは書き側、Pong を見るのは読み側なので共有する。
@@ -1267,7 +1597,8 @@ async fn host_reader(
                 | ControlMessage::SetDisplayName { .. }
                 | ControlMessage::CreateInvite { .. }
                 | ControlMessage::MemoReq { .. }
-                | ControlMessage::AdminDnsOp { .. },
+                | ControlMessage::AdminDnsOp { .. }
+                | ControlMessage::AdminOp { .. },
             ) if isolation.load(Ordering::Relaxed) => {
                 tracing::debug!("承認待ち端末 {member_ip} からの設定変更依頼を拒否しました");
             }
@@ -1313,6 +1644,12 @@ async fn host_reader(
                 // DNS 管理のリモート依頼(admin 委任、ADR-0059 決定 3、J-1c)。
                 // 権限(peer.admin)は apply_admin_dns の中で毎回検証する
                 let reply = requests.apply_admin_dns(member_ip, op).await;
+                let _ = out.send(reply);
+            }
+            Ok(ControlMessage::AdminOp { op }) => {
+                // 汎用 Admin 中継(admin 委任、ADR-0059 J-2 拡大)。
+                // 権限(peer.admin)は apply_admin_op の中で毎回検証する
+                let reply = requests.apply_admin_op(member_ip, op).await;
                 let _ = out.send(reply);
             }
             Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
@@ -1707,6 +2044,19 @@ async fn member_reader(
                 // DNS 管理の応答(admin 委任、ADR-0059 決定 3、J-1c)。
                 // IPC ハンドラが待つ受け口へ渡す
                 link.put_dns_admin_result(accepted, message);
+            }
+            Ok(ControlMessage::AdminOpResult {
+                accepted,
+                message,
+                data,
+            }) => {
+                // 汎用 Admin 中継の応答(admin 委任、ADR-0059 J-2 拡大)。
+                // IPC ハンドラが待つ受け口へ渡す
+                link.put_admin_op_result(AdminOpReply {
+                    accepted,
+                    message,
+                    data,
+                });
             }
             Ok(ControlMessage::MemoEvent { event }) => {
                 // リアルタイム配信(M5 F-2)。キャッシュへ反映し、世代を進める
@@ -2122,6 +2472,507 @@ mod tests {
             "削除フラグが立つこと(UI に「削除された」と出す信号)"
         );
         assert!(server.await.unwrap().is_ok());
+    }
+
+    /// 汎用 Admin 中継(ADR-0059 J-2 拡大): admin を委任されたメンバーからの
+    /// RemoveMember が host.toml へ反映されること。
+    #[tokio::test]
+    async fn apply_admin_op_remove_member_by_admin_updates_host_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-remove-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let admin_key = PrivateKey::generate().public_key();
+        let target_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n\n[[peer]]\nname = \"bob\"\npublic_key = \"{target_key}\"\nallowed_ips = [\"127.0.0.3/32\"]\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+        let target_ip: Ipv4Addr = "127.0.0.3".parse().unwrap();
+        let reply = requests
+            .apply_admin_op(
+                admin_ip,
+                peercove_core::proto::AdminRequest::RemoveMember { ip: target_ip },
+            )
+            .await;
+        match reply {
+            ControlMessage::AdminOpResult { accepted, .. } => {
+                assert!(accepted, "admin は削除できること")
+            }
+            other => panic!("予期しない応答: {other:?}"),
+        }
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert!(
+            config.peers.iter().all(|p| p.public_key != target_key),
+            "host.toml から対象ピアが消えること"
+        );
+    }
+
+    /// 汎用 Admin 中継: admin を委任されていないメンバーからの依頼は拒否され、
+    /// host.toml が変わらないこと。
+    #[tokio::test]
+    async fn apply_admin_op_rejects_non_admin() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-nonadmin-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let actor_key = PrivateKey::generate().public_key();
+        let target_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"not-admin\"\npublic_key = \"{actor_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\n\n[[peer]]\nname = \"bob\"\npublic_key = \"{target_key}\"\nallowed_ips = [\"127.0.0.3/32\"]\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+
+        let actor_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+        let target_ip: Ipv4Addr = "127.0.0.3".parse().unwrap();
+        let reply = requests
+            .apply_admin_op(
+                actor_ip,
+                peercove_core::proto::AdminRequest::RemoveMember { ip: target_ip },
+            )
+            .await;
+        match reply {
+            ControlMessage::AdminOpResult { accepted, .. } => {
+                assert!(!accepted, "admin でなければ拒否されること")
+            }
+            other => panic!("予期しない応答: {other:?}"),
+        }
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert!(
+            config.peers.iter().any(|p| p.public_key == target_key),
+            "拒否時は host.toml が変わらないこと"
+        );
+    }
+
+    /// 汎用 Admin 中継: 対象にホスト自身・依頼者自身を指定すると拒否される
+    /// こと(admin が自分やホストを操作してしまう事故防止)。
+    #[tokio::test]
+    async fn apply_admin_op_rejects_self_and_host_targets() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-selfhost-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let admin_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+        let host_ip: Ipv4Addr = "127.0.0.10".parse().unwrap();
+
+        let self_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                peercove_core::proto::AdminRequest::RemoveMember { ip: admin_ip },
+            )
+            .await;
+        assert!(
+            matches!(
+                self_reply,
+                ControlMessage::AdminOpResult {
+                    accepted: false,
+                    ..
+                }
+            ),
+            "自分自身は対象にできないこと"
+        );
+
+        let host_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                peercove_core::proto::AdminRequest::RemoveMember { ip: host_ip },
+            )
+            .await;
+        assert!(
+            matches!(
+                host_reply,
+                ControlMessage::AdminOpResult {
+                    accepted: false,
+                    ..
+                }
+            ),
+            "ホストは対象にできないこと"
+        );
+    }
+
+    /// 汎用 Admin 中継(ADR-0059 J-2 拡大): AclWrite が host.toml の [acl] へ
+    /// 反映されること。読み(AclRead)が書いた内容を読み返せることも確認する。
+    #[tokio::test]
+    async fn apply_admin_op_acl_write_by_admin_updates_host_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-acl-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let admin_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+
+        let policy = peercove_core::proto::AclPolicyWire {
+            default: peercove_core::acl::AclAction::Deny,
+            groups: vec![],
+            rules: vec![peercove_core::acl::AclRule {
+                id: "deny-all".to_string(),
+                action: peercove_core::acl::AclAction::Deny,
+                source: peercove_core::acl::AclTarget::Any("any".to_string()),
+                destination: peercove_core::acl::AclTarget::Any("any".to_string()),
+                protocol: peercove_core::acl::AclProtocol::Any,
+                ports: vec![],
+                enabled: true,
+            }],
+        };
+        let write_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                peercove_core::proto::AdminRequest::AclWrite {
+                    policy: policy.clone(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                write_reply,
+                ControlMessage::AdminOpResult { accepted: true, .. }
+            ),
+            "admin は ACL を変更できること: {write_reply:?}"
+        );
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert_eq!(config.acl.default, peercove_core::acl::AclAction::Deny);
+        assert_eq!(config.acl.rules.len(), 1);
+
+        let read_reply = requests
+            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::AclRead)
+            .await;
+        match read_reply {
+            ControlMessage::AdminOpResult {
+                accepted: true,
+                data: Some(peercove_core::proto::AdminOpData::AclPolicy { policy: read }),
+                ..
+            } => {
+                assert_eq!(read.default, policy.default);
+                assert_eq!(read.rules.len(), 1);
+            }
+            other => panic!("予期しない応答: {other:?}"),
+        }
+    }
+
+    /// 汎用 Admin 中継: SetSubnets が対象ピアの subnets へ反映されること。
+    #[tokio::test]
+    async fn apply_admin_op_set_subnets_by_admin_updates_host_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-subnets-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let admin_key = PrivateKey::generate().public_key();
+        let target_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n\n[[peer]]\nname = \"bob\"\npublic_key = \"{target_key}\"\nallowed_ips = [\"127.0.0.3/32\"]\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+        let target_ip: Ipv4Addr = "127.0.0.3".parse().unwrap();
+
+        let reply = requests
+            .apply_admin_op(
+                admin_ip,
+                peercove_core::proto::AdminRequest::SetSubnets {
+                    ip: target_ip,
+                    subnets: vec!["192.168.10.0/24".to_string()],
+                },
+            )
+            .await;
+        assert!(
+            matches!(reply, ControlMessage::AdminOpResult { accepted: true, .. }),
+            "admin はサブネットを変更できること: {reply:?}"
+        );
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        let bob = config
+            .peers
+            .iter()
+            .find(|p| p.public_key == target_key)
+            .unwrap();
+        assert_eq!(
+            bob.subnets,
+            vec!["192.168.10.0/24".parse::<ipnet::Ipv4Net>().unwrap()]
+        );
+
+        // 不正な CIDR はホスト側で拒否され、設定は変わらない
+        let bad_reply = requests
+            .apply_admin_op(
+                admin_ip,
+                peercove_core::proto::AdminRequest::SetSubnets {
+                    ip: target_ip,
+                    subnets: vec!["not-a-cidr".to_string()],
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                bad_reply,
+                ControlMessage::AdminOpResult {
+                    accepted: false,
+                    ..
+                }
+            ),
+            "不正な CIDR は拒否されること"
+        );
+    }
+
+    /// 汎用 Admin 中継: DnsCheckNow が稼働中トンネルのヘルス監視(with_health
+    /// で差し込んだ実体)へ即時確認を要求すること。
+    #[tokio::test]
+    async fn apply_admin_op_dns_check_now_requests_health_monitor() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-dnscheck-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let admin_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n"
+            ),
+        )
+        .unwrap();
+        let health = crate::health::SharedHealth::default();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        )
+        .with_health(health.clone());
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+
+        let reply = requests
+            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::DnsCheckNow)
+            .await;
+        assert!(
+            matches!(reply, ControlMessage::AdminOpResult { accepted: true, .. }),
+            "admin は確認を要求できること: {reply:?}"
+        );
+        assert!(
+            health.lock().unwrap().is_forced(),
+            "ヘルス監視へ即時確認が要求されること"
+        );
+    }
+
+    /// 汎用 Admin 中継: with_health を差し込んでいない(= 稼働中トンネルの状態が
+    /// 無い)HostRequests では DnsCheckNow を拒否すること。
+    #[tokio::test]
+    async fn apply_admin_op_dns_check_now_without_health_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-dnscheck-nohealth-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let admin_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+
+        let reply = requests
+            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::DnsCheckNow)
+            .await;
+        assert!(
+            matches!(
+                reply,
+                ControlMessage::AdminOpResult {
+                    accepted: false,
+                    ..
+                }
+            ),
+            "health 未設定なら拒否されること: {reply:?}"
+        );
+    }
+
+    /// 汎用 Admin 中継: DnsListFull が id・ヘルス設定の現在値つきでレコード
+    /// 一覧を返すこと(J-1c の既知の制限の解消)。
+    #[tokio::test]
+    async fn apply_admin_op_dns_list_full_returns_records_with_id_and_health() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-dnslist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let admin_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"admin\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\nadmin = true\n\n[[dns_record]]\nname = \"web\"\nip = \"127.0.0.50\"\nscheme = \"http\"\nport = 8080\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+        let admin_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+
+        let reply = requests
+            .apply_admin_op(admin_ip, peercove_core::proto::AdminRequest::DnsListFull)
+            .await;
+        match reply {
+            ControlMessage::AdminOpResult {
+                accepted: true,
+                data: Some(peercove_core::proto::AdminOpData::DnsRecords { records }),
+                ..
+            } => {
+                assert_eq!(records.len(), 1);
+                assert!(records[0].id.is_some(), "id が遅延付番されること");
+                assert_eq!(records[0].ip, Some("127.0.0.50".parse().unwrap()));
+                assert_eq!(records[0].health_path, "/");
+            }
+            other => panic!("予期しない応答: {other:?}"),
+        }
+
+        // 呼ぶだけで旧レコードにも id が付く(list_records の遅延付番)
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert!(config.dns_records[0].id.is_some());
+    }
+
+    /// 汎用 Admin 中継: 新しく足した ACL/サブネット/DNS 系の依頼も、
+    /// admin を委任されていないメンバーからは拒否されること(既存の
+    /// apply_admin_op_rejects_non_admin と同型)。
+    #[tokio::test]
+    async fn apply_admin_op_rejects_non_admin_for_new_ops() {
+        let dir = std::env::temp_dir().join(format!(
+            "peercove-control-adminop-nonadmin-new-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("host.toml");
+        let actor_key = PrivateKey::generate().public_key();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[interface]\nprivate_key_file = \"host.key\"\naddress = \"127.0.0.10/24\"\n\n[[peer]]\nname = \"not-admin\"\npublic_key = \"{actor_key}\"\nallowed_ips = [\"127.0.0.2/32\"]\n"
+            ),
+        )
+        .unwrap();
+        let requests = HostRequests::new(
+            config_path.clone(),
+            PrivateKey::generate().public_key(),
+            None,
+            crate::memoshare::MemoService::new(&config_path),
+        );
+        let actor_ip: Ipv4Addr = "127.0.0.2".parse().unwrap();
+
+        for op in [
+            peercove_core::proto::AdminRequest::AclRead,
+            peercove_core::proto::AdminRequest::AclWrite {
+                policy: peercove_core::proto::AclPolicyWire {
+                    default: peercove_core::acl::AclAction::Allow,
+                    groups: vec![],
+                    rules: vec![],
+                },
+            },
+            peercove_core::proto::AdminRequest::SetSubnets {
+                ip: "127.0.0.3".parse().unwrap(),
+                subnets: vec!["192.168.10.0/24".to_string()],
+            },
+            peercove_core::proto::AdminRequest::DnsListFull,
+            peercove_core::proto::AdminRequest::DnsCheckNow,
+        ] {
+            let reply = requests.apply_admin_op(actor_ip, op.clone()).await;
+            assert!(
+                matches!(
+                    reply,
+                    ControlMessage::AdminOpResult {
+                        accepted: false,
+                        ..
+                    }
+                ),
+                "{op:?} は admin でなければ拒否されること: {reply:?}"
+            );
+        }
+        let config = peercove_core::config::Config::load(&config_path).unwrap();
+        assert!(config.acl.rules.is_empty(), "拒否時は設定が変わらないこと");
     }
 
     #[tokio::test]

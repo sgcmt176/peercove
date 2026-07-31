@@ -4,17 +4,21 @@ import { Avatar } from "./Avatar";
 import { t } from "../i18n";
 
 /**
- * サブネット共有ページ(M3-7b、ADR-0014 → M3-16 でページ化)。ホストが
- * 各メンバーの公開する背後 LAN(CIDR)を編集する。検証(CIDR 形式・重複)は
- * バックエンドが行い、エラーはそのまま表示する。ホスト自身は転送役にならない
- * ので一覧はホスト以外のメンバー。
+ * サブネット共有ページ(M3-7b、ADR-0014 → M3-16 でページ化)。ホストと、
+ * 管理を委任された(admin)メンバーが各メンバーの公開する背後 LAN(CIDR)を
+ * 編集する(ADR-0059 J-2 拡大の残り)。検証(CIDR 形式・重複)はバックエンドが
+ * 行い、エラーはそのまま表示する。ホスト自身は転送役にならないので一覧は
+ * ホスト以外のメンバー。ホストは設定ファイルへ直接、admin メンバーは
+ * `api.adminSetSubnets` でホストへ中継する(最終判定は常にホスト側)。
  */
 export function SubnetView({
   configPath,
   members,
+  isHost,
 }: {
   configPath: string;
   members: Member[];
+  isHost: boolean;
 }) {
   const targets = members.filter((member) => !member.isHost);
 
@@ -31,6 +35,7 @@ export function SubnetView({
               key={member.publicKey}
               configPath={configPath}
               member={member}
+              isHost={isHost}
             />
           ))}
         </ul>
@@ -44,9 +49,11 @@ export function SubnetView({
 function SubnetRow({
   configPath,
   member,
+  isHost,
 }: {
   configPath: string;
   member: Member;
+  isHost: boolean;
 }) {
   const [text, setText] = useState(member.subnets.join(" "));
   const [busy, setBusy] = useState(false);
@@ -59,8 +66,14 @@ function SubnetRow({
     setNotice(null);
     try {
       const subnets = text.split(/[\s,]+/).filter((s) => s.length > 0);
-      await api.setMemberSubnets(configPath, member.publicKey, subnets);
-      setNotice(t.subnet.saved);
+      if (isHost) {
+        await api.setMemberSubnets(configPath, member.publicKey, subnets);
+        setNotice(t.subnet.saved);
+      } else {
+        // admin メンバー(ADR-0059 J-2 拡大の残り): ホストへ中継。反映は次回の台帳配布
+        await api.adminSetSubnets(configPath, member.ip, subnets);
+        setNotice(t.dns.adminApplyNotice);
+      }
       setTimeout(() => setNotice(null), 6000);
     } catch (e) {
       setError(errorMessage(e));

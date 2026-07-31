@@ -58,6 +58,13 @@ impl HealthMonitor {
         self.force = true;
     }
 
+    /// テスト用: `request_now` が呼ばれたか(admin 中継の DnsCheckNow、
+    /// ADR-0059 J-2 拡大)。
+    #[cfg(test)]
+    pub(crate) fn is_forced(&self) -> bool {
+        self.force
+    }
+
     /// トンネル停止時に実行中の監視バッチを打ち切り、外部への接続を残さない。
     pub fn stop(&mut self) {
         if let Some(batch) = self.batch.take() {

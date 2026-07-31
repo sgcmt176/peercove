@@ -37,6 +37,10 @@ export function DnsView({
   isHost: boolean;
 }) {
   const [records, setRecords] = useState<DnsRecord[]>([]);
+  // admin メンバーがホスト正本から取得した完全な一覧(id・ヘルス設定の
+  // 現在値つき、ADR-0059 J-2 拡大の残り)。取得できるまでは配布データ
+  // (distributed)で表示する(J-1c の既知の制限が残ったフォールバック)。
+  const [adminRecords, setAdminRecords] = useState<DnsRecord[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   // 管理を委任されたメンバー(ADR-0059)。自分の台帳エントリで判定する
@@ -97,6 +101,21 @@ export function DnsView({
     reload();
   }, [reload]);
 
+  // admin メンバー(ADR-0059 J-2 拡大の残り): ホスト正本から id・ヘルス設定
+  // つきの完全な一覧を取得する。開いた時点で 1 回取る(呼ぶだけで旧レコードにも
+  // id が遅延付番される)。取得できない間は配布データにフォールバックする。
+  const reloadAdmin = useCallback(() => {
+    if (!isAdmin) return;
+    api
+      .adminDnsListFull(configPath)
+      .then(setAdminRecords)
+      .catch((e) => setError(errorMessage(e)));
+  }, [configPath, isAdmin]);
+
+  useEffect(() => {
+    reloadAdmin();
+  }, [reloadAdmin]);
+
   const shown = isHost
     ? records.map((record) => ({
         ...record,
@@ -104,13 +123,25 @@ export function DnsView({
           distributed.find((current) => current.fqdn === record.fqdn)?.health ??
           record.health,
       }))
-    : distributed;
+    : isAdmin && adminRecords
+      ? adminRecords.map((record) => ({
+          ...record,
+          health:
+            distributed.find((current) => current.fqdn === record.fqdn)
+              ?.health ?? record.health,
+        }))
+      : distributed;
 
   const checkNow = async () => {
     setChecking(true);
     setError(null);
     try {
-      await api.checkDnsHealth(configPath);
+      if (isHost) {
+        await api.checkDnsHealth(configPath);
+      } else {
+        // admin メンバー(ADR-0059 J-2 拡大の残り): ホストへ中継
+        await api.adminDnsCheckNow(configPath);
+      }
       window.setTimeout(() => setChecking(false), 4000);
     } catch (reason) {
       setChecking(false);
@@ -181,6 +212,7 @@ export function DnsView({
           scheme: scheme.trim() === "" ? null : scheme.trim(),
           port: port.trim() === "" ? null : Number(port),
         });
+        reloadAdmin();
         setNotice(t.dns.adminApplyNotice);
       }
       setPrefix("");
@@ -206,6 +238,7 @@ export function DnsView({
       } else if (record.id) {
         // admin メンバー(ADR-0059 決定 3): id で対象を指定してホストへ中継
         await api.adminDnsOp(configPath, { op: "remove", id: record.id });
+        reloadAdmin();
         setNotice(t.dns.adminApplyNotice);
       } else {
         setError(t.dns.adminMissingId);
@@ -260,7 +293,7 @@ export function DnsView({
 
         <div className="dns-services__head">
           <h3 className="subhead">{t.dns.customHead}</h3>
-          {isHost && shown.some((record) => record.port !== null) && (
+          {canManage && shown.some((record) => record.port !== null) && (
             <button
               type="button"
               className="button--ghost"
@@ -486,6 +519,7 @@ export function DnsView({
               reload();
               void checkNow();
             } else {
+              reloadAdmin();
               setNotice(t.dns.adminApplyNotice);
             }
           }}
@@ -539,8 +573,10 @@ function reasonLabel(reason?: ServiceHealth["reason"]) {
   return t.dns.health.reason[reason];
 }
 
-/** admin メンバー(ADR-0059)は配布データに現在の設定が乗らないため、
- * 開いた時点ではこの既定値から編集を始める(ホストは実際の設定値を使う)。 */
+/** admin メンバーは通常 `adminDnsListFull`(ADR-0059 J-2 拡大の残り)で実際の
+ * 設定値を取得できる。取得前・失敗時のフォールバック(配布データには
+ * ヘルス設定が乗らない)でだけ、この既定値から編集を始める(ホストは常に
+ * 実際の設定値を使う)。 */
 const DEFAULT_HEALTH_SETTINGS: HealthSettings = {
   enabled: true,
   kind: "tcp",

@@ -534,13 +534,15 @@ export const ja = {
       // ツールチップ(label の title)で表示。1〜2 文の簡潔さを保つこと
       canInviteHint:
         "この端末から新しいメンバーを招待できるようにします（発行はホストの記録と全体チャットに残ります）",
+      // admin なメンバーはチェック済み+操作不可で表示する(ADR-0059 J-2 拡大、依頼者指定)
+      canInviteAdminHint: "admin は常に招待を発行できます（個別には外せません）",
       canInviteUpdated: "招待発行の許可を変更しました。数秒で反映されます。",
-      // 管理の委任(ADR-0059、M7 J-1b)
+      // 管理の委任(ADR-0059、M7 J-1b → J-2 拡大でホストとほぼ同等の権限に)
       adminBadge: "管理者",
-      adminBadgeTitle: "管理を委任されています(共有メモの権限管理ができます)",
+      adminBadgeTitle: "管理を委任されています(admin の付与・剥奪以外はホストと同等に操作できます)",
       adminLabel: "管理を委任(admin)",
       adminHint:
-        "この端末に管理を委任します（共有メモの権限管理と DNS 設定をホスト相当で操作できます）",
+        "この端末に管理を委任します（admin の付与・剥奪を除き、メンバー管理・ネットワーク設定・共有メモの権限管理・DNS 設定をホスト相当で操作できます）",
       adminUpdated: "管理の委任を変更しました。数秒で反映されます。",
     },
     // 直接通信の説明(M3-4)。外部 IP の共有について明記する(ADR-0013 条件 3)
@@ -950,6 +952,12 @@ export const ja = {
     memberInvitesLabel: "メンバーによる招待発行を許可",
     memberInvitesHint:
       "— 許可した端末（メンバー詳細で指名）だけが招待を発行できます。OFF にすると全端末で無効になります",
+    // ネットワーク管理(委任、ADR-0059 J-2 拡大)。admin なメンバーの設定ページに出す
+    adminNetworkTitle: "ネットワーク管理(委任)",
+    adminNetworkHint:
+      "管理を委任されているため、ホストのネットワーク設定をここから変更できます。反映まで数秒かかります。",
+    networkDisplayNameLabel: "ネットワーク表示名",
+    networkDisplayNameHint: "— 空欄で既定の表示に戻ります",
     // 受信ファイルサイズ上限(ADR-0015、M3-9)
     maxFileLabel: "受信ファイルの上限（MB）",
     maxFileHint: (defaultMb: number) =>
@@ -1200,7 +1208,7 @@ export const ja = {
     saveVersion: "版を保存",
     saveVersionDone: "版を保存しました",
 
-    // 容量・履歴上限(ホスト管理者のみ、M5 F-3)
+    // 容量・履歴上限(管理者(ホスト/admin)のみ、M5 F-3。ADR-0059 J-2 拡大)
     limits: "上限設定",
     limitsTitle: "共有メモの上限",
     limitsNote:

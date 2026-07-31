@@ -573,7 +573,7 @@ export function SharedMemoView({
           >
             ＋ {t.memo.newMemo}
           </button>
-          {isHost && (
+          {isAdmin && (
             <button
               type="button"
               className="button--icon"
@@ -617,7 +617,7 @@ export function SharedMemoView({
           <SharedFolderList
             folders={folders}
             selected={folderId}
-            isHost={isHost}
+            isAdmin={isAdmin}
             onSelect={setFolderId}
             onRun={run}
             onNotice={setNotice}
@@ -737,7 +737,7 @@ export function SharedMemoView({
                   ✓ {t.sharedMemo.stopEdit}
                 </button>
               )}
-              {isHost && !editing && selected.locked_by && (
+              {isAdmin && !editing && selected.locked_by && (
                 <button
                   type="button"
                   className="button--ghost"
@@ -1248,14 +1248,15 @@ function ModeBtn({
 function SharedFolderList({
   folders,
   selected,
-  isHost,
+  isAdmin,
   onSelect,
   onRun,
   onNotice,
 }: {
   folders: MemoFolder[];
   selected: string | null;
-  isHost: boolean;
+  /** 管理者(ホスト/admin、ADR-0059 J-2 拡大)かどうか。フォルダー管理の出し分けに使う。 */
+  isAdmin: boolean;
   onSelect: (id: string | null) => void;
   onRun: (op: SharedMemoOp, done?: () => void) => Promise<void>;
   onNotice: (message: string) => void;
@@ -1266,7 +1267,7 @@ function SharedFolderList({
     <div className="memo__folders">
       <div className="memo__folders-head muted small">
         {t.sharedMemo.folders}
-        {isHost && (
+        {isAdmin && (
           <button
             type="button"
             className="button--icon"
@@ -1324,7 +1325,7 @@ function SharedFolderList({
               <span className="muted small"> {folder.memo_count}</span>
             )}
           </button>
-          {isHost && (
+          {isAdmin && (
             <>
               <button
                 type="button"

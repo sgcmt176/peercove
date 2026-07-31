@@ -1694,6 +1694,24 @@ async fn admin_dns_op(
     send(IpcRequest::AdminDns { config, op }).await
 }
 
+/// (member、admin 委任)汎用 Admin 中継(ADR-0059 J-2 拡大)。メンバー管理・
+/// ネットワーク設定などをデーモンがコントロールチャネルでホストへ届け、
+/// 権限確認(peer.admin)・適用の結果を待つ。応答の `data` は読み取り系の
+/// 依頼(`read_network_settings`)にだけ載る。ホスト自身は従来どおり各画面
+/// から直接操作する(IPC を経由しない)。
+#[tauri::command]
+async fn admin_op(
+    config_path: String,
+    op: peercove_core::proto::AdminRequest,
+) -> Result<Option<peercove_core::proto::AdminOpData>, String> {
+    let config = canonical(&config_path)?;
+    match peercove_ipc::request_async(IpcRequest::AdminOp { config, op }).await {
+        Ok(IpcResponse::AdminOp { data }) => Ok(data),
+        Ok(_) => Err("予期しない応答です".to_string()),
+        Err(error) => Err(to_message(error)),
+    }
+}
+
 /// 設定ファイルの現在値を読む(M2-G5)。
 #[tauri::command]
 fn read_settings(config_path: String) -> Result<Settings, String> {
@@ -1833,6 +1851,7 @@ pub fn run() {
             set_dns_health,
             check_dns_health,
             admin_dns_op,
+            admin_op,
             read_settings,
             save_settings,
         ])

@@ -4,7 +4,16 @@ import { t } from "../i18n";
 
 type TargetKind = "any" | "member" | "group" | "subnet" | "service";
 
-export function AclView({ configPath, members }: { configPath: string; members: Member[]; }) {
+/**
+ * ACL v2 ポリシー編集画面。ホストと、管理を委任された(admin)メンバーが
+ * 操作できる(ADR-0059 J-2 拡大の残り)。ホストは設定ファイルへ直接
+ * 読み書きし、admin メンバーは `api.adminAclRead`/`adminAclWrite` でホストへ
+ * 中継する(最終判定は常にホスト側)。サービス指定(destination = service)に
+ * 使う DNS レコード一覧も同様に分岐する(admin は `adminDnsListFull` — J-1c の
+ * 配布データには id が乗らない旧レコードがありうるため)。admin が自分自身への
+ * 制限を外せてしまう点は ADR-0059 で許容済み。
+ */
+export function AclView({ configPath, members, isHost }: { configPath: string; members: Member[]; isHost: boolean; }) {
   const [policy, setPolicy] = useState<AclPolicySettings | null>(null);
   const [services, setServices] = useState<DnsRecord[]>([]);
   const [busy, setBusy] = useState(false);
@@ -26,7 +35,11 @@ export function AclView({ configPath, members }: { configPath: string; members: 
     setPolicy(null);
     setServices([]);
     setError(null);
-    Promise.all([api.readAclPolicy(configPath), api.listDnsRecords(configPath)])
+    const loadPolicy = isHost ? api.readAclPolicy(configPath) : api.adminAclRead(configPath);
+    const loadServices = isHost
+      ? api.listDnsRecords(configPath)
+      : api.adminDnsListFull(configPath);
+    Promise.all([loadPolicy, loadServices])
       .then(([loaded, dns]) => {
         if (!alive) return;
         // 初期のACL v2実装は既定値のports/enabledをJSONから省略した。
@@ -48,11 +61,15 @@ export function AclView({ configPath, members }: { configPath: string; members: 
       });
     return () => { alive = false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configPath]);
+  }, [configPath, isHost]);
 
   const save = async (next: AclPolicySettings) => {
     setBusy(true); setError(null);
-    try { await api.writeAclPolicy(configPath, next); setPolicy(next); }
+    try {
+      if (isHost) await api.writeAclPolicy(configPath, next);
+      else await api.adminAclWrite(configPath, next);
+      setPolicy(next);
+    }
     catch (cause) { setError(errorMessage(cause)); }
     finally { setBusy(false); }
   };

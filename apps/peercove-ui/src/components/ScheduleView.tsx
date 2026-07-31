@@ -1,6 +1,7 @@
 // 共有スケジュール表(M6 G-1、ADR-0053)。共有メモの基盤(ホスト正本 DB・
 // コントロールチャネル配信・読み取りキャッシュ)を転用する。閲覧・追加は
-// 全員、編集・削除は作成者 + ホストだけ(`can_edit` で判定)。編集ロックは
+// 全員、編集・削除は作成者 + 管理者(ホスト/admin、ADR-0059 J-2 拡大)だけ
+// (`can_edit` で判定)。編集ロックは
 // 持たず revision CAS のみ(ADR-0053 決定 4)。
 // **予定のタイトル・詳細は console に出さないこと。**
 import { useCallback, useEffect, useMemo, useState } from "react";

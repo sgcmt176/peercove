@@ -439,8 +439,8 @@ impl MemoService {
                 Ok(SharedMemoReply::Done)
             }
             SharedMemoOp::ForceUnlock { id } => {
-                if actor.member_id.is_some() {
-                    bail!("編集ロックの強制解除はホスト管理者だけができます");
+                if !(actor.member_id.is_none() || actor.admin) {
+                    bail!("編集ロックの強制解除は管理者(ホスト/admin)だけができます");
                 }
                 let revision_at_acquire = self
                     .locks
@@ -1307,6 +1307,7 @@ impl MemoService {
                 };
                 let mut for_actor = event.clone();
                 for_actor.can_edit = actor.member_id.is_none()
+                    || actor.admin
                     || actor.member_id.as_deref() == Some(event.owner_id.as_str());
                 connection.send(ControlMessage::MemoEvent {
                     event: SharedMemoEvent::Schedule {
@@ -1347,6 +1348,7 @@ impl MemoService {
                 };
                 let mut for_actor = sheet.clone();
                 for_actor.can_manage = actor.member_id.is_none()
+                    || actor.admin
                     || actor.member_id.as_deref() == Some(sheet.owner_id.as_str());
                 connection.send(ControlMessage::MemoEvent {
                     event: SharedMemoEvent::Sheet {
