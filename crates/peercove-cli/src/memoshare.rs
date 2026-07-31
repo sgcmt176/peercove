@@ -213,7 +213,7 @@ impl MemoService {
         self.seq.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// ホスト管理者としての操作主体。
+    /// ホスト管理者としての操作主体(admin=true。ホストは常に管理者)。
     fn host_actor(config: &Config) -> Actor {
         Actor::host(
             config
@@ -224,7 +224,7 @@ impl MemoService {
         )
     }
 
-    /// 仮想 IP → 操作主体(member_id + 表示名)。
+    /// 仮想 IP → 操作主体(member_id + 表示名 + admin 委任の有無、ADR-0059)。
     fn actor_for_ip(config: &Config, ip: Ipv4Addr) -> anyhow::Result<Actor> {
         let peer = config
             .peers
@@ -238,7 +238,7 @@ impl MemoService {
             .invite_id
             .clone()
             .unwrap_or_else(|| format!("legacy-{ip}"));
-        Ok(Actor::member(id, name))
+        Ok(Actor::member(id, name).with_admin(peer.admin))
     }
 
     /// メンバーからの依頼(コントロールチャネル)。エラーは Err 応答に変換する。
@@ -661,6 +661,29 @@ impl MemoService {
             SharedMemoOp::Sheet { sheet } => {
                 let reply = self.handle_sheet(actor, sheet).await?;
                 Ok(SharedMemoReply::Sheet { reply })
+            }
+            SharedMemoOp::PermGroupList => {
+                // 権限ダイアログ向けの全グループ一覧(M7 J-1b、ADR-0059)。
+                // host か admin を委任されたメンバーだけに返す(それ以外は
+                // 拒否 — 個人の所属を超えてグループ全量を見せる操作のため)
+                if !(actor.member_id.is_none() || actor.admin) {
+                    bail!("グループ一覧を取得できるのはホストと管理者(admin)だけです");
+                }
+                let groups = {
+                    let Some(groups) = self.groups.lock().unwrap().clone() else {
+                        return Ok(SharedMemoReply::PermGroups { groups: Vec::new() });
+                    };
+                    let store = groups.lock().unwrap();
+                    store
+                        .all()
+                        .into_iter()
+                        .map(|g| peercove_core::ipc::PermGroup {
+                            id: g.id,
+                            name: g.name,
+                        })
+                        .collect()
+                };
+                Ok(SharedMemoReply::PermGroups { groups })
             }
         }
     }

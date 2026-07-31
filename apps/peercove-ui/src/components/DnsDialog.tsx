@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
+  AdminDnsOp,
   DnsRecord,
   HealthSettings,
   Member,
@@ -12,14 +13,16 @@ import { t } from "../i18n";
 import { Modal } from "./Modal";
 
 /**
- * DNS 管理画面(M3-1c、ADR-0011 §1b、ADR-0022)。
+ * DNS 管理画面(M3-1c、ADR-0011 §1b、ADR-0022、ADR-0059 決定 3)。
  *
  * - 自動レコード: 台帳から導出されたメンバーの DNS 名(閲覧のみ。改名は
  *   メンバー一覧の ✎ から)
- * - カスタムレコード: ホストのみ追加・削除できる。ターゲットは IP 直指定か
- *   メンバー参照(IP 自動追随 = 別名・サービス名)、配置は最上位かメンバー
- *   配下(端末配下サブドメイン・LAN 機器)。設定に書かれ、5 秒の再読込 →
- *   解決 → 台帳と一緒に全メンバーへ配布される
+ * - カスタムレコード: ホストと、管理を委任された(admin)メンバーが追加・
+ *   削除できる。ターゲットは IP 直指定かメンバー参照(IP 自動追随 = 別名・
+ *   サービス名)、配置は最上位かメンバー配下(端末配下サブドメイン・LAN
+ *   機器)。ホストは設定ファイルへ直接書き込み、admin メンバーはホストへ
+ *   中継して同じ操作をしてもらう(`api.adminDnsOp`、最終判定は常にホスト側)。
+ *   設定変更は 5 秒の再読込 → 解決 → 台帳と一緒に全メンバーへ配布される。
  */
 export function DnsView({
   configPath,
@@ -29,12 +32,17 @@ export function DnsView({
 }: {
   configPath: string;
   members: Member[];
-  /** status で配信された解決済みレコード(member の一覧表示用)。 */
+  /** status で配信された解決済みレコード(member/admin の一覧表示用)。 */
   distributed: DnsRecord[];
   isHost: boolean;
 }) {
   const [records, setRecords] = useState<DnsRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  // 管理を委任されたメンバー(ADR-0059)。自分の台帳エントリで判定する
+  // (最終判定は常にホスト側 — ここは UI の出し分けにすぎない)。
+  const isAdmin = !isHost && (members.find((m) => m.isSelf)?.isAdmin ?? false);
+  const canManage = isHost || isAdmin;
   // ドメイン名(ADR-0024):
   //   <prefix>.<base>.<ネットワーク名>.peercove.internal
   //   prefix   = 先頭の自由入力(空可・先頭 * でワイルドカード)
@@ -149,22 +157,38 @@ export function DnsView({
   const add = async () => {
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
-      await api.addDnsRecord(
-        configPath,
-        relative,
-        effectiveTarget,
-        machineRef,
-        scheme.trim() === "" ? undefined : scheme.trim(),
-        port.trim() === "" ? undefined : Number(port),
-      );
+      if (isHost) {
+        await api.addDnsRecord(
+          configPath,
+          relative,
+          effectiveTarget,
+          machineRef,
+          scheme.trim() === "" ? undefined : scheme.trim(),
+          port.trim() === "" ? undefined : Number(port),
+        );
+        reload();
+      } else {
+        // admin メンバー(ADR-0059 決定 3): ホストへ中継。反映は次回の台帳配布
+        await api.adminDnsOp(configPath, {
+          op: "add",
+          name: relative,
+          ip: effectiveTarget.ip ?? null,
+          member: effectiveTarget.member ?? null,
+          cname: effectiveTarget.cname ?? null,
+          under: machineRef ?? null,
+          scheme: scheme.trim() === "" ? null : scheme.trim(),
+          port: port.trim() === "" ? null : Number(port),
+        });
+        setNotice(t.dns.adminApplyNotice);
+      }
       setPrefix("");
       setBaseFree("");
       setIp("");
       setCnameInput("");
       setScheme("");
       setPort("");
-      reload();
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -174,9 +198,18 @@ export function DnsView({
 
   const remove = async (record: DnsRecord) => {
     setError(null);
+    setNotice(null);
     try {
-      await api.removeDnsRecord(configPath, record.name, record.under);
-      reload();
+      if (isHost) {
+        await api.removeDnsRecord(configPath, record.name, record.under);
+        reload();
+      } else if (record.id) {
+        // admin メンバー(ADR-0059 決定 3): id で対象を指定してホストへ中継
+        await api.adminDnsOp(configPath, { op: "remove", id: record.id });
+        setNotice(t.dns.adminApplyNotice);
+      } else {
+        setError(t.dns.adminMissingId);
+      }
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -273,9 +306,9 @@ export function DnsView({
                 </div>
                 {copyButton(record.fqdn)}
                 {record.url !== null && copyButton(record.url, t.dns.copyUrl)}
-                {isHost && (
+                {canManage && (
                   <>
-                    {record.port !== null && record.healthSettings !== null && (
+                    {record.port !== null && (
                       <button
                         type="button"
                         className="button--link small"
@@ -298,9 +331,11 @@ export function DnsView({
           </ul>
         )}
 
-        {isHost ? (
+        {canManage ? (
           <>
-            <p className="muted small">{t.dns.customNote}</p>
+            <p className="muted small">
+              {isHost ? t.dns.customNote : t.dns.customNoteAdmin}
+            </p>
 
             {/* ドメイン名: <prefix>.<base>.<net>.peercove.internal(ADR-0024) */}
             <span className="field__label">{t.dns.domainLabel}</span>
@@ -436,17 +471,23 @@ export function DnsView({
           <p className="muted small">{t.dns.customNoteMember}</p>
         )}
 
+        {notice && <p className="muted small">{notice}</p>}
         {error && <p className="error-text">{error}</p>}
       </div>
-      {healthEditing?.healthSettings && (
+      {healthEditing && (
         <HealthDialog
           configPath={configPath}
           record={healthEditing}
+          isHost={isHost}
           onClose={() => setHealthEditing(null)}
           onSaved={() => {
             setHealthEditing(null);
-            reload();
-            void checkNow();
+            if (isHost) {
+              reload();
+              void checkNow();
+            } else {
+              setNotice(t.dns.adminApplyNotice);
+            }
           }}
         />
       )}
@@ -498,18 +539,30 @@ function reasonLabel(reason?: ServiceHealth["reason"]) {
   return t.dns.health.reason[reason];
 }
 
+/** admin メンバー(ADR-0059)は配布データに現在の設定が乗らないため、
+ * 開いた時点ではこの既定値から編集を始める(ホストは実際の設定値を使う)。 */
+const DEFAULT_HEALTH_SETTINGS: HealthSettings = {
+  enabled: true,
+  kind: "tcp",
+  path: "/",
+  expectedStatus: null,
+  external: false,
+};
+
 function HealthDialog({
   configPath,
   record,
+  isHost,
   onClose,
   onSaved,
 }: {
   configPath: string;
   record: DnsRecord;
+  isHost: boolean;
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const original = record.healthSettings as HealthSettings;
+  const original = record.healthSettings ?? DEFAULT_HEALTH_SETTINGS;
   const [settings, setSettings] = useState<HealthSettings>(original);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -520,7 +573,23 @@ function HealthDialog({
     setBusy(true);
     setError(null);
     try {
-      await api.setDnsHealth(configPath, record, settings);
+      if (isHost) {
+        await api.setDnsHealth(configPath, record, settings);
+      } else if (record.id) {
+        // admin メンバー(ADR-0059 決定 3): id で対象を指定してホストへ中継
+        const op: AdminDnsOp = {
+          op: "set_health",
+          id: record.id,
+          enabled: settings.enabled,
+          kind: settings.kind,
+          path: settings.path,
+          expected_status: settings.expectedStatus,
+          external: settings.external,
+        };
+        await api.adminDnsOp(configPath, op);
+      } else {
+        throw new Error(t.dns.adminMissingId);
+      }
       onSaved();
     } catch (reason) {
       setError(errorMessage(reason));

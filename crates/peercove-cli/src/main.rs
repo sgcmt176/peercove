@@ -225,6 +225,63 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// 暗号化バックアップの作成・確認・復元(ADR-0059、cron からの定期実行を想定)
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
+}
+
+/// パスフレーズは env か --passphrase-file のみで受け取る(引数直書きは不可。
+/// `ps` やシェル履歴に残るため)。両方指定時は --passphrase-file を優先する。
+#[derive(Subcommand)]
+enum BackupAction {
+    /// 設定・鍵・PSK などを暗号化してバックアップファイルを作成する
+    Create {
+        /// バックアップ対象の設定(host.toml / member.toml)
+        #[arg(long)]
+        config: PathBuf,
+        /// 出力先。ディレクトリを指定するとファイル名を自動生成する
+        #[arg(long)]
+        out: PathBuf,
+        /// パスフレーズが書かれたファイル(前後の空白は無視)。
+        /// 省略時は環境変数 PEERCOVE_BACKUP_PASSPHRASE を使う
+        #[arg(long, value_name = "PATH")]
+        passphrase_file: Option<PathBuf>,
+        /// 共有メモ(グループチャット含む)を同梱しない(既定は同梱。ホストのみ意味を持つ)
+        #[arg(long)]
+        no_memos: bool,
+        /// 出力先が既存ファイルでも上書きする
+        #[arg(long)]
+        force: bool,
+    },
+    /// バックアップの中身を復元せずに確認する
+    Inspect {
+        /// バックアップファイル
+        #[arg(long)]
+        file: PathBuf,
+        /// パスフレーズが書かれたファイル。省略時は環境変数 PEERCOVE_BACKUP_PASSPHRASE
+        #[arg(long, value_name = "PATH")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// バックアップからネットワークを復元する(稼働中のネットワークへは復元できない)
+    Restore {
+        /// バックアップファイル
+        #[arg(long)]
+        file: PathBuf,
+        /// 復元先の基準ディレクトリ。この配下の networks/<name>/ に復元する(既定はカレント)
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// 復元先のネットワーク名(ディレクトリ名になる)
+        #[arg(long)]
+        name: String,
+        /// 同名の既存ネットワークを置き換える(既定は新規名のみ許可)
+        #[arg(long)]
+        replace: bool,
+        /// パスフレーズが書かれたファイル。省略時は環境変数 PEERCOVE_BACKUP_PASSPHRASE
+        #[arg(long, value_name = "PATH")]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -407,6 +464,30 @@ fn run(command: Command, log_level: Option<String>) -> anyhow::Result<()> {
         Command::Status { config } => commands::status::run(&config),
         Command::Down { config } => commands::tunnel::run_down(&config),
         Command::Daemon { action } => run_daemon_action(action, log_level),
+        Command::Backup { action } => run_backup_action(action),
+    }
+}
+
+fn run_backup_action(action: BackupAction) -> anyhow::Result<()> {
+    match action {
+        BackupAction::Create {
+            config,
+            out,
+            passphrase_file,
+            no_memos,
+            force,
+        } => commands::backup::create(&config, &out, passphrase_file.as_deref(), !no_memos, force),
+        BackupAction::Inspect {
+            file,
+            passphrase_file,
+        } => commands::backup::inspect(&file, passphrase_file.as_deref()),
+        BackupAction::Restore {
+            file,
+            dir,
+            name,
+            replace,
+            passphrase_file,
+        } => commands::backup::restore(&file, &dir, &name, replace, passphrase_file.as_deref()),
     }
 }
 

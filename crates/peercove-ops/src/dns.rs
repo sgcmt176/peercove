@@ -378,6 +378,37 @@ pub fn remove_record(
     write_validated(lock, config_path, &doc.to_string())
 }
 
+/// id からレコードを解決して削除する(admin のリモート管理、ADR-0059 決定 3、
+/// J-1c)。配布データ(台帳)には under が乗らないため、(name, under) の組
+/// ではなく安定 ID で対象を特定する必要がある。
+pub fn remove_record_by_id(config_path: &Path, id: &str) -> anyhow::Result<()> {
+    let record = find_by_id(config_path, id)?;
+    remove_record(config_path, &record.name, record.under)
+}
+
+/// id からレコードを解決してヘルスチェック設定を更新する(remove_record_by_id と同型)。
+pub fn set_health_by_id(
+    config_path: &Path,
+    id: &str,
+    settings: &HealthSettings,
+) -> anyhow::Result<()> {
+    let record = find_by_id(config_path, id)?;
+    set_health(config_path, &record.name, record.under, settings)
+}
+
+/// id でレコードを探す。見つからない場合(id 未付与の旧レコード・
+/// 既に削除された等)は明示エラーにする。
+fn find_by_id(
+    config_path: &Path,
+    id: &str,
+) -> anyhow::Result<peercove_core::config::DnsRecordConfig> {
+    Config::load(config_path)?
+        .dns_records
+        .into_iter()
+        .find(|record| record.id.as_deref() == Some(id))
+        .ok_or_else(|| anyhow::anyhow!("レコードが見つかりません(既に削除された可能性があります)"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,5 +772,49 @@ mod tests {
             .collect();
         assert!(names.contains(&"web.host".to_string()));
         assert!(!names.contains(&"web.alice".to_string()));
+    }
+
+    /// admin のリモート管理(ADR-0059 決定 3、J-1c)が使う id 指定の削除・
+    /// ヘルス変更。配布データには under が乗らないため id で特定する。
+    #[test]
+    fn remove_and_set_health_by_id() {
+        let config = setup("by-id");
+        add_record(
+            &config,
+            &NewRecord {
+                name: "web",
+                target: ip("10.68.1.50"),
+                under: None,
+                scheme: Some("http"),
+                port: Some(8080),
+            },
+        )
+        .unwrap();
+        let id = list_records(&config).unwrap()[0].id.clone().unwrap();
+
+        set_health_by_id(
+            &config,
+            &id,
+            &HealthSettings {
+                enabled: true,
+                kind: peercove_core::dns::HealthCheckKind::HttpHead,
+                path: "/ready".into(),
+                expected_status: Some(204),
+                external: false,
+            },
+        )
+        .unwrap();
+        let records = list_records(&config).unwrap();
+        assert_eq!(records[0].health.path, "/ready");
+        assert_eq!(records[0].health.expected_status, Some(204));
+
+        // 存在しない id は明示エラー
+        assert!(
+            set_health_by_id(&config, "svc-does-not-exist", &records[0].health.clone(),).is_err()
+        );
+
+        remove_record_by_id(&config, &id).unwrap();
+        assert!(list_records(&config).unwrap().is_empty());
+        assert!(remove_record_by_id(&config, &id).is_err(), "二重削除");
     }
 }

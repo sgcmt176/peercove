@@ -357,6 +357,7 @@ mod tests {
             capabilities: vec![],
             member_id: None,
             can_invite: false,
+            is_admin: false,
             invited_by: None,
             invite_status: None,
             invite_expires_at: None,
@@ -374,6 +375,7 @@ mod tests {
                 "game".to_string(),
                 vec![entry("alice", "10.1.0.2")],
                 vec![DnsRecord {
+                    id: None,
                     name: "nas".to_string(),
                     ip: "10.1.0.50".parse().unwrap(),
                     scheme: None,
@@ -381,6 +383,7 @@ mod tests {
                     health: None,
                 }],
                 vec![CnameRecord {
+                    id: None,
                     name: "docs".to_string(),
                     target: "example.com".to_string(),
                     resolved_ip: None,

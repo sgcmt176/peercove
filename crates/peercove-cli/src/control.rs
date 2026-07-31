@@ -339,6 +339,9 @@ struct MemberLinkState {
     display_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
     /// メンバー招待の発行依頼(ADR-0048)の応答待ち。dns_reply と同じ仕組み。
     invite_reply: Option<tokio::sync::oneshot::Sender<InviteReply>>,
+    /// DNS 管理依頼(admin 委任、ADR-0059 決定 3、J-1c)の応答待ち。
+    /// dns_reply と同じ仕組み。
+    dns_admin_reply: Option<tokio::sync::oneshot::Sender<(bool, String)>>,
     /// 共有メモ(M5 F-2)の応答待ち(seq → 受け口)。他の依頼と違い
     /// 同時に複数飛ばせる(一覧 + 本文の取り直しなど)。
     memo_pending: HashMap<u64, tokio::sync::oneshot::Sender<peercove_core::memo::SharedMemoReply>>,
@@ -433,6 +436,24 @@ impl MemberLink {
         Some(rx)
     }
 
+    /// DNS カスタムレコードの管理をホストへ依頼し、応答の受け口を返す
+    /// (admin 委任、ADR-0059 決定 3、J-1c)。切断中なら `None`。
+    /// 仕組みは [`Self::request_dns_name`] と同じ。最終判定は常にホスト側
+    /// (peer.admin)なので、ここでは権限チェックしない。
+    pub fn request_dns_admin(
+        &self,
+        op: peercove_core::proto::AdminDnsRequest,
+    ) -> Option<tokio::sync::oneshot::Receiver<(bool, String)>> {
+        let mut state = self.inner.lock().unwrap();
+        let outbox = state.outbox.as_ref()?;
+        if outbox.send(ControlMessage::AdminDnsOp { op }).is_err() {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.dns_admin_reply = Some(tx);
+        Some(rx)
+    }
+
     /// 共有メモの操作をホストへ送り、応答の受け口を返す(M5 F-2)。
     /// 切断中なら `None`。他の依頼と違い同時に複数を待てる。
     pub fn request_memo(
@@ -465,6 +486,7 @@ impl MemberLink {
         state.dns_reply = None; // 応答待ちの受け口は Err(切断)になる
         state.display_reply = None;
         state.invite_reply = None;
+        state.dns_admin_reply = None;
         state.memo_pending.clear();
         state.connection_error = None;
     }
@@ -475,6 +497,7 @@ impl MemberLink {
         state.dns_reply = None;
         state.display_reply = None;
         state.invite_reply = None;
+        state.dns_admin_reply = None;
         state.memo_pending.clear();
     }
 
@@ -497,6 +520,12 @@ impl MemberLink {
     fn put_invite_result(&self, result: InviteReply) {
         if let Some(reply) = self.inner.lock().unwrap().invite_reply.take() {
             let _ = reply.send(result);
+        }
+    }
+
+    fn put_dns_admin_result(&self, accepted: bool, message: String) {
+        if let Some(reply) = self.inner.lock().unwrap().dns_admin_reply.take() {
+            let _ = reply.send((accepted, message));
         }
     }
 
@@ -732,6 +761,117 @@ impl HostRequests {
                     token: None,
                     name: None,
                     expires_at: None,
+                }
+            }
+        }
+    }
+
+    /// DNS カスタムレコードのリモート管理依頼(admin 委任、ADR-0059 決定 3、
+    /// J-1c)を適用し、応答メッセージを返す。権限(peer.admin)は依頼ごとに
+    /// host.toml 正本で確認する(メンバー UI の出し分けは入り口の親切に
+    /// すぎない)。配布(台帳の再配布)は既存の 5 秒周期の再読込に自動で乗る
+    /// ため、ここでは追加の配布処理を書かない。
+    async fn apply_admin_dns(
+        &self,
+        member_ip: Ipv4Addr,
+        op: peercove_core::proto::AdminDnsRequest,
+    ) -> ControlMessage {
+        use peercove_core::proto::AdminDnsRequest;
+        let _guard = self.lock.lock().await;
+        let path = self.config_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let config = peercove_core::config::Config::load(&path)?;
+            let peer = peercove_ops::peers::find_peer(
+                &config,
+                &peercove_ops::peers::Selector::Ip(member_ip),
+            )?;
+            if !peer.admin {
+                anyhow::bail!("管理が委任されていません");
+            }
+            match op {
+                AdminDnsRequest::Add {
+                    name,
+                    ip,
+                    member,
+                    cname,
+                    under,
+                    scheme,
+                    port,
+                } => {
+                    let cname = cname.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                    let target = match (ip, member, cname) {
+                        (Some(ip), None, None) => peercove_ops::dns::RecordTarget::Ip(ip),
+                        (None, Some(member), None) => {
+                            peercove_ops::dns::RecordTarget::Member(member)
+                        }
+                        (None, None, Some(cname)) => {
+                            peercove_ops::dns::RecordTarget::Cname(cname.to_string())
+                        }
+                        _ => anyhow::bail!(
+                            "転送先には IP / メンバー / ドメイン(CNAME)のいずれか 1 つを指定してください"
+                        ),
+                    };
+                    let relative = peercove_ops::dns::add_record(
+                        &path,
+                        &peercove_ops::dns::NewRecord {
+                            name: name.trim(),
+                            target,
+                            under,
+                            scheme: scheme.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                            port,
+                        },
+                    )?;
+                    Ok(format!("レコード \"{relative}\" を追加しました"))
+                }
+                AdminDnsRequest::Remove { id } => {
+                    peercove_ops::dns::remove_record_by_id(&path, &id)?;
+                    Ok("レコードを削除しました".to_string())
+                }
+                AdminDnsRequest::SetHealth {
+                    id,
+                    enabled,
+                    kind,
+                    path: health_path,
+                    expected_status,
+                    external,
+                } => {
+                    peercove_ops::dns::set_health_by_id(
+                        &path,
+                        &id,
+                        &peercove_ops::dns::HealthSettings {
+                            enabled,
+                            kind,
+                            path: health_path,
+                            expected_status,
+                            external,
+                        },
+                    )?;
+                    Ok("ヘルスチェック設定を更新しました".to_string())
+                }
+            }
+        })
+        .await;
+        match outcome {
+            Ok(Ok(message)) => {
+                // 可視化(ADR-0059)。レコード内容の詳細(名前・IP)は debug 程度に留める
+                tracing::info!("メンバー {member_ip} が DNS 設定を変更しました");
+                ControlMessage::AdminDnsResult {
+                    accepted: true,
+                    message,
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::info!("メンバー {member_ip} の DNS 設定変更を受け付けませんでした: {e:#}");
+                ControlMessage::AdminDnsResult {
+                    accepted: false,
+                    message: format!("{e:#}"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("DNS 設定変更の適用タスクが失敗しました: {e}");
+                ControlMessage::AdminDnsResult {
+                    accepted: false,
+                    message: "ホスト側の内部エラーです".to_string(),
                 }
             }
         }
@@ -1126,7 +1266,8 @@ async fn host_reader(
                 ControlMessage::SetDnsName { .. }
                 | ControlMessage::SetDisplayName { .. }
                 | ControlMessage::CreateInvite { .. }
-                | ControlMessage::MemoReq { .. },
+                | ControlMessage::MemoReq { .. }
+                | ControlMessage::AdminDnsOp { .. },
             ) if isolation.load(Ordering::Relaxed) => {
                 tracing::debug!("承認待ち端末 {member_ip} からの設定変更依頼を拒否しました");
             }
@@ -1167,6 +1308,12 @@ async fn host_reader(
                 // メモの内容はログへ出さない(ADR-0049)
                 let reply = requests.memo.handle_for_member(member_ip, op).await;
                 let _ = out.send(ControlMessage::MemoResp { seq, reply });
+            }
+            Ok(ControlMessage::AdminDnsOp { op }) => {
+                // DNS 管理のリモート依頼(admin 委任、ADR-0059 決定 3、J-1c)。
+                // 権限(peer.admin)は apply_admin_dns の中で毎回検証する
+                let reply = requests.apply_admin_dns(member_ip, op).await;
+                let _ = out.send(reply);
             }
             Ok(_) => tracing::debug!("メンバー {member_ip} から: {}", line.trim_end()),
             Err(e) => tracing::debug!("解析できないメッセージを無視: {e}"),
@@ -1556,6 +1703,11 @@ async fn member_reader(
                 // 共有メモの応答(M5 F-2)。IPC ハンドラ・同期タスクの受け口へ渡す
                 link.put_memo_result(seq, reply);
             }
+            Ok(ControlMessage::AdminDnsResult { accepted, message }) => {
+                // DNS 管理の応答(admin 委任、ADR-0059 決定 3、J-1c)。
+                // IPC ハンドラが待つ受け口へ渡す
+                link.put_dns_admin_result(accepted, message);
+            }
             Ok(ControlMessage::MemoEvent { event }) => {
                 // リアルタイム配信(M5 F-2)。キャッシュへ反映し、世代を進める
                 // (UI は status の shared_memo_seq で変化を検知する)
@@ -1584,6 +1736,7 @@ mod tests {
             capabilities: vec![],
             member_id: None,
             can_invite: false,
+            is_admin: false,
             invited_by: None,
             invite_status: None,
             invite_expires_at: None,
@@ -1757,6 +1910,7 @@ mod tests {
                     entry("bob", "100.100.42.3", false),
                 ],
                 dns_records: vec![DnsRecord {
+                    id: Some("svc-1".to_string()),
                     name: "nas".to_string(),
                     ip: "100.100.42.50".parse().unwrap(),
                     scheme: Some("https".to_string()),
@@ -1764,6 +1918,7 @@ mod tests {
                     health: None,
                 }],
                 cname_records: vec![CnameRecord {
+                    id: Some("svc-2".to_string()),
                     name: "docs".to_string(),
                     target: "example.com".to_string(),
                     resolved_ip: None,
@@ -1789,6 +1944,11 @@ mod tests {
             assert!(!dist.members[1].online);
             assert_eq!(dist.dns_records.len(), 1, "DNS レコードも一緒に届く");
             assert_eq!(dist.dns_records[0].name, "nas");
+            assert_eq!(
+                dist.dns_records[0].id.as_deref(),
+                Some("svc-1"),
+                "admin のリモート削除・ヘルス変更(ADR-0059)が id で対象を特定できる"
+            );
             assert_eq!(dist.dns_records[0].scheme.as_deref(), Some("https"));
             assert_eq!(dist.dns_records[0].port, Some(8443));
             assert_eq!(dist.cname_records.len(), 1, "CNAME も一緒に届く");
@@ -1861,6 +2021,7 @@ mod tests {
         let dist = Distribution {
             members: vec![pending, entry("bob", "100.100.42.3", true)],
             dns_records: vec![DnsRecord {
+                id: None,
                 name: "pending-service".to_string(),
                 ip: "100.100.42.2".parse().unwrap(),
                 scheme: None,

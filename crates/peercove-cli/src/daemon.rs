@@ -359,6 +359,38 @@ impl DaemonShared {
                     ),
                 }
             }
+            IpcRequest::AdminDns { config, op } => {
+                // (member)DNS カスタムレコードのリモート管理依頼(admin 委任、
+                // ADR-0059 決定 3、J-1c)。ホストへ送って権限確認(peer.admin)・
+                // 適用の結果を待つ。ロックは送信前に手放す
+                let (link, network) = {
+                    let active = self.active.lock().await;
+                    let active = active.get(&Self::key_for(&config)).with_context(|| {
+                        format!("この設定のトンネルは動いていません({})", config.display())
+                    })?;
+                    if active.role != Role::Member {
+                        bail!(
+                            "この操作はメンバーとして参加しているネットワーク用です\
+                            (ホストは DNS 管理画面から直接操作できます)"
+                        );
+                    }
+                    (Arc::clone(&active.member_link), active.network.clone())
+                };
+                let reply = link
+                    .request_dns_admin(op)
+                    .context("ホストに接続していません(接続が確立してからやり直してください)")?;
+                match tokio::time::timeout(std::time::Duration::from_secs(15), reply).await {
+                    Ok(Ok((true, message))) => {
+                        tracing::info!("DNS 設定を変更しました(network={network}): {message}");
+                        Ok(IpcResponse::Done)
+                    }
+                    Ok(Ok((false, message))) => bail!("{message}"),
+                    Ok(Err(_)) => bail!("ホストとの接続が切れました。やり直してください"),
+                    Err(_) => bail!(
+                        "ホストから応答がありません(ホストのバージョンが古い可能性があります)"
+                    ),
+                }
+            }
             IpcRequest::SharedMemo { config, op } => {
                 // 共有メモ(M5 F-2)。host は正本を直接、member は読み取りを
                 // キャッシュから、変更をコントロールチャネル経由で行う。
@@ -2932,6 +2964,7 @@ mod tests {
                 capabilities: vec![],
                 member_id: member_id.map(String::from),
                 can_invite: false,
+                is_admin: false,
                 invited_by: None,
                 invite_status: None,
                 invite_expires_at: None,

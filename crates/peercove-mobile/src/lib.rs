@@ -576,6 +576,9 @@ pub struct MemberInfo {
     /// この端末がメンバー招待を発行できるか(ADR-0048)。自分のエントリの
     /// 値で「招待を発行」ボタンの表示を決める。
     pub can_invite: bool,
+    /// 管理を委任されているか(ADR-0059)。Android は表示のみ(操作 UI は
+    /// デスクトップのみ)。
+    pub is_admin: bool,
     /// このメンバーを招待した発行者の表示名(ADR-0048)。ホスト発行は None。
     pub invited_by: Option<String>,
     /// メンバーの同一性 ID(ホスト側 invite_id)。デスクトップの
@@ -691,6 +694,7 @@ pub fn members(slug: String) -> Vec<MemberInfo> {
                 app_version: m.app_version.clone(),
                 platform: m.platform.clone(),
                 can_invite: m.can_invite,
+                is_admin: m.is_admin,
                 invited_by: m.invited_by.clone(),
                 member_id: m.member_id.clone(),
             }

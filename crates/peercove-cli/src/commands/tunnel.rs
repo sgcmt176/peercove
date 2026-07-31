@@ -984,6 +984,7 @@ fn build_ledger(
         capabilities: peercove_core::proto::current_capabilities(),
         member_id: None,
         can_invite: false,
+        is_admin: false,
         invited_by: None,
         invite_status: None,
         invite_expires_at: None,
@@ -1035,6 +1036,8 @@ fn build_ledger(
             member_id: peer.invite_id.clone(),
             // 招待発行の可否(ADR-0048)。グローバルトグルと端末指名の AND
             can_invite: config.interface.member_invites && peer.can_invite,
+            // 管理の委任(ADR-0059)。グローバルトグルは無い
+            is_admin: peer.admin,
             // 招待者(ADR-0048)。現在名に解決し、発行者が消えていれば
             // 発行時のスナップショット名で代替する
             invited_by: peer.invited_by_id.as_ref().and_then(|id| {
@@ -1621,6 +1624,26 @@ mod tests {
         assert!(!bob.online);
         assert_eq!(bob.endpoint, None, "古い観測は配布しない");
         assert_eq!(bob.endpoint_age_secs, None);
+    }
+
+    /// 管理の委任(ADR-0059、M7 J-1b): `PeerConfig.admin` が台帳の
+    /// `is_admin` にそのまま反映される(can_invite と違いグローバルトグルは
+    /// 無い)。ホスト自身のエントリは常に false(is_host で表現済み)。
+    #[test]
+    fn build_ledger_reflects_admin() {
+        let admin_key = PrivateKey::generate().public_key();
+        let plain_key = PrivateKey::generate().public_key();
+        let config = host_config(&format!(
+            "[[peer]]\nname = \"alice\"\npublic_key = \"{admin_key}\"\nallowed_ips = [\"10.100.42.2/32\"]\nadmin = true\n\
+             [[peer]]\nname = \"bob\"\npublic_key = \"{plain_key}\"\nallowed_ips = [\"10.100.42.3/32\"]\n"
+        ));
+        let host_key = PrivateKey::generate().public_key();
+        let ledger = build_ledger(&config, &host_key, &[]);
+
+        assert!(ledger[0].is_host);
+        assert!(!ledger[0].is_admin, "ホスト自身のエントリは false のまま");
+        assert!(ledger[1].is_admin, "admin = true のピアは is_admin が立つ");
+        assert!(!ledger[2].is_admin, "既定は非管理者");
     }
 
     /// 鍵ローテーション(ADR-0020): 同じ IP を設定内の別の鍵が引き継いだら、

@@ -1384,6 +1384,19 @@ fn set_member_can_invite(
     .map_err(to_message)
 }
 
+/// 管理の委任(ADR-0059)を端末単位で切り替える(host.toml)。付与・剥奪は
+/// ホストのみ。反映は次のデーモン同期(約 5 秒)で台帳に載る。
+#[tauri::command]
+fn set_member_admin(config_path: String, public_key: String, allowed: bool) -> Result<(), String> {
+    peercove_ops::peers::set_peer_admin(
+        Path::new(&config_path),
+        &Selector::PublicKey(&public_key),
+        allowed,
+    )
+    .map(|_| ())
+    .map_err(to_message)
+}
+
 /// (member)メンバー招待の発行結果。**token は秘密情報**(発行直後のみ表示)。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1668,6 +1681,19 @@ async fn check_dns_health(config_path: String) -> Result<(), String> {
     }
 }
 
+/// (member、admin 委任)DNS カスタムレコードのリモート管理(ADR-0059 決定 3、
+/// J-1c)。デーモンがコントロールチャネルでホストへ届け、権限確認
+/// (peer.admin)・適用の結果を待つ。ホスト自身は従来どおり
+/// `add_dns_record` 等を直接呼ぶ(IPC を経由しない)。
+#[tauri::command]
+async fn admin_dns_op(
+    config_path: String,
+    op: peercove_core::proto::AdminDnsRequest,
+) -> Result<(), String> {
+    let config = canonical(&config_path)?;
+    send(IpcRequest::AdminDns { config, op }).await
+}
+
 /// 設定ファイルの現在値を読む(M2-G5)。
 #[tauri::command]
 fn read_settings(config_path: String) -> Result<Settings, String> {
@@ -1768,6 +1794,7 @@ pub fn run() {
             approve_member,
             rename_member,
             set_member_can_invite,
+            set_member_admin,
             member_create_invite,
             set_member_dns_name,
             set_my_dns_name,
@@ -1805,6 +1832,7 @@ pub fn run() {
             remove_dns_record,
             set_dns_health,
             check_dns_health,
+            admin_dns_op,
             read_settings,
             save_settings,
         ])

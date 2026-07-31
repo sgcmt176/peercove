@@ -205,6 +205,17 @@ pub enum IpcRequest {
     /// 呼ばれる想定(デスクトップ UI 側で Android と同じ扱い)。応答は Done。
     /// 追加メソッドなので [`IPC_VERSION`] は上げない。
     QualityClear { config: PathBuf },
+    /// (member のみ)DNS カスタムレコードのリモート管理を要求する
+    /// (admin 委任、ADR-0059 決定 3、J-1c)。デーモンがコントロールチャネルで
+    /// ホストへ届け、権限確認(peer.admin)と適用の結果を待って返す
+    /// (成功 = Done / 拒否・タイムアウトは Err に理由)。ホスト自身の操作は
+    /// 従来どおり設定ファイル操作(peercove-ops)で、IPC には乗せない。
+    /// 追加メソッドなので [`IPC_VERSION`] は上げない。デスクトップ専用
+    /// (Android は対象外 = ADR-0059 決定 4)。
+    AdminDns {
+        config: PathBuf,
+        op: crate::proto::AdminDnsRequest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -372,6 +372,7 @@ mod tests {
             capabilities: vec![],
             member_id: None,
             can_invite: false,
+            is_admin: false,
             invited_by: None,
             invite_status: None,
             invite_expires_at: None,

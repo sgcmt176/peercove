@@ -58,6 +58,9 @@ pub struct Actor {
     /// GroupInfo.members に含まれるか」で行い、ここには解決済みの
     /// id を渡す(ストア層はグループの実体を知らない)。
     pub group_ids: Vec<String>,
+    /// 管理を委任されたメンバーか(ADR-0059、M7 J-1b)。ホストは常に true。
+    /// `can_manage` の判定にのみ使う(`can_edit` / `visible_to` は不変)。
+    pub admin: bool,
 }
 
 impl Actor {
@@ -66,6 +69,7 @@ impl Actor {
             member_id: None,
             name: name.into(),
             group_ids: Vec::new(),
+            admin: true,
         }
     }
 
@@ -74,12 +78,20 @@ impl Actor {
             member_id: Some(id.into()),
             name: name.into(),
             group_ids: Vec::new(),
+            admin: false,
         }
     }
 
     /// 所属グループの id 一覧を付与する(ホスト側サービス層が解決して渡す)。
     pub fn with_groups(mut self, ids: Vec<String>) -> Self {
         self.group_ids = ids;
+        self
+    }
+
+    /// admin 委任(ADR-0059)の有無を付与する(ホスト側サービス層が
+    /// host.toml の `PeerConfig.admin` を読んで渡す)。
+    pub fn with_admin(mut self, admin: bool) -> Self {
+        self.admin = admin;
         self
     }
 
@@ -194,8 +206,15 @@ impl Row {
         self.effective_level(actor, ctx) == SharedPermLevel::Editor
     }
 
+    /// 権限を変更できるか(所有者・ホスト・admin 委任メンバー、ADR-0059)。
+    /// `row()` は id 直指定でメモを取得する(可視性フィルタなし)ため、
+    /// admin は**自分に見えていないメモの権限も変更できる**(委任の趣旨が
+    /// アクセス整理のため、ホストと同じ扱いにする決定)。ただし
+    /// `visible_to` / `can_edit` は変えないので、一覧(List)には出てこない
+    /// — admin が操作できるのは「自分に見えているメモ + 権限ダイアログ」の
+    /// 範囲に留まり、本文の閲覧権限が広がるわけではない。
     fn can_manage(&self, actor: &Actor) -> bool {
-        actor.is_host() || self.owner_id == actor.owner_id()
+        actor.is_host() || actor.admin || self.owner_id == actor.owner_id()
     }
 
     fn summary(&self, actor: &Actor, ctx: &PermContext) -> SharedMemoSummary {
@@ -1378,7 +1397,7 @@ impl SharedStore {
     ) -> anyhow::Result<SharedMemoDetail> {
         let row = self.row(id)?;
         if !row.can_manage(actor) {
-            bail!("権限を変更できるのは所有者とホスト管理者だけです");
+            bail!("権限を変更できるのは所有者と管理者(ホスト/admin)だけです");
         }
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -3603,6 +3622,42 @@ mod tests {
         let (memos, _) = store.list(&bob, &SharedMemoQuery::default()).unwrap();
         assert!(memos.is_empty());
         // 権限変更はボブにはできない
+        assert!(store
+            .set_perms(&bob, &memo.id, SharedPermLevel::Editor, &[], None)
+            .is_err());
+    }
+
+    /// admin 委任(ADR-0059、M7 J-1b): admin は所有者でなくても SetPerms が
+    /// でき、しかも「自分に見えていないメモ」の権限も変更できる(委任の
+    /// 趣旨がアクセス整理のため、ホストと同じ扱い)。非 admin メンバーは
+    /// 引き続き拒否される。
+    #[test]
+    fn admin_can_set_perms_even_on_invisible_memo() {
+        let (_dir, mut store) = open_temp();
+        let alice = Actor::member("id-alice", "アリス");
+        let bob = Actor::member("id-bob", "ボブ");
+        let carol_admin = Actor::member("id-carol", "キャロル").with_admin(true);
+
+        let memo = store.create(&alice, "共有", "本文", None).unwrap();
+        // 全体 none + 個別なしにして、キャロル(admin)からも見えなくする
+        store
+            .set_perms(&alice, &memo.id, SharedPermLevel::None, &[], None)
+            .unwrap();
+        assert!(
+            store.get(&carol_admin, &memo.id).is_err(),
+            "admin でも閲覧権限が無ければ本文は見えない(visible_to は不変)"
+        );
+
+        // それでも admin は権限変更ができる(can_manage は admin を含む)
+        store
+            .set_perms(&carol_admin, &memo.id, SharedPermLevel::Viewer, &[], None)
+            .unwrap();
+        assert!(
+            store.get(&bob, &memo.id).is_ok(),
+            "admin が everyone を viewer に戻したので、第三者から見えるようになる"
+        );
+
+        // 非 admin のボブには引き続き拒否される
         assert!(store
             .set_perms(&bob, &memo.id, SharedPermLevel::Editor, &[], None)
             .is_err());

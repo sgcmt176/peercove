@@ -342,9 +342,10 @@ nas.game-lan.peercove.internal     → カスタムレコード(ホストが登�
   従来どおり表示名から自動導出される(小文字英数とハイフンに正規化。日本語など
   変換できない名前は `member-<仮想IP末尾>`)
 - **カスタムレコード**は UI のネットワーク詳細 → 「DNS」から追加・削除できる
-  (ホストのみ。設定の `[[dns_record]]` に保存され、全メンバーへ配布される)。
-  M3-14b 以降はターゲットにメンバーを指定でき、IP に自動追随する(下の
-  「カスタム DNS レコードの拡張」参照)
+  (ホストと、管理を委任された admin メンバー。設定の `[[dns_record]]` に
+  保存され、全メンバーへ配布される。admin の操作は「管理の委任」の節を
+  参照)。M3-14b 以降はターゲットにメンバーを指定でき、IP に自動追随する
+  (下の「カスタム DNS レコードの拡張」参照)
 - CLI 単発モード(`peercove host` / `member`)では DNS は動かない
   (デーモン経由 = UI か `daemon start-*` で使うこと)
 
@@ -783,6 +784,36 @@ iptablesで同じ順序・プロトコル・ポート条件を強制します。
 状態に加えて、**誰の招待で参加したか(招待者)**を確認できます
 (ホストが発行した招待は「ホスト」)。
 
+## 管理の委任(admin ロール、ADR-0059)
+
+ホストを VPS 等で常時稼働させ、ホスト管理者が不在のときでも信頼できる
+メンバーに一部の管理操作を任せられます。**最終判定は常にホスト側**
+で行われ、メンバー側の表示は入り口の親切にすぎません。
+
+- **付与・剥奪はホストのみ**: メンバー一覧の **ℹ(詳細)** を開き、
+  「管理を委任(admin)」を ON にします(既定 OFF)。反映は次のデーモン
+  同期(約 5 秒)で全員の台帳に載ります。剥奪も同じ場所から OFF にする
+  だけで、次回の台帳配布で自動的に失効します。
+- admin を委任されたメンバーは、メンバー一覧・詳細に「管理者」バッジが
+  表示されます(デスクトップ・Android 双方。Android は表示のみ)。
+- **admin ができること(V1)**:
+  - 共有メモの権限管理: 自分が所有者でないメモも含めて、共有メモの
+    🔑(権限)ダイアログで権限(全体・メンバー個別・グループ)を変更
+    できます。権限ダイアログのグループ候補も、自分が所属していない
+    グループを含む全グループから選べます。ただし**閲覧権限の無いメモが
+    一覧や本文に見えるようになるわけではありません**(委任の趣旨は
+    アクセス整理のためで、閲覧範囲そのものは変わりません)。
+  - **DNS カスタムレコードの管理(J-1c)**: 「DNS」画面でホストと同じ
+    追加フォーム・削除ボタン・ヘルスチェック設定が使えます。操作はホストへ
+    中継され、ホストの `host.toml` に反映されます(保存先はホストマシンの
+    ままで、admin 端末には何も保存されません)。追加・削除・ヘルス設定の
+    変更後は「変更を送信しました。反映まで数秒かかります」と表示され、
+    実際の一覧更新は次回の台帳配布(約 5〜10 秒)を待ちます。
+    ヘルスチェックの「今すぐ確認」ボタンは引き続きホスト専用です。
+- **admin にできないこと**: グループの所属メンバーの編集(そのグループの
+  メンバー本人のみ)、共有メモの容量上限・フォルダー管理、メンバーの
+  削除・承認、通信制御(ACL)の設定。これらは引き続きホスト専用です。
+
 ## デバイス鍵のローテーション(M3-11)
 
 招待方式(ADR-0005)ではメンバーの秘密鍵をホストが生成してトークンに同梱する
@@ -821,6 +852,43 @@ Argon2idで鍵を作り、XChaCha20-Poly1305で暗号化します。パスフレ
 ネットワークを黙って上書きせず、別名での復元か明示的な置換を選びます。置換対象が稼働中なら
 拒否されます。別端末へ復元したメンバー設定は、接続後にネットワーク設定からデバイス鍵を更新する
 ことを推奨します。
+
+### バックアップ(CLI、M7 J-1a)
+
+VPSでホストをヘッドレス運用する場合など、UIを開かずcronから定期バックアップしたい場合は
+`peercove backup` サブコマンドを使います。パスフレーズは`ps`やシェル履歴に残らないよう、
+**コマンドライン引数では受け取りません**。次の2方式のみです(両方指定した場合は
+`--passphrase-file` を優先):
+
+- 環境変数 `PEERCOVE_BACKUP_PASSPHRASE`
+- `--passphrase-file <path>`(ファイルの中身。前後の空白は無視)
+
+```bash
+# 作成(--out にディレクトリを指定すると
+# peercove-backup-<ネットワーク名>-<YYYYMMDD-HHMMSS>.pcvbackup を自動命名)
+peercove backup create --config networks/home/host.toml --out /var/backups/peercove/ \
+  --passphrase-file /etc/peercove/backup-passphrase
+
+# 中身の確認(復元はしない)
+peercove backup inspect --file /var/backups/peercove/peercove-backup-home-20260731-030000.pcvbackup \
+  --passphrase-file /etc/peercove/backup-passphrase
+
+# 復元(稼働中のネットワークへは拒否される。デーモン未起動なら復元できる)
+peercove backup restore --file backup.pcvbackup --dir . --name home-restored \
+  --passphrase-file /etc/peercove/backup-passphrase
+```
+
+cronの例(パスフレーズを環境ファイルから読む):
+
+```cron
+# /etc/peercove/backup-env に PEERCOVE_BACKUP_PASSPHRASE=... を1行だけ書く
+0 3 * * * . /etc/peercove/backup-env && /usr/local/bin/peercove backup create \
+  --config /etc/peercove/networks/home/host.toml --out /var/backups/peercove/ \
+  >> /var/log/peercove-backup.log 2>&1
+```
+
+`--passphrase-file` に使うファイルはパーミッションを `600`(所有者のみ読み書き)にしてください
+(`chmod 600 /etc/peercove/backup-passphrase`)。環境ファイルを使う場合も同様です。
 
 
 ## 接続診断センター(M3-21)

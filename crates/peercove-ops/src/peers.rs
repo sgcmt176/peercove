@@ -698,6 +698,47 @@ pub fn set_peer_can_invite(
     Ok(display)
 }
 
+/// 管理の委任(ADR-0059)を端末単位で切り替える。既定(false)なら項目を
+/// 消す(設定ファイルを汚さない)。付与・剥奪はホストのみ。
+/// 戻り値は表示用の名前(ログ用)。
+pub fn set_peer_admin(
+    config_path: &Path,
+    selector: &Selector,
+    allowed: bool,
+) -> anyhow::Result<String> {
+    let config = Config::load(config_path)?;
+    let target = find_peer(&config, selector)?;
+    let display = target
+        .name
+        .clone()
+        .unwrap_or_else(|| target.public_key.to_string());
+    let target_key = target.public_key.to_base64();
+    let (lock, mut doc) = load_doc_locked(config_path)?;
+    let mut updated = false;
+    for table in peer_tables(&mut doc)?.iter_mut() {
+        let matches = table
+            .get("public_key")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            == Some(target_key.as_str());
+        if matches {
+            if allowed {
+                table["admin"] = toml_edit::value(true);
+            } else {
+                table.remove("admin");
+            }
+            updated = true;
+        }
+    }
+    if !updated {
+        bail!(
+            "host.toml から対象ピアを特定できませんでした(手編集で public_key が変わっている可能性)"
+        );
+    }
+    write_validated(lock, config_path, &doc.to_string())?;
+    Ok(display)
+}
+
 /// 招待 v3 の初回認証済み Hello を記録する。旧招待・既に記録済みなら変更しない。
 pub fn mark_invite_accepted_by_ip(
     config_path: &Path,
@@ -894,6 +935,45 @@ mod tests {
             !std::fs::read_to_string(&config)
                 .unwrap()
                 .contains("can_invite"),
+            "無効化で項目ごと消える"
+        );
+    }
+
+    /// 管理の委任(ADR-0059)。有効化で admin = true が書かれ、無効化で
+    /// 項目ごと消える(設定ファイルを汚さない)。can_invite と同型。
+    #[test]
+    fn admin_toggle_roundtrip() {
+        let config = setup("admintoggle");
+        let key = PrivateKey::generate().public_key();
+        append_peer(
+            &config,
+            &NewPeer {
+                public_key: key,
+                ip: "10.100.42.2".parse().unwrap(),
+                name: Some("alice"),
+                dns_name: None,
+                preshared_key_file: None,
+                invite_id: None,
+                invite_issued_at: None,
+                invite_expires_at: None,
+                invited_by_id: None,
+                invited_by_name: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !Config::load(&config).unwrap().peers[0].admin,
+            "既定は非管理者"
+        );
+
+        let ip: Ipv4Addr = "10.100.42.2".parse().unwrap();
+        set_peer_admin(&config, &Selector::Ip(ip), true).unwrap();
+        assert!(Config::load(&config).unwrap().peers[0].admin);
+
+        set_peer_admin(&config, &Selector::Ip(ip), false).unwrap();
+        assert!(!Config::load(&config).unwrap().peers[0].admin);
+        assert!(
+            !std::fs::read_to_string(&config).unwrap().contains("admin"),
             "無効化で項目ごと消える"
         );
     }

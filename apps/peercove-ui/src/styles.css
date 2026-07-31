@@ -730,6 +730,12 @@ select {
   border-color: var(--accent, #58a);
 }
 
+/* 管理を委任されたメンバーの印(ADR-0059、M7 J-1b) */
+.tag--admin {
+  color: var(--warning, #b80);
+  border-color: var(--warning, #b80);
+}
+
 /* メンバー間の経路バッジ(M3-4)。直接 = 良い状態なのでオンライン色 */
 .tag--route-direct {
   color: var(--online);

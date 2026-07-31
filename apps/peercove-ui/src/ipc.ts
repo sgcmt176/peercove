@@ -47,6 +47,8 @@ export interface Member {
   aclRuleId: string | null;
   /** この端末がメンバー招待を発行できるか（ADR-0048）。自分の行の値でボタン表示を決める。 */
   canInvite: boolean;
+  /** 管理を委任されているか（ADR-0059）。共有メモの全権限管理を任せられる。 */
+  isAdmin: boolean;
   /** このメンバーを招待した発行者の表示名（ADR-0048）。ホスト発行は null。 */
   invitedBy: string | null;
 }
@@ -95,6 +97,33 @@ export interface HealthSettings {
   expectedStatus: number | null;
   external: boolean;
 }
+
+/**
+ * DNS カスタムレコードのリモート管理依頼（admin 委任、ADR-0059 決定 3、
+ * J-1c）。Rust 側 `peercove_core::proto::AdminDnsRequest` とワイヤ互換の形
+ * （タグ `op` は snake_case）でそのまま渡す。最終判定は常にホスト側。
+ */
+export type AdminDnsOp =
+  | {
+      op: "add";
+      name: string;
+      ip?: string | null;
+      member?: string | null;
+      cname?: string | null;
+      under?: string | null;
+      scheme?: string | null;
+      port?: number | null;
+    }
+  | { op: "remove"; id: string }
+  | {
+      op: "set_health";
+      id: string;
+      enabled: boolean;
+      kind: "tcp" | "http_head";
+      path: string;
+      expected_status?: number | null;
+      external?: boolean;
+    };
 
 export interface Peer {
   publicKey: string;
@@ -952,7 +981,9 @@ export type SharedMemoOp =
   // 共有スケジュール表(M6 G-1、ADR-0053)。additive な相乗り。
   | { op: "schedule"; schedule: ScheduleOp }
   // 共有シート(M6 G-2、ADR-0054)。additive な相乗り。
-  | { op: "sheet"; sheet: SheetOp };
+  | { op: "sheet"; sheet: SheetOp }
+  // 権限ダイアログ向けの全グループ一覧(ADR-0059)。host/admin のみ応答。
+  | { op: "perm_group_list" };
 
 export type SharedMemoReply =
   | {
@@ -977,7 +1008,9 @@ export type SharedMemoReply =
   // 共有スケジュール表(M6 G-1、ADR-0053)。
   | { kind: "schedule"; reply: ScheduleReply }
   // 共有シート(M6 G-2、ADR-0054)。
-  | { kind: "sheet"; reply: SheetReply };
+  | { kind: "sheet"; reply: SheetReply }
+  // PermGroupList への応答(ADR-0059、host/admin のみ)。
+  | { kind: "perm_groups"; groups: PermGroup[] };
 
 /** UI が扱う接続状態。デーモン自体へ届かない場合を含む。 */
 export type Connection =
@@ -1028,6 +1061,9 @@ export const api = {
   // メンバーはデーモン経由でホストへ発行を依頼する（token は秘密情報）
   setMemberCanInvite: (configPath: string, publicKey: string, allowed: boolean) =>
     invoke<void>("set_member_can_invite", { configPath, publicKey, allowed }),
+  // 管理の委任（ADR-0059）。付与・剥奪はホストのみ
+  setMemberAdmin: (configPath: string, publicKey: string, allowed: boolean) =>
+    invoke<void>("set_member_admin", { configPath, publicKey, allowed }),
   memberCreateInvite: (
     configPath: string,
     name: string | null,
@@ -1170,6 +1206,10 @@ export const api = {
   }),
   checkDnsHealth: (configPath: string) =>
     invoke<void>("check_dns_health", { configPath }),
+  // (member、admin 委任) DNS カスタムレコードのリモート管理（ADR-0059 決定 3、
+  // J-1c）。ホストへ中継され、権限確認（peer.admin）を経て適用される。
+  adminDnsOp: (configPath: string, op: AdminDnsOp) =>
+    invoke<void>("admin_dns_op", { configPath, op }),
   readSettings: (configPath: string) =>
     invoke<Settings>("read_settings", { configPath }),
   saveSettings: (configPath: string, update: SettingsUpdate) =>

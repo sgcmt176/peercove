@@ -1372,6 +1372,15 @@ private fun MemberDetailDialog(member: MemberInfo, onDismiss: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                // 管理の委任(ADR-0059、M7 J-1b)。Android は表示のみ
+                // (操作 UI はデスクトップのみ)
+                if (member.isAdmin) {
+                    Text(
+                        stringResource(R.string.member_detail_is_admin),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         },
         confirmButton = {

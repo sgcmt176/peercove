@@ -604,6 +604,11 @@ pub enum SharedMemoOp {
     Sheet {
         sheet: SheetOp,
     },
+    /// 共有メモの権限ダイアログ向けの全グループ一覧(M7 J-1b、ADR-0059)。
+    /// ホスト管理者と admin を委任されたメンバーだけが応答を受け取れる
+    /// (それ以外は拒否)。additive な相乗り(capability は `shared_memo`
+    /// のまま。旧クライアントはこの variant を解析失敗で無視する)。
+    PermGroupList,
 }
 
 /// [`SharedMemoOp`] への応答。
@@ -662,6 +667,10 @@ pub enum SharedMemoReply {
     /// 共有シート(M6 G-2、ADR-0054)。
     Sheet {
         reply: SheetReply,
+    },
+    /// PermGroupList への応答(id と現在名だけ。M7 J-1b、ADR-0059)。
+    PermGroups {
+        groups: Vec<crate::ipc::PermGroup>,
     },
 }
 

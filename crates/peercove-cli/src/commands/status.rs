@@ -120,7 +120,8 @@ pub fn write_status_file(
         .with_context(|| format!("{} の書き込みに失敗しました", path.display()))
 }
 
-fn human_bytes(bytes: u64) -> String {
+// backup コマンド(サイズ表示)からも再利用する(M6 H-10 で統一した表記)
+pub(crate) fn human_bytes(bytes: u64) -> String {
     // 表記は KB/MB(依頼者指定で KiB/MiB から統一、M6 H-10)。計算は従来どおり 1024 進。
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
@@ -184,6 +185,7 @@ mod tests {
                 capabilities: vec![],
                 member_id: None,
                 can_invite: false,
+                is_admin: false,
                 invited_by: None,
                 invite_status: None,
                 invite_expires_at: None,
@@ -206,6 +208,7 @@ mod tests {
                 capabilities: vec![],
                 member_id: None,
                 can_invite: false,
+                is_admin: false,
                 invited_by: None,
                 invite_status: None,
                 invite_expires_at: None,

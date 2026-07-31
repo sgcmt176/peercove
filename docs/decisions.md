@@ -3671,3 +3671,66 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
      「DNS 名は変わりません」と明記する。
 - **理由**: 表示と識別子の分離はメンバー名で実績があり、稼働中でも安全に
   変更できる。旧クライアントは未知の台帳フィールドを無視する(additive)。
+
+## ADR-0059: メンバーロール(admin 委任)とバックアップ CLI(M7 J-1)
+
+- **ステータス**: 採用(2026-07-26、設計)。実装は J-1a(バックアップ CLI)/
+  J-1b(admin 基盤 + 共有メモ権限、**実装済み 2026-07-31**)/
+  J-1c(DNS のリモート管理、**実装済み 2026-07-31**)
+- **背景**: 依頼者がホストを VPS で常時稼働させる計画。ヘッドレス運用の
+  ため (1) 暗号化バックアップの CLI 化、(2) ホストが信用するメンバーへ
+  admin 権限を委任し、グループ権限操作と DNS 設定をメンバー端末から
+  行えるようにしたい(保存先はホストマシンのまま)。
+- **前例**: ADR-0048(メンバーによる招待発行)が「メンバー → ホストへ
+  依頼を中継 → ホストが host.toml 正本で権限検証 → 既存 ops を実行 →
+  依頼元の接続にだけ結果を返す」という型を確立済み。admin はこの型の
+  適用範囲を広げるだけで、**最終判定は常にホスト側**という原則を守る
+  (メンバー UI の出し分けは入り口の親切にすぎない)。
+- **決定**:
+  1. **付与**: `PeerConfig.admin: bool`(additive、既定 false は書かない。
+     `can_invite` と同型)。ops `set_peer_admin`、ホスト UI のメンバー詳細に
+     チェックボックス(「管理を委任(admin)」)。付与・剥奪はホストのみ。
+  2. **配布**: `LedgerEntry.is_admin`(additive)で全員へ。メンバー UI は
+     自分のエントリでロールを知る。admin 剥奪は次回台帳配布で自動失効。
+  3. **admin ができること(V1)**:
+     - **共有メモの権限管理**: 全メモの権限変更(`SetPerms`)と権限
+       ダイアログでの**全グループの参照**(新 op `PermGroupList`、host/admin
+       のみ応答)。実装は `Actor.admin` を追加し `can_manage` を
+       「ホスト or admin or 所有者」に拡張。
+     - **DNS カスタムレコードの管理**: 追加・削除・ヘルス設定。新しい
+       コントロールメッセージ(additive)でホストへ中継し、ホストが
+       `peercove_ops::dns` を実行。配布は既存の 5 秒周期の台帳更新に乗る。
+  3b. **実装時の確定(J-1b)**: `can_manage` の拡張により、admin は権限
+     変更に加えて**他メンバーのメモのゴミ箱・復元・完全削除・コメント
+     削除**もホスト同様に行える(判定関数が共通のため)。「アクセス整理を
+     任せる」という委任の趣旨に合致するため仕様として採用し、user-guide に
+     明記する。閲覧権限(visible_to / can_edit)は不変。
+  3c. **実装時の確定(J-1c)**: 配布される解決済み DNS レコード
+     (`ControlMessage::Ledger` の `dns_records` / `cname_records`、core
+     `DnsRecord` / `CnameRecord`)には、削除・ヘルス変更の対象を一意に
+     特定できる情報が乗っていなかった(`under` がワイヤに無く、host UI 専用の
+     `RecordDetail.id` も配布されていなかった)。これが実装時いちばんの
+     落とし穴だったため、`DnsRecord` / `CnameRecord` に **`id: Option<String>`
+     を additive で追加**し、`resolve_records` / `resolve_cnames` が
+     `DnsRecordConfig.id`(ADR-0035 の安定 ID)をそのまま乗せるようにした。
+     admin 発の `AdminDnsRequest::Remove` / `SetHealth` はこの `id` で対象を
+     指定する(`peercove_ops::dns::remove_record_by_id` /
+     `set_health_by_id` を新設)。id 未付与のまま配布された旧レコード
+     (host.toml の DNS 画面を一度も開かず id 補完が走っていない場合)は
+     admin から操作できず、明示エラーを返す(ホストが一度 DNS 画面を開けば
+     解決する)。また、ヘルス設定の現在値(有効/方式/パス等)も配布データには
+     乗らないため、admin がヘルスチェック設定を開くと既定値(有効・TCP・
+     `/`)から編集を始める仕様とした(ホストは実際の設定値を表示)。
+     「今すぐ確認」はホスト専用のまま(IPC `CheckDnsHealth` が元々ホスト
+     ロール限定のため変更なし)。
+  4. **やらないこと(V1)**: グループ定義(メンバー構成)の編集権限は
+     従来どおり「そのグループのメンバー」のみ。共有メモの上限設定・
+     フォルダー管理・メンバー削除・ACL・招待承認はホスト専用のまま。
+     Android は admin バッジの表示のみ(操作 UI はデスクトップのみ)。
+  5. **バックアップ CLI**: `peercove backup create/inspect/restore`。
+     パスフレーズは**引数では受け取らない**(ps に露出するため)。
+     環境変数 `PEERCOVE_BACKUP_PASSPHRASE` またはファイル指定
+     (`--passphrase-file`)。restore は該当ネットワークが稼働中なら拒否
+     (UI と同じガード)。cron からの定期実行を想定。
+- **互換**: プロトコル・IPC とも additive のみ。`PeerConfig.admin` を書いた
+  host.toml は旧バイナリで読めない(既存の `can_invite` と同じ注意)。

@@ -961,6 +961,11 @@ function MemberRow({
                 {t.tunnel.member.self}
               </span>
             )}
+            {member.isAdmin && (
+              <span className="tag tag--admin" title={t.tunnel.member.adminBadgeTitle}>
+                {t.tunnel.member.adminBadge}
+              </span>
+            )}
             <span
               className="tag member__version"
               title={
@@ -1165,6 +1170,7 @@ function MemberDetailDialog({
 }) {
   // 端末指名のチェックは楽観更新(台帳への反映は約 5 秒後)
   const [canInvite, setCanInvite] = useState(member.canInvite);
+  const [admin, setAdmin] = useState(member.isAdmin);
   const [busy, setBusy] = useState(false);
 
   const toggleCanInvite = async (allowed: boolean) => {
@@ -1174,6 +1180,21 @@ function MemberDetailDialog({
       await api.setMemberCanInvite(config, member.publicKey, allowed);
       setCanInvite(allowed);
       onNotice(t.tunnel.member.canInviteUpdated);
+    } catch (e) {
+      onError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 管理の委任(ADR-0059、M7 J-1b)。付与・剥奪はホストのみ
+  const toggleAdmin = async (allowed: boolean) => {
+    setBusy(true);
+    onError("");
+    try {
+      await api.setMemberAdmin(config, member.publicKey, allowed);
+      setAdmin(allowed);
+      onNotice(t.tunnel.member.adminUpdated);
     } catch (e) {
       onError(errorMessage(e));
     } finally {
@@ -1266,6 +1287,20 @@ function MemberDetailDialog({
             <span>
               {t.tunnel.member.canInviteLabel}
               <small className="muted"> {t.tunnel.member.canInviteHint}</small>
+            </span>
+          </label>
+        )}
+        {isHost && !member.isHost && !member.isSelf && (
+          <label className="field--check">
+            <input
+              type="checkbox"
+              checked={admin}
+              disabled={busy}
+              onChange={(event) => void toggleAdmin(event.target.checked)}
+            />
+            <span>
+              {t.tunnel.member.adminLabel}
+              <small className="muted"> {t.tunnel.member.adminHint}</small>
             </span>
           </label>
         )}

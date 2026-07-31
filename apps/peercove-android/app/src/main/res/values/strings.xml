@@ -104,6 +104,7 @@
     <string name="member_detail_invited_by">招待者</string>
     <string name="member_detail_invited_by_host">ホスト</string>
     <string name="member_detail_can_invite">この端末は招待を発行できます</string>
+    <string name="member_detail_is_admin">管理を委任されています(共有メモの権限管理ができます)</string>
     <string name="member_invite_button">招待を発行</string>
     <string name="member_invite_title">メンバーを招待</string>
     <string name="member_invite_note">ホストに依頼して招待を発行します。発行はホストの記録と全体チャットのお知らせに残ります（有効期限は最長 7 日）。</string>

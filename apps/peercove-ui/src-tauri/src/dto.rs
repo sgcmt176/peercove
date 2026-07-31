@@ -120,6 +120,8 @@ pub struct Member {
     /// この端末がメンバー招待を発行できるか(ADR-0048)。member ロールの
     /// UI は自分の行の値で「招待を発行」ボタンの表示を決める。
     pub can_invite: bool,
+    /// 管理を委任されているか(ADR-0059)。共有メモの全権限管理を任せられる。
+    pub is_admin: bool,
     /// このメンバーを招待した発行者の表示名(ADR-0048)。ホスト発行は null。
     pub invited_by: Option<String>,
     /// member_id(= invite_id、ADR-0047)。共有メモの個別権限指定に使う
@@ -153,6 +155,7 @@ impl Member {
             force_relay: entry.force_relay,
             acl_rule_id: entry.acl_rule_id.clone(),
             can_invite: entry.can_invite,
+            is_admin: entry.is_admin,
             invited_by: entry.invited_by.clone(),
             member_id: entry.member_id.clone(),
         }
@@ -473,7 +476,9 @@ impl From<&TunnelInfo> for Tunnel {
                         peercove_core::dns::DNS_SUFFIX
                     );
                     DnsRecordDto {
-                        id: None,
+                        // 配布された id をそのまま使う(ADR-0059 決定 3、J-1c)。
+                        // admin メンバーが削除・ヘルス変更を id で指定できるようにする。
+                        id: record.id.clone(),
                         name: record.name.clone(),
                         ip: Some(record.ip.to_string()),
                         cname: None,
@@ -499,7 +504,7 @@ impl From<&TunnelInfo> for Tunnel {
                         peercove_core::dns::DNS_SUFFIX
                     );
                     DnsRecordDto {
-                        id: None,
+                        id: record.id.clone(),
                         name: record.name.clone(),
                         ip: None,
                         cname: Some(record.target.clone()),
@@ -949,6 +954,7 @@ mod tests {
                 capabilities: peercove_core::proto::current_capabilities(),
                 member_id: None,
                 can_invite: false,
+                is_admin: false,
                 invited_by: None,
                 invite_status: Some("joined".to_string()),
                 invite_expires_at: Some(1_700_086_400),
@@ -974,6 +980,7 @@ mod tests {
             shared_memo: false,
             perm_groups: vec![],
             dns_records: vec![peercove_core::dns::DnsRecord {
+                id: Some("svc-1".to_string()),
                 name: "web.alice".to_string(),
                 ip: "10.100.42.2".parse().unwrap(),
                 scheme: Some("http".to_string()),
@@ -981,6 +988,7 @@ mod tests {
                 health: None,
             }],
             cname_records: vec![peercove_core::dns::CnameRecord {
+                id: Some("svc-2".to_string()),
                 name: "docs".to_string(),
                 target: "example.com".to_string(),
                 resolved_ip: None,
@@ -1025,6 +1033,10 @@ mod tests {
             "配信されたレコードが status に載る(ADR-0022 検証 FB)"
         );
         assert_eq!(json["tunnel"]["dnsRecords"][0]["ip"], "10.100.42.2");
+        assert_eq!(
+            json["tunnel"]["dnsRecords"][0]["id"], "svc-1",
+            "配布された id がそのまま載る(ADR-0059 決定 3、J-1c。admin の削除・ヘルス変更に使う)"
+        );
         assert_eq!(json["tunnel"]["dnsRecords"][0]["scheme"], "http");
         assert_eq!(json["tunnel"]["dnsRecords"][0]["port"], 8080);
         assert_eq!(
@@ -1067,6 +1079,7 @@ mod tests {
             capabilities: vec![],
             member_id: None,
             can_invite: false,
+            is_admin: false,
             invited_by: None,
             invite_status: None,
             invite_expires_at: None,

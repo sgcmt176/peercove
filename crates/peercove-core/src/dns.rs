@@ -108,6 +108,13 @@ pub fn service_url(fqdn: &str, scheme: Option<&str>, port: Option<u16>) -> Optio
 /// カスタム A レコード(ADR-0011 §1b)。ホストが設定に持ち、台帳と一緒に配布する。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsRecord {
+    /// 設定の安定 ID(ADR-0035)。admin のリモート管理(ADR-0059 決定 3、J-1c)が
+    /// 削除・ヘルス変更の対象を指定するのに使う(name/under だけではワイヤに
+    /// 親情報が乗らず一意に特定できないため)。旧バージョン(id 導入前に登録)
+    /// のレコードは None — その場合はリモート管理の対象にできない。
+    /// 追加フィールドなので [`crate::proto::PROTO_VERSION`] は上げない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// ラベル(正規化済み。`nas` など)
     pub name: String,
     pub ip: Ipv4Addr,
@@ -125,6 +132,9 @@ pub struct DnsRecord {
 /// 返す。A レコードとは別枠で配る(旧メンバー互換のため)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CnameRecord {
+    /// 設定の安定 ID(ADR-0035)。DnsRecord::id と同じ用途(ADR-0059 決定 3、J-1c)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// 相対名(正規化済み。`docs`, `*.app` など)
     pub name: String,
     /// 別名の指す先(小文字・末尾ドットなしの絶対ドメイン。外部可)
@@ -289,6 +299,7 @@ pub fn resolve_records(
             },
         };
         resolved.push(DnsRecord {
+            id: record.id.clone(),
             name,
             ip,
             scheme: record.scheme.clone(),
@@ -336,6 +347,7 @@ pub fn resolve_cnames(
             },
         };
         resolved.push(CnameRecord {
+            id: record.id.clone(),
             name,
             target: target.clone(),
             resolved_ip: None, // ホスト(poc)が外部解決してから埋める
@@ -378,6 +390,7 @@ mod tests {
             capabilities: vec![],
             member_id: None,
             can_invite: false,
+            is_admin: false,
             invited_by: None,
             invite_status: None,
             invite_expires_at: None,
@@ -602,6 +615,7 @@ mod tests {
         let ledger = vec![member(Some("alice"), "10.1.0.2", false)];
         let custom = vec![
             DnsRecord {
+                id: None,
                 name: "web.alice".to_string(),
                 ip: "10.1.0.2".parse().unwrap(),
                 scheme: None,
@@ -609,6 +623,7 @@ mod tests {
                 health: None,
             },
             DnsRecord {
+                id: None,
                 name: "Bad.alice".to_string(), // 大文字ラベル → 無視
                 ip: "10.1.0.3".parse().unwrap(),
                 scheme: None,
@@ -631,6 +646,7 @@ mod tests {
         let ledger = vec![member(Some("nas"), "10.1.0.2", false)];
         let custom = vec![
             DnsRecord {
+                id: None,
                 name: "nas".to_string(), // メンバー名と衝突 → 自動生成が勝つ
                 ip: "10.1.0.99".parse().unwrap(),
                 scheme: None,
@@ -638,6 +654,7 @@ mod tests {
                 health: None,
             },
             DnsRecord {
+                id: None,
                 name: "printer".to_string(),
                 ip: "10.1.0.50".parse().unwrap(),
                 scheme: None,
@@ -645,6 +662,7 @@ mod tests {
                 health: None,
             },
             DnsRecord {
+                id: None,
                 name: "Bad Label".to_string(), // 不正 → 無視
                 ip: "10.1.0.51".parse().unwrap(),
                 scheme: None,

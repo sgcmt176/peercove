@@ -179,6 +179,59 @@ pub enum ControlMessage {
     /// **閲覧権限があり、Hello で `shared_memo` capability を名乗った接続に
     /// だけ**送る(旧クライアントには一切流れない)。
     MemoEvent { event: crate::memo::SharedMemoEvent },
+    /// member → host: DNS カスタムレコードのリモート管理依頼(ADR-0059 決定 3、
+    /// J-1c)。発行者が admin(委任済み)かどうかは常にホストが host.toml 正本
+    /// (`PeerConfig.admin`)で検証する(メンバー UI の出し分けは入り口の親切に
+    /// すぎない)。配布(台帳の再配布)は既存の 5 秒周期に自動で乗るため、
+    /// 適用そのものは `peercove_ops::dns` への委譲のみ。
+    ///
+    /// 追加メッセージなので [`PROTO_VERSION`] は上げない。旧ホストは解析に
+    /// 失敗して黙って無視する(メンバー側はタイムアウトで未対応と案内する)。
+    AdminDnsOp { op: AdminDnsRequest },
+    /// host → member: [`ControlMessage::AdminDnsOp`] への応答(依頼が来た
+    /// 接続にだけ返す)。
+    AdminDnsResult { accepted: bool, message: String },
+}
+
+/// [`ControlMessage::AdminDnsOp`] の中身(ADR-0059 決定 3、J-1c)。
+/// `Add` のフィールドはホスト UI の Tauri コマンド `add_dns_record` と
+/// `peercove_ops::dns::NewRecord` に合わせた表現(ip / member / cname の
+/// いずれか 1 つ + under + scheme/port)。`Remove` / `SetHealth` は配布された
+/// レコード `id`(ADR-0035)で対象を指定する — 配布データには `under` が
+/// 乗らないため(name, under)の組では一意に特定できない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AdminDnsRequest {
+    /// レコードの追加。ターゲットは ip / member / cname のいずれか 1 つ。
+    Add {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ip: Option<Ipv4Addr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<crate::config::MemberRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cname: Option<String>,
+        /// 親メンバー(端末配下サブドメインのとき)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        under: Option<crate::config::MemberRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheme: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+    },
+    /// レコードの削除(id 指定)。
+    Remove { id: String },
+    /// ヘルスチェック設定の変更(id 指定、`peercove_ops::dns::HealthSettings` と同じ表現)。
+    SetHealth {
+        id: String,
+        enabled: bool,
+        kind: crate::dns::HealthCheckKind,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_status: Option<u16>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        external: bool,
+    },
 }
 
 /// 台帳の 1 エントリ。ホスト自身も 1 エントリとして含める。
@@ -218,6 +271,12 @@ pub struct LedgerEntry {
     /// 互換規則は endpoint と同じ(追加フィールド — 旧版とは互いに無視し合う)。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub can_invite: bool,
+    /// このメンバーが管理を委任されているか(ADR-0059)。共有メモの全権限
+    /// 管理(SetPerms・全グループ参照)を任せられる。最終判定は常にホスト側
+    /// (ここは UI の出し分け用)。互換規則は endpoint と同じ(追加フィールド
+    /// — 旧版とは互いに無視し合う)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_admin: bool,
     /// このメンバーを招待した発行者の表示名(ADR-0048)。ホストが
     /// invited_by_id → 現在の表示名に解決して載せる(発行者が削除済みなら
     /// 発行時のスナップショット名)。ホスト発行・旧ピアは None。
@@ -279,6 +338,7 @@ mod tests {
             capabilities: vec![],
             member_id: None,
             can_invite: false,
+            is_admin: false,
             invited_by: None,
             invite_status: None,
             invite_expires_at: None,
@@ -319,6 +379,7 @@ mod tests {
             ControlMessage::Ledger {
                 members: vec![entry()],
                 dns_records: vec![crate::dns::DnsRecord {
+                    id: Some("svc-1".to_string()),
                     name: "nas".to_string(),
                     ip: "100.100.42.50".parse().unwrap(),
                     scheme: None,
@@ -326,6 +387,7 @@ mod tests {
                     health: None,
                 }],
                 cname_records: vec![crate::dns::CnameRecord {
+                    id: Some("svc-2".to_string()),
                     name: "docs".to_string(),
                     target: "example.com".to_string(),
                     resolved_ip: None,
@@ -363,6 +425,36 @@ mod tests {
             ControlMessage::SetDisplayNameResult {
                 accepted: true,
                 message: "更新しました".to_string(),
+            },
+            ControlMessage::AdminDnsOp {
+                op: AdminDnsRequest::Add {
+                    name: "web".to_string(),
+                    ip: Some("10.1.0.50".parse().unwrap()),
+                    member: None,
+                    cname: None,
+                    under: Some(crate::config::MemberRef::Host),
+                    scheme: Some("http".to_string()),
+                    port: Some(8080),
+                },
+            },
+            ControlMessage::AdminDnsOp {
+                op: AdminDnsRequest::Remove {
+                    id: "svc-1".to_string(),
+                },
+            },
+            ControlMessage::AdminDnsOp {
+                op: AdminDnsRequest::SetHealth {
+                    id: "svc-1".to_string(),
+                    enabled: true,
+                    kind: crate::dns::HealthCheckKind::HttpHead,
+                    path: "/ready".to_string(),
+                    expected_status: Some(204),
+                    external: false,
+                },
+            },
+            ControlMessage::AdminDnsResult {
+                accepted: false,
+                message: "管理が委任されていません".to_string(),
             },
         ];
         for message in messages {
@@ -414,6 +506,7 @@ mod tests {
 
         // サービス情報なしのレコードは M3-14c より前の JSON と完全に一致する。
         let json = serde_json::to_string(&crate::dns::DnsRecord {
+            id: None,
             name: "nas".to_string(),
             ip: "100.100.42.50".parse().unwrap(),
             scheme: None,
@@ -421,7 +514,10 @@ mod tests {
             health: None,
         })
         .unwrap();
-        assert_eq!(json, r#"{"name":"nas","ip":"100.100.42.50"}"#);
+        assert_eq!(
+            json, r#"{"name":"nas","ip":"100.100.42.50"}"#,
+            "id が None のときは互換ワイヤ表現(id フィールドが乗らない)"
+        );
 
         // 旧ホストからの台帳(dns_records なし)も読める
         let old: ControlMessage =

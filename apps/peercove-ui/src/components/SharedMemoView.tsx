@@ -127,6 +127,32 @@ export function SharedMemoView({
   );
   const [saveError, setSaveError] = useState("");
   const [permsFor, setPermsFor] = useState<SharedMemoDetail | null>(null);
+  // 管理を委任されたメンバーか(ADR-0059、M7 J-1b)。host は既に permGroups
+  // に全グループが載っているので、ここでの追加取得は非 host の admin だけ
+  const isAdmin = isHost || members.some((m) => m.isSelf && m.isAdmin);
+  // 権限ダイアログを開いたとき、非 host の admin だけ全グループを取り直す
+  // (通常の permGroups は「自分の所属グループだけ」に絞られているため)
+  const [adminGroups, setAdminGroups] = useState<PermGroup[] | null>(null);
+  useEffect(() => {
+    if (isHost || !isAdmin || !permsFor) {
+      setAdminGroups(null);
+      return;
+    }
+    let cancelled = false;
+    void api
+      .sharedMemoOp(configPath, { op: "perm_group_list" })
+      .then((reply) => {
+        if (!cancelled && reply.kind === "perm_groups") {
+          setAdminGroups(reply.groups);
+        }
+      })
+      .catch(() => {
+        // 取得失敗時は permGroups(自分の所属分)にフォールバックする
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [configPath, isHost, isAdmin, permsFor]);
   // メモ間リンクのバックリンク欄(M5 F-5 Stage 2、ADR-0052 決定 2)。
   const [backlinks, setBacklinks] = useState<SharedMemoSummary[]>([]);
   /** 変更履歴パネルを開いているか(本文領域を置き換える)。 */
@@ -515,7 +541,7 @@ export function SharedMemoView({
         <PermsDialog
           memo={permsFor}
           members={members}
-          permGroups={permGroups}
+          permGroups={!isHost && isAdmin && adminGroups ? adminGroups : permGroups}
           onClose={() => setPermsFor(null)}
           onSave={(everyone, memberPerms, groupPerms) =>
             void run(

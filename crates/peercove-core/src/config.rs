@@ -312,6 +312,12 @@ pub struct PeerConfig {
     /// 旧バージョンでは読めない(明示エラーになる)。
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_invite: bool,
+    /// 管理を委任されたメンバー(ADR-0059)。付与・剥奪はホストのみ。
+    /// 共有メモの全権限管理(SetPerms・全グループ参照)を任せられる。
+    /// 既定 false。注意: `deny_unknown_fields` のため、これを書いた設定は
+    /// 旧バージョンでは読めない(明示エラーになる)。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub admin: bool,
     /// このピアを招待した発行メンバーの invite_id(= 台帳の member_id、
     /// ADR-0048)。ホスト自身が発行した招待では書かない。
     #[serde(skip_serializing_if = "Option::is_none")]
