@@ -47,6 +47,13 @@ export function QualityView({ tunnel }: { tunnel: Tunnel }) {
     };
   }, [period, tunnel.config]);
 
+  const isHost = tunnel.role === "hosting";
+  /** ホストの公開鍵(メンバーから見て唯一 RTT を測れる相手)。 */
+  const hostKey = useMemo(
+    () => tunnel.members.find((member) => member.isHost)?.publicKey ?? "",
+    [tunnel.members],
+  );
+
   const peers = useMemo(() => {
     // 品質履歴 DB は過去のサンプルをそのまま保持するため、削除済みメンバーの
     // publicKey も残っている。現在のメンバー一覧(tunnel.members)に無い
@@ -67,11 +74,18 @@ export function QualityView({ tunnel }: { tunnel: Tunnel }) {
 
   useEffect(() => {
     if (!peers.some((peer) => peer.key === peerKey)) {
-      setPeerKey(peers[0]?.key ?? "");
+      // メンバーの既定はホスト(唯一 RTT を測れる相手。M7 J-3 追補、依頼者
+      // 指摘)。ホスト自身の画面では従来どおり先頭のメンバーを選ぶ。
+      const preferred = !isHost && peers.some((peer) => peer.key === hostKey)
+        ? hostKey
+        : peers[0]?.key ?? "";
+      setPeerKey(preferred);
     }
-  }, [peerKey, peers]);
+  }, [peerKey, peers, isHost, hostKey]);
 
   const selected = samples.filter((sample) => sample.publicKey === peerKey);
+  /** 選んだ相手の RTT を測れない組み合わせか(メンバー同士)。 */
+  const unmeasurable = !isHost && peerKey !== "" && peerKey !== hostKey;
   const latest = selected.at(-1) ?? null;
   const measured = selected.filter((sample) => sample.rttAvgMs !== null);
   const avg = average(measured.map((sample) => sample.rttAvgMs as number));
@@ -113,6 +127,10 @@ export function QualityView({ tunnel }: { tunnel: Tunnel }) {
         </div>
       </section>
 
+      {/* 測定対象外の理由を明示する(M7 J-3 追補、依頼者指摘)。RTT は
+          コントロールチャネル(ホスト ↔ 各メンバーの接続)の ping-pong で
+          測っているため、メンバー同士は接続が無く測れない。 */}
+      {unmeasurable && <p className="notice">{t.quality.unmeasuredReason}</p>}
       {error && <p className="error">{error}</p>}
       {corruptLines > 0 && <p className="notice">{t.quality.corrupt(corruptLines)}</p>}
       {loading && samples.length === 0 ? (
