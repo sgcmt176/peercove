@@ -97,6 +97,18 @@ fn chat_queue_path(config_path: &Path) -> PathBuf {
     config_path.with_extension("chatq.json")
 }
 
+/// `reconcile_identities` のサイドカー(`chatids.json`)の値。同一性(id)に
+/// 加え、直近の表示名もキャッシュしておく(M7 J-5 追補)。メンバーが
+/// ネットワークから削除されると台帳から消え、以後は名前が引けなくなるため、
+/// 削除のお知らせに使う表示名は**消える前**にここへ控えておく必要がある
+/// (デスクトップ版 `peercove-cli::chat::IdentityRecord` と同じ理由)。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct IdentityRecord {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 /// 保存済みの送信待ちキューを読む(壊れていたら空 = 諦めて捨てる)。
 fn load_chat_queue(config_path: &Path) -> Vec<PendingChat> {
     let Ok(data) = std::fs::read_to_string(chat_queue_path(config_path)) else {
@@ -815,6 +827,8 @@ fn handle_conn(
                 failed: false,
                 file: None,
                 system: false,
+                // M7 J-5: Android は text フォールバックのままで種別化しない(対象外)
+                system_event: None,
             };
             shared.chat.lock().unwrap().append(entry);
             send_json(&mut writer, &MsgFrame::ChatAck { id: id.clone() })?;
@@ -858,6 +872,8 @@ fn handle_conn(
                         failed: false,
                         file: None,
                         system: true,
+                        // M7 J-5: Android は text フォールバックのまま(対象外)
+                        system_event: None,
                     });
                 }
                 tracing::info!("{sender_name}({peer_ip})からグループ更新を受信しました(id={id})");
@@ -992,6 +1008,7 @@ fn receive_file(
                         path: Some(dest.clone()),
                     }),
                     system: false,
+                    system_event: None,
                 });
             }
         }
@@ -1429,6 +1446,7 @@ impl SessionShared {
             failed: false,
             file: None,
             system: false,
+            system_event: None,
         });
         // direct 宛は積んだ時点の宛先の同一性(member_id)も控える(誤配送防止)
         let to_member_id = match scope {
@@ -1654,15 +1672,17 @@ impl SessionShared {
     ///
     /// 同一性はホストが振る **member_id(invite_id)** で判定する。公開鍵は
     /// 鍵ローテーション(ADR-0020/0044 — Android は参加直後に自動実行)でも
-    /// 変わるため使えない。`<config>.chatids.json` に IP → "id:<member_id>" を
-    /// 保存して台帳受信のたびに突き合わせる。初回・旧形式(公開鍵の記録)は
-    /// 記録し直すだけ(既存履歴は消さない)。
+    /// 変わるため使えない。`<config>.chatids.json` に IP → `IdentityRecord`
+    /// (id + 直近の表示名)を保存して台帳受信のたびに突き合わせる。初回・
+    /// 旧形式(id 文字列を直接値にしていた版)は空から作り直すだけ
+    /// (既存のチャット履歴は消さない — 消えるのは同一性の検知キャッシュのみ)。
     fn reconcile_identities(&self, members: &[LedgerEntry]) {
         let path = self.cfg.config_path.with_extension("chatids.json");
-        let mut map: std::collections::HashMap<String, String> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let mut map: std::collections::HashMap<String, IdentityRecord> =
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
         let mut replaced: Vec<Ipv4Addr> = Vec::new();
         let mut changed = false;
         // 初回同期(サイドカーが空)では過去の招待までお知らせしない(ADR-0048)
@@ -1677,11 +1697,20 @@ impl SessionShared {
             let ip = entry.ip.to_string();
             let id = format!("id:{member_id}");
             match map.get(&ip) {
-                Some(prev) if *prev == id => {} // 同一メンバー
-                // 旧形式(公開鍵)からの移行: 記録し直すだけで消さない
-                Some(prev) if !prev.starts_with("id:") => {
-                    map.insert(ip, id);
-                    changed = true;
+                Some(prev) if prev.id == id => {
+                    // 同一メンバー。表示名は変わりうるので追随させる(削除時の
+                    // お知らせで直近の表示名を出すため、消える前に控えておく。
+                    // デスクトップ版と同じ理由 — M7 J-5 追補)
+                    if prev.name != entry.name {
+                        map.insert(
+                            ip,
+                            IdentityRecord {
+                                id,
+                                name: entry.name.clone(),
+                            },
+                        );
+                        changed = true;
+                    }
                 }
                 Some(_) => {
                     if self.chat.lock().unwrap().clear_direct(entry.ip) {
@@ -1701,7 +1730,13 @@ impl SessionShared {
                         ),
                     );
                     replaced.push(entry.ip);
-                    map.insert(ip, id);
+                    map.insert(
+                        ip,
+                        IdentityRecord {
+                            id,
+                            name: entry.name.clone(),
+                        },
+                    );
                     changed = true;
                 }
                 None => {
@@ -1720,27 +1755,43 @@ impl SessionShared {
                             );
                         }
                     }
-                    map.insert(ip, id);
+                    map.insert(
+                        ip,
+                        IdentityRecord {
+                            id,
+                            name: entry.name.clone(),
+                        },
+                    );
                     changed = true;
                 }
             }
         }
-        // サイドカーに居るのに台帳から消えた IP = ネットワークから削除された
-        let departed: Vec<Ipv4Addr> = map
-            .keys()
-            .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
-            .filter(|ip| !members.iter().any(|e| e.ip == *ip))
+        // サイドカーに居るのに台帳から消えた IP = ネットワークから削除された。
+        // 表示名は台帳から既に消えているため引けない — 消える前にサイドカーへ
+        // 控えておいた名前(IdentityRecord::name)を使う(M7 J-5 追補)。
+        let departed: Vec<(Ipv4Addr, Option<String>)> = map
+            .iter()
+            .filter_map(|(ip, rec)| {
+                ip.parse::<Ipv4Addr>()
+                    .ok()
+                    .map(|addr| (addr, rec.name.clone()))
+            })
+            .filter(|(addr, _)| !members.iter().any(|e| e.ip == *addr))
             .collect();
-        for ip in &departed {
+        for (ip, name) in &departed {
             map.remove(&ip.to_string());
             changed = true;
             self.append_system_line(
                 ChatScope::Network,
                 None,
                 None,
-                format!("{ip} がネットワークから削除されました"),
+                match name {
+                    Some(n) => format!("{n}({ip})がネットワークから削除されました"),
+                    None => format!("{ip} がネットワークから削除されました"),
+                },
             );
         }
+        let departed: Vec<Ipv4Addr> = departed.into_iter().map(|(ip, _)| ip).collect();
         // 置き換わった・居なくなった相手宛の送信待ち(1:1)は破棄する
         let stale: Vec<Ipv4Addr> = replaced.iter().chain(departed.iter()).copied().collect();
         if !stale.is_empty() {
@@ -1787,6 +1838,8 @@ impl SessionShared {
             failed: false,
             file: None,
             system: true,
+            // M7 J-5: Android は text フォールバックのままで種別化しない(対象外)
+            system_event: None,
         });
     }
 
@@ -1884,6 +1937,7 @@ impl SessionShared {
             failed: false,
             file: None,
             system: true,
+            system_event: None,
         });
     }
 
@@ -2031,6 +2085,7 @@ impl SessionShared {
             failed: false,
             file: None,
             system: true,
+            system_event: None,
         });
         tracing::info!(
             "グループを作成しました(id={} members={} delivered={delivered})",
@@ -2192,6 +2247,7 @@ impl SessionShared {
                 failed: false,
                 file: None,
                 system: true,
+                system_event: None,
             });
         }
         tracing::info!(
@@ -2311,6 +2367,7 @@ impl SessionShared {
                 path: Some(src.to_path_buf()),
             }),
             system: false,
+            system_event: None,
         });
 
         let ctx = ChatContext { scope, group_id };

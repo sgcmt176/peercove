@@ -215,6 +215,9 @@ impl DaemonShared {
                     failed: false,
                     file: None,
                     system: true,
+                    // 自由記述のローカルお知らせなので種別化しない(表示側は
+                    // text をそのまま出す。ADR-0061)
+                    system_event: None,
                 });
                 Ok(IpcResponse::Done)
             }
@@ -632,6 +635,7 @@ impl DaemonShared {
                     failed: false,
                     file: None,
                     system: true,
+                    system_event: Some(peercove_core::msg::SystemEvent::ChatHistoryCleared),
                 });
                 Ok(IpcResponse::Done)
             }
@@ -729,6 +733,7 @@ impl DaemonShared {
             failed: false,
             file: None,
             system: false,
+            system_event: None,
         });
         active
             .chat_queue
@@ -1224,7 +1229,7 @@ impl DaemonShared {
                 .and_then(|e| e.name.clone())
                 .unwrap_or_else(|| ip.to_string())
         };
-        for text in crate::groups::system_messages(previous, group, self_ip, &name_of) {
+        for (event, text) in crate::groups::system_messages(previous, group, self_ip, &name_of) {
             chat.lock().unwrap().append(ChatMessageInfo {
                 seq: 0, // append が振る
                 id: crate::msg::new_transfer_id(),
@@ -1237,6 +1242,7 @@ impl DaemonShared {
                 failed: false,
                 file: None,
                 system: true,
+                system_event: Some(event),
             });
         }
     }
@@ -1349,6 +1355,7 @@ impl DaemonShared {
                         path: Some(path.clone()),
                     }),
                     system: false,
+                    system_event: None,
                 });
                 Some(entry.seq)
             }

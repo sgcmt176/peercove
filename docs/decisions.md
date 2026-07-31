@@ -3892,3 +3892,72 @@ M0 では回避策(Tailscale 停止 or 設定でレンジ変更)を README に�
     `admin_can_set_perms_even_on_invisible_memo` は挙動が変わるため期待値を
     更新し、新規に `admin_sees_memo_and_trash_without_explicit_permission`
     を追加した。
+
+## ADR-0061: システムメッセージの構造化と表示側での多言語化(M7 J-5)
+
+- **ステータス**: 実装済み(2026-07-31)
+- **背景**: UI の言語設定を英語に切り替えても、チャット欄のシステム
+  メッセージ(グループ作成・改名・メンバー増減・退出、メンバー削除・
+  再追加のお知らせ、チャット履歴の全消去、ファイル受信失敗など)だけが
+  日本語のまま表示される(依頼者の実機検証)。原因はデーモン(Rust)側で
+  日本語の文章を組み立ててチャット履歴にそのまま保存し、UI は保存された
+  文字列を描画するだけだったため。
+- **選択肢**:
+  1. 生成時に UI の言語設定をデーモンへ伝え、デーモン側で言語別の文章を
+     生成する。デーモンは常駐プロセスで複数 UI(将来のマルチウィンドウ等)
+     から見られうる上、言語設定は本来 UI のローカル設定であり、デーモンに
+     持たせると IPC のたびに言語を渡す必要が生じ設計が複雑になる。
+  2. **保存する情報を「種別 + パラメータ」に構造化し、文章の組み立ては
+     表示側(UI の i18n)に任せる。** 過去分・旧クライアント向けに日本語
+     本文もそのまま残す(フォールバック)。
+  - **決定**: 2 を採用。
+- **決定の詳細**:
+  1. `peercove-core::msg::SystemEvent`(`#[serde(tag = "kind",
+     rename_all = "snake_case")]` の enum)を新設。`GroupCreated`
+     `AddedToGroup` `GroupRenamed` `MembersAdded` `SelfLeftGroup`
+     `SelfRemovedFromGroup` `MembersLeft` `MembersRemoved` `MemberReplaced`
+     `MemberInvited` `MemberRemovedFromNetwork` `ChatHistoryCleared`
+     `FileReceiveFailed` の 13 種。人名・グループ名は文章に埋め込まず
+     値として持たせる。
+  2. `ChatMessageInfo`(`peercove-core::ipc`)に
+     `system_event: Option<SystemEvent>` を additive で追加
+     (`#[serde(default, skip_serializing_if = "Option::is_none")]`)。
+     旧バージョンが書いた行(フィールド無し)は `None` になり、`text`
+     (日本語)へフォールバックする。`PROTO_VERSION` / `IPC_VERSION` は
+     据え置き。
+  3. 生成側: `crates/peercove-cli/src/groups.rs::system_messages` は
+     `Vec<String>` から `Vec<(SystemEvent, String)>` へ変更(呼び出し元の
+     `daemon.rs::append_group_system`、`msg.rs` の group_update 受信ハンドラ
+     が追随)。`chat.rs::reconcile_identities`(メンバー再追加・削除の
+     お知らせ)、`daemon.rs` の `ChatClearAll`、`msg.rs` のファイル受信失敗
+     お知らせも同様に `system_event` を詰める。`ChatLocalNote`
+     (メモのメンション通知など、UI が組み立てた自由記述)は種別化しない
+     (`system_event: None` のまま、`text` をそのまま出す)。
+  4. **Android(`crates/peercove-mobile`)は対象外**。`ChatMessageInfo` を
+     共有しているため全構築箇所へ `system_event: None` を additive に足す
+     コンパイル対応のみ行い、Kotlin 側は従来どおり `text`(日本語)を
+     そのまま表示する。
+  5. 表示側: `dto.rs` → `ipc.ts` → `ChatPanel.tsx` まで `systemEvent` を
+     通す。`ChatPanel.tsx` の `systemMessageText()` が `kind` で分岐し、
+     `ja.tsx` / `en.tsx` の `t.chat.system.*` へ委譲する。`systemEvent` が
+     無ければ従来どおり `text` を出す。
+  6. **追補(依頼者の実機検証)**: メンバー削除のお知らせが「IP がそのまま」
+     (`10.99.56.3 がネットワークから削除されました`)で表示名が分からない
+     指摘。原因は `reconcile_identities` の同一性サイドカー
+     (`<config>.chatids.json`)が id(`HashMap<String, String>`)しか
+     持たず、削除検知の時点では台帳から名前が引けないこと。サイドカーの
+     値を `IdentityRecord { id, name: Option<String> }` に拡張し、台帳の
+     更新のたびに直近の表示名を追随させておく(消える**前**に控えておく)
+     ことで、削除のお知らせに表示名を出せるようにした
+     (`MemberRemovedFromNetwork { ip, name: Option<String> }` へ拡張)。
+     旧形式のサイドカー(値が文字列)は新しい形へ deserialize できず空に
+     リセットされるが、これは検知キャッシュの再構築だけで済み(チャット
+     履歴自体は消えない)、実害は小さいと判断した。デスクトップ・Android
+     両方に同じ拡張を入れ、Android も表示名を出せるようにした
+     (Kotlin 側は `text` をそのまま出すだけなので追加対応不要)。
+- **互換性の扱い**: additive のみ。旧デーモン ⇔ 新 UI、新デーモン ⇔ 旧 UI の
+  どちらの組み合わせでも、`system_event` が無ければ `text`
+  (生成時点の言語 = 日本語)にフォールバックするため壊れない。
+  **既に保存済みの過去のシステムメッセージは、言語を切り替えても日本語の
+  ままになる**(`system_event` を持たないため)。これは仕様として
+  `docs/user-guide.md` に明記した。

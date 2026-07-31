@@ -215,6 +215,7 @@ mod tests {
             failed: false,
             file: None,
             system: false,
+            system_event: None,
         }
     }
 

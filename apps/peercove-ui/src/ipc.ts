@@ -263,6 +263,27 @@ export interface StorageUsage {
   memoBytes: number;
 }
 
+/**
+ * システムメッセージの種別とパラメータ（ADR-0061、M7 J-5）。表示側（このファイルの
+ * 利用先）が言語に合わせて文章を組み立てる。デーモン側 `peercove_core::msg::SystemEvent`
+ * と対で保守すること。`kind` は Rust 側の `#[serde(tag = "kind", rename_all = "snake_case")]`
+ * と同じ snake_case（他の scope 等の文字列表現と同じ流儀）。
+ */
+export type SystemEvent =
+  | { kind: "group_created"; group: string }
+  | { kind: "added_to_group"; group: string; by: string }
+  | { kind: "group_renamed"; from: string; to: string }
+  | { kind: "members_added"; group: string; by: string; names: string[] }
+  | { kind: "self_left_group" }
+  | { kind: "self_removed_from_group" }
+  | { kind: "members_left"; names: string[] }
+  | { kind: "members_removed"; names: string[] }
+  | { kind: "member_replaced"; name: string }
+  | { kind: "member_invited"; inviter: string; name: string }
+  | { kind: "member_removed_from_network"; ip: string; name?: string | null }
+  | { kind: "chat_history_cleared" }
+  | { kind: "file_receive_failed"; sender: string; file: string };
+
 /** チャット履歴の 1 通（ADR-0016、M3-13b）。 */
 export interface ChatMessage {
   /** 履歴内の通し番号（差分フェッチ・未読管理に使う）。 */
@@ -283,6 +304,12 @@ export interface ChatMessage {
   file: ChatFile | null;
   /** グループ操作のお知らせ（中央の 1 行として表示。未読・通知の対象外）。 */
   system: boolean;
+  /**
+   * システムメッセージの種別とパラメータ（M7 J-5）。`null` なら旧バージョンが
+   * 書いた行、またはローカルお知らせ（ChatLocalNote、メンション通知など）
+   * なので、表示側は `text`（日本語）をそのまま出す。
+   */
+  systemEvent: SystemEvent | null;
 }
 
 /** チャット内ファイル送信の情報（M3-13d）。実体は受信ボックス。 */

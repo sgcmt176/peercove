@@ -628,6 +628,40 @@ export const ja = {
     // テキストファイルのプレビュー(M3-13e)
     textOpen: "クリックで全文を表示",
     textTruncated: "ファイルが大きいため先頭のみ表示しています。",
+
+    // システムメッセージ(ADR-0061、M7 J-5)。デーモンが `system_event` で
+    // 種別 + パラメータを送ってきたとき、ここで言語に合わせた文章を組み立てる。
+    // `system_event` が無い行(旧バージョン・ローカルお知らせ)は message.text
+    // をそのまま出す(ChatPanel.tsx 側のフォールバック)。
+    system: {
+      groupCreated: (group: string) => `グループ「${group}」を作成しました`,
+      addedToGroup: (group: string, by: string) =>
+        `${by}があなたをグループ「${group}」に追加しました`,
+      groupRenamed: (from: string, to: string) =>
+        `グループ名が「${from}」から「${to}」に変わりました`,
+      // group は現在の表示テキストでは使わない(会話自体がそのグループの
+      // ものなので文脈で分かる)。SystemEvent には将来のため残してある
+      membersAdded: (by: string, names: string[]) =>
+        `${by}が${names.join("、")}を追加しました`,
+      selfLeftGroup: "グループから退出しました",
+      selfRemovedFromGroup: "あなたはグループのメンバーから外れました",
+      membersLeft: (names: string[]) =>
+        `${names.join("、")}がグループから退出しました`,
+      membersRemoved: (names: string[]) =>
+        `${names.join("、")}がグループのメンバーから外れました`,
+      memberReplaced: (name: string) =>
+        `${name} は新しい端末として参加しました(以前の履歴と送信待ちを破棄しました)`,
+      memberInvited: (inviter: string, name: string) =>
+        `${inviter} がメンバー招待を発行しました(${name})`,
+      // name が取れなければ IP のみ(削除後は台帳から名前が引けないことがある)
+      memberRemovedFromNetwork: (ip: string, name: string | null) =>
+        name
+          ? `${name}(${ip})がネットワークから削除されました`
+          : `${ip} がネットワークから削除されました`,
+      chatHistoryCleared: "チャット履歴を削除しました",
+      fileReceiveFailed: (sender: string, file: string) =>
+        `${sender}からのファイル「${file}」を受信できませんでした`,
+    },
   },
 
   // 共有オブジェクト参照 `@memo:id` のカード(M5 F-5 Stage 4、ADR-0052 決定 1)

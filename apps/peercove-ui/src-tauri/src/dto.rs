@@ -244,6 +244,10 @@ pub struct ChatMessage {
     pub file: Option<ChatFile>,
     /// グループ操作のお知らせ(中央の 1 行として表示する)。
     pub system: bool,
+    /// システムメッセージの種別とパラメータ(ADR-0061、M7 J-5)。frontend が
+    /// 言語に合わせて文章を組み立てる。`null` なら `text`(日本語)を出す
+    /// (旧バージョンが書いた行、または種別化されていないローカルお知らせ)。
+    pub system_event: Option<peercove_core::msg::SystemEvent>,
 }
 
 /// チャット内ファイル送信の情報(M3-13d)。実体は受信ボックス。
@@ -284,6 +288,7 @@ impl From<&ChatMessageInfo> for ChatMessage {
                 path: file.path.as_deref().map(display_path),
             }),
             system: info.system,
+            system_event: info.system_event.clone(),
         }
     }
 }

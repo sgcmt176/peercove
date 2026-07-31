@@ -24,8 +24,8 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use peercove_core::ipc::{ChatFileInfo, ChatMessageInfo, TransferDirection, TransferInfo};
 use peercove_core::msg::{
-    ChatContext, ChatScope, GroupInfo, MsgFrame, MAX_CHAT_TEXT_BYTES, MAX_GROUP_MEMBERS,
-    MAX_GROUP_NAME_BYTES, MSG_PORT, MSG_VERSION,
+    ChatContext, ChatScope, GroupInfo, MsgFrame, SystemEvent, MAX_CHAT_TEXT_BYTES,
+    MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES, MSG_PORT, MSG_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -339,6 +339,7 @@ async fn handle_incoming(
                 failed: false,
                 file: None,
                 system: false,
+                system_event: None,
             };
             chat.lock().unwrap().append(entry);
             send_frame(&mut write_half, &MsgFrame::ChatAck { id: id.clone() }).await?;
@@ -383,7 +384,7 @@ async fn handle_incoming(
                         .cloned()
                         .unwrap_or_else(|| ip.to_string())
                 };
-                for text in crate::groups::system_messages(
+                for (event, text) in crate::groups::system_messages(
                     update.previous.as_ref(),
                     &group,
                     own_ip,
@@ -401,6 +402,7 @@ async fn handle_incoming(
                         failed: false,
                         file: None,
                         system: true,
+                        system_event: Some(event),
                     });
                 }
                 tracing::info!(
@@ -606,6 +608,7 @@ async fn receive_file(
                     ChatScope::Network | ChatScope::Group => None,
                 },
                 text: String::new(),
+                system_event: None,
                 sent_at: now_unix_ms(),
                 failed: false,
                 file: Some(ChatFileInfo {
@@ -683,6 +686,10 @@ async fn receive_file(
                     failed: false,
                     file: None,
                     system: true,
+                    system_event: Some(SystemEvent::FileReceiveFailed {
+                        sender: sender_name.to_string(),
+                        file: name,
+                    }),
                 });
             }
         }

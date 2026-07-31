@@ -611,6 +611,33 @@ export const en: Strings = {
     // Text file preview (M3-13e)
     textOpen: "Click to show the full text",
     textTruncated: "The file is large, so only the beginning is shown.",
+
+    // System messages (ADR-0061, M7 J-5). When the daemon sends a `system_event`
+    // (kind + parameters), build the sentence here in the current language.
+    // Lines without `system_event` (older versions, local announcements) fall
+    // back to message.text as-is (handled on the ChatPanel.tsx side).
+    system: {
+      groupCreated: (group: string) => `Created the group "${group}"`,
+      addedToGroup: (group: string, by: string) => `${by} added you to the group "${group}"`,
+      groupRenamed: (from: string, to: string) => `Group name changed from "${from}" to "${to}"`,
+      // group isn't used in the current wording (the conversation itself is
+      // that group, so it's implied). Kept on SystemEvent for future use
+      membersAdded: (by: string, names: string[]) => `${by} added ${names.join(", ")}`,
+      selfLeftGroup: "You left the group",
+      selfRemovedFromGroup: "You were removed from the group",
+      membersLeft: (names: string[]) => `${names.join(", ")} left the group`,
+      membersRemoved: (names: string[]) =>
+        `${names.join(", ")} ${names.length === 1 ? "was" : "were"} removed from the group`,
+      memberReplaced: (name: string) =>
+        `${name} joined as a new device (previous history and pending messages were discarded)`,
+      memberInvited: (inviter: string, name: string) => `${inviter} issued a member invite (${name})`,
+      // Falls back to the IP alone when no name is available (the ledger entry is already gone after removal)
+      memberRemovedFromNetwork: (ip: string, name: string | null) =>
+        name ? `${name} (${ip}) was removed from the network` : `${ip} was removed from the network`,
+      chatHistoryCleared: "Chat history was cleared",
+      fileReceiveFailed: (sender: string, file: string) =>
+        `Couldn't receive the file "${file}" from ${sender}`,
+    },
   },
 
   // Shared object reference `@memo:id` card (M5 F-5 Stage 4, ADR-0052 decision 1)

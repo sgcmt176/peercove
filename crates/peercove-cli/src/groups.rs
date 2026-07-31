@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use peercove_core::msg::GroupInfo;
+use peercove_core::msg::{GroupInfo, SystemEvent};
 
 pub type SharedGroups = Arc<Mutex<GroupStore>>;
 
@@ -253,33 +253,51 @@ impl GroupStore {
     }
 }
 
-/// グループ更新の差分から、会話に出すシステムメッセージ本文を作る
+/// グループ更新の差分から、会話に出すシステムメッセージを作る
 /// (LINE 風 — 2026-07-11 検証フィードバック)。`old` は置換前(新規なら
 /// `None`)、`name_of` は仮想 IP → 表示名の解決。
+///
+/// 戻りは `(種別 + パラメータ, 日本語本文)` の組(ADR-0061、M7 J-5)。
+/// 種別は表示側(UI の i18n)が言語に合わせて文章を組み立てるのに使い、
+/// 日本語本文は旧クライアント互換 + フォールバックとして `text` にそのまま入る。
 pub fn system_messages(
     old: Option<&GroupInfo>,
     new: &GroupInfo,
     self_ip: Ipv4Addr,
     name_of: &dyn Fn(Ipv4Addr) -> String,
-) -> Vec<String> {
+) -> Vec<(SystemEvent, String)> {
     let mut out = Vec::new();
     let Some(old) = old else {
         // 初めて知ったグループ: 自分が作った / 追加された
         if new.updated_by == self_ip {
-            out.push(format!("グループ「{}」を作成しました", new.name));
+            out.push((
+                SystemEvent::GroupCreated {
+                    group: new.name.clone(),
+                },
+                format!("グループ「{}」を作成しました", new.name),
+            ));
         } else if new.members.contains(&self_ip) {
-            out.push(format!(
-                "{}があなたをグループ「{}」に追加しました",
-                name_of(new.updated_by),
-                new.name
+            let by = name_of(new.updated_by);
+            out.push((
+                SystemEvent::AddedToGroup {
+                    group: new.name.clone(),
+                    by: by.clone(),
+                },
+                format!("{by}があなたをグループ「{}」に追加しました", new.name),
             ));
         }
         return out;
     };
     if old.name != new.name {
-        out.push(format!(
-            "グループ名が「{}」から「{}」に変わりました",
-            old.name, new.name
+        out.push((
+            SystemEvent::GroupRenamed {
+                from: old.name.clone(),
+                to: new.name.clone(),
+            },
+            format!(
+                "グループ名が「{}」から「{}」に変わりました",
+                old.name, new.name
+            ),
         ));
     }
     let added: Vec<Ipv4Addr> = new
@@ -289,10 +307,13 @@ pub fn system_messages(
         .copied()
         .collect();
     if added.contains(&self_ip) {
-        out.push(format!(
-            "{}があなたをグループ「{}」に追加しました",
-            name_of(new.updated_by),
-            new.name
+        let by = name_of(new.updated_by);
+        out.push((
+            SystemEvent::AddedToGroup {
+                group: new.name.clone(),
+                by: by.clone(),
+            },
+            format!("{by}があなたをグループ「{}」に追加しました", new.name),
         ));
     }
     let added_names: Vec<String> = added
@@ -301,10 +322,14 @@ pub fn system_messages(
         .map(|ip| name_of(*ip))
         .collect();
     if !added_names.is_empty() {
-        out.push(format!(
-            "{}が{}を追加しました",
-            name_of(new.updated_by),
-            added_names.join("、")
+        let by = name_of(new.updated_by);
+        out.push((
+            SystemEvent::MembersAdded {
+                group: new.name.clone(),
+                by: by.clone(),
+                names: added_names.clone(),
+            },
+            format!("{by}が{}を追加しました", added_names.join("、")),
         ));
     }
     let removed: Vec<Ipv4Addr> = old
@@ -317,9 +342,15 @@ pub fn system_messages(
     // ネットワーク削除に伴う自動整理)で文言を分ける(2026-07-20 検証 FB)
     if removed.contains(&self_ip) {
         if new.updated_by == self_ip {
-            out.push("グループから退出しました".to_string());
+            out.push((
+                SystemEvent::SelfLeftGroup,
+                "グループから退出しました".to_string(),
+            ));
         } else {
-            out.push("あなたはグループのメンバーから外れました".to_string());
+            out.push((
+                SystemEvent::SelfRemovedFromGroup,
+                "あなたはグループのメンバーから外れました".to_string(),
+            ));
         }
     }
     let removed_names: Vec<String> = removed
@@ -329,14 +360,21 @@ pub fn system_messages(
         .collect();
     if !removed_names.is_empty() {
         if removed.contains(&new.updated_by) {
-            out.push(format!(
-                "{}がグループから退出しました",
-                removed_names.join("、")
+            out.push((
+                SystemEvent::MembersLeft {
+                    names: removed_names.clone(),
+                },
+                format!("{}がグループから退出しました", removed_names.join("、")),
             ));
         } else {
-            out.push(format!(
-                "{}がグループのメンバーから外れました",
-                removed_names.join("、")
+            out.push((
+                SystemEvent::MembersRemoved {
+                    names: removed_names.clone(),
+                },
+                format!(
+                    "{}がグループのメンバーから外れました",
+                    removed_names.join("、")
+                ),
             ));
         }
     }
@@ -639,13 +677,24 @@ mod tests {
         let created = group("g1", 1, "10.0.0.2", &["10.0.0.2", "10.0.0.1"]);
         assert_eq!(
             system_messages(None, &created, me, &name_of),
-            vec!["グループ「グループg1」を作成しました"]
+            vec![(
+                SystemEvent::GroupCreated {
+                    group: "グループg1".to_string()
+                },
+                "グループ「グループg1」を作成しました".to_string()
+            )]
         );
         // 初受信(自分がメンバー)= 追加された
         let received = group("g1", 1, "10.0.0.1", &["10.0.0.1", "10.0.0.2"]);
         assert_eq!(
             system_messages(None, &received, me, &name_of),
-            vec!["aliceがあなたをグループ「グループg1」に追加しました"]
+            vec![(
+                SystemEvent::AddedToGroup {
+                    group: "グループg1".to_string(),
+                    by: "alice".to_string()
+                },
+                "aliceがあなたをグループ「グループg1」に追加しました".to_string()
+            )]
         );
         // 改名は変更前後の両方を出す
         let old = group("g1", 1, "10.0.0.1", &["10.0.0.1", "10.0.0.2"]);
@@ -653,36 +702,65 @@ mod tests {
         renamed.name = "新チーム".to_string();
         assert_eq!(
             system_messages(Some(&old), &renamed, me, &name_of),
-            vec!["グループ名が「グループg1」から「新チーム」に変わりました"]
+            vec![(
+                SystemEvent::GroupRenamed {
+                    from: "グループg1".to_string(),
+                    to: "新チーム".to_string()
+                },
+                "グループ名が「グループg1」から「新チーム」に変わりました".to_string()
+            )]
         );
         // メンバー追加(他人)
         let grown = group("g1", 2, "10.0.0.1", &["10.0.0.1", "10.0.0.2", "10.0.0.3"]);
         assert_eq!(
             system_messages(Some(&old), &grown, me, &name_of),
-            vec!["aliceがcarolを追加しました"]
+            vec![(
+                SystemEvent::MembersAdded {
+                    group: "グループg1".to_string(),
+                    by: "alice".to_string(),
+                    names: vec!["carol".to_string()]
+                },
+                "aliceがcarolを追加しました".to_string()
+            )]
         );
         // 他人が外された(updated_by = alice が carol を除いた = キック)
         assert_eq!(
             system_messages(Some(&grown), &old, me, &name_of),
-            vec!["carolがグループのメンバーから外れました"]
+            vec![(
+                SystemEvent::MembersRemoved {
+                    names: vec!["carol".to_string()]
+                },
+                "carolがグループのメンバーから外れました".to_string()
+            )]
         );
         // 他人の退出(updated_by = carol 自身が抜けた)
         let carol_left = group("g1", 3, "10.0.0.3", &["10.0.0.1", "10.0.0.2"]);
         assert_eq!(
             system_messages(Some(&grown), &carol_left, me, &name_of),
-            vec!["carolがグループから退出しました"]
+            vec![(
+                SystemEvent::MembersLeft {
+                    names: vec!["carol".to_string()]
+                },
+                "carolがグループから退出しました".to_string()
+            )]
         );
         // 自分の退出
         let without_me = group("g1", 2, "10.0.0.2", &["10.0.0.1"]);
         assert_eq!(
             system_messages(Some(&old), &without_me, me, &name_of),
-            vec!["グループから退出しました"]
+            vec![(
+                SystemEvent::SelfLeftGroup,
+                "グループから退出しました".to_string()
+            )]
         );
         // 自分が外された(updated_by = alice)
         let kicked_me = group("g1", 2, "10.0.0.1", &["10.0.0.1"]);
         assert_eq!(
             system_messages(Some(&old), &kicked_me, me, &name_of),
-            vec!["あなたはグループのメンバーから外れました"]
+            vec![(
+                SystemEvent::SelfRemovedFromGroup,
+                "あなたはグループのメンバーから外れました".to_string()
+            )]
         );
         // メンバー外の update(自分が居ないグループの転送)ではメッセージなし
         let others = group("g2", 1, "10.0.0.1", &["10.0.0.1", "10.0.0.3"]);

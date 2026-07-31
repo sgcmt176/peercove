@@ -1133,9 +1133,52 @@ function lastMessageOf(
   return null;
 }
 
+/** システムメッセージの本文を言語に合わせて組み立てる(ADR-0061、M7 J-5)。
+ * `systemEvent` が無い(旧バージョン・ローカルお知らせ)場合は `text`
+ * (日本語)をそのまま返す。 */
+function systemMessageText(message: ChatMessage): string {
+  const event = message.systemEvent;
+  if (!event) return message.text;
+  const s = t.chat.system;
+  switch (event.kind) {
+    case "group_created":
+      return s.groupCreated(event.group);
+    case "added_to_group":
+      return s.addedToGroup(event.group, event.by);
+    case "group_renamed":
+      return s.groupRenamed(event.from, event.to);
+    case "members_added":
+      return s.membersAdded(event.by, event.names);
+    case "self_left_group":
+      return s.selfLeftGroup;
+    case "self_removed_from_group":
+      return s.selfRemovedFromGroup;
+    case "members_left":
+      return s.membersLeft(event.names);
+    case "members_removed":
+      return s.membersRemoved(event.names);
+    case "member_replaced":
+      return s.memberReplaced(event.name);
+    case "member_invited":
+      return s.memberInvited(event.inviter, event.name);
+    case "member_removed_from_network":
+      return s.memberRemovedFromNetwork(event.ip, event.name ?? null);
+    case "chat_history_cleared":
+      return s.chatHistoryCleared;
+    case "file_receive_failed":
+      return s.fileReceiveFailed(event.sender, event.file);
+    default: {
+      // 未知の種別(新しいデーモン → 古い UI)は text へフォールバック
+      const _exhaustive: never = event;
+      void _exhaustive;
+      return message.text;
+    }
+  }
+}
+
 function previewOf(message: ChatMessage, selfIp: string): string {
   // グループ操作のお知らせは本文そのまま(「自分: 」を付けない)
-  if (message.system) return message.text;
+  if (message.system) return systemMessageText(message);
   const prefix = message.from === selfIp ? t.chat.previewSelf : "";
   const body = message.file
     ? t.chat.filePreview(message.file.name)
@@ -1468,9 +1511,19 @@ function Bubbles({
             {separator && <div className="chat__date">{date}</div>}
             {message.system ? (
               // グループ操作・メンションのお知らせ(ADR-0055 決定 1d の
-              // ローカルお知らせ行も同じ形。`@memo:id` はカード化される — LINE 風)
+              // ローカルお知らせ行も同じ形。`@memo:id` はカード化される — LINE 風)。
+              // systemEvent があれば言語に合わせて組み立てる(ADR-0061、M7 J-5)。
+              // 組み立てた文章に `@memo:id` は含まれないが、renderMessageBody は
+              // トークンが無ければそのまま返すだけなので安全に通せる。
               <div className="chat__system">
-                {renderMessageBody(message.text, configPath, refSeq, onOpenRef, myName, memberNames)}
+                {renderMessageBody(
+                  systemMessageText(message),
+                  configPath,
+                  refSeq,
+                  onOpenRef,
+                  myName,
+                  memberNames,
+                )}
               </div>
             ) : (
               <div className={own ? "msg msg--own" : "msg"}>

@@ -68,6 +68,61 @@ pub struct GroupInfo {
     pub updated_by: Ipv4Addr,
 }
 
+/// システムメッセージの種別とパラメータ(ADR-0061、M7 J-5)。
+///
+/// チャットのお知らせ行(`ChatMessageInfo::system == true`)は、従来は
+/// デーモン側で日本語の文章として生成し、そのまま `text` に保存していた
+/// (UI の言語設定が効かない不具合の原因)。以後は生成側が「種別 +
+/// パラメータ(人名・グループ名など)」だけをここに詰め、文章の組み立ては
+/// 表示側(UI の i18n)に任せる。`text` フィールドは互換のため引き続き
+/// 日本語で埋める(このフィールドを知らない旧クライアント向けのフォール
+/// バック。表示側もこのフィールドが `None` のときは `text` を出す)。
+///
+/// 人名・グループ名は文章へ埋め込まず、値として持たせる(表示側の言語で
+/// 組み立てられるように)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SystemEvent {
+    /// グループを作成した(常に自分の操作)。
+    GroupCreated { group: String },
+    /// 自分がグループに追加された(新規に知った、または追加された)。
+    AddedToGroup { group: String, by: String },
+    /// グループ名が変わった。
+    GroupRenamed { from: String, to: String },
+    /// 他メンバーがグループに追加された。
+    MembersAdded {
+        group: String,
+        by: String,
+        names: Vec<String>,
+    },
+    /// 自分がグループから退出した(自分の操作)。
+    SelfLeftGroup,
+    /// 自分がグループのメンバーから外れた(他者の操作、または削除メンバーの
+    /// 自動整理)。
+    SelfRemovedFromGroup,
+    /// 他メンバーがグループから退出した(本人の操作)。
+    MembersLeft { names: Vec<String> },
+    /// 他メンバーがグループのメンバーから外れた(キック、または削除メンバーの
+    /// 自動整理)。
+    MembersRemoved { names: Vec<String> },
+    /// メンバーが削除 → 同名・同 IP で再追加され、別端末(別の同一性)として
+    /// 扱われた(以前の履歴と送信待ちを破棄した)。
+    MemberReplaced { name: String },
+    /// メンバーが招待を発行した(ADR-0048)。
+    MemberInvited { inviter: String, name: String },
+    /// メンバーがネットワークから削除された。`name` は削除される直前まで
+    /// 分かっていた表示名(取れなければ `None` — 表示側は IP にフォールバック)。
+    MemberRemovedFromNetwork {
+        ip: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// チャット履歴を全消去した(自分の操作、M6 H-10a)。
+    ChatHistoryCleared,
+    /// チャット内ファイルの受信に失敗した。
+    FileReceiveFailed { sender: String, file: String },
+}
+
 /// 1 行 1 メッセージでやり取りする制御フレーム。
 ///
 /// ファイル転送の流れ(ADR-0015):

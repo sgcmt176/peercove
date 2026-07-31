@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::quality::QualityReport;
 
 use crate::diagnostics::DiagnosticReport;
-use crate::msg::{ChatContext, ChatScope, GroupInfo};
+use crate::msg::{ChatContext, ChatScope, GroupInfo, SystemEvent};
 use crate::proto::LedgerEntry;
 
 /// Windows の名前付きパイプ名。
@@ -329,6 +329,13 @@ pub struct ChatMessageInfo {
     /// `text` が本文で、UI は吹き出しでなく中央の 1 行として表示する。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub system: bool,
+    /// システムメッセージの種別とパラメータ(ADR-0061、M7 J-5)。表示側が
+    /// 言語に合わせて文章を組み立てる。`None` なら `text`(日本語)を出す
+    /// (旧バージョンが書いた行、または種別化されていない自由記述のお知らせ
+    /// — 例: ChatLocalNote のメンション通知)。additive なので旧バージョンの
+    /// 行(フィールド無し)を読んでも壊れない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_event: Option<SystemEvent>,
 }
 
 /// チャット履歴に記録するファイル送信の情報(ADR-0016、M3-13d)。
@@ -850,6 +857,7 @@ mod tests {
             failed: false,
             file: None,
             system: false,
+            system_event: None,
         };
         let json = serde_json::to_string(&IpcReply {
             id: 14,
@@ -886,6 +894,7 @@ mod tests {
             failed: true,
             file: None,
             system: false,
+            system_event: None,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(!json.contains("\"to\""), "network 宛は to を省略: {json}");
@@ -910,6 +919,7 @@ mod tests {
             failed: false,
             file: None,
             system: false,
+            system_event: None,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains(r#""group_id":"g1""#), "{json}");
@@ -935,6 +945,7 @@ mod tests {
                 path: Some(PathBuf::from("C:/inbox/写真.jpg")),
             }),
             system: false,
+            system_event: None,
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(
@@ -959,9 +970,16 @@ mod tests {
             failed: false,
             file: None,
             system: true,
+            system_event: Some(crate::msg::SystemEvent::GroupCreated {
+                group: "開発".to_string(),
+            }),
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains(r#""system":true"#), "{json}");
+        assert!(
+            json.contains(r#""system_event":{"kind":"group_created","group":"開発"}"#),
+            "system_event は種別 + パラメータで乗る(M7 J-5): {json}"
+        );
         let parsed: ChatMessageInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, message);
 
@@ -1022,6 +1040,20 @@ mod tests {
             json,
             r#"{"id":16,"ok":{"type":"group","group":{"id":"g1","name":"開発","members":["10.83.19.1"],"revision":1,"updated_by":"10.83.19.1"}}}"#
         );
+    }
+
+    /// system_event は additive(ADR-0061、M7 J-5): 旧バージョンが書いた
+    /// 履歴行(フィールド無し)を読んでも壊れず `None` になり、UI は
+    /// `text`(日本語)へフォールバックできる。
+    #[test]
+    fn chat_message_without_system_event_defaults_to_none() {
+        let legacy = r#"{"seq":1,"id":"c1","scope":"group","group_id":"g1","from":"10.83.19.1","text":"グループ「開発」を作成しました","sent_at":1,"system":true}"#;
+        let parsed: ChatMessageInfo = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed.system_event, None,
+            "未知フィールドは None にフォールバック"
+        );
+        assert_eq!(parsed.text, "グループ「開発」を作成しました");
     }
 
     /// RegisterAutostart(ADR-0057、M6 H-8e)のワイヤ表現。role は既存の

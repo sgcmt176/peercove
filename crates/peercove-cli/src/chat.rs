@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use peercove_core::ipc::{ChatMessageInfo, MAX_CHAT_BYTES_PER_REPLY, MAX_CHAT_MESSAGES_PER_REPLY};
-use peercove_core::msg::ChatScope;
+use peercove_core::msg::{ChatScope, SystemEvent};
 use peercove_core::proto::LedgerEntry;
 use serde::{Deserialize, Serialize};
 
@@ -34,12 +34,26 @@ fn identity_path(config_path: &Path) -> PathBuf {
     config_path.with_extension("chatids.json")
 }
 
+/// [`reconcile_identities`] のサイドカー(`chatids.json`)の値。同一性(id)に
+/// 加え、直近の表示名もキャッシュしておく(M7 J-5 追補)。メンバーが
+/// ネットワークから削除されると台帳から消え、以後は名前が引けなくなるため、
+/// 削除のお知らせに使う表示名は**消える前**にここへ控えておく必要がある。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct IdentityRecord {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 /// メンバーの再追加(削除 → 同名・同 IP で再参加)を検知して、その相手との
-/// 1:1 履歴を消す。同一性は**公開鍵**で判定する(再追加すると鍵が変わる)。
+/// 1:1 履歴を消す。同一性はホストが振る **member_id(invite_id)** で判定する
+/// (公開鍵は鍵ローテーション(ADR-0020)で変わるため使えない)。
 ///
-/// `<config>.chatids.json` に `IP → 公開鍵` を保存し、台帳同期のたびに突き合わせる。
-/// 初回(サイドカー無し)は現状を記録するだけ(既存履歴は消さない)。
-/// `self_ip`(自分)と `is_host` は 1:1 の対象外なので飛ばす。
+/// `<config>.chatids.json` に `IP → IdentityRecord`(id + 直近の表示名。
+/// M7 J-5 追補)を保存し、台帳同期のたびに突き合わせる。初回・旧形式
+/// (サイドカー無し、または形の合わない旧バージョンのファイル)は空から
+/// 作り直すだけ(既存のチャット履歴は消さない — 消えるのは同一性の検知
+/// キャッシュのみ)。`self_ip`(自分)と `is_host` は 1:1 の対象外なので飛ばす。
 pub fn reconcile_identities(
     config_path: &Path,
     self_ip: Ipv4Addr,
@@ -48,7 +62,7 @@ pub fn reconcile_identities(
     queue: &SharedChatQueue,
 ) -> ReconcileOutcome {
     let path = identity_path(config_path);
-    let mut map: HashMap<String, String> = std::fs::read_to_string(&path)
+    let mut map: HashMap<String, IdentityRecord> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -69,12 +83,19 @@ pub fn reconcile_identities(
         let ip = entry.ip.to_string();
         let id = format!("id:{member_id}");
         match map.get(&ip) {
-            Some(prev) if *prev == id => {} // 同一メンバー
-            // 旧形式(公開鍵を記録していた v0.1.1)からの移行: 記録し直す
-            // だけで消さない(鍵ローテーション誤検知を持ち越さない)
-            Some(prev) if !prev.starts_with("id:") => {
-                map.insert(ip, id);
-                changed = true;
+            Some(prev) if prev.id == id => {
+                // 同一メンバー。表示名は変わりうるので追随させる(削除時の
+                // お知らせで直近の表示名を出すため、消える前に控えておく)
+                if prev.name != entry.name {
+                    map.insert(
+                        ip,
+                        IdentityRecord {
+                            id,
+                            name: entry.name.clone(),
+                        },
+                    );
+                    changed = true;
+                }
             }
             Some(_) => {
                 // ID が変わった = 別のメンバーに置き換わった。1:1 履歴を消す
@@ -84,18 +105,27 @@ pub fn reconcile_identities(
                         entry.ip
                     );
                 }
-                append_system(
-                    chat,
-                    ChatScope::Direct,
-                    Some(entry.ip),
-                    self_ip,
-                    format!(
-                        "{} は新しい端末として参加しました(以前の履歴と送信待ちを破棄しました)",
-                        entry.name.as_deref().unwrap_or(&ip)
-                    ),
-                );
+                {
+                    let name = entry.name.as_deref().unwrap_or(&ip).to_string();
+                    append_system(
+                        chat,
+                        ChatScope::Direct,
+                        Some(entry.ip),
+                        self_ip,
+                        SystemEvent::MemberReplaced { name: name.clone() },
+                        format!(
+                            "{name} は新しい端末として参加しました(以前の履歴と送信待ちを破棄しました)"
+                        ),
+                    );
+                }
                 outcome.replaced.push(entry.ip);
-                map.insert(ip, id);
+                map.insert(
+                    ip,
+                    IdentityRecord {
+                        id,
+                        name: entry.name.clone(),
+                    },
+                );
                 changed = true;
             }
             None => {
@@ -103,31 +133,45 @@ pub fn reconcile_identities(
                 // 全体会話へお知らせ行で可視化する(参加前の pending 段階で出る)
                 if known_before {
                     if let Some(inviter) = entry.invited_by.as_deref() {
+                        let name = entry.name.as_deref().unwrap_or(&ip).to_string();
                         append_system(
                             chat,
                             ChatScope::Network,
                             None,
                             self_ip,
-                            format!(
-                                "{inviter} がメンバー招待を発行しました({})",
-                                entry.name.as_deref().unwrap_or(&ip)
-                            ),
+                            SystemEvent::MemberInvited {
+                                inviter: inviter.to_string(),
+                                name: name.clone(),
+                            },
+                            format!("{inviter} がメンバー招待を発行しました({name})"),
                         );
                     }
                 }
-                map.insert(ip, id);
+                map.insert(
+                    ip,
+                    IdentityRecord {
+                        id,
+                        name: entry.name.clone(),
+                    },
+                );
                 changed = true;
             }
         }
     }
     // サイドカーに居るのに台帳から消えた IP = ネットワークから削除された。
     // 記録を落として一度だけお知らせを出す(以後は「未知の IP」扱い)。
-    let departed: Vec<Ipv4Addr> = map
-        .keys()
-        .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
-        .filter(|ip| !ledger.iter().any(|e| e.ip == *ip))
+    // 表示名は台帳から既に消えているため引けない — 消える前にサイドカーへ
+    // 控えておいた名前(IdentityRecord::name)を使う(M7 J-5 追補)。
+    let departed: Vec<(Ipv4Addr, Option<String>)> = map
+        .iter()
+        .filter_map(|(ip, rec)| {
+            ip.parse::<Ipv4Addr>()
+                .ok()
+                .map(|addr| (addr, rec.name.clone()))
+        })
+        .filter(|(addr, _)| !ledger.iter().any(|e| e.ip == *addr))
         .collect();
-    for ip in &departed {
+    for (ip, name) in &departed {
         map.remove(&ip.to_string());
         changed = true;
         append_system(
@@ -135,11 +179,18 @@ pub fn reconcile_identities(
             ChatScope::Network,
             None,
             self_ip,
-            format!("{ip} がネットワークから削除されました"),
+            SystemEvent::MemberRemovedFromNetwork {
+                ip: ip.to_string(),
+                name: name.clone(),
+            },
+            match name {
+                Some(n) => format!("{n}({ip})がネットワークから削除されました"),
+                None => format!("{ip} がネットワークから削除されました"),
+            },
         );
         tracing::info!("{ip} が台帳から消えたため送信待ちを破棄します");
     }
-    outcome.departed = departed;
+    outcome.departed = departed.into_iter().map(|(ip, _)| ip).collect();
     // 置き換わった・居なくなった相手宛の送信待ち(1:1)は破棄する
     // (再追加された別人へ旧メッセージを届けない — 2026-07-20 検証 FB)
     let stale = outcome.all();
@@ -186,12 +237,15 @@ impl ReconcileOutcome {
     }
 }
 
-/// お知らせ行(system)を履歴へ 1 行足す。
+/// お知らせ行(system)を履歴へ 1 行足す。`event` は表示側で言語に合わせて
+/// 文章を組み立てるための種別 + パラメータ(ADR-0061、M7 J-5)。`text` は
+/// 従来どおり日本語本文(旧クライアント互換 + フォールバック)。
 fn append_system(
     chat: &SharedChatLog,
     scope: ChatScope,
     to: Option<Ipv4Addr>,
     self_ip: Ipv4Addr,
+    event: SystemEvent,
     text: String,
 ) {
     chat.lock().unwrap().append(ChatMessageInfo {
@@ -206,6 +260,7 @@ fn append_system(
         failed: false,
         file: None,
         system: true,
+        system_event: Some(event),
     });
 }
 
@@ -527,6 +582,7 @@ mod tests {
             failed: false,
             file: None,
             system: false,
+            system_event: None,
         }
     }
 
