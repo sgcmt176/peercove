@@ -2850,12 +2850,29 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert!(!sent[0].failed);
 
-        // ファイル送信(B → A)。A の受信ボックスに同じ内容で保存される
+        // ファイル送信(B → A)。A の受信ボックスに同じ内容で保存される。
+        // CI の高負荷ランナーでは、直前のチャット接続の後始末と重なった
+        // 2 本目の loopback TCP が稀に reset される(os error 10054)ことが
+        // あるため、有界リトライで吸収する(実運用でもファイル送信の失敗は
+        // 再送で回復する設計 = 再送キュー/UI の再試行と同じ意味論)。
         let src = temp_dir("pair-src").join("挨拶.txt");
         std::fs::write(&src, "file over peercove").unwrap();
-        b.shared
-            .send_file("127.0.0.1".parse().unwrap(), &src)
-            .unwrap();
+        let mut last_err = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            match b.shared.send_file("127.0.0.1".parse().unwrap(), &src) {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("ファイル送信が 3 回とも失敗: {e:#}");
+        }
         let inbox = a.shared.inbox_dir();
         let saved = std::fs::read_dir(&inbox)
             .unwrap()
