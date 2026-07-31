@@ -8,3 +8,9 @@ local.properties
 
 # Rust から生成される成果物(cargo-ndk が置く .so と UniFFI 生成 Kotlin)
 app/src/main/jniLibs/
+
+# リリース署名の鍵とパスワード。**絶対にコミットしない**
+# (鍵はリポジトリ外に置く運用を推奨。docs/development.md「リリース APK の署名」)
+keystore.properties
+*.jks
+*.keystore

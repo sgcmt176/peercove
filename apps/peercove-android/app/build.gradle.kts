@@ -29,6 +29,30 @@ fun sdkDirFromLocalProperties(): String? {
     return p.getProperty("sdk.dir")
 }
 
+// ---- リリース署名 ----------------------------------------------------------
+// リリース APK は自己生成の鍵で署名して sideload 配布する(Play ストアは未対応)。
+// 鍵本体とパスワードはリポジトリに入れないので、apps/peercove-android/
+// keystore.properties(gitignore 済み)から読む。ファイルが無ければ署名設定を
+// 付けない = 未署名 APK。debug ビルドと CI は従来どおり通る。
+// 作り方は docs/development.md「リリース APK の署名」。
+//
+// **署名鍵を変えると既存インストールを上書き更新できない**(Android が拒否する。
+// 利用者はアンインストールが必要 = 設定・チャット・メモが消える)。一度配布した
+// 鍵とパスワードは必ず保管し続けること。
+fun releaseSigningProps(): Properties? {
+    val f = File(rootDir, "keystore.properties")
+    if (!f.exists()) return null
+    val p = Properties()
+    f.inputStream().use { p.load(it) }
+    return p
+}
+
+// storeFile は絶対パス(リポジトリ外に置く運用を推奨)と、rootDir 相対の両方を許す
+fun resolveKeystoreFile(path: String): File {
+    val f = File(path)
+    return if (f.isAbsolute) f else File(rootDir, path)
+}
+
 val jniLibsDir: File = file("src/main/jniLibs")
 val uniffiOutDir: Provider<Directory> = layout.buildDirectory.dir("generated/uniffi")
 
@@ -76,9 +100,34 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    val signingProps = releaseSigningProps()
+
+    signingConfigs {
+        if (signingProps != null) {
+            create("release") {
+                val storePath = requireNotNull(signingProps.getProperty("storeFile")) {
+                    "keystore.properties に storeFile がありません"
+                }
+                val store = resolveKeystoreFile(storePath)
+                require(store.exists()) { "キーストアが見つかりません: ${store.absolutePath}" }
+                storeFile = store
+                storePassword = signingProps.getProperty("storePassword")
+                keyAlias = signingProps.getProperty("keyAlias")
+                keyPassword = signingProps.getProperty("keyPassword")
+                // v3 を有効にしておくと、将来どうしても鍵を替えたくなったときに
+                // 「鍵のローテーション」で上書き更新できる余地が残る(Android 9+)。
+                // minSdk 26 なので v1(JAR 署名)は不要。
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            // keystore.properties が無い環境では未署名のまま(端末には入らない)
+            signingProps?.let { signingConfig = signingConfigs.getByName("release") }
         }
     }
 

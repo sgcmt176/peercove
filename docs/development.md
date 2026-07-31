@@ -207,15 +207,82 @@ cd apps\peercove-android
 - Rust だけ検証したい場合: `cargo ndk -t arm64-v8a build -p peercove-mobile`
   (`ANDROID_HOME` か `ANDROID_NDK_HOME` を設定して実行)
 
+### リリース APK の署名
+
+配布用 APK は**自己生成の鍵**で署名します(sideload 配布。Play ストアは未対応
+= ADR-0039)。デスクトップのコード署名見送り(有償の証明書が必要)とは別の話で、
+Android は署名が無いと**そもそも端末にインストールできない**ため必須です。
+
+> **鍵は最初のリリースで決め切ること。** Android は署名鍵が変わったアプリの
+> 上書き更新を拒否します。後から鍵を替えると利用者はアンインストールが必要になり、
+> **設定・チャット履歴・メモがすべて消えます**。生成した `.jks` とパスワードは
+> 必ず保管し続けてください(紛失 = 以後アップデートを配れない)。
+> ※ v3 署名を有効にしてあるので、Android 9 以上に限れば将来「鍵のローテーション」
+> で救済できる余地は残ります。それでも鍵の保管が前提です。
+
+#### 1. キーストアを作る(初回のみ)
+
+**リポジトリ外**に置きます(誤コミット防止)。有効期限は長めに取ります
+(期限切れ = アップデートを配れなくなる)。
+
+```powershell
+& "$env:JAVA_HOME\bin\keytool.exe" -genkeypair -v `
+  -keystore "$env:USERPROFILE\.peercove\peercove-release.jks" `
+  -storetype PKCS12 -keyalg RSA -keysize 4096 -validity 10000 `
+  -alias peercove
+```
+
+対話でパスワードと識別名(CN など)を聞かれます。**パスワードはパスワード
+マネージャ等に保管**してください。
+
+#### 2. `keystore.properties` を置く
+
+`apps/peercove-android/keystore.properties`(gitignore 済み。コミットしない):
+
+```properties
+storeFile=C:/Users/<user>/.peercove/peercove-release.jks
+storePassword=<キーストアのパスワード>
+keyAlias=peercove
+keyPassword=<鍵のパスワード>
+```
+
+`storeFile` は絶対パスと `apps/peercove-android/` からの相対パスの両方を受けます。
+
+#### 3. ビルドする
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+cd apps\peercove-android
+.\gradlew.bat assembleRelease
+#   → app\build\outputs\apk\release\app-release.apk
+```
+
+`keystore.properties` が**無い**環境ではビルドは通りますが成果物は
+`app-release-unsigned.apk` になり、端末にはインストールできません(CI や
+デバッグビルドを壊さないための挙動です)。署名の確認:
+
+```powershell
+& "$env:LOCALAPPDATA\Android\Sdk\build-tools\36.0.0\apksigner.bat" verify -v `
+  app\build\outputs\apk\release\app-release.apk
+```
+
+`Verified using v2 scheme` と `v3 scheme` が `true` なら期待どおりです
+(minSdk 26 なので v1 = JAR 署名は不要)。
+
+> **デバッグ APK を配布しないこと。** `assembleDebug` の成果物は
+> `debuggable=true` で、adb からアプリ専有データ(秘密鍵・チャット履歴)を
+> 読み出せてしまいます。また署名鍵が開発機ごとに違うため、後でリリース鍵へ
+> 移行できません。
+
 ## リリース手順(タグ + バイナリ添付)
 
-初回リリースは手動です(コード署名・リリース自動化 CI は未整備。§下記の注意)。
-Windows 機と Linux 機の両方でビルドする必要があります(MSI は Windows、deb は
-Linux でしか作れないため)。
+リリースは手動です(デスクトップのコード署名・リリース自動化 CI は未整備。
+§下記の注意)。Windows 機と Linux 機の両方でビルドする必要があります
+(MSI は Windows、deb は Linux でしか作れないため)。
 
 ### 1. バージョンを上げる
 
-`0.1.0` を新バージョンに揃えます(4 か所。ずれるとインストーラのファイル名と
+新バージョンに揃えます(6 か所。ずれるとインストーラのファイル名と
 UI 表示が食い違います):
 
 ```
@@ -223,12 +290,18 @@ Cargo.toml                              … [workspace.package] version
 apps/peercove-ui/package.json           … "version"
 apps/peercove-ui/src-tauri/tauri.conf.json … "version"
 apps/peercove-ui/src-tauri/Cargo.toml   … [package] version
+apps/peercove-android/app/build.gradle.kts … versionName(表示用)
+apps/peercove-android/app/build.gradle.kts … versionCode(**必ず +1**。
+                                              据え置くと端末が更新を拒否する)
 ```
 
 ゲート(`cargo fmt --check` / `clippy` / `test`、UI の `npm run build`)を通し、
-コミットしておきます。
+コミットしておきます。CI が見ていないのは **Android ビルド**と**パッケージング**
+だけなので、その 2 つは手元で確認します。
 
 ### 2. 成果物をビルドする
+
+古い成果物が混ざらないよう、先に `packaging/dist/` を消しておきます。
 
 **Windows 機**(MSI + ポータブル ZIP):
 
@@ -252,12 +325,23 @@ sh packaging/make-notices.sh                           # → THIRD-PARTY-NOTICES
 sh packaging/make-tar.sh                                # → tar.gz
 ```
 
-集まる成果物(合計 5 点):
+**Android**(署名済み APK。上の「リリース APK の署名」の準備が必要):
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+cd apps\peercove-android
+.\gradlew.bat assembleRelease
+#   → app\build\outputs\apk\release\app-release.apk
+#   配布名は PeerCove-<版>.apk に付け替える
+```
+
+集まる成果物(合計 6 点):
 
 - `PeerCove_<版>_x64_ja-JP.msi`(Windows インストーラ)
 - `PeerCove_<版>_amd64.deb`(Ubuntu インストーラ)
 - `PeerCove-portable-windows-x64.zip`
 - `PeerCove-portable-linux-x64.tar.gz`
+- `PeerCove-<版>.apk`(Android。**署名済みであることを apksigner で確認する**)
 - `THIRD-PARTY-NOTICES.txt`
 
 ### 3. タグを打って push する
@@ -279,6 +363,7 @@ gh release create v<版> \
   PeerCove_<版>_amd64.deb \
   PeerCove-portable-windows-x64.zip \
   PeerCove-portable-linux-x64.tar.gz \
+  PeerCove-<版>.apk \
   THIRD-PARTY-NOTICES.txt
 ```
 
@@ -286,13 +371,20 @@ gh を使わない場合は GitHub の «Releases» → «Draft a new release» 
 選び、上記ファイルをドラッグして公開します。README のインストール節は Releases
 からの入手を前提にしているので、初回リリース後はリンクが有効になります。
 
+Android の APK は Releases から端末へ直接ダウンロードしてインストールできます
+(提供元不明のアプリの許可が必要。Play Protect の警告が出ることがあります)。
+**署名鍵が変わると上書き更新できない**ので、デバッグ APK で試用していた端末は
+一度アンインストールしてから入れ直してもらう必要があります(アプリ内データは
+消えます)。
+
 > **注意(未整備・既知の割り切り)**:
-> - **コード署名なし**。Windows は SmartScreen の警告、Ubuntu は未署名 deb の
->   警告が出ます(利用者に案内が必要)。署名は将来対応(ADR-0010 で言及)。
+> - **デスクトップはコード署名なし**。Windows は SmartScreen の警告、Ubuntu は
+>   未署名 deb の警告が出ます(利用者に案内が必要)。署名は将来対応
+>   (ADR-0010 で言及)。Android は自己生成の鍵で署名済み(上記)。
 > - **リリースビルドの自動化 CI は無し**。上記はすべて手元での手動ビルドです。
 >   タグ push で MSI/deb を自動ビルドして添付する GitHub Actions ワークフローは
 >   今後の課題(Tauri のクロスビルド + 署名の設計が必要)。
-> - **バージョンの一斉更新スクリプトは無し**。上の 4 ファイルを手で揃えます。
+> - **バージョンの一斉更新スクリプトは無し**。上の 6 か所を手で揃えます。
 
 ## コミット前チェック(ゲート)
 
