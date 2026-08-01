@@ -26,6 +26,8 @@ pub struct LinuxBackend {
     acl_generation: u64,
     /// 承認待ち端末に適用中の仮想 IP。INPUT/OUTPUT/FORWARD の解除に使う。
     isolated_ips: Vec<std::net::Ipv4Addr>,
+    /// メンバー間中継の許可ルールを入れたか(ホストのみ)。down で対解除する。
+    relay_rule: bool,
 }
 
 #[cfg(test)]
@@ -66,6 +68,23 @@ mod acl_tests {
             .any(|pair| pair == ["--ctstate", "ESTABLISHED,RELATED"]));
         assert!(args.windows(2).any(|pair| pair == ["--ctdir", "REPLY"]));
         assert!(args.windows(2).any(|pair| pair == ["-j", "ACCEPT"]));
+    }
+
+    /// 中継の許可は「トンネル IF に入って同じトンネル IF から出る」もの限定。
+    /// ここが広すぎると、ホストの他のインターフェース間の転送まで開けてしまう。
+    #[test]
+    fn relay_rule_allows_only_tunnel_to_tunnel_forwarding() {
+        let args = relay_rule_args("-I", "pcv0");
+        assert_eq!(args[0], "-I", "先頭挿入(ACL の DROP は後から更に上へ入る)");
+        assert!(args.windows(2).any(|pair| pair == ["-i", "pcv0"]));
+        assert!(args.windows(2).any(|pair| pair == ["-o", "pcv0"]));
+        assert!(args.windows(2).any(|pair| pair == ["-j", "ACCEPT"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--comment", "peercove-relay"]));
+        // 削除は同じ引数で op だけ変える(取りこぼすと再起動のたびに増える)
+        let del = relay_rule_args("-D", "pcv0");
+        assert_eq!(&del[1..], &args[1..]);
     }
 }
 
@@ -137,6 +156,35 @@ fn forward_rule_args(op: &str, src: &str, dst: &str) -> Vec<String> {
         "comment",
         "--comment",
         "peercove-subnet-router",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// メンバー間中継(ハブ&スポーク)の許可ルール。トンネル IF に入って同じ
+/// トンネル IF から出るパケット = ホストが中継するメンバー間通信。
+///
+/// **これが無いと、FORWARD の既定ポリシーが DROP の環境(Docker を入れた
+/// ホスト、ufw 有効な Ubuntu、firewalld など)でメンバー間通信だけが落ちる。**
+/// ホスト自身との通信は INPUT/OUTPUT なので通り、参加も台帳同期も成功するため、
+/// 「繋がっているのに相手のサービスにだけ届かない」という分かりにくい形で出る
+/// (VPS 運用の実機で発生)。`-I`(先頭挿入)だが、ACL の DROP と承認待ちの
+/// 隔離ルールは後から `-I` されるので、必ずこれより上位に来る(遮断は保たれる)。
+fn relay_rule_args(op: &str, wg_if: &str) -> Vec<String> {
+    [
+        op,
+        "FORWARD",
+        "-i",
+        wg_if,
+        "-o",
+        wg_if,
+        "-j",
+        "ACCEPT",
+        "-m",
+        "comment",
+        "--comment",
+        "peercove-relay",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -263,7 +311,38 @@ impl LinuxBackend {
             acl_policy: None,
             acl_generation: 0,
             isolated_ips: Vec::new(),
+            relay_rule: false,
         })
+    }
+
+    /// メンバー間中継の許可ルールを入れる(ホストのみ)。前回異常終了で残った
+    /// 同じルールを先に消してから入れ直すので、重複しない。
+    ///
+    /// iptables が無い環境もあるので失敗は警告に留める(既定ポリシーが ACCEPT
+    /// なら、このルールが無くても中継は通る)。
+    fn apply_relay_rule(&mut self) {
+        let _ = iptables(&relay_rule_args("-D", &self.if_name));
+        match iptables(&relay_rule_args("-I", &self.if_name)) {
+            Ok(_) => {
+                self.relay_rule = true;
+                tracing::info!("メンバー間中継を許可しました(FORWARD {})", self.if_name);
+            }
+            Err(e) => tracing::warn!(
+                "メンバー間中継の許可ルールを入れられませんでした: {e:#}。\
+                 FORWARD の既定ポリシーが DROP の環境(Docker / ufw / firewalld)では\
+                 メンバー同士の通信が届きません",
+            ),
+        }
+    }
+
+    /// 中継の許可ルールを外す。
+    fn clear_relay_rule(&mut self) {
+        if !std::mem::take(&mut self.relay_rule) {
+            return;
+        }
+        if let Err(e) = iptables(&relay_rule_args("-D", &self.if_name)) {
+            tracing::warn!("メンバー間中継の許可ルールの削除に失敗しました: {e:#}");
+        }
     }
 
     /// 適用中の ACL ルールをすべて解除する(down・全解除の共通処理)。
@@ -463,6 +542,8 @@ impl WgBackend for LinuxBackend {
                 let _ = self.api.remove_interface();
                 return Err(e);
             }
+            // sysctl だけでは足りない。FORWARD チェーンでも許可が要る
+            self.apply_relay_rule();
         }
         Ok(())
     }
@@ -730,6 +811,7 @@ impl WgBackend for LinuxBackend {
         self.clear_router();
         self.clear_isolation();
         self.clear_acl();
+        self.clear_relay_rule();
         match self.api.remove_interface() {
             Ok(()) => Ok(()),
             // 存在しない場合は成功扱い(クリーンアップの冪等性)
